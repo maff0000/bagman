@@ -1,0 +1,24 @@
+SYNTHETIC TEST DATA — NOT A REAL INVOICE — FABRICATED FOR BAGMAN CD-1 TESTS
+
+This file is a synthetic fixture created for automated testing only. It
+contains no real customer, vendor, bank, or financial information. Every
+value below is fabricated and does not correspond to any real transaction,
+company, or person. See PID.md §8 (Production Data Doctrine) and §15 Test E.
+
+Invoice Number: SYNTH-INV-0001
+Issue Date:     2000-01-01
+Bill To:        Example Synthetic Customer Ltd (not a real company)
+Vendor:         Example Synthetic Vendor Ltd (not a real company)
+Currency:       GBP
+
+Line Items:
+  1 x Synthetic Test Widget      £10.00
+  2 x Synthetic Test Service     £25.00
+
+Subtotal:  £60.00
+Tax (0%):  £0.00
+Total:     £60.00
+
+This document must never be treated as evidence of any real financial
+transaction. It exists solely to exercise fixture-loading and
+synthetic-data-verification test code.
