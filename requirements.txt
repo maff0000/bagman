@@ -1,0 +1,27 @@
+# Runtime dependencies for BAGMAN CD-2 (WI-2 domain implementation).
+#
+# Only two runtime dependencies are introduced, both explicitly
+# authorised by the PL for this work item:
+#
+#   jsonschema          - validates every domain object's to_dict()
+#                          output against its contracts/*.schema.json
+#                          file (Draft 2020-12) before it is accepted.
+#   rfc3339-validator    - jsonschema's built-in "date-time" format
+#                          checker only registers itself if this
+#                          package is importable (see
+#                          jsonschema._format); without it, `format:
+#                          date-time` is silently unenforced. This is
+#                          exactly the gap WI-1 flagged.
+#
+# Versions pinned to the current stable release of each as of this
+# work item (2026-09-12) — see the WI-2 delivery report for the
+# environment check that produced these:
+#   jsonschema 4.10.3 was already installed in the delivery
+#   environment (a transitive dependency from elsewhere), but the
+#   latest stable release, 4.26.0, is pinned here deliberately since
+#   there was no prior CD-2 code depending on the older version's
+#   behaviour.
+#
+# Do not add anything else here without flagging it to the PL first.
+jsonschema==4.26.0
+rfc3339-validator==0.1.4
