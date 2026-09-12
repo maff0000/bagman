@@ -36,7 +36,18 @@
 # dependency, not merely test tooling, and belongs in this file
 # instead. Pinned to the version already used by requirements-dev.txt.
 #
+# referencing - pinned explicitly by the PL after CD-2 audit flagged it:
+# core/contract_validation.py imports `referencing` directly
+# (Registry/Resource/DRAFT202012) to cross-resolve $ref between
+# contracts/*.schema.json files. It was previously only present as an
+# undeclared transitive dependency of jsonschema>=4.18 — correct today,
+# but a package a module imports directly should be pinned directly,
+# not left to arrive incidentally via another package's own dependency
+# choices, which could change in a future jsonschema release. Pinned to
+# the version that was already resolving and passing all 102 tests.
+#
 # Do not add anything else here without flagging it to the PL first.
 jsonschema==4.26.0
 rfc3339-validator==0.1.4
 PyYAML==6.0.2
+referencing==0.37.0
