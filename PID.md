@@ -1,1534 +1,1526 @@
-# BAGMAN PID v2 — Canonical Entity, Evidence, Provenance & Audit Foundation
+# BAGMAN PID v3 — Runtime & Evidence Store
 
 ## 1. Product Identity
 
 **Product:** BAGMAN
 **Repository:** `github.com/maff0000/bagman`
 **Authoritative working tree:** `/srv/bagman`
-**Canonical CD-1 merge:** `19d3f66688a3ad2bf178a230b34ff5b6122f0d4a`
+**Canonical CD-2 merge:** `2dd4714131bcee0062ea929ecaea2c5d253025bb`
 **Primary branch:** `main`
 
-This PID authorises CD-2:
+This PID authorises:
 
-> **Canonical Entity, Evidence, Provenance & Audit Foundation**
+> **CD-3 — BAGMAN Runtime & Evidence Store**
 
-CD-2 establishes the internal identity, evidence, lineage and audit model on which all later BAGMAN capabilities depend.
+CD-3 turns the canonical in-memory foundation delivered in CD-2 into a durable BAGMAN-owned runtime.
 
-It does **not** connect BAGMAN to any live mailbox, bank, accounting platform, billing platform or SaaS provider.
+It establishes:
+
+* PostgreSQL persistence
+* durable immutable evidence storage
+* Docker Compose runtime
+* migrations
+* repository implementations
+* health/readiness
+* backup/restore foundations
+* runtime observability
+* durable restart/recovery proof
+
+It does **not** authorise any live mailbox, banking, accounting, billing or SaaS-provider integration.
 
 ---
 
 # 2. Delivery Objective
 
-CD-2 shall establish a durable canonical model for:
+The objective is to prove:
 
-* governed entities
-* evidence identity
-* evidence provenance
-* evidence relationships
-* source identity
-* immutable audit events
-* correlation and causality
-* component manifests
-* canonical contracts
-* deterministic validation
-* synthetic fixtures
-* persistence-ready domain models
+> BAGMAN can persist canonical state and immutable evidence durably across container restarts, recover that state deterministically, and operate entirely inside BAGMAN-owned Docker infrastructure.
 
-The desired end state is:
-
-> Any future document, email, bank transaction, invoice, receipt, tax record or external event can enter BAGMAN through an adapter and be represented using stable internal identities without the rest of BAGMAN needing to understand the originating provider.
-
-CD-2 is therefore a **foundation of meaning**, not an integration delivery.
+At the end of CD-3, BAGMAN should be capable of receiving a synthetic evidence item through its canonical API, persisting its metadata and binary content, shutting down completely, restarting, and proving that the same canonical evidence, provenance, audit trail and content remain intact.
 
 ---
 
-# 3. Core Architectural Principle
+# 3. Runtime Doctrine
 
-External systems speak provider-specific language.
+BAGMAN is Docker-first.
 
-BAGMAN must not.
+All CD-3 runtime dependencies shall be BAGMAN-specific.
 
-Future examples include:
+No shared runtime database, cache, object store or application service belonging to another project may be consumed.
 
-```text
-Microsoft message ID
-Gmail message ID
-IMAP UID
-Starling transaction ID
-Revolut transaction ID
-Xero invoice ID
-Chargebee subscription ID
-```
-
-These are external identifiers.
-
-BAGMAN must establish its own canonical identities.
-
-Conceptually:
+Canonical operational naming shall follow:
 
 ```text
-EXTERNAL SYSTEM
-      ↓
-ADAPTER
-      ↓
-CANONICAL BAGMAN IDENTITY
-      ↓
-BAGMAN SERVICES
+bagman-<role>
 ```
 
-No core BAGMAN component should require knowledge of Microsoft, Google, Starling, Revolut, Xero, Chargebee, uSecure, Huntress or other provider-specific identifiers except through explicit source references.
+Initial runtime is expected to include:
+
+```text
+bagman-db
+bagman-objects
+bagman-api
+```
+
+A worker container may be introduced only if genuinely required by CD-3.
+
+Do not create containers merely to mirror code directories.
 
 ---
 
-# 4. Canonical Governed Entity Model
+# 4. Redis Doctrine
 
-CD-2 shall introduce a canonical `GovernedEntity` model.
+Redis remains out of scope.
 
-Initial governed entities:
+CD-3 shall not introduce Redis.
 
-```text
-NOUSTAI_LIMITED
-INFOSECURS_LIMITED
-MATTHEW_SCOTT_PERSONAL
-```
+PostgreSQL and normal application/runtime patterns are sufficient for this delivery.
 
-These identities are stable BAGMAN identities.
-
-They must not depend on:
-
-* email address
-* bank account
-* Xero tenant
-* legal registration number
-* display name
-* current jurisdiction
-
-Those attributes may be associated with the entity later.
-
-## Required conceptual fields
-
-A governed entity shall support at minimum:
-
-```text
-entity_id
-entity_type
-canonical_name
-display_name
-status
-created_at
-metadata
-```
-
-Suggested entity types:
-
-```text
-COMPANY
-PERSON
-```
-
-Future extension must remain possible for:
-
-```text
-TRUST
-PARTNERSHIP
-OTHER
-```
-
-without schema redesign.
-
-## Entity isolation invariant
-
-Every canonical financial or evidential record must ultimately be:
-
-* associated with exactly one governed entity, or
-* explicitly unresolved
-
-Never silently infer ownership and persist it as truth without provenance.
-
-The unresolved state must be first-class.
+Any future Redis introduction requires a separate architectural decision demonstrating need.
 
 ---
 
-# 5. Canonical Identifier Doctrine
+# 5. Required Docker Runtime
 
-BAGMAN identities must not be derived directly from mutable business values.
+CD-3 shall provide a BAGMAN-controlled Compose runtime.
 
-Do not use:
-
-```text
-invoice number
-email address
-supplier name
-filename
-bank reference
-customer name
-```
-
-as primary canonical identifiers.
-
-Use opaque immutable BAGMAN-generated identifiers.
-
-Preferred form:
+Preferred high-level topology:
 
 ```text
-UUIDv7
+                 ┌─────────────────┐
+                 │   bagman-api    │
+                 └────────┬────────┘
+                          │
+             ┌────────────┴────────────┐
+             │                         │
+      ┌──────▼──────┐          ┌───────▼────────┐
+      │  bagman-db  │          │ bagman-objects │
+      │ PostgreSQL  │          │ object storage │
+      └─────────────┘          └────────────────┘
 ```
 
-or an equivalently justified monotonic globally unique identifier.
+All services must run on a BAGMAN-specific Docker network.
 
-The exact implementation may be selected by FORGE if objectively justified and documented.
+No database or object-storage port should be publicly exposed unless required for explicit development use.
 
-Identifiers must be:
-
-* globally unique within BAGMAN
-* immutable
-* non-secret
-* safe for logs
-* safe for URLs where applicable
-* independent from external-provider identifiers
+Internal service-to-service networking is preferred.
 
 ---
 
-# 6. Evidence Model
+# 6. Container Naming
 
-CD-2 shall introduce a first-class `EvidenceItem`.
+Canonical Compose/service/container naming shall be clear and operational.
 
-An EvidenceItem represents something BAGMAN has observed or received.
-
-Examples later include:
+Use:
 
 ```text
-email
-email attachment
-uploaded PDF
-receipt image
-invoice
-bank statement
-HMRC letter
-contract
-CSV export
-JSON API payload
-generated tax pack
+bagman-db
+bagman-objects
+bagman-api
 ```
 
-CD-2 itself shall use synthetic examples only.
-
-## Evidence identity
-
-Each EvidenceItem shall receive its own canonical BAGMAN ID.
-
-Suggested fields:
+Future names may include:
 
 ```text
-evidence_id
-entity_id or unresolved
-evidence_type
-source_id
-observed_at
-received_at
-content_hash
-mime_type
-original_name
-size_bytes
-storage_reference
-status
-created_at
-metadata
+bagman-worker
+bagman-ui
+bagman-agent
+bagman-notify
 ```
 
-Not every field must apply to every evidence type.
-
-Avoid forcing provider-specific fields into the canonical base model.
+Do not use whimsical or ambiguous names.
 
 ---
 
-# 7. Evidence Immutability
+# 7. Image Doctrine
 
-Original received evidence is immutable.
+Application images must be reproducible and versionable.
 
-Once BAGMAN records an original evidence artifact, it must not be silently modified.
+Do not use `latest` as canonical promotion identity.
 
-Corrections occur by:
+The same BAGMAN application image shall eventually be promoted between environments, with only external configuration/secrets differing.
 
-* adding new derived records
-* superseding interpretation
-* adding classifications
-* linking replacement evidence
-* recording explicit corrective actions
+CD-3 should establish this pattern now.
 
-They do not occur by rewriting history.
+The runtime should expose build/version metadata sufficient to associate a running container with:
 
-Example:
-
-```text
-Original PDF
-    ↓
-EvidenceItem A
-    ↓
-Extraction v1
-    ↓
-Extraction v2
-```
-
-not:
-
-```text
-EvidenceItem A overwritten
-```
-
-This distinction is mandatory.
+* Git commit
+* image identity
+* application version where applicable
 
 ---
 
-# 8. Content Hashing
+# 8. PostgreSQL
 
-Evidence content should use cryptographic content hashing.
+CD-3 shall introduce BAGMAN-owned PostgreSQL.
 
-Default:
-
-```text
-SHA-256
-```
-
-The content hash supports:
-
-* duplicate detection
-* integrity validation
-* provenance
-* evidence identity checks
-
-The hash is not necessarily the canonical evidence ID.
-
-Two observations of identical bytes may still represent separate source observations.
-
-Therefore BAGMAN must distinguish:
-
-```text
-evidence identity
-```
-
-from:
-
-```text
-content identity
-```
-
-This is important.
-
-Example:
-
-Two mailboxes may receive the same invoice PDF.
-
-That can result in:
-
-```text
-two EvidenceItem observations
-same SHA-256 content hash
-```
-
-Later deduplication logic may associate them.
-
-CD-2 must not prematurely collapse those observations into one record.
-
----
-
-# 9. Source Model
-
-Introduce a canonical `Source`.
-
-A source describes where information originated.
-
-Examples for future use:
-
-```text
-MAILBOX
-MANUAL_UPLOAD
-BANK
-ACCOUNTING_PLATFORM
-BILLING_PLATFORM
-GENERATED
-API
-```
-
-Provider-specific identity belongs underneath the source model.
-
-Suggested conceptual structure:
-
-```text
-source_id
-source_type
-provider
-external_source_ref
-governed_entity_hint
-status
-metadata
-```
-
-Example later:
-
-```text
-source_type: MAILBOX
-provider: MICROSOFT_GRAPH
-external_source_ref: matt@infosecurs.com
-```
-
-This does not mean all records from that mailbox automatically belong to Infosecurs.
-
-A source may provide an entity hint without asserting canonical ownership.
-
----
-
-# 10. External Reference Model
-
-External identifiers must be represented separately from canonical IDs.
-
-Introduce an `ExternalReference`.
-
-Suggested fields:
-
-```text
-external_reference_id
-provider
-resource_type
-external_id
-canonical_object_type
-canonical_object_id
-source_id
-first_observed_at
-metadata
-```
-
-This lets BAGMAN say:
-
-```text
-BAGMAN evidence EV-...
-corresponds to
-Microsoft Graph message AAMk...
-```
-
-without contaminating BAGMAN's internal identity model.
-
-Uniqueness rules must be explicit.
-
-For example, the same external ID may only be meaningful within:
-
-```text
-provider + account/source + resource type
-```
-
-Do not assume provider IDs are globally unique.
-
----
-
-# 11. Provenance Model
-
-BAGMAN must always be able to answer:
-
-> Where did this information come from?
-
-Introduce explicit provenance.
-
-For a derived fact, provenance should be able to trace back to one or more EvidenceItems.
-
-Conceptually:
-
-```text
-Canonical fact
-      ↓
-Provenance edge
-      ↓
-EvidenceItem
-      ↓
-Source
-```
-
-Provenance may also include transformation information.
-
-Suggested fields:
-
-```text
-provenance_id
-subject_type
-subject_id
-evidence_id
-relationship
-transform_id
-created_at
-metadata
-```
-
-Relationships may include:
-
-```text
-OBSERVED_FROM
-EXTRACTED_FROM
-DERIVED_FROM
-GENERATED_FROM
-SUPERSEDES
-SUPPORTS
-CONTRADICTS
-```
-
-Do not hardcode only invoice-oriented provenance.
-
-This is a platform-level primitive.
-
----
-
-# 12. Derived Data Doctrine
-
-BAGMAN must distinguish:
-
-```text
-original evidence
-```
-
-from:
-
-```text
-derived interpretation
-```
-
-Examples later:
-
-Original:
-
-```text
-PDF invoice
-email
-bank transaction payload
-```
-
-Derived:
-
-```text
-supplier name
-invoice total
-tax classification
-R&D candidate status
-reconciliation proposal
-```
-
-A derived fact may change.
-
-Original evidence does not.
-
-This must be obvious in both contracts and persistence design.
-
----
-
-# 13. Audit Event Model
-
-CD-2 shall establish an append-oriented canonical `AuditEvent`.
-
-An audit event records something meaningful that happened inside BAGMAN.
-
-Examples later:
-
-```text
-EVIDENCE_OBSERVED
-EVIDENCE_STORED
-ENTITY_ASSIGNED
-CLASSIFICATION_PROPOSED
-CLASSIFICATION_APPROVED
-RECONCILIATION_PROPOSED
-RECONCILIATION_CONFIRMED
-DOCUMENT_DOWNLOADED
-TAX_PACK_GENERATED
-CUSTOMER_SUSPENSION_REQUESTED
-```
-
-CD-2 need only implement foundation events.
-
-## Required audit characteristics
-
-Audit events must be:
-
-* immutable after creation
-* UTC timestamped
-* actor-attributed
-* correlation-aware
-* causally traceable
-* structured
-* queryable
-* safe to log
-
-Suggested fields:
-
-```text
-audit_event_id
-event_type
-occurred_at
-actor_type
-actor_id
-subject_type
-subject_id
-correlation_id
-causation_id
-payload
-schema_version
-```
-
----
-
-# 14. Actor Model
-
-BAGMAN must distinguish who or what caused an action.
-
-Suggested actor types:
-
-```text
-SYSTEM
-USER
-AGENT
-SERVICE
-EXTERNAL_SYSTEM
-```
-
-Examples later:
-
-```text
-Matt
-BAGMAN Agent
-mail-ingest worker
-reconciler
-Chargebee
-```
-
-Do not represent all activity as "system".
-
-That destroys accountability.
-
----
-
-# 15. Correlation and Causality
-
-Every multi-step workflow must be traceable.
-
-Introduce:
-
-```text
-correlation_id
-causation_id
-```
-
-Example later:
-
-```text
-incoming email
- correlation=A
-
-attachment discovered
- correlation=A
- causation=email-event-id
-
-invoice extracted
- correlation=A
- causation=attachment-event-id
-
-classification proposed
- correlation=A
- causation=extraction-event-id
-```
-
-This allows BAGMAN to reconstruct complete operational stories.
-
----
-
-# 16. Time Doctrine
-
-All canonical timestamps shall be stored and processed in UTC.
-
-Use timezone-aware timestamps.
-
-No naive datetime values are permitted in canonical BAGMAN state.
-
-Original local/provider timestamps may be preserved separately when required for evidential reasons.
-
-Canonical event time remains UTC.
-
----
-
-# 17. Schema Versioning
-
-Canonical contracts must include schema/version identity.
-
-Once later components consume these contracts, silent incompatible changes become dangerous.
-
-Therefore contracts shall support explicit versioning.
-
-Example:
-
-```text
-bagman.evidence.v1
-bagman.audit_event.v1
-bagman.entity.v1
-```
-
-The exact naming convention may be refined during implementation.
-
-Contract changes must distinguish:
-
-* backward-compatible additions
-* breaking semantic changes
-
-Breaking changes require a new contract version or documented migration.
-
----
-
-# 18. Contract Format
-
-FORGE should use a machine-validatable contract representation.
-
-Preferred:
-
-```text
-JSON Schema
-```
-
-where appropriate.
-
-Pydantic/domain models may be generated from or validated against those contracts, but no Python-only model should silently become the sole cross-component authority if a language-neutral schema is practical.
-
-Contracts belong under:
-
-```text
-contracts/
-```
-
-Suggested layout:
-
-```text
-contracts/
-├── entity/
-├── evidence/
-├── source/
-├── provenance/
-├── audit/
-└── common/
-```
-
----
-
-# 19. Component Manifests
-
-CD-2 shall introduce the component-manifest pattern discussed in the BAGMAN architecture.
-
-Each bounded component implemented now or later should be capable of declaring:
-
-```text
-id
-version
-responsibility
-owns
-consumes
-produces
-dependencies
-external_access
-prohibited
-```
-
-Preferred filename:
-
-```text
-component.yaml
-```
-
-Example conceptual form:
-
-```yaml
-id: BAGMAN.CORE.EVIDENCE
-version: 1
-
-responsibility:
-  "Own canonical evidence identity and provenance."
-
-owns:
-  - EvidenceItem
-  - Provenance
-
-consumes: []
-
-produces:
-  - EvidenceObserved
-
-external_access: false
-
-prohibited:
-  - direct_email_access
-  - direct_bank_access
-  - direct_xero_access
-```
-
-CD-2 should create manifests only for components that genuinely exist.
-
-Do not fabricate future runtime components as though implemented.
-
----
-
-# 20. Core Domain Placement
-
-Expected CD-2 implementation areas:
-
-```text
-core/
-contracts/
-services/evidence/
-tests/
-memory/
-```
-
-Potential supporting configuration:
-
-```text
-config/
-```
-
-FORGE may introduce a small shared Python package if required to implement canonical types and validation cleanly.
-
-Avoid generic dumping grounds such as:
-
-```text
-utils.py
-common.py
-helpers.py
-```
-
-unless their responsibility is genuinely well-defined.
-
----
-
-# 21. Persistence Boundary
-
-CD-2 must design models so they are persistence-ready.
-
-However CD-2 should avoid prematurely building the complete production database platform.
-
-Two acceptable approaches:
-
-### Option A
-
-Implement domain/contract models and a narrow in-memory/reference repository abstraction.
-
-### Option B
-
-Introduce a minimal PostgreSQL-backed persistence proof if it materially increases confidence in constraints and immutability semantics.
-
-If PostgreSQL is introduced, it must be:
+Container:
 
 ```text
 bagman-db
 ```
 
-and BAGMAN-specific.
+PostgreSQL becomes the durable canonical structured datastore.
 
-No shared host PostgreSQL.
+It must persist at minimum:
 
-No Redis.
+* governed entities
+* sources
+* external references
+* evidence metadata
+* provenance
+* audit events
 
-The choice must be justified in the delivery evidence.
-
-The priority is correct domain semantics, not infrastructure volume.
+The persistence layer must preserve CD-2 semantics.
 
 ---
 
-# 22. Repository Interfaces
+# 9. Database Ownership
 
-Where persistence interfaces are introduced, BAGMAN should use explicit repository/service contracts.
+Only BAGMAN persistence components may write BAGMAN canonical tables.
+
+Future adapters must not directly write SQL.
+
+Future GUI and AI agent components must not directly write SQL.
+
+All canonical mutations must continue through BAGMAN domain/service/repository contracts.
+
+---
+
+# 10. Database Schema
+
+The database schema must reflect the canonical contracts rather than redefine them arbitrarily.
+
+Expected tables include concepts equivalent to:
+
+```text
+governed_entities
+sources
+external_references
+evidence_items
+provenance
+audit_events
+```
+
+Exact names may differ if justified.
+
+Provider-specific data should remain in bounded metadata or external-reference structures and must not contaminate canonical identity.
+
+---
+
+# 11. Database Constraints
+
+Important domain invariants must be enforced in persistence where practical.
+
+Examples include:
+
+* primary canonical IDs unique
+* external-reference tuple uniqueness
+* foreign-key integrity
+* append-only audit identity
+* valid evidence/source relationships
+* no accidental duplicate canonical records from replay
+* entity ownership nullable only where unresolved is legitimate
+
+Database constraints should complement, not replace, domain validation.
+
+---
+
+# 12. Migrations
+
+CD-3 must introduce a formal migration mechanism.
+
+Recommended:
+
+```text
+Alembic
+```
+
+or an equivalently justified migration system.
+
+Requirements:
+
+* migrations committed to Git
+* ordered and deterministic
+* no manual schema editing as normal operation
+* migration version queryable
+* clean database can reach current schema automatically
+* existing database can upgrade without destructive reset
+
+No schema creation hidden inside random application startup logic.
+
+---
+
+# 13. Persistence Repository Implementations
+
+CD-2 repository interfaces must gain durable PostgreSQL implementations.
+
+Expected examples:
+
+```text
+PostgresEntityRepository
+PostgresSourceRepository
+PostgresExternalReferenceRepository
+PostgresEvidenceRepository
+PostgresProvenanceRepository
+PostgresAuditRepository
+```
+
+The in-memory implementations remain useful for fast tests.
+
+Canonical service behaviour must not fork between in-memory and PostgreSQL variants.
+
+---
+
+# 14. Composition Root
+
+CD-3 should introduce a clean runtime composition root that chooses repository implementations from configuration.
+
+Conceptually:
+
+```text
+DEV/TEST
+  -> InMemory repositories
+
+RUNTIME
+  -> PostgreSQL repositories
+```
+
+The domain layer must not contain environment checks scattered across files.
+
+Do not spread:
+
+```python
+if ENV == "prod":
+```
+
+through canonical domain code.
+
+---
+
+# 15. Evidence Object Storage
+
+CD-3 shall introduce BAGMAN-owned object storage for original evidence bytes.
+
+Container:
+
+```text
+bagman-objects
+```
+
+Preferred implementation:
+
+```text
+MinIO
+```
+
+or another S3-compatible self-hosted store if objectively better.
+
+The purpose is to provide durable immutable evidence storage behind an internal BAGMAN storage contract.
+
+---
+
+# 16. Storage Abstraction
+
+Core/domain code must not depend directly on MinIO APIs.
+
+Introduce an abstraction such as:
+
+```text
+EvidenceObjectStore
+```
+
+with operations conceptually equivalent to:
+
+```text
+put()
+get()
+exists()
+verify_hash()
+```
+
+Provider-specific storage implementation lives behind that contract.
+
+This allows later migration to another S3-compatible service or cloud object store without rewriting evidence semantics.
+
+---
+
+# 17. Evidence Immutability
+
+Original evidence bytes are immutable.
+
+Once stored under a canonical evidence record, BAGMAN must not silently overwrite the original object.
+
+If a different object arrives, it is new evidence.
+
+If corrected content arrives, it is new evidence.
+
+Do not implement "replace file contents but keep the same evidence ID."
+
+---
+
+# 18. Content Addressing and Verification
+
+Stored evidence must be verified against the canonical SHA-256 content hash.
+
+Required pattern:
+
+```text
+bytes received
+   ↓
+SHA-256 calculated
+   ↓
+canonical EvidenceItem
+   ↓
+bytes stored
+   ↓
+retrieved bytes can be re-hashed
+   ↓
+hash equality proven
+```
+
+BAGMAN must detect corruption or mismatch.
+
+Object-storage keys must not rely solely on user filenames.
+
+The filename may be retained as metadata, but storage identity must use a safe canonical scheme.
+
+---
+
+# 19. Object Key Doctrine
+
+Preferred structure may resemble:
+
+```text
+evidence/<evidence_id>/<content_hash>
+```
+
+or equivalent.
+
+The exact form may be refined.
+
+Requirements:
+
+* safe
+* deterministic
+* no directory traversal
+* no reliance on original filename
+* no accidental overwrite
+* canonical evidence ID visible or recoverable
+
+---
+
+# 20. Evidence Registration Transaction Semantics
+
+CD-3 must explicitly handle the fact that metadata persistence and object storage span two systems.
+
+Avoid creating silent half-valid evidence.
+
+The system must define what happens if:
+
+```text
+database succeeds
+object storage fails
+```
+
+or:
+
+```text
+object storage succeeds
+database fails
+```
+
+A robust staged lifecycle is preferred.
 
 For example:
 
 ```text
-EvidenceRepository
-AuditRepository
-EntityRepository
-```
-
-Core domain logic must not scatter SQL throughout unrelated services.
-
-Likewise, future adapters must not write directly into database tables.
-
----
-
-# 23. Initial Entity Registry
-
-CD-2 shall establish canonical definitions for:
-
-```text
-NOUSTAI_LIMITED
-INFOSECURS_LIMITED
-MATTHEW_SCOTT_PERSONAL
-```
-
-These may be represented through safe committed configuration because their identities are not credentials.
-
-Do not add sensitive company/account data merely because the entities exist.
-
-Initial metadata should remain minimal.
-
----
-
-# 24. Evidence Type Taxonomy
-
-CD-2 should define an extensible evidence taxonomy.
-
-Initial safe values may include:
-
-```text
-EMAIL
-EMAIL_ATTACHMENT
-DOCUMENT
-INVOICE
-RECEIPT
-STATEMENT
-CONTRACT
-TAX_DOCUMENT
-CORRESPONDENCE
-API_PAYLOAD
-USER_UPLOAD
-GENERATED_DOCUMENT
-UNKNOWN
-```
-
-Do not assume classification is always known when evidence enters BAGMAN.
-
-`UNKNOWN` is legitimate.
-
-Likewise, a generic `DOCUMENT` may later be reclassified.
-
-Original observation history must remain visible.
-
----
-
-# 25. Evidence Status
-
-Evidence workflow state should remain distinct from evidence identity/type.
-
-Potential statuses:
-
-```text
 OBSERVED
-REGISTERED
+  ↓
+object stored + hash verified
+  ↓
 AVAILABLE
-SUPERSEDED
-QUARANTINED
+```
+
+Failure may result in:
+
+```text
 ERROR
 ```
 
-Do not introduce financial statuses such as:
+or:
 
 ```text
-PAID
-RECONCILED
-POSTED_TO_XERO
+QUARANTINED
 ```
 
-into the evidence object.
+with a recoverable workflow.
 
-Those belong to later finance domains.
+Do not pretend cross-system atomicity exists where it does not.
 
 ---
 
-# 26. Upload Readiness
+# 21. Audit Persistence
 
-Because the future GUI will support document uploads, CD-2 models should support:
+Audit events must become durable.
+
+They must remain append-oriented.
+
+Normal application code must not expose:
 
 ```text
-source_type = MANUAL_UPLOAD
+update_audit_event()
+delete_audit_event()
 ```
 
-without requiring a future schema change.
+as routine operations.
 
-CD-2 does not need to implement the production upload GUI.
-
-Synthetic API/unit proof is sufficient.
+Database permissions or repository design should make audit mutation difficult by default.
 
 ---
 
-# 27. Agent and Memory Fabric Interaction
+# 22. Provenance Persistence
 
-The BAGMAN AI agent must not use unstructured memory as canonical truth.
+Provenance must survive restart and remain queryable.
 
-CD-2 shall establish that:
+The CD-2 lineage proof must work against PostgreSQL-backed repositories.
+
+BAGMAN must still be able to trace:
 
 ```text
-canonical domain state
-        ↓
-structured memory projection
-        ↓
-BAGMAN Agent
+Derived object
+    ↓
+Provenance
+    ↓
+EvidenceItem
+    ↓
+Source
 ```
 
-not:
-
-```text
-agent memory
-        ↓
-canonical financial truth
-```
-
-Memory Fabric may retain architectural context and summaries, but EvidenceItem, Entity and AuditEvent identities remain authoritative in canonical services/contracts.
-
-CD-2 should document this boundary explicitly.
+after a complete runtime restart.
 
 ---
 
-# 28. Generated Memory Projection
+# 23. Idempotency Persistence
 
-Where practical, CD-2 should provide a lightweight deterministic way to generate or update architecture-memory material from:
+The CD-2 idempotency guarantee must survive process restart.
 
-* component manifests
-* contracts
-* canonical entity definitions
-
-This need not be sophisticated.
-
-The goal is to prevent BAGMAN's architecture memory from drifting away from the source tree.
-
-Do not introduce a vector database.
-
----
-
-# 29. Security Doctrine
-
-CD-1 security doctrine remains fully binding.
-
-Specifically:
-
-* repository remains treated as public
-* no live credentials
-* no mailbox passwords
-* no OAuth tokens
-* no bank credentials
-* no real financial documents
-* no customer-sensitive data
-* no production database
-* no production mailbox contents
-
-Synthetic fixtures only.
-
-Gitleaks and existing security tests remain mandatory.
-
-CD-2 must not weaken any CD-1 control.
-
----
-
-# 30. Synthetic Fixture Doctrine
-
-CD-2 shall create realistic but obviously fabricated fixtures demonstrating:
-
-* multiple governed entities
-* unresolved entity ownership
-* duplicate content from different sources
-* external-provider references
-* evidence provenance
-* derived relationships
-* audit causality
-* schema/version validation
-
-Suggested fictional parties:
-
-```text
-Example Systems Ltd
-Synthetic Cloud Services Ltd
-Test Customer Ltd
-```
-
-Do not reuse real BAGMAN suppliers/customers for convenience.
-
----
-
-# 31. Required Contract Tests
-
-At minimum, prove:
-
-### Entity identity
-
-* valid canonical entity accepted
-* malformed entity rejected
-* unsupported type rejected where appropriate
-* immutable canonical identifier semantics
-
-### Evidence
-
-* evidence requires canonical identity
-* unresolved entity is supported
-* valid content hash accepted
-* malformed hash rejected
-* provider-specific metadata does not become canonical identity
-* duplicate bytes can exist as distinct observations
-
-### External references
-
-* provider/source scope enforced
-* canonical/external identity separation proven
-
-### Provenance
-
-* derived record can trace to evidence
-* invalid/orphan provenance rejected
-* multiple evidence sources supported
-
-### Audit
-
-* UTC-aware timestamps mandatory
-* actor required
-* correlation supported
-* causation supported
-* immutable/event-oriented semantics demonstrated
-
-### Versioning
-
-* contracts carry schema version
-* incompatible structures fail validation
-
----
-
-# 32. Required Architectural Tests
-
-CD-2 should add tests proving boundaries where practical.
-
-Examples:
-
-* core domain code does not import provider adapters
-* evidence service does not import banking/accounting/billing adapters
-* agent code is not used as canonical domain authority
-* contracts do not reference provider-specific implementation classes
-* no Redis dependency introduced
-* no direct third-party SDK dependency introduced in core
-
-These tests may be static/import-based if appropriate.
-
----
-
-# 33. Required API Surface
-
-CD-2 may introduce a minimal internal API or service facade if useful.
-
-Acceptable operations include:
-
-```text
-register_entity()
-register_source()
-register_evidence()
-link_external_reference()
-record_provenance()
-record_audit_event()
-get_evidence()
-trace_provenance()
-```
-
-These are internal canonical operations.
-
-Do not introduce external-provider endpoints.
-
-A production HTTP API is not required unless FORGE can justify that it materially proves the architecture.
-
----
-
-# 34. Idempotency
-
-Future adapters will retry.
-
-Therefore CD-2 must establish idempotency semantics.
+This is mandatory.
 
 Example:
 
-The same:
-
 ```text
-provider
-source
-resource_type
-external_id
+register evidence
+shutdown BAGMAN
+restart BAGMAN
+retry same provider/source/resource/external-ID
 ```
 
-observed repeatedly must not blindly produce duplicate canonical records unless the domain explicitly allows separate observations.
+must return the same canonical evidence identity.
 
-Exact semantics should be documented per contract.
+It must not create:
 
-Evidence content duplication and event replay are not the same concept and must not be conflated.
+* duplicate EvidenceItem
+* duplicate ExternalReference
+* duplicate `EVIDENCE_OBSERVED` audit event
+
+This is one of the most important CD-3 acceptance proofs.
 
 ---
 
-# 35. Error Model
+# 24. Runtime API
 
-Introduce a small canonical error vocabulary where needed.
+CD-3 may expose a minimal internal HTTP API around canonical operations.
+
+This is encouraged if it materially proves containerised runtime behaviour.
+
+Possible operations:
+
+```text
+GET  /health
+GET  /ready
+GET  /version
+
+POST /internal/entities
+POST /internal/sources
+POST /internal/evidence
+GET  /internal/evidence/{id}
+GET  /internal/provenance/...
+```
+
+The exact API may be smaller.
+
+This is not yet the final public/user-facing BAGMAN API.
+
+No external integration endpoints are authorised.
+
+---
+
+# 25. Health and Readiness
+
+Every long-running BAGMAN container must provide meaningful health/readiness behaviour.
+
+For `bagman-api`:
+
+### Liveness
+
+Answers:
+
+> Is the process alive?
+
+### Readiness
+
+Answers:
+
+> Can BAGMAN currently perform its required work?
+
+Readiness should fail if required dependencies such as PostgreSQL or object storage are unavailable.
+
+A process that is alive but cannot reach its required persistence layer is not ready.
+
+---
+
+# 26. Docker Healthchecks
+
+Compose should use actual healthchecks.
+
+Startup ordering should rely on health/readiness where appropriate, not blind sleep statements such as:
+
+```bash
+sleep 10
+```
+
+Avoid race-condition-driven runtime startup.
+
+---
+
+# 27. Structured Logging
+
+All application containers must use structured logs.
+
+Minimum fields where applicable:
+
+```text
+timestamp_utc
+level
+component
+message
+correlation_id
+canonical_object_id
+event_type
+```
+
+Do not log:
+
+* secrets
+* credentials
+* document bodies
+* full email bodies
+* object contents
+
+Use identifiers rather than sensitive content wherever practical.
+
+---
+
+# 28. UTC
+
+UTC remains mandatory everywhere.
+
+Containers should operate in UTC.
+
+PostgreSQL canonical timestamps must be timezone-aware.
+
+Logs must be UTC.
+
+No local-time assumptions are permitted in persistence.
+
+---
+
+# 29. Configuration
+
+CD-1 three-layer configuration doctrine remains binding.
+
+Committed configuration may include safe runtime structure.
+
+Secrets remain outside `/srv/bagman`.
 
 Examples:
 
 ```text
-VALIDATION_ERROR
-CONFLICT
-NOT_FOUND
-DUPLICATE_EXTERNAL_REFERENCE
-INVALID_PROVENANCE
-IMMUTABILITY_VIOLATION
+database password
+MinIO root credentials
+internal runtime credentials
 ```
 
-Do not leak raw database/third-party exceptions as canonical behaviour.
+must be mounted through external secret files or equivalent governed mechanism.
+
+No secrets in Compose files.
+
+No real `.env` committed.
 
 ---
 
-# 36. Observability
+# 30. Database Credentials
 
-Even at foundation level, operations should produce structured logs.
+Database credentials should use secret-file loading where practical.
 
-Requirements:
-
-* UTC timestamps
-* component identity
-* correlation ID where available
-* canonical object IDs
-* no secrets
-* no evidence content bodies by default
-
-Do not log complete document contents or sensitive payloads.
-
-CD-2 need not implement a full observability platform.
-
----
-
-# 37. No Monolithic Core
-
-`core/` must not become a miscellaneous BAGMAN dumping ground.
-
-The intended meaning is:
-
-> shared canonical primitives and rules that genuinely span domains.
-
-If logic belongs to evidence, finance, tax, billing or another bounded service, put it there.
-
----
-
-# 38. Explicitly Out of Scope
-
-CD-2 SHALL NOT implement:
-
-* Microsoft Graph connectivity
-* Gmail connectivity
-* IMAP connectivity
-* mailbox polling
-* mailbox credentials
-* document OCR
-* LLM invoice extraction
-* supplier classification
-* bank connectivity
-* Revolut connectivity
-* Starling connectivity
-* bank reconciliation
-* Xero connectivity
-* Chargebee connectivity
-* customer collections
-* uSecure connectivity
-* Huntress connectivity
-* service suspension
-* R&D qualification logic
-* VAT logic
-* corporation tax logic
-* personal tax calculations
-* HMRC submission
-* production document upload GUI
-* final visual GUI
-* BAGMAN conversational AI
-* autonomous financial action
-* production secrets
-* production data
-
-References to these future capabilities are permitted only where required to prove extensibility.
-
----
-
-# 39. FORGE Delivery Decomposition
-
-FORGE should decompose CD-2 into small work items.
-
-Recommended structure:
-
-### WI-1 — Canonical contracts
-
-Implement:
-
-* common identity primitives
-* entity schema
-* source schema
-* external-reference schema
-* evidence schema
-* provenance schema
-* audit schema
-
-### WI-2 — Domain implementation
-
-Implement validation/domain models and repository interfaces.
-
-### WI-3 — Component manifests and memory projection
-
-Implement:
-
-* component manifest schema
-* manifests for actual CD-2 components
-* deterministic architecture-memory projection
-
-### WI-4 — Tests and evidence
-
-Implement:
-
-* contract tests
-* architectural-boundary tests
-* synthetic fixtures
-* CD-1 regression/security tests
-* delivery evidence
-
-Parallelisation is permitted only where work items are genuinely independent.
-
----
-
-# 40. Git Doctrine
-
-All CD-1 Git discipline remains binding.
-
-FORGE Engineers shall not independently alter repository history outside the established FORGE delivery workflow.
-
-Required:
-
-* dedicated CD-2 branch
-* controlled worktrees
-* PL review
-* clean commits
-* independent Auditor
-* true integration evidence
-* clean working tree
-* no hidden/generated runtime material
-
----
-
-# 41. CI
-
-Existing Security workflow must remain green.
-
-CD-2 shall extend CI to include:
+Example:
 
 ```text
-security tests
-contract tests
-domain tests
-architectural-boundary tests
+/run/secrets/postgres_password
 ```
 
-No live external dependency is permitted in CI.
+Do not hardcode credentials such as:
 
-No secret is required.
+```text
+postgres/postgres
+```
 
-No Docker Hub/private registry credential is required merely to run tests.
+for the canonical BAGMAN runtime merely because it is development.
+
+Tests may use ephemeral credentials generated within isolated CI/runtime contexts if they are clearly non-production.
 
 ---
 
-# 42. Acceptance Criteria
+# 31. Object Storage Credentials
 
-CD-2 is complete only when the following are independently proven.
+Object-store credentials are secrets.
 
-## Identity
+They must follow the same external-secret doctrine.
 
-* canonical BAGMAN IDs implemented
-* governed entities implemented
-* initial three entity identities represented
-* unresolved ownership supported
+No MinIO root password or access key may enter Git.
 
-## Evidence
+---
 
-* EvidenceItem contract implemented
-* immutable-evidence semantics documented and tested
-* content hashing implemented
-* evidence identity separated from content identity
-* duplicate-content/multiple-observation case proven
+# 32. Network Exposure
 
-## Sources
+Database and object storage should not be exposed publicly.
 
-* canonical Source implemented
-* external references implemented
-* provider identity isolated from canonical identity
+Preferred:
 
-## Provenance
+```text
+bagman-api
+   |
+bagman internal Docker network
+   |
+bagman-db / bagman-objects
+```
 
-* provenance relationships implemented
-* evidence lineage query/proof exists
-* derived-versus-original distinction tested
+Host exposure for debugging should be opt-in and documented.
 
-## Audit
+Production doctrine should remain closed by default.
 
-* AuditEvent implemented
-* UTC enforced
-* actors represented
-* correlation and causality represented
-* audit events append-oriented/immutable by contract
+---
 
-## Contracts
+# 33. Persistent Volumes
 
-* versioned machine-validatable schemas
-* contract tests green
-* malformed structures rejected
+Containers are disposable.
 
-## Architecture
+Data is not.
 
-* component manifest schema implemented
-* actual CD-2 components have manifests
-* provider adapters are not imported into canonical core
-* no Redis introduced
-* no live third-party connectivity introduced
+Introduce BAGMAN-owned named volumes.
 
-## Memory Fabric
+Expected:
 
-* architecture memory can be deterministically generated/projected from authoritative manifests/contracts
-* memory is explicitly non-authoritative for canonical finance/evidence state
+```text
+bagman-postgres-data
+bagman-object-data
+```
+
+Exact naming may vary slightly under Compose project prefixes, but ownership must be explicit.
+
+Destroying/recreating application containers must not destroy evidence or database state.
+
+---
+
+# 34. Backup Foundation
+
+CD-3 must establish a real backup foundation.
+
+At minimum:
+
+### PostgreSQL
+
+Provide a repeatable logical backup procedure.
+
+For example:
+
+```text
+pg_dump
+```
+
+### Object store
+
+Provide a repeatable evidence backup/snapshot/export procedure.
+
+The exact production backup destination is not required in CD-3.
+
+What is required is:
+
+> deterministic backup and restore capability proven with synthetic data.
+
+---
+
+# 35. Restore Proof
+
+Backup without restore proof is not accepted.
+
+CD-3 must demonstrate:
+
+1. create synthetic BAGMAN state
+2. persist synthetic evidence bytes
+3. create backup
+4. destroy/recreate a clean runtime or clean persistence target
+5. restore
+6. verify all canonical IDs remain identical
+7. verify evidence bytes remain identical
+8. verify SHA-256 remains identical
+9. verify provenance remains intact
+10. verify audit trail remains intact
+
+---
+
+# 36. Database Migrations in Runtime
+
+Runtime startup must not silently run destructive migrations without governance.
+
+For development, automatic safe migration may be acceptable.
+
+The mechanism must still be explicit and visible.
+
+Future production operation should be able to separate:
+
+```text
+migrate
+```
+
+from:
+
+```text
+start application
+```
+
+Do not build migration behaviour that cannot later be controlled independently.
+
+---
+
+# 37. Initial Persistence Scope
+
+CD-3 persists only CD-2 canonical domains:
+
+* GovernedEntity
+* Source
+* ExternalReference
+* EvidenceItem
+* Provenance
+* AuditEvent
+
+Do not introduce finance, invoice, reconciliation, tax or billing tables yet.
+
+Those belong to later domain deliveries.
+
+---
+
+# 38. GUI Scope
+
+The production GUI remains out of scope.
+
+CD-3 may expose a tiny diagnostic runtime page only if useful for health/runtime proof.
+
+Do not start building the polished BAGMAN interface in this delivery.
+
+---
+
+# 39. Agent Scope
+
+The BAGMAN AI agent remains out of scope.
+
+No LLM integration.
+
+No agent reasoning.
+
+No autonomous financial behaviour.
+
+Memory Fabric remains an architecture projection only at this stage.
+
+---
+
+# 40. External Integration Scope
+
+Explicitly forbidden in CD-3:
+
+* Microsoft Graph
+* Gmail
+* IMAP
+* Starling
+* Revolut
+* Xero
+* Chargebee
+* uSecure
+* Huntress
+* HMRC
+* any other live external provider
+
+No credentials for those systems may be introduced.
+
+---
+
+# 41. No Production Evidence
+
+All runtime demonstrations use synthetic data.
+
+No real:
+
+* invoice
+* receipt
+* statement
+* email
+* customer record
+* tax document
+* bank transaction
+
+may enter CD-3 tests or runtime evidence.
+
+---
+
+# 42. Required Persistence Tests
+
+At minimum:
+
+### Entity persistence
+
+* create entity
+* restart repository/runtime
+* same entity retrievable
+
+### Source persistence
+
+* create source
+* restart
+* source retained
+
+### Evidence persistence
+
+* store metadata
+* store bytes
+* restart
+* same EvidenceItem retrieved
+
+### Hash integrity
+
+* stored object re-hashes correctly
+* mismatched content rejected
+
+### External reference
+
+* uniqueness enforced
+* replay resolves existing object
+* conflicting target rejected
+
+### Provenance
+
+* lineage persists across restart
+
+### Audit
+
+* audit events survive restart
+* correlation/causation retained
+
+---
+
+# 43. Required Runtime Restart Proof
+
+FORGE must prove:
+
+```text
+docker compose up
+        ↓
+register synthetic entity/source/evidence
+        ↓
+persist evidence bytes
+        ↓
+record provenance/audit
+        ↓
+docker compose down
+        ↓
+docker compose up
+        ↓
+retrieve same canonical IDs
+        ↓
+verify same evidence hash
+        ↓
+verify same lineage/audit
+```
+
+This is mandatory.
+
+A unit-test-only implementation is insufficient.
+
+---
+
+# 44. Required Container Rebuild Proof
+
+FORGE must also prove data survives application container replacement.
+
+At minimum:
+
+```text
+build bagman-api image
+run
+persist data
+remove bagman-api container
+recreate bagman-api
+verify data remains
+```
+
+Persistence must belong to durable volumes/services, not application container filesystem layers.
+
+---
+
+# 45. Required Failure Proof
+
+CD-3 must demonstrate BAGMAN behaves correctly when dependencies fail.
+
+At minimum:
+
+### PostgreSQL unavailable
+
+* API not ready
+* no silent fallback to in-memory persistence
+
+### Object storage unavailable
+
+* evidence cannot become falsely AVAILABLE
+* failure is visible/audited/logged
+
+### Hash mismatch
+
+* rejected
+* evidence not silently accepted
+
+There must be no "best effort" silent data loss.
+
+---
+
+# 46. No Hidden Fallback
+
+This is a hard invariant.
+
+If runtime is configured for PostgreSQL:
+
+> database failure must not cause BAGMAN to silently switch to in-memory repositories.
+
+If runtime is configured for object storage:
+
+> storage failure must not cause BAGMAN to silently store evidence on arbitrary local disk.
+
+Fail loudly.
+
+---
+
+# 47. Object Download Proof
+
+CD-3 shall expose or test a governed evidence retrieval operation.
+
+Given:
+
+```text
+evidence_id
+```
+
+BAGMAN must be able to:
+
+* locate canonical metadata
+* locate stored object
+* retrieve bytes
+* verify hash
+
+This becomes the foundation for future GUI download functionality.
+
+---
+
+# 48. Manual Upload Readiness
+
+Although the GUI upload surface is out of scope, the runtime should be structurally ready for future:
+
+```text
+MANUAL_UPLOAD
+```
+
+sources.
+
+A synthetic upload path/harness may be used for acceptance.
+
+No browser UI is required.
+
+---
+
+# 49. Runtime Version Endpoint
+
+If an API is introduced, include:
+
+```text
+/version
+```
+
+or equivalent.
+
+It should expose safe information such as:
+
+```text
+git_commit
+build_version
+schema_migration_version
+runtime_environment
+```
+
+No secrets.
+
+This will later be useful in the Operations GUI.
+
+---
+
+# 50. Operational Commands
+
+Provide clear documented commands for:
+
+```text
+start
+stop
+status
+logs
+migrate
+backup
+restore
+test
+```
+
+These may be scripts or Make targets.
+
+Avoid obscure multi-line commands that operators must reconstruct manually.
+
+---
+
+# 51. `/srv/bagman` Organisation
+
+CD-3 must preserve directory clarity.
+
+Expected areas:
+
+```text
+deployment/docker/
+deployment/compose/
+deployment/environments/
+ops/
+scripts/
+services/evidence/
+core/
+```
+
+Do not scatter Dockerfiles and operational scripts randomly at repository root.
+
+---
+
+# 52. Component Manifests
+
+Update or introduce manifests for actual runtime components only.
+
+Examples may include:
+
+```text
+BAGMAN.RUNTIME.API
+BAGMAN.RUNTIME.POSTGRES
+BAGMAN.RUNTIME.OBJECTS
+```
+
+if they are genuinely implemented as governed components.
+
+Memory projection must remain drift-checked.
+
+---
+
+# 53. Architecture Boundary
+
+Persistence implementations may depend on PostgreSQL/object storage clients.
+
+Canonical contracts/domain models must not.
+
+Provider-specific infrastructure code belongs in infrastructure/runtime layers.
+
+Do not import MinIO/PostgreSQL SDKs directly into canonical entity/evidence model modules.
+
+---
+
+# 54. SQL Discipline
+
+Do not scatter handwritten SQL across the project.
+
+Use an explicit persistence layer.
+
+If SQLAlchemy is chosen, use it consistently.
+
+If a lighter database layer is chosen, it must still preserve repository boundaries and migration discipline.
+
+The exact library choice may be made by FORGE if justified.
+
+---
+
+# 55. Transaction Boundaries
+
+Database writes that form one canonical operation should use explicit transactions.
+
+For example:
+
+```text
+EvidenceItem
++
+ExternalReference
++
+AuditEvent
+```
+
+where appropriate should not leave avoidable partial database state.
+
+Object-store operations remain separate and require the staged semantics defined earlier.
+
+---
+
+# 56. Audit of Storage Operations
+
+Material evidence storage events should produce audit events.
+
+Examples:
+
+```text
+EVIDENCE_STORED
+EVIDENCE_AVAILABLE
+EVIDENCE_STORAGE_FAILED
+EVIDENCE_HASH_VERIFIED
+```
+
+Exact taxonomy may be refined.
+
+Keep events structured and safe.
+
+---
+
+# 57. Error Handling
+
+Persistence failures must map into BAGMAN canonical errors.
+
+Examples:
+
+```text
+PERSISTENCE_ERROR
+STORAGE_ERROR
+INTEGRITY_ERROR
+CONFLICT
+NOT_FOUND
+```
+
+Do not leak raw psycopg/SQLAlchemy/MinIO stack details to callers as the public contract.
+
+Detailed internal logs may retain technical cause safely.
+
+---
+
+# 58. Security
+
+All CD-1 and CD-2 security doctrine remains binding.
+
+Existing gitleaks and security tests must continue to pass.
+
+Add security tests where necessary for:
+
+* Compose secret use
+* no credentials in committed deployment files
+* no default production passwords
+* no unintended public database exposure
+* no production data fixtures
+
+---
+
+# 59. CI
+
+CI shall continue to run:
+
+* gitleaks
+* full existing test suite
+* architecture-memory drift check
+
+CD-3 should additionally prove persistence/runtime behaviour.
+
+Where practical, CI may start ephemeral PostgreSQL/object-storage services.
+
+Do not require real secrets.
+
+Synthetic ephemeral credentials are acceptable.
+
+Docker-based acceptance may run in CI if stable.
+
+---
+
+# 60. Required Acceptance Harness
+
+Create a deterministic CD-3 acceptance path that proves:
+
+1. build/start BAGMAN runtime
+2. migrations apply successfully
+3. health/readiness green
+4. register synthetic governed entity
+5. register synthetic source
+6. store synthetic evidence bytes
+7. create canonical EvidenceItem
+8. external reference persisted
+9. provenance persisted
+10. audit persisted
+11. evidence downloaded and hash verified
+12. stop runtime
+13. restart runtime
+14. prove same canonical IDs/state
+15. repeat same external observation
+16. prove idempotency
+17. backup state
+18. restore into clean target
+19. prove same IDs/bytes/hash/lineage
+20. clean shutdown
+
+---
+
+# 61. Expected Work Items
+
+Recommended FORGE decomposition:
+
+### WI-1 — PostgreSQL persistence
+
+* database schema
+* migrations
+* durable repositories
+* persistence tests
+
+### WI-2 — Object evidence store
+
+* object-store abstraction
+* MinIO/S3 implementation
+* hash verification
+* immutable storage semantics
+
+### WI-3 — Container runtime
+
+* bagman-api
+* bagman-db
+* bagman-objects
+* Docker/Compose
+* health/readiness
+* version metadata
+* config/secrets
+
+### WI-4 — Backup/restore and runtime acceptance
+
+* backup
+* restore
+* restart proof
+* dependency failure proof
+* end-to-end acceptance evidence
+
+Sequence should follow real dependencies.
+
+---
+
+# 62. Explicitly Out of Scope
+
+CD-3 SHALL NOT implement:
+
+* mailbox access
+* Microsoft Graph
+* Gmail
+* IMAP
+* invoice extraction
+* OCR
+* AI document classification
+* bank connectivity
+* Revolut
+* Starling
+* reconciliation
+* Xero
+* Chargebee
+* customer management
+* dunning
+* uSecure
+* Huntress
+* tax calculation
+* R&D logic
+* HMRC submission
+* production GUI
+* BAGMAN terminal
+* BAGMAN AI agent
+* notification delivery
+* real credentials
+* real evidence
+
+---
+
+# 63. Acceptance Criteria
+
+CD-3 is complete only when independently proven:
+
+## Runtime
+
+* BAGMAN Docker Compose runtime starts cleanly
+* BAGMAN-specific network/services used
+* `bagman-db`, `bagman-objects`, and application runtime correctly isolated
+* no Redis
+* health/readiness meaningful
+
+## PostgreSQL
+
+* migrations reproducible
+* CD-2 canonical state durable
+* repository contracts preserved
+* uniqueness/foreign-key constraints correct
+
+## Evidence storage
+
+* evidence bytes stored durably
+* original bytes immutable
+* SHA-256 validated
+* content retrieved by canonical identity
+* no filename-based unsafe storage
+
+## Restart
+
+* canonical IDs survive full runtime restart
+* lineage survives
+* audit survives
+* bytes/hash survive
+
+## Idempotency
+
+* replay after restart returns same EvidenceItem
+* no duplicate external reference
+* no duplicate observation audit event
+
+## Failure behaviour
+
+* DB failure causes not-ready/fail-loud behaviour
+* storage failure does not falsely mark evidence AVAILABLE
+* hash mismatch rejected
+* no in-memory/local-disk silent fallback
+
+## Backup/restore
+
+* synthetic backup succeeds
+* restore into clean environment succeeds
+* canonical IDs preserved
+* content bytes/hash preserved
+* provenance and audit preserved
 
 ## Security
 
-* all CD-1 security tests remain green
-* gitleaks remains green
-* no real production data
-* no secret required
+* secrets external
+* Compose contains no real credentials
+* no production data
+* gitleaks green
+* all previous security tests green
+
+## Architecture
+
+* domain models do not depend directly on PostgreSQL/MinIO
+* persistence behind repository/storage interfaces
+* memory projection updated and drift-check green
 
 ## CI
 
-* full CI green on delivery PR
-
-## Git
-
-* `git diff --check` clean
-* delivery branch clean
-* independent audit complete
+* full test suite green
+* runtime/persistence proof green
+* live PR CI green
 
 ---
 
-# 43. Required Runtime Proof
+# 64. Audit Requirements
 
-Source inspection alone is insufficient.
+A fresh independent Auditor shall reproduce the acceptance evidence.
 
-FORGE must provide executable proof demonstrating at minimum:
+The Auditor must independently:
 
-```text
-1. create synthetic governed entity
-2. register synthetic source
-3. register synthetic evidence
-4. hash evidence
-5. associate external reference
-6. create derived provenance relationship
-7. record audit events
-8. trace evidence lineage end-to-end
-9. reject malformed/invalid cases
-10. repeat an idempotent observation safely
-```
-
-This may be through tests or a dedicated acceptance harness.
-
-The output must be deterministic and retained in delivery evidence.
-
----
-
-# 44. Audit Requirements
-
-A fresh Auditor must independently review CD-2.
-
-The Auditor must not rely solely on Engineer or PL statements.
-
-It must independently:
-
-* read this PID
-* inspect contracts
+* inspect Docker topology
+* inspect network/port exposure
+* inspect secret handling
+* run migrations from clean state
+* start runtime
+* run acceptance harness
+* restart runtime
+* reproduce persistent idempotency
+* stop object storage and verify fail-loud behaviour
+* stop PostgreSQL and verify readiness failure
+* verify hash-mismatch rejection
+* independently perform backup/restore
+* rerun gitleaks
 * run full tests
-* run gitleaks
-* verify no forbidden integration exists
-* verify no production data exists
-* inspect import/dependency boundaries
-* reproduce lineage proof
-* reproduce immutability/idempotency checks
-* inspect component manifests
-* verify Memory Fabric projection is derived from authoritative metadata
-* walk each §42 acceptance criterion individually
+* check no Redis dependency exists
+* walk every §63 acceptance item
 
 ---
 
-# 45. Verdict Vocabulary
+# 65. Verdict Vocabulary
 
-The Auditor and PL shall use:
+Use:
 
-### FOUNDATION_MODEL_GREEN
+### RUNTIME_FOUNDATION_GREEN
 
-All mandatory CD-2 acceptance criteria proven.
+All mandatory CD-3 requirements independently proven.
 
-### FOUNDATION_MODEL_RED
+### RUNTIME_FOUNDATION_RED
 
-One or more mandatory criteria failed.
+One or more mandatory requirements failed.
 
 ### BLOCKED
 
-Required proof cannot be completed because of an external condition.
+External conditions prevent required proof.
 
-Do not use generic "looks good" language as final acceptance.
-
----
-
-# 46. Exit Gate
-
-No live mailbox integration may begin until CD-2 reaches:
-
-> **FOUNDATION_MODEL_GREEN**
-
-When CD-2 is green, BAGMAN should possess a trustworthy internal representation for:
-
-```text
-WHO
-what governed entity is involved
-
-WHAT
-what evidence or canonical object exists
-
-WHERE FROM
-what source produced it
-
-HOW KNOWN
-what provenance supports it
-
-WHAT HAPPENED
-what audit event occurred
-
-WHY CONNECTED
-what correlation/causation relationship exists
-```
-
-Only then should live evidence begin entering the platform.
+No generic "looks good" verdict.
 
 ---
 
-# 47. Expected Next Delivery
+# 66. Exit Gate
 
-Subject to successful CD-2 completion, the likely next delivery is:
+No live mailbox may connect until CD-3 reaches:
 
-> **CD-3 — BAGMAN Runtime & Evidence Store**
+> **RUNTIME_FOUNDATION_GREEN**
 
-Expected scope would include:
+At that point BAGMAN must have proven:
 
-* `bagman-db`
-* BAGMAN-specific PostgreSQL
-* object storage
-* Docker Compose runtime
-* migrations
-* durable evidence persistence
-* immutable document storage
-* health/readiness
-* backup foundation
-
-Still with no live mailbox connectivity unless explicitly authorised by the next PID.
+> canonical truth survives processes, containers and restarts; original evidence bytes are durably preserved; provenance and audit remain intact; and the entire runtime can be recovered from backup.
 
 ---
 
-# 48. Product Principle
+# 67. Expected Next Delivery
 
-BAGMAN will eventually make consequential decisions about money, tax, customers and service access.
+If CD-3 completes cleanly, the likely next delivery is:
 
-Before it can make those decisions, it must first know with certainty:
+> **CD-4 — Evidence Intake & Manual Upload Foundation**
 
-> **what exists, who it belongs to, where it came from, what happened to it, and why BAGMAN believes it.**
+That should likely introduce:
 
-CD-2 exists to establish that truth foundation.
+* governed upload API
+* document ingestion workflow
+* evidence intake state machine
+* safe file validation
+* quarantine
+* first GUI evidence/document surface
+
+Then live mailbox ingestion can follow once the intake path itself is mature.
+
+This is preferable to making Microsoft or IMAP the first real source of evidence.
+
+---
+
+# 68. Product Principle
+
+CD-2 taught BAGMAN what evidence **means**.
+
+CD-3 must prove BAGMAN can **keep it safely**.
+
+The architectural invariant is:
+
+> **BAGMAN must never claim to know something unless the canonical record, original evidence, provenance and audit trail can survive the death and reconstruction of the application runtime.**
