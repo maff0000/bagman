@@ -76,7 +76,38 @@ class ImmutabilityViolationError(BagmanError):
     """An attempt was made to change a field or record that is
     immutable by contract (PID §7, §35) — e.g. re-registering an
     existing ``entity_id``, changing an ``EvidenceItem``'s immutable
-    fields, or reassigning an already-resolved ``entity_id``.
+    fields, or reassigning an already-resolved ``entity_id``. Also
+    raised by ``persistence.objects.EvidenceObjectStore.put()`` (CD-3
+    WI-2) when different bytes are given for a storage key that
+    already holds different content (PID §17) — original evidence
+    bytes are immutable in exactly the same sense this error already
+    names, so that case reuses this error rather than introducing a
+    new one.
     """
 
     error_code = "IMMUTABILITY_VIOLATION"
+
+
+class StorageError(BagmanError):
+    """The object-store backend is unreachable or misbehaving — a
+    network error, missing/inaccessible bucket, credential failure,
+    etc. (PID §57, CD-3 WI-2).
+
+    ``persistence.objects.minio_store.MinIOObjectStore`` never lets a
+    raw ``boto3``/``botocore`` exception escape any of its public
+    methods; it catches and re-raises as this instead.
+    """
+
+    error_code = "STORAGE_ERROR"
+
+
+class IntegrityError(BagmanError):
+    """A SHA-256 content-hash mismatch (PID §18, CD-3 WI-2): either the
+    caller-supplied ``content_hash`` did not match the bytes actually
+    about to be stored (``EvidenceObjectStore.put()``), or a
+    ``verify_hash()``/``get()``-time re-hash of retrieved bytes did not
+    match the expected value — corruption or mismatch detected on
+    read.
+    """
+
+    error_code = "INTEGRITY_ERROR"
