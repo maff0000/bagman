@@ -1,0 +1,52 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://bagman.internal/contracts/entity/bagman.entity.v1.schema.json",
+  "title": "BAGMAN GovernedEntity",
+  "description": "Canonical `GovernedEntity` (PID §4). A governed entity is a stable BAGMAN identity (e.g. NOUSTAI_LIMITED, INFOSECURS_LIMITED, MATTHEW_SCOTT_PERSONAL) that must not depend on email address, bank account, Xero tenant, legal registration number, display name, or current jurisdiction — those may be associated with the entity later. Every canonical financial or evidential record must ultimately be associated with exactly one governed entity, or be explicitly unresolved (see `entity_id` on `EvidenceItem`); unresolved is a first-class state, never a silent inference.",
+  "type": "object",
+  "properties": {
+    "entity_id": {
+      "$ref": "https://bagman.internal/contracts/common/bagman.identifier.v1.schema.json",
+      "description": "Canonical BAGMAN identifier for this entity. Immutable once assigned: once an `entity_id` has been issued for a governed entity it must never be reassigned or changed for the life of that entity. JSON Schema validates the shape of a single instance only and cannot itself enforce immutability across time/writes — that guarantee is enforced at the domain/repository layer (e.g. an EntityRepository rejecting any update that changes `entity_id`), not by this schema."
+    },
+    "entity_type": {
+      "type": "string",
+      "pattern": "^[A-Z][A-Z_]*$",
+      "description": "The kind of governed entity. Deliberately open (NOT a closed enum) so new entity types can be introduced without a schema redesign, per PID §4's explicit extensibility requirement. Known initial values (documentation only, not an enforced closed set): `COMPANY`, `PERSON`. Anticipated future values include `TRUST`, `PARTNERSHIP`, `OTHER`."
+    },
+    "canonical_name": {
+      "type": "string",
+      "pattern": "^[A-Z][A-Z0-9_]*$",
+      "description": "Stable, human-legible slug identifier for the entity, e.g. `NOUSTAI_LIMITED`. Distinct from `entity_id` (the opaque internal identifier — never business-meaningful) and from `display_name` (a human-friendly label that may change over time). `canonical_name` is expected to remain stable but is a legible business-facing slug, not the opaque canonical ID."
+    },
+    "display_name": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Human-friendly display label for the entity, e.g. \"Noustai Limited\". May change over time; not used as a canonical identifier."
+    },
+    "status": {
+      "type": "string",
+      "pattern": "^[A-Z][A-Z_]*$",
+      "description": "Lifecycle status of the governed entity. Deliberately open (NOT a closed enum), for the same extensibility reason as `entity_type`. Known initial values (documentation only): `ACTIVE`, `ARCHIVED`."
+    },
+    "created_at": {
+      "$ref": "https://bagman.internal/contracts/common/bagman.utc_timestamp.v1.schema.json",
+      "description": "UTC timestamp at which this entity was registered in BAGMAN."
+    },
+    "metadata": {
+      "type": "object",
+      "description": "Free-form, genuinely open metadata about the entity. Additional properties are intentionally permitted here (unlike the top level of this schema) per the PID's own metadata examples. Must not contain secrets or sensitive company/account data (PID §23, §29).",
+      "additionalProperties": true,
+      "default": {}
+    }
+  },
+  "required": [
+    "entity_id",
+    "entity_type",
+    "canonical_name",
+    "display_name",
+    "status",
+    "created_at"
+  ],
+  "additionalProperties": false
+}

@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://bagman.internal/contracts/common/bagman.utc_timestamp.v1.schema.json",
+  "title": "BAGMAN Canonical UTC Timestamp",
+  "description": "BAGMAN's canonical timestamp representation. UTC is canonical for all timestamped state in BAGMAN (PID §16). Expressed as a JSON Schema `date-time` string, which per RFC 3339 / the JSON Schema `format: date-time` vocabulary already requires an explicit UTC offset (`Z`) or a numeric zone offset in every value it accepts — this rejects naive (timezone-unaware) datetimes by construction, since a naive datetime cannot be serialised as a valid `date-time` string at all. Producers must serialise canonical timestamps in UTC (offset `Z` / `+00:00`) rather than merely 'some' offset, even though the schema pattern alone cannot force the offset value to be zero — this stronger constraint is documented here and enforced at the domain/repository layer, not by JSON Schema. Original local/provider timestamps may be preserved separately for evidential reasons, but canonical event time is always this type.",
+  "type": "string",
+  "format": "date-time",
+  "examples": [
+    "2026-09-12T09:41:07Z",
+    "2026-09-12T09:41:07.123456Z"
+  ]
+}

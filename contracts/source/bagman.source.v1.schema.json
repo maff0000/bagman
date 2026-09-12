@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://bagman.internal/contracts/source/bagman.source.v1.schema.json",
+  "title": "BAGMAN Source",
+  "description": "Canonical `Source` (PID §9). Describes where information originated. Provider-specific identity belongs underneath the source model (via `provider` / `external_source_ref`), never as canonical BAGMAN identity.",
+  "type": "object",
+  "properties": {
+    "source_id": {
+      "$ref": "https://bagman.internal/contracts/common/bagman.identifier.v1.schema.json",
+      "description": "Canonical BAGMAN identifier for this source."
+    },
+    "source_type": {
+      "type": "string",
+      "pattern": "^[A-Z][A-Z_]*$",
+      "description": "The kind of source. Deliberately open (NOT a closed enum), for the same extensibility reason as `GovernedEntity.entity_type` (PID §4/§9). Known initial values (documentation only, not an enforced closed set): `MAILBOX`, `MANUAL_UPLOAD`, `BANK`, `ACCOUNTING_PLATFORM`, `BILLING_PLATFORM`, `GENERATED`, `API`. `MANUAL_UPLOAD` is included from CD-2 so a future upload GUI (PID §26) requires no schema change."
+    },
+    "provider": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The concrete provider/system behind this source. Deliberately open (not a closed enum) — new providers must be addable without schema redesign. Known initial example values (documentation only): `MICROSOFT_GRAPH`, `IMAP`, `GMAIL`, `STARLING`, `REVOLUT`, `XERO`, `CHARGEBEE`, `USECURE`, `HUNTRESS`, `INTERNAL`."
+    },
+    "external_source_ref": {
+      "type": "string",
+      "description": "An optional provider-scoped identity string for this source, e.g. a mailbox address such as `matt@infosecurs.com`. This is NOT a secret — it is an identity string only (never a credential, password, or token; see PID §29)."
+    },
+    "governed_entity_hint": {
+      "type": ["string", "null"],
+      "description": "An optional hint referencing a `GovernedEntity` by `canonical_name` or `entity_id`. This is explicitly a HINT, not an ownership assertion: per PID §9, \"a source may provide an entity hint without asserting canonical ownership.\" For example, a mailbox provider hint of `matt@infosecurs.com` does not mean all records observed from that mailbox automatically belong to Infosecurs. `null` means no hint is available."
+    },
+    "status": {
+      "type": "string",
+      "pattern": "^[A-Z][A-Z_]*$",
+      "description": "Lifecycle status of the source. Deliberately open (not a closed enum)."
+    },
+    "metadata": {
+      "type": "object",
+      "description": "Free-form, genuinely open metadata about the source. Must not contain secrets or credentials (PID §29).",
+      "additionalProperties": true,
+      "default": {}
+    }
+  },
+  "required": [
+    "source_id",
+    "source_type",
+    "provider",
+    "status"
+  ],
+  "additionalProperties": false
+}

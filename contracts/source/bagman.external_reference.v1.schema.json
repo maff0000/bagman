@@ -1,0 +1,62 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://bagman.internal/contracts/source/bagman.external_reference.v1.schema.json",
+  "title": "BAGMAN ExternalReference",
+  "description": "Canonical `ExternalReference` (PID §10). Represents an external, provider-native identifier separately from BAGMAN's own canonical identities, e.g. 'BAGMAN evidence EV-... corresponds to Microsoft Graph message AAMk...' without contaminating BAGMAN's internal identity model. Placement note: this schema lives under `contracts/source/` rather than a dedicated `contracts/external_reference/` folder — the PID's suggested layout (§18) does not list a separate folder for ExternalReference, and §9/§10 introduce ExternalReference immediately after, and in the same conceptual family as, Source; see `contracts/README.md` for the full placement rationale. COMPOSITE UNIQUENESS RULE (PID §10, §34): `external_id` is a raw provider-native identifier and is NEVER assumed globally unique on its own. Uniqueness is scoped to the tuple (`provider`, `source_id`, `resource_type`, `external_id`) taken together. The same `external_id` value may legitimately reappear under a different provider, source, or resource type without collision. Idempotent re-observation of the same (`provider`, `source_id`, `resource_type`, `external_id`) tuple must not blindly produce duplicate canonical records unless the domain explicitly allows separate observations (PID §34) — enforced at the domain/repository layer, not by this schema alone.",
+  "type": "object",
+  "properties": {
+    "external_reference_id": {
+      "$ref": "https://bagman.internal/contracts/common/bagman.identifier.v1.schema.json",
+      "description": "Canonical BAGMAN identifier for this external-reference record itself."
+    },
+    "provider": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The external provider/system that issued `external_id`, e.g. `MICROSOFT_GRAPH`, `XERO`, `STARLING`. Part of the composite uniqueness scope (see top-level description)."
+    },
+    "resource_type": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The kind of external resource being referenced, e.g. `EMAIL_MESSAGE`, `BANK_TRANSACTION`, `INVOICE`. Part of the composite uniqueness scope (see top-level description)."
+    },
+    "external_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The raw, provider-native identifier as issued by the external system, e.g. a Microsoft Graph message ID. This value is NEVER assumed globally unique on its own — see the composite uniqueness rule in this schema's top-level description. Part of the composite uniqueness scope."
+    },
+    "canonical_object_type": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The BAGMAN-internal canonical object type that this external reference maps to, e.g. `EvidenceItem`."
+    },
+    "canonical_object_id": {
+      "$ref": "https://bagman.internal/contracts/common/bagman.identifier.v1.schema.json",
+      "description": "Canonical BAGMAN identifier of the internal object (of type `canonical_object_type`) that this external reference maps to."
+    },
+    "source_id": {
+      "$ref": "https://bagman.internal/contracts/common/bagman.identifier.v1.schema.json",
+      "description": "Canonical identifier of the `Source` this external reference was observed through. Part of the composite uniqueness scope (see top-level description)."
+    },
+    "first_observed_at": {
+      "$ref": "https://bagman.internal/contracts/common/bagman.utc_timestamp.v1.schema.json",
+      "description": "UTC timestamp at which this external reference was first observed by BAGMAN."
+    },
+    "metadata": {
+      "type": "object",
+      "description": "Free-form, genuinely open metadata about this external reference.",
+      "additionalProperties": true,
+      "default": {}
+    }
+  },
+  "required": [
+    "external_reference_id",
+    "provider",
+    "resource_type",
+    "external_id",
+    "canonical_object_type",
+    "canonical_object_id",
+    "source_id",
+    "first_observed_at"
+  ],
+  "additionalProperties": false
+}
