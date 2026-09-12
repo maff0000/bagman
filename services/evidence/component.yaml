@@ -1,0 +1,43 @@
+# BAGMAN component manifest (PID §19) for services/evidence/.
+# Validated by scripts/generate_architecture_memory.py against
+# contracts/manifest/bagman.component_manifest.v1.schema.json.
+
+id: BAGMAN.SERVICES.EVIDENCE
+version: 1
+
+responsibility: >
+  Own canonical EvidenceItem identity and its immutability and
+  idempotent-observation semantics (an EvidenceItem, once recorded, is
+  never mutated, and a replayed observation of the same external
+  reference resolves to the existing record rather than creating a
+  duplicate).
+
+owns:
+  - EvidenceItem
+
+# What services/evidence/evidence.py actually imports from core/:
+# identity (id generation), timestamps (UTC handling), errors
+# (ImmutabilityViolationError, NotFoundError, ValidationError),
+# contract_validation (validate_against_contract), and the
+# ExternalReferenceRepository type it is constructed with.
+consumes:
+  - BAGMAN.CORE
+
+# services/evidence/ does not itself emit audit events; core/api.py
+# does that centrally for every canonical write, including the
+# EVIDENCE_OBSERVED event for evidence registered through this
+# component (see core/component.yaml's `produces`). Left empty here
+# rather than duplicating that attribution.
+produces: []
+
+dependencies:
+  - jsonschema
+  - rfc3339-validator
+
+external_access: false
+
+prohibited:
+  - direct_email_access
+  - direct_bank_access
+  - direct_xero_access
+  - direct_chargebee_access

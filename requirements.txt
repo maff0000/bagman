@@ -1,11 +1,15 @@
-# Runtime dependencies for BAGMAN CD-2 (WI-2 domain implementation).
+# Runtime dependencies for BAGMAN CD-2.
 #
-# Only two runtime dependencies are introduced, both explicitly
-# authorised by the PL for this work item:
+# jsonschema and rfc3339-validator were introduced by WI-2, both
+# explicitly authorised by the PL for that work item:
 #
 #   jsonschema          - validates every domain object's to_dict()
 #                          output against its contracts/*.schema.json
 #                          file (Draft 2020-12) before it is accepted.
+#                          Also used by WI-3's
+#                          scripts/generate_architecture_memory.py to
+#                          validate component.yaml manifests against
+#                          contracts/manifest/bagman.component_manifest.v1.schema.json.
 #   rfc3339-validator    - jsonschema's built-in "date-time" format
 #                          checker only registers itself if this
 #                          package is importable (see
@@ -22,6 +26,17 @@
 #   there was no prior CD-2 code depending on the older version's
 #   behaviour.
 #
+# PyYAML - moved here by WI-3. It was previously dev-only
+# (requirements-dev.txt) because nothing outside the test suite used
+# it. WI-3's scripts/generate_architecture_memory.py now imports it
+# directly to parse component.yaml manifests and
+# config/base/entities.yaml, and that script is meant to be run
+# outside test contexts (by a developer or a CI drift-check job, not
+# only by pytest) — so it is now an application-adjacent tool
+# dependency, not merely test tooling, and belongs in this file
+# instead. Pinned to the version already used by requirements-dev.txt.
+#
 # Do not add anything else here without flagging it to the PL first.
 jsonschema==4.26.0
 rfc3339-validator==0.1.4
+PyYAML==6.0.2

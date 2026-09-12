@@ -1,0 +1,80 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://bagman.internal/contracts/manifest/bagman.component_manifest.v1.schema.json",
+  "title": "BAGMAN Component Manifest",
+  "description": "Validates a `component.yaml` file (PID §19): the self-declaration a bounded BAGMAN component (a genuinely-existing top-level directory such as `core/` or `services/evidence/`) makes about its own responsibility, ownership, dependencies, and boundaries. Manifests exist only for components that genuinely exist as delivered (PID §19) — never for illustrative future components. This schema is consumed by `scripts/generate_architecture_memory.py`, which discovers every `component.yaml` in the repository, validates it against this schema, and projects the validated manifests (plus the contracts and the canonical entity registry) into the generated, non-canonical architecture memory at `memory/generated/architecture-index.md` (PID §27-28). Deliberately does not `$ref` `contracts/common/bagman.identifier.v1.schema.json` or `bagman.schema_version.v1.schema.json`: `id` here is a dotted, uppercase, human-authored component path (e.g. `BAGMAN.CORE`), not an opaque UUIDv7 canonical identifier, and `version` is a plain incrementing integer local to the manifest file, not a `bagman.<domain>.v<N>` contract-version string — neither shared primitive's shape fits, so both fields are defined directly on this schema instead. See `contracts/manifest/README.md` for the full rationale.",
+  "type": "object",
+  "properties": {
+    "id": {
+      "type": "string",
+      "pattern": "^BAGMAN(\\.[A-Z][A-Z0-9_]*)+$",
+      "description": "Dotted, uppercase, component-scoped identifier, e.g. `BAGMAN.CORE`, `BAGMAN.SERVICES.EVIDENCE`. Always starts with `BAGMAN` followed by one or more dot-separated segments, each an uppercase letter/digit/underscore token starting with a letter. Distinct from the opaque canonical `*_id` identifiers defined in `contracts/common/bagman.identifier.v1.schema.json` (those identify domain object instances at runtime; this identifies a static, source-tree component)."
+    },
+    "version": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Manifest version for this component, starting at 1 and incremented whenever the component's declared shape (responsibility/owns/consumes/produces/dependencies/external_access/prohibited) changes materially. A plain local integer counter — not a `bagman.<domain>.v<N>` contract-version string (`contracts/common/bagman.schema_version.v1.schema.json` does not apply here, since a manifest is not itself a versioned wire contract)."
+    },
+    "responsibility": {
+      "type": "string",
+      "minLength": 1,
+      "description": "One clear sentence stating what this component is responsible for. Should be specific enough that a reader can tell what does NOT belong in the component from reading it alone."
+    },
+    "owns": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "description": "The canonical domain types this component defines and owns (e.g. `GovernedEntity`, `EvidenceItem`). May be empty for a component that owns no canonical type of its own. A given canonical type must be owned by exactly one component's manifest across the repository."
+    },
+    "consumes": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "description": "Other component `id`s (e.g. `BAGMAN.CORE`) or specific types/utilities from them that this component depends on. May be empty. Existence of an entry here does not itself grant the dependency — it documents a dependency that already exists in code, for drift detection."
+    },
+    "produces": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "description": "Event types (e.g. `AuditEvent.event_type` values such as `EVIDENCE_OBSERVED`) or other artifacts this component emits. May be empty for a component that emits nothing of its own. Attribute a produced event to the component whose code actually emits it, not the component the event is conceptually 'about' — those can differ (see `core/component.yaml` for a documented example)."
+    },
+    "dependencies": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "description": "Non-BAGMAN (third-party/stdlib-external) dependencies this component relies on directly, e.g. `jsonschema`, `rfc3339-validator`. May be empty."
+    },
+    "external_access": {
+      "type": "boolean",
+      "description": "Whether this component is permitted direct access to an external provider (mailbox, bank, Xero, Chargebee, etc). Must be `false` for every CD-2 component — CD-2 introduces no external connectivity (PID §38). Reserved as a placeholder for later deliveries where a component (e.g. a future adapter) may legitimately need `true`."
+    },
+    "prohibited": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "description": "Explicit prohibitions this component must never violate, e.g. `direct_email_access`, `direct_bank_access`, `direct_xero_access`, `direct_chargebee_access` (PID §38's out-of-scope connectivity, expressed as prohibitions). May be empty, though for CD-2 domain components the connectivity prohibitions are expected to be listed explicitly rather than omitted."
+    }
+  },
+  "required": [
+    "id",
+    "version",
+    "responsibility",
+    "owns",
+    "consumes",
+    "produces",
+    "dependencies",
+    "external_access",
+    "prohibited"
+  ],
+  "additionalProperties": false
+}
