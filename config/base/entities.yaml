@@ -1,0 +1,18 @@
+# BAGMAN — canonical legal/operating entities
+#
+# Layer 1 (committed configuration structure) — see config/README.md.
+# Entity identifiers only. No account numbers, tax IDs, addresses, or other
+# sensitive identifiers belong in this file.
+
+entities:
+  NOUSTAI_LIMITED:
+    display_name: "Noust AI Limited"
+    type: company
+
+  INFOSECURS_LIMITED:
+    display_name: "Infosecurs Limited"
+    type: company
+
+  MATTHEW_SCOTT_PERSONAL:
+    display_name: "Matthew Scott (Personal)"
+    type: personal

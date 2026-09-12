@@ -1,0 +1,19 @@
+# Normalize line endings for all text files, let Git decide text vs binary.
+* text=auto
+
+# Shell scripts always keep LF endings and executable bit semantics.
+*.sh text eol=lf
+
+# Common text formats — normalize line endings.
+*.md text
+*.yml text
+*.yaml text
+*.json text
+*.py text eol=lf
+
+# Treat common binary/image formats as binary (no diff/merge mangling).
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.pdf binary

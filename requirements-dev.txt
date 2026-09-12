@@ -1,0 +1,6 @@
+# Development/test-only dependencies for BAGMAN.
+# Never add runtime application dependencies here — this file is for the
+# tooling that runs the test suite (tests/security/ etc.) and CI only.
+
+pytest==8.3.4
+PyYAML==6.0.2

@@ -1,0 +1,41 @@
+# BAGMAN — future integration placeholders (example)
+#
+# Layer 1 (committed configuration structure) — see config/README.md.
+# These entries describe INTENDED future integrations only. CD-1 does not
+# connect to any of them (see PID.md section 16 — Explicitly Out of Scope).
+#
+# No endpoints, tenant IDs, account identifiers, or other values that would
+# require protection are recorded here — only a `credential_ref` name
+# pointing at an external secret (Layer 3: /srv/bagman-secrets/ locally, or
+# /run/secrets/<name> at container runtime).
+
+integrations:
+  xero_noustai:
+    provider: xero
+    entity_ref: NOUSTAI_LIMITED
+    credential_ref: BAGMAN_XERO_NOUSTAI
+
+  xero_infosecurs:
+    provider: xero
+    entity_ref: INFOSECURS_LIMITED
+    credential_ref: BAGMAN_XERO_INFOSECURS
+
+  revolut:
+    provider: revolut
+    credential_ref: BAGMAN_REVOLUT
+
+  starling:
+    provider: starling
+    credential_ref: BAGMAN_STARLING
+
+  chargebee:
+    provider: chargebee
+    credential_ref: BAGMAN_CHARGEBEE
+
+  usecure:
+    provider: usecure
+    credential_ref: BAGMAN_USECURE
+
+  huntress:
+    provider: huntress
+    credential_ref: BAGMAN_HUNTRESS

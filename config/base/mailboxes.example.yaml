@@ -1,0 +1,30 @@
+# BAGMAN — mailbox identity definitions (example)
+#
+# Layer 1 (committed configuration structure) — see config/README.md.
+# Mailbox addresses are identities, not secrets, and are safe to commit.
+# Credentials for these mailboxes are NEVER stored here — only a
+# `credential_ref` name pointing at an external secret (Layer 3:
+# /srv/bagman-secrets/ locally, or /run/secrets/<name> at container runtime).
+#
+# CD-1 does not connect to any of these mailboxes (see PID.md section 7/16).
+
+mailboxes:
+  infosecurs_matt:
+    provider: microsoft_graph
+    address: matt@infosecurs.com
+    credential_ref: BAGMAN_MAIL_INFOSECURS
+
+  noust_matt:
+    provider: imap
+    address: matt@noust.ai
+    credential_ref: BAGMAN_MAIL_NOUSTAI
+
+  gmail_primary:
+    provider: gmail
+    address: mgs241171@gmail.com
+    credential_ref: BAGMAN_MAIL_GMAIL_PRIMARY
+
+  gmail_secondary:
+    provider: gmail
+    address: matt.george.scott@gmail.com
+    credential_ref: BAGMAN_MAIL_GMAIL_SECONDARY

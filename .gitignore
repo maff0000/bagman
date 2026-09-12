@@ -1,0 +1,55 @@
+# --- Secrets & environment ---
+.env
+.env.*
+!.env.example
+
+secrets/
+*.secret
+*.pem
+*.key
+*.p12
+*.pfx
+
+credentials.json
+token.json
+
+# --- Runtime / generated / production data ---
+runtime/
+data/
+backups/
+
+*.sqlite
+*.db
+
+# --- Local-only configuration overrides ---
+config/local/
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+.venv/
+venv/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# --- Node (future UI tooling) ---
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# --- Docker ---
+*.pid
+
+# --- Editor / OS noise ---
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
