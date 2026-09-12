@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://bagman.internal/contracts/common/bagman.schema_version.v1.schema.json",
+  "title": "BAGMAN Contract Schema Version",
+  "description": "BAGMAN's canonical contract-version identifier string, per PID §17. Format: `bagman.<domain>.v<N>`, e.g. `bagman.evidence.v1`, `bagman.audit_event.v1`, `bagman.entity.v1`. `<domain>` is a lowercase, underscore-separated token naming the contract's domain; `<N>` is a positive integer contract version, incremented for breaking changes (a breaking change ships as a new file/version, e.g. `v2`, alongside the prior version — the prior version is never edited in place). This primitive is referenced by name from any contract that needs to self-declare its own schema version (e.g. the `schema_version` field on `AuditEvent`), and by convention its value for a given schema equals that schema's own version identifier.",
+  "type": "string",
+  "pattern": "^bagman\\.[a-z_]+\\.v[0-9]+$",
+  "examples": [
+    "bagman.evidence.v1",
+    "bagman.audit_event.v1",
+    "bagman.entity.v1"
+  ]
+}

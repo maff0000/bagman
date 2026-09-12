@@ -1,0 +1,37 @@
+SYNTHETIC TEST DATA — NOT A REAL INVOICE — FABRICATED FOR BAGMAN CD-2 TESTS
+
+This file is a synthetic fixture created for automated testing only. It
+contains no real customer, vendor, bank, or financial information. Every
+value below is fabricated and does not correspond to any real transaction,
+company, or person. "Synthetic Cloud Services Ltd" is a fictional party
+(PID.md §30) invented for CD-2's evidence/provenance fixtures; "NoustAI
+Limited" is used here only as the fictional invoice's addressee text
+inside this synthetic document's own body — it is NOT a real invoice
+issued to the real NOUSTAI_LIMITED governed entity, and this fixture
+does not create, and must never be used to create, a fourth
+GovernedEntity (PID.md §23: the only three real governed entities are
+NOUSTAI_LIMITED, INFOSECURS_LIMITED, MATTHEW_SCOTT_PERSONAL). See
+PID.md §8 (Production Data Doctrine) and §30 (Synthetic Fixture
+Doctrine).
+
+Invoice Number: SYNTH-INV-CD2-0002
+Issue Date:     2026-08-01
+Bill To:        NoustAI Limited (synthetic reference only, not a real transaction)
+Vendor:         Synthetic Cloud Services Ltd (not a real company)
+Currency:       GBP
+
+Line Items:
+  1 x Synthetic Cloud Compute Subscription (Aug 2026)   £480.00
+  1 x Synthetic Object Storage Add-on                    £45.00
+
+Subtotal:  £525.00
+Tax (20%): £105.00
+Total:     £630.00
+
+This document must never be treated as evidence of any real financial
+transaction. It exists solely to exercise CD-2 evidence/provenance
+domain tests (tests/integration/test_domain_and_lineage.py) — e.g.
+registering synthetic evidence with a content hash, associating an
+external reference, and tracing provenance back to this fixture — not
+to represent any real invoice from any real supplier to any real
+BAGMAN governed entity.

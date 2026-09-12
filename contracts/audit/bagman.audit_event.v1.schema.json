@@ -1,0 +1,79 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://bagman.internal/contracts/audit/bagman.audit_event.v1.schema.json",
+  "title": "BAGMAN AuditEvent",
+  "description": "Canonical, append-oriented `AuditEvent` (PID §13-15). Records something meaningful that happened inside BAGMAN. Audit events are immutable after creation, UTC timestamped, actor-attributed, correlation-aware, and causally traceable. This schema is CD-2's foundation event contract; CD-2 need only implement the foundation event taxonomy (see `event_type` below) — later deliveries will add further event types without breaking this contract.",
+  "type": "object",
+  "properties": {
+    "audit_event_id": {
+      "$ref": "https://bagman.internal/contracts/common/bagman.identifier.v1.schema.json",
+      "description": "Canonical BAGMAN identifier for this audit event."
+    },
+    "event_type": {
+      "type": "string",
+      "pattern": "^[A-Z][A-Z_]*$",
+      "description": "The kind of event that occurred. Deliberately open (NOT a closed enum) so future event types can be added without schema redesign. CD-2's own foundation event set (documentation only, not an enforced closed set): `ENTITY_REGISTERED`, `SOURCE_REGISTERED`, `EVIDENCE_OBSERVED`, `EVIDENCE_REGISTERED`, `EXTERNAL_REFERENCE_LINKED`, `PROVENANCE_RECORDED`. Later deliveries are expected to add further event types (e.g. `CLASSIFICATION_PROPOSED`, `RECONCILIATION_CONFIRMED`, and others from PID §13's longer illustrative list) — those are NOT implemented in CD-2 and are named here only to document the taxonomy's future direction."
+    },
+    "occurred_at": {
+      "$ref": "https://bagman.internal/contracts/common/bagman.utc_timestamp.v1.schema.json",
+      "description": "UTC timestamp at which the recorded event occurred."
+    },
+    "actor_type": {
+      "type": "string",
+      "enum": ["SYSTEM", "USER", "AGENT", "SERVICE", "EXTERNAL_SYSTEM"],
+      "description": "The category of actor that caused this event. PID §14 gives this exact closed list and does not ask for extensibility here (unlike `entity_type` / `source_type` / `evidence_type` / evidence `status` elsewhere in these contracts), so this is a closed JSON Schema `enum`."
+    },
+    "actor_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Identifies the SPECIFIC actor that caused this event, e.g. `\"matt\"`, `\"bagman-agent\"`, `\"mail-ingest-worker\"`, `\"reconciler\"`, `\"chargebee\"`. Must not be a generic literal such as `\"system\"` alone — PID §14 explicitly instructs BAGMAN not to represent all activity as system, since that destroys accountability."
+    },
+    "subject_type": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The canonical BAGMAN object type this event is about, e.g. `EvidenceItem`, `GovernedEntity`, `Source`."
+    },
+    "subject_id": {
+      "$ref": "https://bagman.internal/contracts/common/bagman.identifier.v1.schema.json",
+      "description": "Canonical identifier of the subject object (of type `subject_type`) this event is about."
+    },
+    "correlation_id": {
+      "$ref": "https://bagman.internal/contracts/common/bagman.identifier.v1.schema.json",
+      "description": "Identifier shared by every audit event belonging to the same multi-step workflow/operational story (PID §15). Every audit event must belong to a correlation."
+    },
+    "causation_id": {
+      "oneOf": [
+        { "$ref": "https://bagman.internal/contracts/common/bagman.identifier.v1.schema.json" },
+        { "type": "null" }
+      ],
+      "description": "The `audit_event_id` of the event that directly caused this one, forming a causal chain within a `correlation_id`. This field is REQUIRED (the key must always be present) and is `null` ONLY for the first event in a causal chain — a caller cannot omit causation silently; it must be stated explicitly, even when there is none yet."
+    },
+    "payload": {
+      "type": "object",
+      "description": "Structured, event-specific detail. Must NEVER contain secrets, credentials, or full evidence-content bodies (PID §36) — audit events must be safe to log. Keep payloads to canonical object references and small structured facts, not raw document/email contents.",
+      "additionalProperties": true,
+      "default": {}
+    },
+    "schema_version": {
+      "allOf": [
+        { "$ref": "https://bagman.internal/contracts/common/bagman.schema_version.v1.schema.json" }
+      ],
+      "const": "bagman.audit_event.v1",
+      "description": "Contract version identifier for this AuditEvent record. Must literally equal `\"bagman.audit_event.v1\"` for instances of this schema version."
+    }
+  },
+  "required": [
+    "audit_event_id",
+    "event_type",
+    "occurred_at",
+    "actor_type",
+    "actor_id",
+    "subject_type",
+    "subject_id",
+    "correlation_id",
+    "causation_id",
+    "payload",
+    "schema_version"
+  ],
+  "additionalProperties": false
+}

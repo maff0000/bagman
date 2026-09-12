@@ -15,3 +15,18 @@ other production evidence may ever be added to this directory. See
 As of CD-1 this contains one example fixture
 (`invoices/example_synthetic_invoice.txt`) demonstrating the convention;
 no fixture-consuming implementation exists yet.
+
+## CD-2 fixtures
+
+- `invoices/synthetic_cloud_services_invoice_to_noustai.txt` — a
+  fabricated invoice from the fictional **Synthetic Cloud Services
+  Ltd** (PID §30's suggested fictional party) to **NoustAI Limited**,
+  used by `tests/integration/test_domain_and_lineage.py` and
+  `tests/integration/test_runtime_proof.py` as the underlying
+  "document" a synthetic `EvidenceItem` is registered for (content
+  hashed, linked to an external reference, and traced through
+  provenance). "NoustAI Limited" here is only text inside this
+  fabricated document's own body — it is not, and must never become,
+  a fourth `GovernedEntity`; the three real governed entities remain
+  exactly `NOUSTAI_LIMITED`, `INFOSECURS_LIMITED`,
+  `MATTHEW_SCOTT_PERSONAL` (PID §23).

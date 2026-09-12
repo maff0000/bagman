@@ -1,0 +1,53 @@
+# Runtime dependencies for BAGMAN CD-2.
+#
+# jsonschema and rfc3339-validator were introduced by WI-2, both
+# explicitly authorised by the PL for that work item:
+#
+#   jsonschema          - validates every domain object's to_dict()
+#                          output against its contracts/*.schema.json
+#                          file (Draft 2020-12) before it is accepted.
+#                          Also used by WI-3's
+#                          scripts/generate_architecture_memory.py to
+#                          validate component.yaml manifests against
+#                          contracts/manifest/bagman.component_manifest.v1.schema.json.
+#   rfc3339-validator    - jsonschema's built-in "date-time" format
+#                          checker only registers itself if this
+#                          package is importable (see
+#                          jsonschema._format); without it, `format:
+#                          date-time` is silently unenforced. This is
+#                          exactly the gap WI-1 flagged.
+#
+# Versions pinned to the current stable release of each as of this
+# work item (2026-09-12) — see the WI-2 delivery report for the
+# environment check that produced these:
+#   jsonschema 4.10.3 was already installed in the delivery
+#   environment (a transitive dependency from elsewhere), but the
+#   latest stable release, 4.26.0, is pinned here deliberately since
+#   there was no prior CD-2 code depending on the older version's
+#   behaviour.
+#
+# PyYAML - moved here by WI-3. It was previously dev-only
+# (requirements-dev.txt) because nothing outside the test suite used
+# it. WI-3's scripts/generate_architecture_memory.py now imports it
+# directly to parse component.yaml manifests and
+# config/base/entities.yaml, and that script is meant to be run
+# outside test contexts (by a developer or a CI drift-check job, not
+# only by pytest) — so it is now an application-adjacent tool
+# dependency, not merely test tooling, and belongs in this file
+# instead. Pinned to the version already used by requirements-dev.txt.
+#
+# referencing - pinned explicitly by the PL after CD-2 audit flagged it:
+# core/contract_validation.py imports `referencing` directly
+# (Registry/Resource/DRAFT202012) to cross-resolve $ref between
+# contracts/*.schema.json files. It was previously only present as an
+# undeclared transitive dependency of jsonschema>=4.18 — correct today,
+# but a package a module imports directly should be pinned directly,
+# not left to arrive incidentally via another package's own dependency
+# choices, which could change in a future jsonschema release. Pinned to
+# the version that was already resolving and passing all 102 tests.
+#
+# Do not add anything else here without flagging it to the PL first.
+jsonschema==4.26.0
+rfc3339-validator==0.1.4
+PyYAML==6.0.2
+referencing==0.37.0

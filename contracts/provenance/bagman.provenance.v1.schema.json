@@ -1,0 +1,65 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://bagman.internal/contracts/provenance/bagman.provenance.v1.schema.json",
+  "title": "BAGMAN Provenance",
+  "description": "Canonical `Provenance` edge (PID §11). Lets BAGMAN answer 'where did this information come from?' by tracing a derived/canonical fact (the `subject`) back to the single `EvidenceItem` it was observed, extracted, derived, or generated from. This is a platform-level, domain-agnostic primitive — not hardcoded to invoice-oriented provenance. Each `Provenance` record traces to exactly ONE `evidence_id`. Where a subject has multiple evidence sources, this is represented as MULTIPLE `Provenance` records (one per contributing evidence item), never as a single record carrying an array of evidence IDs.",
+  "type": "object",
+  "properties": {
+    "provenance_id": {
+      "$ref": "https://bagman.internal/contracts/common/bagman.identifier.v1.schema.json",
+      "description": "Canonical BAGMAN identifier for this provenance edge."
+    },
+    "subject_type": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The canonical BAGMAN object type this provenance edge is about, e.g. `EvidenceItem`, `Classification`. Deliberately an open string, not a closed enum."
+    },
+    "subject_id": {
+      "$ref": "https://bagman.internal/contracts/common/bagman.identifier.v1.schema.json",
+      "description": "Canonical identifier of the subject object (of type `subject_type`) that this provenance edge is about."
+    },
+    "evidence_id": {
+      "$ref": "https://bagman.internal/contracts/common/bagman.identifier.v1.schema.json",
+      "description": "Canonical identifier of the ONE `EvidenceItem` this specific provenance edge traces to. Where a subject is supported by multiple evidence items, represent that as multiple `Provenance` records, not as an array on this field."
+    },
+    "relationship": {
+      "type": "string",
+      "enum": [
+        "OBSERVED_FROM",
+        "EXTRACTED_FROM",
+        "DERIVED_FROM",
+        "GENERATED_FROM",
+        "SUPERSEDES",
+        "SUPPORTS",
+        "CONTRADICTS"
+      ],
+      "description": "The nature of the relationship between `subject` and `evidence_id`. This is a CLOSED, platform-level, domain-agnostic vocabulary (PID §11 does not ask for this field to be extensible, unlike `entity_type` / `source_type` / `evidence_type` / `status` elsewhere in these contracts), so it is expressed as a JSON Schema `enum` rather than an open pattern string."
+    },
+    "transform_id": {
+      "oneOf": [
+        { "$ref": "https://bagman.internal/contracts/common/bagman.identifier.v1.schema.json" },
+        { "type": "null" }
+      ],
+      "description": "Optional canonical identifier of the process/transform that produced this derivation, if any. `null` (or the key omitted) means no transform is recorded, e.g. for a direct `OBSERVED_FROM` relationship."
+    },
+    "created_at": {
+      "$ref": "https://bagman.internal/contracts/common/bagman.utc_timestamp.v1.schema.json",
+      "description": "UTC timestamp at which this provenance edge was recorded."
+    },
+    "metadata": {
+      "type": "object",
+      "description": "Free-form, genuinely open metadata about this provenance edge.",
+      "additionalProperties": true,
+      "default": {}
+    }
+  },
+  "required": [
+    "provenance_id",
+    "subject_type",
+    "subject_id",
+    "evidence_id",
+    "relationship",
+    "created_at"
+  ],
+  "additionalProperties": false
+}

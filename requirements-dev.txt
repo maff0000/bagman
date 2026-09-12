@@ -3,4 +3,6 @@
 # tooling that runs the test suite (tests/security/ etc.) and CI only.
 
 pytest==8.3.4
-PyYAML==6.0.2
+# PyYAML moved to requirements.txt by WI-3: it is now imported directly by
+# scripts/generate_architecture_memory.py, which is meant to run outside
+# test contexts (developer/CI drift-check usage), not only under pytest.

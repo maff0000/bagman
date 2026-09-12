@@ -1,0 +1,58 @@
+# BAGMAN component manifest (PID §19) for core/.
+# Validated by scripts/generate_architecture_memory.py against
+# contracts/manifest/bagman.component_manifest.v1.schema.json.
+
+id: BAGMAN.CORE
+version: 1
+
+responsibility: >
+  Own canonical identity, timestamp, error, contract-validation, and
+  domain-model primitives (GovernedEntity, Source, ExternalReference,
+  Provenance, AuditEvent) plus their in-memory reference repositories,
+  and expose the single BagmanCanonicalAPI orchestration facade
+  (core/api.py) that composes these with services/evidence/ to record
+  every canonical write's audit event — including EVIDENCE_OBSERVED,
+  which is emitted from here even though EvidenceItem itself is owned
+  by services/evidence/ (see the `produces` note below).
+
+owns:
+  - GovernedEntity
+  - Source
+  - ExternalReference
+  - Provenance
+  - AuditEvent
+
+# The one documented import-boundary exception (core/api.py's module
+# docstring): core/ otherwise never imports services/, but the
+# composition-root facade must, by PID §33's requirement that a single
+# facade expose both register_evidence/get_evidence (which compose
+# services.evidence.evidence.EvidenceRepository) and the pure core/
+# operations.
+consumes:
+  - services/evidence
+
+# The five AuditEvent.event_type values emitted by core/api.py's write
+# methods (PID §33/§13). EVIDENCE_OBSERVED is listed here rather than
+# under services/evidence/component.yaml's `produces` because the
+# *facade method that emits the event* (register_evidence, calling
+# self.record_audit_event) lives in core/api.py, inside core/ — event
+# attribution here follows which code emits the event, not which
+# component the event is conceptually about.
+produces:
+  - ENTITY_REGISTERED
+  - SOURCE_REGISTERED
+  - EVIDENCE_OBSERVED
+  - EXTERNAL_REFERENCE_LINKED
+  - PROVENANCE_RECORDED
+
+dependencies:
+  - jsonschema
+  - rfc3339-validator
+
+external_access: false
+
+prohibited:
+  - direct_email_access
+  - direct_bank_access
+  - direct_xero_access
+  - direct_chargebee_access

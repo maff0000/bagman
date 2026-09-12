@@ -1,0 +1,11 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://bagman.internal/contracts/common/bagman.identifier.v1.schema.json",
+  "title": "BAGMAN Canonical Identifier",
+  "description": "BAGMAN's opaque, canonical internal identifier. A lowercase UUIDv7 string (RFC 9562): standard 8-4-4-4-12 lowercase hexadecimal UUID string form, with the version nibble (first hex digit of the 3rd group) fixed to `7` and the variant nibble (first hex digit of the 4th group) constrained to one of `8`, `9`, `a`, `b`. This identifier is: opaque (carries no business meaning), immutable once assigned, non-secret, safe to write to logs, safe to use in URLs, and independent of any external-provider identifier (see PID §5). It is used as the canonical `*_id` field on every BAGMAN domain object (GovernedEntity, EvidenceItem, Source, ExternalReference, Provenance, AuditEvent, etc.) via `$ref` from this schema. It must never be derived from a mutable business value (invoice number, email address, supplier name, filename, bank reference, customer name).",
+  "type": "string",
+  "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+  "examples": [
+    "018f5b3e-3c2a-7a4e-8b2d-6f1a2c3d4e5f"
+  ]
+}

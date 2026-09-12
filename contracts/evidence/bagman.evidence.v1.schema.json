@@ -1,0 +1,103 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://bagman.internal/contracts/evidence/bagman.evidence.v1.schema.json",
+  "title": "BAGMAN EvidenceItem",
+  "description": "Canonical `EvidenceItem` (PID §6-8). Represents something BAGMAN has observed or received (an email, an attachment, an uploaded document, a bank statement, etc). Original received evidence is immutable once recorded (PID §7): corrections happen by adding new derived records, superseding interpretation, or linking replacement evidence — never by rewriting history. JSON Schema validates the shape of a single instance and cannot itself enforce immutability across time/writes; that guarantee is enforced at the domain/repository layer.",
+  "type": "object",
+  "properties": {
+    "evidence_id": {
+      "$ref": "https://bagman.internal/contracts/common/bagman.identifier.v1.schema.json",
+      "description": "Canonical BAGMAN identifier for this evidence item. This, not `content_hash`, is the evidence's canonical identity (see `content_hash` description below)."
+    },
+    "entity_id": {
+      "oneOf": [
+        { "$ref": "https://bagman.internal/contracts/common/bagman.identifier.v1.schema.json" },
+        { "type": "null" }
+      ],
+      "description": "Canonical identifier of the `GovernedEntity` this evidence is associated with, or explicit `null` if entity ownership is UNRESOLVED. `null` is a first-class, explicit state (PID §4's entity isolation invariant) — it means BAGMAN has deliberately not yet resolved which governed entity this evidence belongs to, and must never be treated as, or silently upgraded to, an inferred entity. This field is REQUIRED (the key must always be present) precisely so that a caller cannot omit entity resolution silently: an omitted key would hide the question, whereas an explicit `null` states plainly that resolution has not happened."
+    },
+    "evidence_type": {
+      "type": "string",
+      "pattern": "^[A-Z][A-Z_]*$",
+      "description": "The kind of evidence. Deliberately open (NOT a closed enum) per the extensible taxonomy in PID §24. Known initial values (documentation only, not an enforced closed set): `EMAIL`, `EMAIL_ATTACHMENT`, `DOCUMENT`, `INVOICE`, `RECEIPT`, `STATEMENT`, `CONTRACT`, `TAX_DOCUMENT`, `CORRESPONDENCE`, `API_PAYLOAD`, `USER_UPLOAD`, `GENERATED_DOCUMENT`, `UNKNOWN`. `UNKNOWN` is explicitly legitimate — classification is not always known when evidence enters BAGMAN, and a generic `DOCUMENT` may later be reclassified without altering the original observation history."
+    },
+    "source_id": {
+      "$ref": "https://bagman.internal/contracts/common/bagman.identifier.v1.schema.json",
+      "description": "Canonical identifier of the `Source` this evidence was observed through."
+    },
+    "observed_at": {
+      "$ref": "https://bagman.internal/contracts/common/bagman.utc_timestamp.v1.schema.json",
+      "description": "UTC timestamp at which the underlying event/content was originally observed (e.g. an email's send time), as best known to BAGMAN."
+    },
+    "received_at": {
+      "$ref": "https://bagman.internal/contracts/common/bagman.utc_timestamp.v1.schema.json",
+      "description": "UTC timestamp at which BAGMAN itself received/ingested this evidence."
+    },
+    "content_hash": {
+      "type": "object",
+      "description": "Cryptographic content hash of the evidence's bytes, supporting duplicate detection, integrity validation, and provenance (PID §8). IMPORTANT: the content hash is NOT the canonical evidence identity (`evidence_id` is). Two separate `EvidenceItem` observations may legitimately share the same `content_hash` value (e.g. the same PDF invoice received via two different mailboxes) and must NOT be prematurely collapsed into a single record — later, explicit deduplication logic may choose to associate them, but CD-2 must preserve them as distinct observations.",
+      "properties": {
+        "algorithm": {
+          "type": "string",
+          "minLength": 1,
+          "default": "SHA-256",
+          "description": "Hash algorithm identifier. `SHA-256` is the only currently-supported value, but this is expressed as an open string rather than a closed enum so that a future supported algorithm does not require a schema redesign."
+        },
+        "value": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$",
+          "description": "Lowercase hex-encoded digest, 64 characters for SHA-256."
+        }
+      },
+      "required": ["algorithm", "value"],
+      "additionalProperties": false
+    },
+    "mime_type": {
+      "type": "string",
+      "minLength": 1,
+      "description": "IANA media type of the evidence content, e.g. `application/pdf`, `message/rfc822`."
+    },
+    "original_name": {
+      "type": "string",
+      "description": "Original filename or label as received, if any, e.g. `invoice-2026-04.pdf`. Optional — not every evidence type has one."
+    },
+    "size_bytes": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Size of the evidence content in bytes."
+    },
+    "storage_reference": {
+      "type": "string",
+      "description": "Placeholder reference to where the evidence content is stored. CD-2 has no real storage backend yet (that is CD-3 scope, PID §47); this field exists so the contract does not require redesign once a storage backend is introduced."
+    },
+    "status": {
+      "type": "string",
+      "pattern": "^[A-Z][A-Z_]*$",
+      "description": "Evidence workflow state, kept distinct from evidence identity/type (PID §25). Deliberately open (not a closed enum). Known initial values (documentation only): `OBSERVED`, `REGISTERED`, `AVAILABLE`, `SUPERSEDED`, `QUARANTINED`, `ERROR`. Financial statuses such as `PAID`, `RECONCILED`, or `POSTED_TO_XERO` must NEVER appear here — those belong to later finance-domain objects, not to the evidence object (PID §25)."
+    },
+    "created_at": {
+      "$ref": "https://bagman.internal/contracts/common/bagman.utc_timestamp.v1.schema.json",
+      "description": "UTC timestamp at which this EvidenceItem record was created in BAGMAN."
+    },
+    "metadata": {
+      "type": "object",
+      "description": "Free-form, genuinely open metadata about the evidence. Provider-specific fields belong here, never promoted into canonical identity fields.",
+      "additionalProperties": true,
+      "default": {}
+    }
+  },
+  "required": [
+    "evidence_id",
+    "entity_id",
+    "evidence_type",
+    "source_id",
+    "observed_at",
+    "received_at",
+    "content_hash",
+    "mime_type",
+    "size_bytes",
+    "status",
+    "created_at"
+  ],
+  "additionalProperties": false
+}
