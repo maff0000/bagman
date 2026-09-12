@@ -1,12 +1,28 @@
 name: Security
 
-# Runs the CD-1 security gate: secret scanning + the deterministic
-# security test suite under tests/security/ (PID.md §14/§15).
+# CD-1's security gate (secret scanning + tests/security/, PID.md
+# §14/§15), extended by CD-2 (PID.md §41) to also run the full pytest
+# suite added by CD-2: tests/contract/ (schema/contract tests),
+# tests/integration/ (domain/lineage behaviour + architectural-boundary
+# tests), alongside tests/security/ — i.e. everything PID §41 names:
+# security tests, contract tests, domain tests, architectural-boundary
+# tests.
+#
+# A single `pytest tests/ -v` runs all of the above rather than one
+# step per named category: verbose output already reports each test's
+# full path (tests/<category>/...), so per-category attribution is
+# still visible in the log, and a single recursive invocation means a
+# future test file added under tests/ is picked up automatically
+# instead of silently being skipped because no hardcoded step happened
+# to list it.
 #
 # No step in this workflow requires or references any secret. Gitleaks is
 # installed as a pinned release binary (no license key needed for public
-# repositories / OSS use), and the security test suite is entirely
-# self-contained (it inspects this repository's own git state).
+# repositories / OSS use), and the full test suite is entirely
+# self-contained: no live external dependency (network, database, Redis,
+# Docker registry) is used anywhere in tests/security/, tests/contract/,
+# or tests/integration/ — confirmed by inspection (only local
+# subprocess calls to git/gitleaks and an in-memory core.api instance).
 
 on:
   pull_request:
@@ -46,8 +62,16 @@ jobs:
       - name: Run gitleaks scan
         run: gitleaks detect --source . --redact --verbose
 
-      - name: Install dev dependencies
-        run: pip install -r requirements-dev.txt
+      - name: Install dependencies
+        run: pip install -r requirements.txt -r requirements-dev.txt
 
-      - name: Run security test suite
-        run: pytest tests/security/ -v
+      - name: Run full test suite (security + contract + domain + architectural-boundary)
+        env:
+          # Belt-and-braces: pyproject.toml's [tool.pytest.ini_options]
+          # pythonpath = ["."] already puts the repo root on sys.path
+          # for every pytest invocation (CI or local), which is what
+          # lets tests/contract/ and tests/integration/ import the
+          # `core` package. This env var is redundant given that but
+          # harmless, and kept as an explicit CI-level guarantee.
+          PYTHONPATH: ${{ github.workspace }}
+        run: pytest tests/ -v
