@@ -1,0 +1,46 @@
+# BAGMAN component manifest (PID §52) for persistence/postgres/.
+# Validated by scripts/generate_architecture_memory.py against
+# contracts/manifest/bagman.component_manifest.v1.schema.json.
+#
+# Added retroactively by CD-3 WI-3 — WI-1 (which built this component)
+# shipped without a manifest; this is the first work item to introduce
+# component.yaml validation/projection for it.
+
+id: BAGMAN.PERSISTENCE.POSTGRES
+version: 1
+
+responsibility: >
+  Own durable, PostgreSQL-backed implementations of every CD-2
+  repository interface (GovernedEntity, Source, ExternalReference,
+  EvidenceItem, Provenance, AuditEvent) plus the SQLAlchemy engine/
+  session factory and Alembic migration schema — preserving exactly
+  the same canonical behaviour (immutability, idempotent external-
+  reference/evidence-observation replay, append-only audit) as the
+  in-memory reference implementations core/ and services/evidence/
+  ship, durably.
+
+owns: []
+
+# Implements the repository ABC interfaces core/ and
+# services/evidence/ define; does not define any canonical domain type
+# of its own. Depends on core/'s errors, identity, timestamps, and
+# contract_validation, and on services/evidence/'s EvidenceItem/
+# EvidenceRepository/ExternalReferenceHint.
+consumes:
+  - BAGMAN.CORE
+  - BAGMAN.SERVICES.EVIDENCE
+
+produces: []
+
+dependencies:
+  - SQLAlchemy
+  - psycopg
+  - alembic
+
+external_access: false
+
+prohibited:
+  - direct_email_access
+  - direct_bank_access
+  - direct_xero_access
+  - direct_chargebee_access

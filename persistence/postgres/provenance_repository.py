@@ -16,14 +16,14 @@ from __future__ import annotations
 from typing import Any, Mapping, Optional
 
 from sqlalchemy.engine import Engine
-from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+from sqlalchemy.exc import DataError, IntegrityError, SQLAlchemyError
 
 from core import identity
 from core.contract_validation import validate_against_contract
 from core.errors import InvalidProvenanceError, NotFoundError, PersistenceError, ValidationError
 from core.provenance import Provenance, ProvenanceRepository
 from core.timestamps import utc_now
-from persistence.postgres.db_errors import is_foreign_key_violation
+from persistence.postgres.db_errors import is_foreign_key_violation, is_invalid_uuid_format
 from persistence.postgres.models import ProvenanceRow
 from persistence.postgres.session import get_engine, session_scope
 
@@ -128,6 +128,13 @@ class PostgresProvenanceRepository(ProvenanceRepository):
                 return _row_to_provenance(row)
         except NotFoundError:
             raise
+        except DataError as exc:
+            if is_invalid_uuid_format(exc):
+                raise NotFoundError(
+                    f"no Provenance with provenance_id '{provenance_id}' "
+                    "(malformed identifier can never exist)"
+                ) from exc
+            raise PersistenceError(f"could not read Provenance: {exc}") from exc
         except SQLAlchemyError as exc:
             raise PersistenceError(f"could not read Provenance: {exc}") from exc
 

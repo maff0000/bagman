@@ -36,6 +36,17 @@ def test_unknown_entity_id_raises_not_found():
         repo.get_entity(identity.generate_id())
 
 
+def test_malformed_entity_id_raises_not_found_not_persistence_error():
+    """PL bug fix (CD-3 WI-3): a syntactically-invalid (non-UUID-shaped)
+    id string must resolve to NotFoundError (-> HTTP 404), not
+    PersistenceError (-> HTTP 503) — a malformed id can never
+    correspond to an existing row, so "not found" is the honest
+    answer, not "the persistence layer is broken"."""
+    repo = PostgresEntityRepository()
+    with pytest.raises(NotFoundError):
+        repo.get_entity("not-a-valid-uuid")
+
+
 def test_re_registering_an_existing_entity_id_is_rejected_by_the_real_primary_key():
     repo = PostgresEntityRepository()
     entity = repo.register_entity(

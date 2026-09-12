@@ -1,0 +1,23 @@
+# OPT-IN override — publishes bagman-db/bagman-objects ports to
+# 127.0.0.1 for local debugging only (PID §32's "opt-in and
+# documented" allowance). NOT applied by default; apply it explicitly
+# alongside the base file:
+#
+#   docker compose -p bagman \
+#     -f deployment/compose/docker-compose.yml \
+#     -f deployment/compose/docker-compose.debug-ports.yml \
+#     up -d
+#
+# Production doctrine remains closed by default (PID §32) — this file
+# exists only for a developer who needs to point `psql`/`mc`/an S3
+# client at these services directly from the host.
+
+services:
+  bagman-db:
+    ports:
+      - "127.0.0.1:5432:5432"
+
+  bagman-objects:
+    ports:
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"

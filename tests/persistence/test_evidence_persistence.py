@@ -259,3 +259,36 @@ def test_unknown_evidence_id_raises_not_found():
     repo = PostgresEvidenceRepository(PostgresExternalReferenceRepository())
     with pytest.raises(NotFoundError):
         repo.get_evidence(identity.generate_id())
+
+
+def test_malformed_evidence_id_raises_not_found_not_persistence_error():
+    """PL bug fix (CD-3 WI-3): `GET /internal/evidence/{id}` with a
+    syntactically-invalid (non-UUID-shaped) id string was wrongly
+    returning `core.errors.PersistenceError` (-> HTTP 503) instead of
+    `core.errors.NotFoundError` (-> HTTP 404), because
+    `session.get(EvidenceItemRow, evidence_id)` against a native
+    PostgreSQL `UUID` column raises a DBAPI `DataError`
+    (psycopg `InvalidTextRepresentation`, SQLSTATE 22P02) BEFORE the
+    "row is None" check ever runs, and the method's generic
+    `except SQLAlchemyError` caught it. A malformed id can never
+    correspond to an existing row, so NotFoundError is the honest,
+    correct translation -- not PersistenceError, which must stay
+    reserved for genuine connectivity/operational failures. The
+    well-formed-but-nonexistent case (`test_unknown_evidence_id_
+    raises_not_found` above) was already correct; only the malformed-
+    format case was wrong."""
+    repo = PostgresEvidenceRepository(PostgresExternalReferenceRepository())
+    with pytest.raises(NotFoundError):
+        repo.get_evidence("not-a-valid-uuid")
+
+
+def test_malformed_evidence_id_in_update_status_raises_not_found():
+    repo = PostgresEvidenceRepository(PostgresExternalReferenceRepository())
+    with pytest.raises(NotFoundError):
+        repo.update_status("not-a-valid-uuid", "AVAILABLE")
+
+
+def test_malformed_evidence_id_in_assign_entity_raises_not_found():
+    repo = PostgresEvidenceRepository(PostgresExternalReferenceRepository())
+    with pytest.raises(NotFoundError):
+        repo.assign_entity("not-a-valid-uuid", identity.generate_id())

@@ -6,3 +6,15 @@ pytest==8.3.4
 # PyYAML moved to requirements.txt by WI-3: it is now imported directly by
 # scripts/generate_architecture_memory.py, which is meant to run outside
 # test contexts (developer/CI drift-check usage), not only under pytest.
+#
+# httpx2 - added by CD-3 WI-3 PL-review re-verification: fastapi.testclient.
+# TestClient (used by tests/app_api/) requires it transitively via
+# starlette.testclient at test-collection time — the WI-3 dispatch that
+# introduced fastapi/starlette to requirements.txt never added this
+# dev-only test dependency, so `pytest tests/app_api/` failed to even
+# collect (`RuntimeError: ... requires the httpx2 package`) before this.
+# starlette 1.6.0 (pulled in transitively by fastapi==0.141.1) prefers
+# httpx2 over the now-deprecated `httpx`-with-starlette.testclient path.
+# Test-only (never imported by application code under app/), so it
+# belongs here, not in requirements.txt.
+httpx2==2.12.0

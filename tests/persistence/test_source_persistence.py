@@ -59,6 +59,15 @@ def test_unknown_source_id_raises_not_found():
         repo.get_source(identity.generate_id())
 
 
+def test_malformed_source_id_raises_not_found_not_persistence_error():
+    """PL bug fix (CD-3 WI-3): same class of bug as evidence_repository
+    -- a syntactically-invalid (non-UUID-shaped) id must resolve to
+    NotFoundError, not PersistenceError."""
+    repo = PostgresSourceRepository()
+    with pytest.raises(NotFoundError):
+        repo.get_source("not-a-valid-uuid")
+
+
 def test_list_sources_returns_every_registered_source():
     repo = PostgresSourceRepository()
     a = repo.register_source(source_type="MANUAL_UPLOAD", provider="INTERNAL", status="ACTIVE")

@@ -24,14 +24,14 @@ from __future__ import annotations
 from typing import Any, Mapping, Optional
 
 from sqlalchemy.engine import Engine
-from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+from sqlalchemy.exc import DataError, IntegrityError, SQLAlchemyError
 
 from core import identity
 from core.contract_validation import validate_against_contract
 from core.errors import DuplicateExternalReferenceError, NotFoundError, PersistenceError, ValidationError
 from core.external_reference import ExternalReference, ExternalReferenceRepository
 from core.timestamps import utc_now
-from persistence.postgres.db_errors import unique_violation_constraint
+from persistence.postgres.db_errors import is_invalid_uuid_format, unique_violation_constraint
 from persistence.postgres.models import ExternalReferenceRow
 from persistence.postgres.session import get_engine, session_scope
 
@@ -174,6 +174,13 @@ class PostgresExternalReferenceRepository(ExternalReferenceRepository):
                 return _row_to_reference(row)
         except NotFoundError:
             raise
+        except DataError as exc:
+            if is_invalid_uuid_format(exc):
+                raise NotFoundError(
+                    f"no ExternalReference with external_reference_id '{external_reference_id}' "
+                    "(malformed identifier can never exist)"
+                ) from exc
+            raise PersistenceError(f"could not read ExternalReference: {exc}") from exc
         except SQLAlchemyError as exc:
             raise PersistenceError(f"could not read ExternalReference: {exc}") from exc
 

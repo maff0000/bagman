@@ -1,0 +1,151 @@
+# BAGMAN CD-3 WI-3 runtime — bagman-db / bagman-objects / bagman-api
+# (PID §5-8, §15, §24-33).
+#
+# Project name is explicitly "bagman" (also passable via
+# `docker compose -p bagman ...`) so every container/volume/network
+# this stack creates is genuinely `bagman-*`, not an ambiguous
+# auto-generated prefix derived from whatever directory this file
+# happens to be run from.
+#
+# Network exposure (PID §32): bagman-db and bagman-objects publish NO
+# host port by default — internal service-to-service traffic on
+# bagman-net only. bagman-api is the one deliberate, documented
+# exception: it is BAGMAN's intended access point, bound to
+# 127.0.0.1 only (not 0.0.0.0) so it is reachable from this host but
+# not the wider network by default.
+#
+# A host-published port for bagman-db/bagman-objects, for local
+# debugging only, is available as an explicit opt-in override file —
+# see docker-compose.debug-ports.yml — never applied by default.
+#
+# Usage:
+#   docker compose -p bagman -f deployment/compose/docker-compose.yml build \
+#     --build-arg GIT_COMMIT=$(git rev-parse HEAD)
+#   docker compose -p bagman -f deployment/compose/docker-compose.yml up -d
+# (or `make build` / `make start` — see the repo-root Makefile, which
+# exports BAGMAN_GIT_COMMIT from `git rev-parse HEAD` automatically.)
+
+name: bagman
+
+networks:
+  bagman-net:
+    name: bagman-net
+
+volumes:
+  bagman-postgres-data:
+    name: bagman-postgres-data
+  bagman-object-data:
+    name: bagman-object-data
+
+secrets:
+  # Real secrets, provisioned externally by the PL at
+  # /srv/bagman-secrets/ (outside this repository, chmod 600) — never
+  # copied into this file, never committed. See PID §29-31.
+  postgres_password:
+    file: /srv/bagman-secrets/postgres_password
+  minio_root_user:
+    file: /srv/bagman-secrets/minio_root_user
+  minio_root_user_password:
+    file: /srv/bagman-secrets/minio_root_user_password
+
+services:
+  bagman-db:
+    image: postgres:17
+    container_name: bagman-db
+    networks:
+      - bagman-net
+    # No host port publish (PID §32) — bagman-api reaches this over
+    # bagman-net only, at bagman-db:5432.
+    environment:
+      POSTGRES_DB: bagman
+      POSTGRES_USER: bagman
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+      PGTZ: UTC
+      TZ: UTC
+    secrets:
+      - postgres_password
+    volumes:
+      - bagman-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bagman -d bagman"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+    restart: unless-stopped
+
+  bagman-objects:
+    # Pinned to a real, pullable, non-`:latest` release tag (PID §7) —
+    # verified pullable via `docker manifest inspect` and cross-checked
+    # against quay.io's own tag listing API at delivery time
+    # (2026-09-12); this was the most recent RELEASE tag quay.io
+    # reported for quay.io/minio/minio at that time.
+    image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z.hotfix.7aa24e772
+    container_name: bagman-objects
+    networks:
+      - bagman-net
+    # No host port publish by default (PID §32). A host-published port
+    # for the MinIO S3 API (:9000) / console (:9001), for local
+    # debugging only, is an explicit opt-in override — see
+    # docker-compose.debug-ports.yml — never the default.
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER_FILE: /run/secrets/minio_root_user
+      MINIO_ROOT_PASSWORD_FILE: /run/secrets/minio_root_user_password
+      TZ: UTC
+    secrets:
+      - minio_root_user
+      - minio_root_user_password
+    volumes:
+      - bagman-object-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+    restart: unless-stopped
+
+  bagman-api:
+    build:
+      context: ../../
+      dockerfile: deployment/docker/api/Dockerfile
+      args:
+        GIT_COMMIT: ${BAGMAN_GIT_COMMIT:-unknown}
+    image: bagman-api:${BAGMAN_IMAGE_TAG:-dev}
+    container_name: bagman-api
+    networks:
+      - bagman-net
+    depends_on:
+      bagman-db:
+        condition: service_healthy
+      bagman-objects:
+        condition: service_healthy
+    environment:
+      BAGMAN_RUNTIME_ENV: production
+      BAGMAN_DB_HOST: bagman-db
+      BAGMAN_DB_PORT: "5432"
+      BAGMAN_DB_NAME: bagman
+      BAGMAN_DB_USER: bagman
+      BAGMAN_DB_PASSWORD_FILE: /run/secrets/postgres_password
+      BAGMAN_OBJECT_STORE_ENDPOINT_URL: http://bagman-objects:9000
+      BAGMAN_OBJECT_STORE_BUCKET: bagman-evidence
+      BAGMAN_OBJECT_STORE_ACCESS_KEY_FILE: /run/secrets/minio_root_user
+      BAGMAN_OBJECT_STORE_SECRET_KEY_FILE: /run/secrets/minio_root_user_password
+      BAGMAN_LOG_LEVEL: INFO
+      TZ: UTC
+    secrets:
+      - postgres_password
+      - minio_root_user
+      - minio_root_user_password
+    # The one deliberate host-published entry point (PID §5) — bound to
+    # loopback only, not 0.0.0.0.
+    ports:
+      - "127.0.0.1:8000:8000"
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 15s
+    restart: unless-stopped

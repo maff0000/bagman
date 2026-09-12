@@ -72,6 +72,17 @@ def test_unknown_audit_event_id_raises_not_found():
         repo.get_audit_event(identity.generate_id())
 
 
+def test_malformed_audit_event_id_raises_not_found_not_persistence_error():
+    """PL bug fix (CD-3 WI-3): same class of bug as evidence_repository
+    -- a syntactically-invalid (non-UUID-shaped) id must resolve to
+    NotFoundError, not PersistenceError."""
+    from core.errors import NotFoundError
+
+    repo = PostgresAuditRepository()
+    with pytest.raises(NotFoundError):
+        repo.get_audit_event("not-a-valid-uuid")
+
+
 def test_audit_repository_class_defines_no_update_or_delete_method():
     """Structural proof of PID §21's 'repository design should make
     audit mutation difficult by default' — no update/delete method

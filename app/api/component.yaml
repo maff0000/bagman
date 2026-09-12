@@ -1,0 +1,57 @@
+# BAGMAN component manifest (PID §52) for app/api/.
+# Validated by scripts/generate_architecture_memory.py against
+# contracts/manifest/bagman.component_manifest.v1.schema.json.
+#
+# NOTE (CD-3 WI-3 rename): this package lives at app/api/, not
+# runtime/api/ (the prior dispatch's original choice) — a tracked path
+# with a directory component literally named `runtime` collides with
+# CD-1's tests/security/test_repo_hygiene.py PROHIBITED_DIRECTORY_NAMES
+# guard. The `id:` below is unchanged: it names a conceptual component,
+# not a literal path.
+
+id: BAGMAN.RUNTIME.API
+version: 1
+
+responsibility: >
+  Own the FastAPI/Uvicorn HTTP-facing application layer that exposes
+  BagmanCanonicalAPI as a runnable, containerised service: health/
+  readiness (with a hard no-fallback invariant on readiness failure),
+  version metadata, structured logging, and thin internal HTTP
+  wrappers around register_entity/register_source/register_evidence/
+  get_evidence/trace_provenance. Also owns the PID §14 composition
+  root — the one place BAGMAN_RUNTIME_ENV is read to choose between
+  in-memory and PostgreSQL+MinIO-backed repositories.
+
+owns: []
+
+# What app/api/ actually imports: core.api.BagmanCanonicalAPI and
+# core.errors.* (the facade + error vocabulary), the durable
+# persistence/postgres/* repositories and persistence/objects/*
+# object-store implementations (composition.py only), and the
+# in-memory persistence/objects/memory_store.InMemoryObjectStore for
+# development/test composition.
+consumes:
+  - BAGMAN.CORE
+  - BAGMAN.SERVICES.EVIDENCE
+  - BAGMAN.PERSISTENCE.POSTGRES
+  - BAGMAN.PERSISTENCE.OBJECTS
+
+# app/api/ does not itself emit AuditEvents — every write it
+# performs goes through core.api.BagmanCanonicalAPI, which already
+# emits its own events (see core/component.yaml's `produces`).
+produces: []
+
+dependencies:
+  - fastapi
+  - uvicorn
+  - python-multipart
+  - SQLAlchemy
+  - alembic
+
+external_access: false
+
+prohibited:
+  - direct_email_access
+  - direct_bank_access
+  - direct_xero_access
+  - direct_chargebee_access

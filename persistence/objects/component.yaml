@@ -1,0 +1,37 @@
+# BAGMAN component manifest (PID §52) for persistence/objects/.
+# Validated by scripts/generate_architecture_memory.py against
+# contracts/manifest/bagman.component_manifest.v1.schema.json.
+#
+# Added retroactively by CD-3 WI-3 — WI-2 (which built this component)
+# shipped without a manifest; this is the first work item to introduce
+# component.yaml validation/projection for it.
+
+id: BAGMAN.PERSISTENCE.OBJECTS
+version: 1
+
+responsibility: >
+  Own the EvidenceObjectStore abstraction (put/get/exists/verify_hash)
+  for durable, immutable, content-addressed original-evidence-bytes
+  storage, its MinIO/S3-compatible boto3 implementation, and — added
+  by WI-3 — a narrow in-memory reference implementation used only by
+  the runtime composition root's development/test mode. Core/domain
+  code never depends on a storage-provider SDK directly (PID §53);
+  this component is the only place that does.
+
+owns: []
+
+consumes:
+  - BAGMAN.CORE
+
+produces: []
+
+dependencies:
+  - boto3
+
+external_access: false
+
+prohibited:
+  - direct_email_access
+  - direct_bank_access
+  - direct_xero_access
+  - direct_chargebee_access

@@ -12,14 +12,14 @@ from __future__ import annotations
 from typing import Any, Mapping, Optional
 
 from sqlalchemy.engine import Engine
-from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+from sqlalchemy.exc import DataError, IntegrityError, SQLAlchemyError
 
 from core import identity
 from core.contract_validation import validate_against_contract
 from core.entity import EntityRepository, GovernedEntity
 from core.errors import ImmutabilityViolationError, NotFoundError, PersistenceError, ValidationError
 from core.timestamps import utc_now
-from persistence.postgres.db_errors import unique_violation_constraint
+from persistence.postgres.db_errors import is_invalid_uuid_format, unique_violation_constraint
 from persistence.postgres.models import GovernedEntityRow
 from persistence.postgres.session import get_engine, session_scope
 
@@ -112,6 +112,13 @@ class PostgresEntityRepository(EntityRepository):
                 return _row_to_entity(row)
         except NotFoundError:
             raise
+        except DataError as exc:
+            if is_invalid_uuid_format(exc):
+                raise NotFoundError(
+                    f"no GovernedEntity with entity_id '{entity_id}' "
+                    "(malformed identifier can never exist)"
+                ) from exc
+            raise PersistenceError(f"could not read GovernedEntity: {exc}") from exc
         except SQLAlchemyError as exc:
             raise PersistenceError(f"could not read GovernedEntity: {exc}") from exc
 

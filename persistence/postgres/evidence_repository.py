@@ -28,7 +28,7 @@ from datetime import datetime
 from typing import Any, Mapping, Optional, Union
 
 from sqlalchemy.engine import Engine
-from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+from sqlalchemy.exc import DataError, IntegrityError, SQLAlchemyError
 
 from core import identity
 from core.contract_validation import validate_against_contract
@@ -41,7 +41,11 @@ from core.errors import (
 )
 from core.external_reference import ExternalReferenceRepository
 from core.timestamps import utc_now
-from persistence.postgres.db_errors import is_foreign_key_violation, unique_violation_constraint
+from persistence.postgres.db_errors import (
+    is_foreign_key_violation,
+    is_invalid_uuid_format,
+    unique_violation_constraint,
+)
 from persistence.postgres.models import EvidenceItemRow, ExternalReferenceRow
 from persistence.postgres.session import get_engine, session_scope
 from services.evidence.evidence import (
@@ -227,6 +231,13 @@ class PostgresEvidenceRepository(EvidenceRepository):
                 return _row_to_evidence(row)
         except NotFoundError:
             raise
+        except DataError as exc:
+            if is_invalid_uuid_format(exc):
+                raise NotFoundError(
+                    f"no EvidenceItem with evidence_id '{evidence_id}' "
+                    "(malformed identifier can never exist)"
+                ) from exc
+            raise PersistenceError(f"could not read EvidenceItem: {exc}") from exc
         except SQLAlchemyError as exc:
             raise PersistenceError(f"could not read EvidenceItem: {exc}") from exc
 
@@ -256,6 +267,13 @@ class PostgresEvidenceRepository(EvidenceRepository):
                 validate_against_contract(updated.to_dict(), _SCHEMA)
         except (NotFoundError, ValidationError):
             raise
+        except DataError as exc:
+            if is_invalid_uuid_format(exc):
+                raise NotFoundError(
+                    f"no EvidenceItem with evidence_id '{evidence_id}' "
+                    "(malformed identifier can never exist)"
+                ) from exc
+            raise PersistenceError(f"could not update EvidenceItem status: {exc}") from exc
         except SQLAlchemyError as exc:
             raise PersistenceError(f"could not update EvidenceItem status: {exc}") from exc
 
@@ -267,7 +285,21 @@ class PostgresEvidenceRepository(EvidenceRepository):
                 # SELECT ... FOR UPDATE: locks the row for the rest of
                 # this transaction so a concurrent second assign_entity
                 # call cannot race past the "already resolved" check.
-                row = session.get(EvidenceItemRow, evidence_id, with_for_update=True)
+                try:
+                    row = session.get(EvidenceItemRow, evidence_id, with_for_update=True)
+                except DataError as exc:
+                    # A malformed evidence_id (not a genuinely broken
+                    # persistence layer) — see db_errors.is_invalid_uuid_format.
+                    # Deliberately scoped to just this lookup so a
+                    # DataError from the row.entity_id write below (a
+                    # malformed entity_id, a different case entirely)
+                    # is never mislabelled as "no such EvidenceItem".
+                    if is_invalid_uuid_format(exc):
+                        raise NotFoundError(
+                            f"no EvidenceItem with evidence_id '{evidence_id}' "
+                            "(malformed identifier can never exist)"
+                        ) from exc
+                    raise
                 if row is None:
                     raise NotFoundError(f"no EvidenceItem with evidence_id '{evidence_id}'")
                 if row.entity_id is not None:

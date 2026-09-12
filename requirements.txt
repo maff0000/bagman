@@ -103,6 +103,38 @@
 #   psycopg[binary]  3.3.5
 #   alembic          1.20.0
 #
+# FastAPI, Uvicorn, python-multipart - introduced by CD-3 WI-3 (Container
+# runtime), PL decision already made for this work item:
+#
+#   fastapi          - the HTTP framework for app/api/. Chosen (over a
+#                       bare WSGI app or Flask) because it gives typed
+#                       request/response models (Pydantic) for the
+#                       /internal/* marshalling layer almost for free, and
+#                       its ASGI foundation pairs directly with uvicorn
+#                       below. No domain logic lives in these models —
+#                       they exist purely for HTTP request/response
+#                       validation and translation to/from
+#                       core.api.BagmanCanonicalAPI calls (PID §24/§33).
+#   uvicorn[standard] - the ASGI server that actually runs the FastAPI
+#                       app (`uvicorn app.api.main:app`), invoked by
+#                       deployment/docker/api/entrypoint.sh after
+#                       migrations complete. The `[standard]` extra pulls
+#                       in uvloop/httptools for production-grade
+#                       performance rather than the pure-Python fallback
+#                       loop.
+#   python-multipart  - required by FastAPI/Starlette to parse
+#                       `multipart/form-data` request bodies — needed for
+#                       POST /internal/evidence, which accepts a JSON
+#                       metadata part alongside a raw file part (PID
+#                       §47/§48) in the same request.
+#
+# Versions pinned to the current stable release of each as of this work
+# item (2026-09-12), verified via `pip index versions <pkg>` against the
+# live package index at delivery time:
+#   fastapi           0.141.1
+#   uvicorn[standard] 0.52.4
+#   python-multipart  0.0.32
+#
 # Do not add anything else here without flagging it to the PL first.
 jsonschema==4.26.0
 rfc3339-validator==0.1.4
@@ -112,3 +144,6 @@ boto3==1.43.93
 SQLAlchemy==2.0.52
 psycopg[binary]==3.3.5
 alembic==1.20.0
+fastapi==0.141.1
+uvicorn[standard]==0.52.4
+python-multipart==0.0.32

@@ -11,12 +11,13 @@ from __future__ import annotations
 from typing import Any, Mapping, Optional
 
 from sqlalchemy.engine import Engine
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import DataError, SQLAlchemyError
 
 from core import identity
 from core.contract_validation import validate_against_contract
 from core.errors import NotFoundError, PersistenceError, ValidationError
 from core.source import Source, SourceRepository
+from persistence.postgres.db_errors import is_invalid_uuid_format
 from persistence.postgres.models import SourceRow
 from persistence.postgres.session import get_engine, session_scope
 
@@ -95,6 +96,12 @@ class PostgresSourceRepository(SourceRepository):
                 return _row_to_source(row)
         except NotFoundError:
             raise
+        except DataError as exc:
+            if is_invalid_uuid_format(exc):
+                raise NotFoundError(
+                    f"no Source with source_id '{source_id}' (malformed identifier can never exist)"
+                ) from exc
+            raise PersistenceError(f"could not read Source: {exc}") from exc
         except SQLAlchemyError as exc:
             raise PersistenceError(f"could not read Source: {exc}") from exc
 

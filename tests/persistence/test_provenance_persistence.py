@@ -121,3 +121,15 @@ def test_unknown_provenance_id_raises_not_found():
     repo = PostgresProvenanceRepository(ev_repo)
     with pytest.raises(NotFoundError):
         repo.get_provenance(identity.generate_id())
+
+
+def test_malformed_provenance_id_raises_not_found_not_persistence_error():
+    """PL bug fix (CD-3 WI-3): same class of bug as evidence_repository
+    -- a syntactically-invalid (non-UUID-shaped) id must resolve to
+    NotFoundError, not PersistenceError."""
+    from core.errors import NotFoundError
+
+    ev_repo = PostgresEvidenceRepository(PostgresExternalReferenceRepository())
+    repo = PostgresProvenanceRepository(ev_repo)
+    with pytest.raises(NotFoundError):
+        repo.get_provenance("not-a-valid-uuid")

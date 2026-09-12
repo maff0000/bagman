@@ -15,13 +15,14 @@ from typing import Any, Mapping, Optional
 from datetime import datetime
 
 from sqlalchemy.engine import Engine
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import DataError, SQLAlchemyError
 
 from core import actor, identity
 from core.audit import AuditEvent, AuditRepository
 from core.contract_validation import validate_against_contract
 from core.errors import NotFoundError, PersistenceError, ValidationError
 from core.timestamps import utc_now
+from persistence.postgres.db_errors import is_invalid_uuid_format
 from persistence.postgres.models import AuditEventRow
 from persistence.postgres.session import get_engine, session_scope
 
@@ -125,6 +126,13 @@ class PostgresAuditRepository(AuditRepository):
                 return _row_to_audit_event(row)
         except NotFoundError:
             raise
+        except DataError as exc:
+            if is_invalid_uuid_format(exc):
+                raise NotFoundError(
+                    f"no AuditEvent with audit_event_id '{audit_event_id}' "
+                    "(malformed identifier can never exist)"
+                ) from exc
+            raise PersistenceError(f"could not read AuditEvent: {exc}") from exc
         except SQLAlchemyError as exc:
             raise PersistenceError(f"could not read AuditEvent: {exc}") from exc
 

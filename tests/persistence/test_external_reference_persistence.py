@@ -10,7 +10,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from core import identity
-from core.errors import DuplicateExternalReferenceError
+from core.errors import DuplicateExternalReferenceError, NotFoundError
 from persistence.postgres.external_reference_repository import PostgresExternalReferenceRepository
 from persistence.postgres.models import ExternalReferenceRow
 from persistence.postgres.session import get_engine, session_scope
@@ -184,3 +184,18 @@ def test_database_itself_rejects_a_raw_duplicate_tuple_insert_bypassing_the_repo
             )
         ).scalar_one()
     assert count == 1
+
+
+def test_unknown_external_reference_id_raises_not_found():
+    repo = PostgresExternalReferenceRepository()
+    with pytest.raises(NotFoundError):
+        repo.get_external_reference(identity.generate_id())
+
+
+def test_malformed_external_reference_id_raises_not_found_not_persistence_error():
+    """PL bug fix (CD-3 WI-3): same class of bug as evidence_repository
+    -- a syntactically-invalid (non-UUID-shaped) id must resolve to
+    NotFoundError, not PersistenceError."""
+    repo = PostgresExternalReferenceRepository()
+    with pytest.raises(NotFoundError):
+        repo.get_external_reference("not-a-valid-uuid")
