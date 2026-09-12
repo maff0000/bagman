@@ -1,0 +1,39 @@
+# BAGMAN — top-level application configuration skeleton
+#
+# Layer 1 (committed configuration structure) — see config/README.md.
+# This file contains structure and safe defaults ONLY.
+# It must never contain real hostnames, endpoints, or secrets.
+# Environment-specific values are supplied via Layer 2 (config/examples/*.env
+# templates, populated per-environment at runtime) and referenced here only
+# as placeholders.
+
+app:
+  name: bagman
+  # Semantic version of the BAGMAN application config schema, not a release.
+  version: "0.1.0"
+
+environment:
+  # Overridden at runtime via Layer 2 environment configuration
+  # (e.g. BAGMAN_ENV). Never set a real environment value here.
+  name: "<SET_VIA_ENVIRONMENT>"
+
+logging:
+  # Overridden at runtime via Layer 2 (e.g. LOG_LEVEL).
+  level: "<SET_VIA_ENVIRONMENT>"
+
+datastore:
+  # PostgreSQL is the intended canonical structured datastore (see PID.md).
+  # No hostname, port, or credential belongs here — those are Layer 2/3.
+  engine: postgresql
+  host_ref: "<SET_VIA_ENVIRONMENT>"
+
+secrets:
+  # Documents how this application expects to consume secrets at runtime.
+  # No secret values are ever present in this file.
+  consumption_mode: mounted_file
+  mount_root: /run/secrets
+
+features:
+  # Feature flags are Layer 2 concerns; this lists known flags with safe
+  # (disabled) defaults only.
+  example_feature_flag: false
