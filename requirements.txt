@@ -78,9 +78,37 @@
 # reason, cross-$ref resolution, that could in principle diverge from
 # jsonschema's own pin).
 #
+# SQLAlchemy, psycopg, alembic - introduced by CD-3 WI-1 (PostgreSQL
+# persistence), per the PL's explicit decision for that work item:
+#
+#   SQLAlchemy    - ORM/Core layer for the new persistence/postgres/
+#                   package (table definitions in
+#                   persistence/postgres/models.py, sessions/engine in
+#                   persistence/postgres/session.py). Chosen by PL
+#                   decision over a lighter/handwritten-SQL layer (PID
+#                   §54).
+#   psycopg[binary] - the PostgreSQL driver SQLAlchemy uses
+#                   (`postgresql+psycopg://` dialect), v3, per PL
+#                   decision. The `[binary]` extra bundles a
+#                   pre-compiled libpq so no system PostgreSQL
+#                   dev-headers/toolchain are required to install it.
+#   alembic       - migrations (`alembic.ini` at repo root,
+#                   `alembic/env.py`, `alembic/versions/`), per PL
+#                   decision (PID §12).
+#
+# Versions pinned to the current stable release of each as of this
+# work item (2026-09-12), verified via `pip index versions <pkg>`
+# against the live package index at delivery time:
+#   SQLAlchemy       2.0.52
+#   psycopg[binary]  3.3.5
+#   alembic          1.20.0
+#
 # Do not add anything else here without flagging it to the PL first.
 jsonschema==4.26.0
 rfc3339-validator==0.1.4
 PyYAML==6.0.2
 referencing==0.37.0
 boto3==1.43.93
+SQLAlchemy==2.0.52
+psycopg[binary]==3.3.5
+alembic==1.20.0

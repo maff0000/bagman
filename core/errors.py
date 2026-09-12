@@ -111,3 +111,23 @@ class IntegrityError(BagmanError):
     """
 
     error_code = "INTEGRITY_ERROR"
+
+
+class PersistenceError(BagmanError):
+    """A general persistence-layer failure distinct from a constraint
+    violation — e.g. a database connectivity/operational failure (PID
+    §57's ``PERSISTENCE_ERROR``).
+
+    Added by CD-3 WI-1 (PostgreSQL persistence): every
+    ``persistence/postgres/*_repository.py`` implementation catches
+    generic ``sqlalchemy.exc.OperationalError``/``DatabaseError`` (and
+    any other non-constraint driver/SQLAlchemy failure) and re-raises
+    it as this canonical error rather than letting a raw psycopg/
+    SQLAlchemy exception escape as the public contract (PID §57). A
+    genuine constraint violation (unique/foreign-key) is still
+    translated to the more specific existing error it corresponds to
+    (``ImmutabilityViolationError``, ``DuplicateExternalReferenceError``,
+    ``InvalidProvenanceError``) rather than this generic one.
+    """
+
+    error_code = "PERSISTENCE_ERROR"
