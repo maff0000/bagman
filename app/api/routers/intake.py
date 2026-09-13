@@ -62,17 +62,50 @@ Given that signal:
   remains a perfectly valid transition even the second time a request
   reaches it): re-attempt validation on it, but WITHOUT re-emitting
   ``INTAKE_RECEIVED`` a second time (that event already exists, written
-  by whichever concurrent request actually created the row). This is a
-  deliberately narrow, explicit behaviour — the deep concurrency proof
-  (two truly simultaneous requests) is WI-5's job, not this one's.
+  by whichever concurrent request actually created the row).
+
+  **CD-4 WI-5 update (PID §54) — the genuine concurrent-race case,
+  closed**: this handler does NOT simply assume it is free to enter
+  the pipeline just because the row it read back was ``RECEIVED`` —
+  another request, racing on the exact same idempotency key, may be
+  doing the exact same thing at the exact same moment (both requests'
+  own ``create_intake_record`` calls can each independently observe
+  the row as still ``RECEIVED``, e.g. one created it and has not yet
+  reached ``VALIDATING``, or both are replaying an equally-fresh row).
+  This handler therefore itself explicitly claims the
+  ``RECEIVED -> VALIDATING`` transition — via its own
+  ``composition.intake_repository.transition_status(intake_id,
+  "VALIDATING")`` call — BEFORE emitting ``INTAKE_VALIDATION_STARTED``
+  and BEFORE calling ``run_intake_validation`` (which is then handed
+  the already-``VALIDATING`` record via its ``record=`` parameter, so
+  it does not re-attempt that same transition itself). If this
+  request's own claim attempt raises ``InvalidStateTransitionError``,
+  a concurrent request already won that race a moment earlier — this
+  request lost, cleanly, with NOTHING audited (no
+  ``INTAKE_VALIDATION_STARTED`` for a validation attempt that never
+  actually started) — see the next bullet, whose behaviour this falls
+  through to.
+
+  (Prior to this fix, ``run_intake_validation`` performed this same
+  claim internally, AFTER this handler had already unconditionally
+  emitted ``INTAKE_VALIDATION_STARTED`` — so the losing request's
+  ``InvalidStateTransitionError`` propagated out of
+  ``run_intake_validation`` entirely uncaught, becoming an unhandled
+  HTTP 500 with a spurious audit event already recorded. This was a
+  real, reproduced bug — not a theoretical one — found and fixed during
+  WI-5's own concurrency proof; see
+  ``tests/acceptance/idempotency_and_concurrency_proof.py``'s module
+  docstring and part (c.2) for the exact reproduction, and the CD-4
+  evidence file for the full writeup.)
 * **replay landing on ``VALIDATING``** (a genuinely concurrent request
-  is mid-flight validating it RIGHT NOW): ``VALIDATING`` has no
-  self-transition in ``ALLOWED_TRANSITIONS`` (see
-  ``services.evidence.intake.intake``), so re-entering the pipeline
-  would raise ``InvalidStateTransitionError`` — this handler does NOT
-  attempt that. It simply returns the record's current (still
-  in-flight) state with HTTP 202, emitting no new audit events. A
-  narrow, documented gap — WI-5's concurrency proof, not this one's.
+  is mid-flight validating it RIGHT NOW — either because this handler
+  read the row after it was already ``VALIDATING``, or because THIS
+  handler's own claim attempt above just lost the race): ``VALIDATING``
+  has no self-transition in ``ALLOWED_TRANSITIONS`` (see
+  ``services.evidence.intake.intake``), so re-entering the pipeline is
+  never attempted for this case. This handler simply returns the
+  record's current (still in-flight) state with HTTP 202, emitting no
+  new audit events.
 * **replay landing on any OTHER state** (``ACCEPTED``, or any terminal
   state — ``QUARANTINED``/``REJECTED``/``REGISTERED``/``FAILED``): the
   pipeline/registration is NOT re-run at all — this resolves straight
@@ -136,7 +169,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ValidationError as PydanticValidationError
 
 from core import identity
-from core.errors import BagmanError
+from core.errors import BagmanError, InvalidStateTransitionError
 from services.evidence.intake.validation_pipeline import run_intake_validation
 from app.api.composition import get_composition, get_manual_upload_source_id
 
@@ -410,89 +443,109 @@ async def intake_evidence(
             )
             last_event_id = received_event.audit_event_id
 
-        validation_started_event = _emit(
-            composition,
-            event_type="INTAKE_VALIDATION_STARTED",
-            actor_type=meta.actor_type,
-            actor_id=meta.actor_id,
-            subject_type="IntakeRecord",
-            subject_id=record.intake_id,
-            correlation_id=record.correlation_id,
-            causation_id=last_event_id,
-        )
-        last_event_id = validation_started_event.audit_event_id
+        # CD-4 WI-5 (PID §54) — claim the RECEIVED -> VALIDATING
+        # transition OURSELVES, explicitly, before emitting
+        # INTAKE_VALIDATION_STARTED or calling run_intake_validation.
+        # See this module's own docstring ("replay landing on a still-
+        # RECEIVED row") for the full race analysis: a genuinely
+        # concurrent request racing on the same idempotency key can
+        # reach this exact point at the same moment. Losing this claim
+        # (InvalidStateTransitionError) means a concurrent request won
+        # it a moment earlier — this request falls straight through to
+        # the same "replay landing on VALIDATING" handling (the final
+        # `else` branch below this whole `if`), with NOTHING audited
+        # for this attempt.
+        try:
+            validating_record = composition.intake_repository.transition_status(
+                record.intake_id, "VALIDATING"
+            )
+        except InvalidStateTransitionError:
+            record = composition.intake_repository.get_intake_record(record.intake_id)
+        else:
+            validation_started_event = _emit(
+                composition,
+                event_type="INTAKE_VALIDATION_STARTED",
+                actor_type=meta.actor_type,
+                actor_id=meta.actor_id,
+                subject_type="IntakeRecord",
+                subject_id=record.intake_id,
+                correlation_id=record.correlation_id,
+                causation_id=last_event_id,
+            )
+            last_event_id = validation_started_event.audit_event_id
 
-        result = run_intake_validation(
-            intake_id=record.intake_id,
-            stream=file.file,
-            repository=composition.intake_repository,
-            object_store=composition.object_store,
-            scanner=composition.scanner,
-        )
+            result = run_intake_validation(
+                intake_id=validating_record.intake_id,
+                stream=file.file,
+                repository=composition.intake_repository,
+                object_store=composition.object_store,
+                scanner=composition.scanner,
+                record=validating_record,
+            )
 
-        if result.status == "REJECTED":
-            _emit(
-                composition,
-                event_type="INTAKE_REJECTED",
-                actor_type=meta.actor_type,
-                actor_id=meta.actor_id,
-                subject_type="IntakeRecord",
-                subject_id=record.intake_id,
-                correlation_id=record.correlation_id,
-                causation_id=last_event_id,
-                payload={"failure_code": result.failure_code},
-            )
-            record = result
-        elif result.status == "QUARANTINED":
-            _emit(
-                composition,
-                event_type="INTAKE_QUARANTINED",
-                actor_type=meta.actor_type,
-                actor_id=meta.actor_id,
-                subject_type="IntakeRecord",
-                subject_id=record.intake_id,
-                correlation_id=record.correlation_id,
-                causation_id=last_event_id,
-                payload={"quarantine_reason": result.quarantine_reason},
-            )
-            record = result
-        elif result.status == "FAILED":
-            _emit(
-                composition,
-                event_type="INTAKE_FAILED",
-                actor_type=meta.actor_type,
-                actor_id=meta.actor_id,
-                subject_type="IntakeRecord",
-                subject_id=record.intake_id,
-                correlation_id=record.correlation_id,
-                causation_id=last_event_id,
-                payload={"failure_code": result.failure_code},
-            )
-            record = result
-        elif result.status == "ACCEPTED":
-            accepted_event = _emit(
-                composition,
-                event_type="INTAKE_ACCEPTED",
-                actor_type=meta.actor_type,
-                actor_id=meta.actor_id,
-                subject_type="IntakeRecord",
-                subject_id=record.intake_id,
-                correlation_id=record.correlation_id,
-                causation_id=last_event_id,
-                payload={
-                    "detected_mime_type": result.detected_mime_type,
-                    "size_bytes": result.size_bytes,
-                },
-            )
-            record, evidence = _register_accepted_evidence(
-                composition=composition,
-                record=result,
-                meta=meta,
-                causation_id=accepted_event.audit_event_id,
-            )
-            just_registered = True
-        else:  # pragma: no cover - defensive; the pipeline never returns anything else
-            record = result
+            if result.status == "REJECTED":
+                _emit(
+                    composition,
+                    event_type="INTAKE_REJECTED",
+                    actor_type=meta.actor_type,
+                    actor_id=meta.actor_id,
+                    subject_type="IntakeRecord",
+                    subject_id=record.intake_id,
+                    correlation_id=record.correlation_id,
+                    causation_id=last_event_id,
+                    payload={"failure_code": result.failure_code},
+                )
+                record = result
+            elif result.status == "QUARANTINED":
+                _emit(
+                    composition,
+                    event_type="INTAKE_QUARANTINED",
+                    actor_type=meta.actor_type,
+                    actor_id=meta.actor_id,
+                    subject_type="IntakeRecord",
+                    subject_id=record.intake_id,
+                    correlation_id=record.correlation_id,
+                    causation_id=last_event_id,
+                    payload={"quarantine_reason": result.quarantine_reason},
+                )
+                record = result
+            elif result.status == "FAILED":
+                _emit(
+                    composition,
+                    event_type="INTAKE_FAILED",
+                    actor_type=meta.actor_type,
+                    actor_id=meta.actor_id,
+                    subject_type="IntakeRecord",
+                    subject_id=record.intake_id,
+                    correlation_id=record.correlation_id,
+                    causation_id=last_event_id,
+                    payload={"failure_code": result.failure_code},
+                )
+                record = result
+            elif result.status == "ACCEPTED":
+                accepted_event = _emit(
+                    composition,
+                    event_type="INTAKE_ACCEPTED",
+                    actor_type=meta.actor_type,
+                    actor_id=meta.actor_id,
+                    subject_type="IntakeRecord",
+                    subject_id=record.intake_id,
+                    correlation_id=record.correlation_id,
+                    causation_id=last_event_id,
+                    payload={
+                        "detected_mime_type": result.detected_mime_type,
+                        "size_bytes": result.size_bytes,
+                    },
+                )
+                record, evidence = _register_accepted_evidence(
+                    composition=composition,
+                    record=result,
+                    meta=meta,
+                    causation_id=accepted_event.audit_event_id,
+                )
+                just_registered = True
+            else:  # pragma: no cover - defensive; the pipeline never returns anything else
+                record = result
     # else: replay resolving to an already-progressed record
     # (VALIDATING/ACCEPTED/terminal) — see module docstring: nothing is
     # re-run, nothing new is audited; a REGISTERED replay's evidence is

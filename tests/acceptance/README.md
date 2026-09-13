@@ -1,10 +1,11 @@
 # tests/acceptance/
 
-CD-3 WI-4 acceptance evidence (PID §43, §44, §35, §60) — real,
-directly-runnable scripts that drive the ACTUAL `docker compose -p
-bagman` runtime (build/up/down/restart/rm/recreate) and the REAL live
-`bagman-api` HTTP surface, using the real secrets already provisioned
-at `/srv/bagman-secrets/`. No mocks anywhere in this directory.
+CD-3 WI-4 acceptance evidence (PID §43, §44, §35, §60), extended by
+CD-4 WI-5 (PID §25/§52-57/§63/§65) — real, directly-runnable scripts
+that drive the ACTUAL `docker compose -p bagman` runtime (build/up/
+down/restart/rm/recreate/stop/start) and the REAL live `bagman-api`
+HTTP surface, using the real secrets already provisioned at
+`/srv/bagman-secrets/`. No mocks anywhere in this directory.
 
 ## Why these are not `pytest`-collected
 
@@ -34,6 +35,21 @@ or all three via `make accept`. Each script also independently brings
 the stack up itself first (`docker compose build` + `up -d --wait`),
 so any one of them can also be run standalone against a cold host.
 
+CD-4 WI-5 adds four more scripts, same style/rigor, same reasons for
+NOT being `pytest`-collected (see below). Each also independently
+brings the stack up first, so any one is runnable standalone; run them
+in any order (they do not depend on state left behind by the three
+scripts above, and — unlike `restore_into_clean_target_proof.py` above
+— none of them perform a final `down -v`, so the stack is always left
+running afterwards):
+
+```bash
+python3 tests/acceptance/idempotency_and_concurrency_proof.py
+python3 tests/acceptance/content_policy_and_quarantine_proof.py
+python3 tests/acceptance/dependency_failure_proof.py
+python3 tests/acceptance/browser_acceptance_proof.py   # requires: pip install playwright && python3 -m playwright install chromium
+```
+
 ## What each proves
 
 * `restart_proof.py` — PID §43: register synthetic entity/source/
@@ -56,6 +72,45 @@ so any one of them can also be run standalone against a cold host.
   destroy is back, then perform the final clean shutdown (`down -v`,
   confirmed no `bagman-*` containers/volumes/networks remain, plus the
   `bagman-api` image removed).
+
+## CD-4 WI-5 additions
+
+* `idempotency_and_concurrency_proof.py` — PID §25/§52-54: idempotency
+  survives a real restart; a same-key/different-bytes replay gets a
+  real HTTP 409 `IDEMPOTENCY_CONFLICT`; two genuinely concurrent
+  requests on the same idempotency key (real threads, real
+  `requests.post` calls) resolve to one canonical outcome. Also runs a
+  second, lower-level concurrency proof (real OS threads, barrier-
+  synchronized, executed INSIDE the running `bagman-api` container via
+  `docker compose exec`, directly against
+  `IntakeRepository.create_intake_record`/`run_intake_validation`) —
+  see this file's own module docstring for exactly why the HTTP-layer
+  proof alone cannot force genuine interleaving on this single-worker
+  deployment, and the real, reproduced-then-fixed race this second
+  layer actually caught in `app/api/routers/intake.py`.
+* `content_policy_and_quarantine_proof.py` — PID §63's full fixture
+  list (valid PDF/JPEG/PNG/text/CSV, empty file, oversized stream,
+  MIME mismatch, unsupported binary, synthetic archive, path-traversal
+  filename, the standard EICAR test string, duplicate content) against
+  the real stack with the REAL `bagman-scan` ClamAV daemon — no stub
+  scanner anywhere in this script.
+* `dependency_failure_proof.py` — PID §55-57: stops `bagman-scan`,
+  `bagman-objects`, and `bagman-db` in turn, proving `/ready` reports
+  503 with the correct `failed_dependency`, a real upload attempted
+  during each outage fails closed/visibly/loudly (never a false
+  success), and each dependency's restart brings the stack back to
+  fully healthy with a fresh upload succeeding again.
+* `browser_acceptance_proof.py` — PID §65/§66: a real headless-Chromium
+  (Playwright) session against the REAL Docker Compose `bagman-api`
+  (not the dev-mode instance WI-4 used) — app loads, Documents
+  renders, a real upload through the real file input, the real
+  workflow-status text progressing to completion, the new row
+  appearing in the real list, the detail panel opening with real data,
+  a byte-identical download, and both a QUARANTINED (real EICAR, real
+  ClamAV) and a REJECTED (synthetic archive) upload rendering
+  correctly and distinctly. Requires `playwright` (`pip install
+  playwright && python3 -m playwright install chromium`) — deliberately
+  not added to `requirements-dev.txt`; see the CD-4 WI-5 evidence file.
 
 ## Failure proof (PID §45) — not duplicated here
 

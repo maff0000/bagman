@@ -68,3 +68,47 @@ All notable changes to BAGMAN will be documented in this file.
   and fixed; final approved head `2708918`). See
   `memory/generated/CD3-RUNTIME-AND-EVIDENCE-STORE-EVIDENCE-2026-09-12.md`
   for the full evidence trail.
+
+## 2026-09-13 — CD-4 — Evidence Intake & Manual Upload Foundation
+
+- Governed Evidence Intake: `IntakeRecord` domain model + PID §7 state
+  machine (RECEIVED/VALIDATING/QUARANTINED/REJECTED/ACCEPTED/
+  REGISTERED/FAILED), durable PostgreSQL persistence with a real
+  partial-unique-index-backed idempotency-conflict doctrine.
+- Full content-validation pipeline: filename safety, hand-rolled
+  content-type sniffing (detected vs. reported MIME), bounded/
+  streaming ingest with incremental SHA-256, a real `ClamAVScanner`
+  (raw `clamd` protocol, no new dependency) behind an
+  `EvidenceSafetyScanner` abstraction, explicit archive/executable/
+  unsupported-type/scan-failure policy, and quarantine.
+- `POST /internal/intake/evidence` — the single governed HTTP boundary
+  through which untrusted bytes may become canonical evidence — plus
+  paginated `GET /internal/intake`/`GET /internal/intake/{id}`. The
+  CD-3 direct-upload bypass (`POST /internal/evidence` accepting raw
+  file bytes) is removed entirely, not merely deprecated.
+- The first BAGMAN Documents GUI (`app/api/static/`): plain HTML/CSS/
+  vanilla-JS, no framework/build step, served directly from
+  `bagman-api`. Real upload, honest workflow-status rendering, list/
+  detail/download, distinct QUARANTINED/REJECTED/FAILED presentation.
+- `bagman-scan` (ClamAV) added to the Docker Compose runtime; `/ready`
+  extended to prove scanner reachability alongside postgres/
+  object_store, preserving the existing no-fallback/no-caching
+  doctrine.
+- Acceptance/hardening (WI-5): re-ran and confirmed every WI-1-4
+  acceptance script against the real stack; found and root-cause-fixed
+  one real concurrency race (a genuinely concurrent narrow-replay
+  request could raise an unhandled `InvalidStateTransitionError`
+  instead of resolving cleanly — reproduced with real barrier-
+  synchronized threads against a real PostgreSQL, fixed in
+  `app/api/routers/intake.py`/`services/evidence/intake/
+  validation_pipeline.py`); four new real-stack proof scripts
+  (idempotency/concurrency, content-policy/quarantine fixtures against
+  a real ClamAV daemon, dependency-failure with recovery, real-browser
+  acceptance via Playwright against the real Docker Compose stack);
+  nine new architecture-boundary tests (PID §67).
+- No mailbox, bank, accounting, or billing connectivity implemented.
+- **Verdict: pending** — WI-5's own evidence trail drafted at
+  `memory/generated/CD4-EVIDENCE-INTAKE-AND-MANUAL-UPLOAD-FOUNDATION-EVIDENCE-2026-09-13.md`;
+  the PL reconciles, dispatches an independent Auditor (PID §71), and
+  issues the actual `INTAKE_FOUNDATION_GREEN`/`INTAKE_FOUNDATION_RED`/
+  `BLOCKED` verdict before this entry is finalised.

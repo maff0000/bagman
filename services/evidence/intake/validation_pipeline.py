@@ -58,7 +58,7 @@ instance without either module needing to import the other.
 """
 from __future__ import annotations
 
-from typing import Any, Mapping, Protocol
+from typing import Any, Mapping, Optional, Protocol
 
 from core.errors import (
     ContentTypeMismatchError,
@@ -91,12 +91,37 @@ def run_intake_validation(
     object_store: _ObjectStore,
     scanner: EvidenceSafetyScanner,
     policy: IntakePolicy = DEFAULT_INTAKE_POLICY,
+    record: Optional[IntakeRecord] = None,
 ) -> IntakeRecord:
     """Validate the untrusted content behind ``stream`` against an
     already-``RECEIVED`` ``IntakeRecord`` identified by ``intake_id``,
     driving it through ``VALIDATING`` to its terminal-or-``ACCEPTED``
     outcome (see module docstring for the ``ACCEPTED`` handoff
     boundary).
+
+    ``record`` (CD-4 WI-5, PID §54): optional, already-fetched
+    ``IntakeRecord`` whose ``RECEIVED -> VALIDATING`` transition the
+    CALLER has already durably claimed for itself (via its own
+    ``repository.transition_status(intake_id, "VALIDATING")`` call)
+    before invoking this function. When given, this function trusts
+    that claim and does NOT attempt the transition itself — it simply
+    proceeds with ``record`` as its current state. When omitted
+    (``None``, the default — every pre-WI-5 caller's shape), this
+    function performs that same read-then-claim sequence itself,
+    exactly as before.
+
+    This split exists because ``app/api/routers/intake.py``'s "narrow
+    replay lands on a still-RECEIVED row" case (PID §25/§53's
+    documented gap, closed by WI-5) needs to know WHETHER it won that
+    claim BEFORE deciding whether to emit ``INTAKE_VALIDATION_STARTED``
+    at all — emitting that event and only then discovering (via an
+    ``InvalidStateTransitionError`` raised from inside this function)
+    that a concurrent request already claimed ``VALIDATING`` first
+    would leave behind a spurious audit event for a validation attempt
+    that never actually started. See that router module's own
+    docstring for the full race analysis and
+    ``tests/acceptance/idempotency_and_concurrency_proof.py`` for the
+    real, reproduced-then-fixed bug this closes.
 
     Returns the final ``IntakeRecord`` snapshot. Never raises for an
     ordinary validation/quarantine/scan outcome — REJECTED/QUARANTINED/
@@ -105,10 +130,16 @@ def run_intake_validation(
     a value, an exception is reserved for a genuine programming/
     infrastructure error, e.g. ``intake_id`` not existing at all, or a
     contract-validation failure on a field this pipeline itself sets
-    incorrectly).
+    incorrectly). A caller that itself already claimed the
+    ``VALIDATING`` transition (passed ``record=...``) and lost a
+    concurrent race doing so is expected to catch
+    ``InvalidStateTransitionError`` from ITS OWN
+    ``transition_status(..., "VALIDATING")`` call, not from this
+    function.
     """
-    record = repository.get_intake_record(intake_id)
-    record = repository.transition_status(intake_id, "VALIDATING")
+    if record is None:
+        record = repository.get_intake_record(intake_id)
+        record = repository.transition_status(intake_id, "VALIDATING")
 
     try:
         assert_filename_safe(record.original_filename, max_length=policy.max_filename_length)
