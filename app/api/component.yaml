@@ -10,7 +10,7 @@
 # not a literal path.
 
 id: BAGMAN.RUNTIME.API
-version: 2
+version: 3
 
 responsibility: >
   Own the FastAPI/Uvicorn HTTP-facing application layer that exposes
@@ -31,7 +31,18 @@ responsibility: >
   BAGMAN_RUNTIME_ENV is read to choose between in-memory and
   PostgreSQL+MinIO+ClamAV-backed repositories/object-store/scanner —
   and the stable MANUAL_UPLOAD Source resolve-or-create lifecycle (PID
-  §9).
+  §9). CD-4 WI-4 additionally owns serving the first BAGMAN Documents
+  GUI (PID §36-42) as plain static HTML/CSS/vanilla-JS assets
+  (app/api/static/), mounted at "/" via Starlette's StaticFiles — no
+  separate `bagman-ui` runtime/container was introduced (PID §42's
+  "may be selected by FORGE" framework decision: the simplest option
+  that needs zero new infrastructure), so this manifest is deliberately
+  NOT split into a distinct BAGMAN.RUNTIME.UI component; the GUI is
+  judged to genuinely be part of bagman-api's own delivery boundary,
+  not a separate bounded component, since it introduces no new process,
+  dependency surface, or deployment unit of its own. The GUI itself
+  owns/decides no evidence business logic (PID §40) — it is a pure
+  client of the very API routes this same manifest already describes.
 
 owns: []
 
@@ -79,6 +90,7 @@ produces:
 
 dependencies:
   - fastapi
+  - starlette
   - uvicorn
   - python-multipart
   - SQLAlchemy

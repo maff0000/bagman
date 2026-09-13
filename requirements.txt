@@ -135,7 +135,19 @@
 #   uvicorn[standard] 0.52.4
 #   python-multipart  0.0.32
 #
-# Do not add anything else here without flagging it to the PL first.
+# starlette - introduced by CD-4 WI-4 (Documents GUI): app/api/main.py
+# imports `starlette.staticfiles.StaticFiles` directly to serve the
+# BAGMAN Documents GUI's static assets (app/api/static/) alongside the
+# existing FastAPI routers (PID §42's "plain HTML/CSS/vanilla-JS, no
+# Node runtime" decision). starlette was previously only an undeclared
+# transitive dependency of fastapi; per this file's own established
+# discipline (see the `referencing`/boto3 notes above — "a package a
+# module imports directly should be pinned directly"), it is now
+# pinned explicitly. Pinned to 1.6.0, the exact version fastapi==0.141.1
+# already resolves to (verified via a clean `pip install -r
+# requirements.txt` on 2026-09-13) — no version change, just an
+# explicit pin for a dependency this code now imports by name.
+starlette==1.6.0
 jsonschema==4.26.0
 rfc3339-validator==0.1.4
 PyYAML==6.0.2

@@ -1,4 +1,5 @@
-"""``bagman-api`` — the FastAPI application instance (CD-3 WI-3, PID §24).
+"""``bagman-api`` — the FastAPI application instance (CD-3 WI-3, PID §24;
+static UI mounting added CD-4 WI-4, PID §36-42).
 
 Responsibilities of this module, and only this module:
 
@@ -8,6 +9,18 @@ Responsibilities of this module, and only this module:
 * attach one request-scoped correlation-id (PID §27) to every request/
   response, generating a fresh one when a caller does not supply
   ``X-Correlation-Id``;
+* serve the first BAGMAN Documents GUI (CD-4 WI-4) as plain static
+  assets (HTML/CSS/vanilla-JS — no framework, no build step, no Node
+  runtime; PID §42) from ``app/api/static/``, mounted at ``/`` via
+  Starlette's ``StaticFiles`` — deliberately mounted LAST, after every
+  ``app.include_router(...)`` call below, so every existing JSON route
+  (``/internal/*``, ``/health``, ``/ready``, ``/version``, plus
+  FastAPI's own ``/docs``/``/openapi.json``) is matched first and keeps
+  working exactly as before; the static mount only ever answers a
+  request no earlier route claimed. ``html=True`` makes ``GET /``
+  serve ``static/index.html`` (the BAGMAN shell) and any other
+  unmatched path fall through to a 404 from ``StaticFiles`` itself,
+  never from the JSON API;
 * centralise translation of ``core.errors.BagmanError`` (and any
   unexpected exception) into an HTTP response — the exact mapping the
   WI-3 contract specifies:
@@ -56,9 +69,11 @@ from __future__ import annotations
 import logging
 import os
 import uuid
+from pathlib import Path
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
+from starlette.staticfiles import StaticFiles
 
 from core.errors import (
     BagmanError,
@@ -85,6 +100,13 @@ app.include_router(health.router)
 app.include_router(version.router)
 app.include_router(internal.router)
 app.include_router(intake.router)
+
+#: CD-4 WI-4 — the BAGMAN Documents GUI (PID §36-42), served as plain
+#: static assets. Mounted LAST and at "/" so it never shadows any
+#: route registered above (Starlette matches mounted/declared routes
+#: in registration order) — see this module's own docstring.
+_STATIC_DIR = Path(__file__).resolve().parent / "static"
+app.mount("/", StaticFiles(directory=str(_STATIC_DIR), html=True), name="ui")
 
 #: Ordered so a subclass is matched by the most specific applicable
 #: entry — every current core.errors.* type is a direct, flat subclass
