@@ -62,6 +62,9 @@ All notable changes to BAGMAN will be documented in this file.
   Docker, not simulated.
 - No mailbox, bank, accounting, or billing connectivity implemented.
 - **Verdict: RUNTIME_FOUNDATION_GREEN** (independent Auditor review +
-  PL spot-check, commit `5d03198`). See
+  PL spot-check, commit `5d03198`; two real live-CI-only failures found
+  and fixed post-audit; one PID §59 CI-control gap — the architecture-
+  memory drift check missing from CI — found by architect delta review
+  and fixed; final approved head `2708918`). See
   `memory/generated/CD3-RUNTIME-AND-EVIDENCE-STORE-EVIDENCE-2026-09-12.md`
   for the full evidence trail.

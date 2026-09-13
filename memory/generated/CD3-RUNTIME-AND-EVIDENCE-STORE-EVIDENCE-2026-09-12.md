@@ -2,9 +2,10 @@
 
 **PID:** `PID.md` v3 ("BAGMAN PID v3 — Runtime & Evidence Store")
 **Delivery branch:** `cd-3/runtime-and-evidence-store`
-**Commit under audit:** `5d0319896bc056b9778427bfe41042fce60c9b1c`
+**Commit under audit (Auditor's dispatch):** `5d0319896bc056b9778427bfe41042fce60c9b1c`
+**Final PR head after architect's delta review:** `27089184a1e3dcbba465b98c4c2b47e093540be9` — see §6c below
 **PL:** Bagman persona (Trinity ecosystem), operating under Forge doctrine (`/srv/forge`) in hub-model mode.
-**Date:** 2026-09-12
+**Date:** 2026-09-12 (initial delivery); 2026-09-13 (post-audit CI fixes and architect delta review)
 
 Per Forge doctrine this evidence trail lives in the repository, not only in session/fabric state.
 
@@ -106,6 +107,26 @@ After both fixes, the live GitHub Actions run (`34738774690`) passed in full —
 
 This is recorded here in full, not silently smoothed over, because it is exactly the kind of gap Forge's evidence doctrine exists to surface: both the PL and a fresh, thorough Auditor verified this delivery extensively on a capable host and both, correctly and honestly, flagged that live CI was the one thing neither could observe — and when it was finally observed, it did not simply pass, it required two more rounds of genuine debugging. The lesson carried forward: "PL/Auditor verification passed locally" and "live CI is green" are different claims, and the second must actually be checked, not assumed once the first holds.
 
-## 6b. Exit-gate statement (PID §66)
+## 6b. Architect delta review — one mandatory CI control missing, fixed
+
+Matt (architect) reviewed PR #3 directly against PID §59 and found one concrete, correctly-scoped gap: **PID §59 requires CI to continue running the architecture-memory drift check** (`scripts/generate_architecture_memory.py --check`, established in CD-2). `.github/workflows/security.yml` ran gitleaks and the three pytest steps (non-Docker suites, `tests/persistence`, `tests/app_api`) but never actually invoked the drift check — it had only ever been run and confirmed locally (by every WI's own Engineer report, by the PL's own reconciliation, and by the Auditor), never enforced in the live pipeline itself. The architect explicitly confirmed the rest of the delivery — Docker topology, secrets, no-fallback composition, evidence integrity (hash recomputed before storage, immutable, hash re-verified on read) — matched doctrine, and scoped this as a single, mandatory, narrow fix rather than reopening the wider runtime design.
+
+**Ruling:** "CD-3 remains RUNTIME_FOUNDATION_GREEN in substance, but PR #3 is NOT YET APPROVED FOR MERGE because one mandatory CI control from PID §59 is absent."
+
+**Fix** (commit `2708918`): added a `Check architecture memory projection` step to `.github/workflows/security.yml`, running `python3 scripts/generate_architecture_memory.py --check` right after dependency install, before the test suites — so a future `component.yaml`/contract/entity-registry change that drifts the committed `memory/generated/architecture-index.md` out of sync now fails CI loudly, not only locally.
+
+**Verification performed, in the order the architect specified:**
+1. `python3 scripts/generate_architecture_memory.py --check` locally → `architecture-index.md is up to date.`
+2. `gitleaks detect --source . -v --redact` → 21 commits scanned, no leaks found.
+3. The relevant regression suite (`tests/security tests/contract tests/integration`, the suite this step sits directly beside) in a fresh venv → 102 passed.
+4. Pushed (commit `2708918`).
+5. **New live GitHub Actions run observed at the new head**, run `34744470069` — confirmed via `gh run view --job` that `Check architecture memory projection` now runs as its own named, visibly green step, distinct from and preceding all three test steps, not silently folded into or skipped by any of them.
+6. This evidence file updated with the final head SHA and run — this section.
+
+**Final PR head:** `27089184a1e3dcbba465b98c4c2b47e093540be9`. Live CI green in full, including the previously-missing drift check, confirmed by direct inspection of the run's step list, not inferred.
+
+This is recorded in full for the same reason as §6a: a Human reviewer catching a real, narrow compliance gap that both the PL and the Auditor missed is exactly Forge's independent-scrutiny doctrine working as intended, not a failure to smooth over.
+
+## 6c. Exit-gate statement (PID §66)
 
 Per PID §66, no live mailbox integration may begin until CD-3 reaches RUNTIME_FOUNDATION_GREEN. That condition is met as of this commit. BAGMAN has proven: canonical truth survives full container restart (with idempotency intact); canonical truth survives application-container replacement while the database/object-store containers are untouched; canonical truth and original evidence bytes both survive complete destruction and restoration from backup into a provably clean target; and dependency failure produces an honest, loud, non-silent readiness failure rather than any fallback. No mailbox credential, bank credential, Xero/Chargebee/SaaS credential, production document, or customer data has entered this repository or runtime at any point in CD-3. Per PID §67, the expected next delivery is CD-4 — Evidence Intake & Manual Upload Foundation — still with no live mailbox connectivity unless explicitly authorised by that PID.
