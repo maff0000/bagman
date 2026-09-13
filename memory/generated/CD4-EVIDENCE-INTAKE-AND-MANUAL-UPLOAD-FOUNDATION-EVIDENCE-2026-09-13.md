@@ -323,3 +323,92 @@ With this, every PID §70 acceptance criterion has now been independently confir
 ## 7. Exit-gate statement (PID §73) — drafted, not issued
 
 Per PID §73, no live mailbox integration may begin until CD-4 reaches **INTAKE_FOUNDATION_GREEN**. This Engineer's own account of the evidence above supports that outcome — every PID §70 acceptance bullet was independently exercised against the real stack (not merely read about), the one genuine defect found during the whole delivery arc (§2.2) was fixed with a documented, narrow, root-cause fix rather than a workaround, and no mailbox/bank/accounting/billing connectivity or forbidden SDK exists anywhere in the tree. **The actual verdict — `INTAKE_FOUNDATION_GREEN`, `INTAKE_FOUNDATION_RED`, or `BLOCKED` — is the PL's to issue, after PL reconciliation and independent Auditor dispatch (PID §71), not this Engineer's.**
+
+---
+
+## 8. Architect delta round (PR #4 review, 2026-09-13)
+
+The human Architect reviewed PR #4 at head `83c3f8552cd4ef99392bc891e72c4666a7996aaf` (the state recorded through §7 above) and ruled:
+
+> "CD-4 is INTAKE_FOUNDATION_GREEN in substance, but NOT YET APPROVED FOR MERGE." — two specific deltas required before merge; no redesign, no unrelated refactor, no CD-5 authorised.
+
+### 8.1 Delta A — safe server-side evidence download headers
+
+**Finding:** `GET /internal/evidence/{evidence_id}/content` returned raw bytes with no `Content-Disposition` header at all — only the GUI's client-side `<a download>` attribute (`app/api/static/app.js`) forced a save. The Architect ruled the server itself, not a browser attribute a client fully controls and could omit, must be the actual safety boundary.
+
+**Fix (commit `7868b48`):**
+
+* New `app/api/http_headers.py::safe_content_disposition_header()` — the RFC 6266/RFC 5987 dual-parameter pattern: an ASCII-only, quote/backslash/separator-free, control-character-free `filename="..."` fallback (built by *dropping*, never escaping, every unsafe character — a dropped character can never re-open a broken escape sequence) plus a fully `urllib.parse.quote(..., safe="")`-percent-encoded `filename*=UTF-8''...` for correct Unicode support. Falls back to a safe `evidence-<evidence_id>` label when no usable filename remains.
+* `app/api/routers/internal.py::get_evidence_content` now sets this header plus `X-Content-Type-Options: nosniff` on every response. Bytes and the existing `X-Bagman-*` hash headers are unchanged.
+* `app/api/static/app.js`'s download-link comment rewritten: the attribute is defense-in-depth only from here on, not the safety boundary.
+* New `tests/app_api/test_evidence_download_headers.py` (12 tests): ordinary filename, Unicode round-trip, double-quote filename, `nosniff` presence, byte-identity, plus two direct unit tests of the helper itself for CRLF-injection and path-traversal strings (neither reachable through the real HTTP pipeline today, since `services.evidence.intake.filename_safety` already rejects both at intake — tested directly against the helper to prove the encoding layer is defensive on its own terms regardless of upstream filtering).
+
+### 8.2 Delta B — immutable ClamAV image identity
+
+**Finding:** `deployment/compose/docker-compose.yml`'s `bagman-scan` service used `image: clamav/clamav:stable` — a moving release channel, not an immutable runtime identity, despite an existing comment defending this as deliberate. The Architect overrode that reasoning: a release channel is still a moving tag regardless of how deliberately chosen, and is not acceptable identity for a runtime dependency.
+
+**Fix (commit `7868b48`):**
+
+* Independently resolved digest (PL, then re-confirmed independently by both the delta Engineer and the focused Auditor, all three matching): `clamav/clamav@sha256:1fdfd24c6f0a0fb60788481487459a6d4eda8a9b448641594e04db8410d34422` — the exact image the `clamav/clamav:stable` tag resolved to on this host at delta time, i.e. the same image every CD-4 ClamAV-dependent test had already been built and verified against.
+* `deployment/compose/docker-compose.yml`'s `bagman-scan.image` is now `clamav/clamav:stable@sha256:1fdfd24c6f0a0fb60788481487459a6d4eda8a9b448641594e04db8410d34422` — the `@sha256:...` suffix is what actually pins the image; `:stable` is retained only as a human-readable release-channel label. Comment rewritten to state this distinction accurately (the prior comment calling `:stable` alone "pinned" was wrong and has been replaced).
+* `tests/app_api/conftest.py::CLAMAV_IMAGE` pinned to the identical digest, so the disposable per-test-run fixture can never silently drift onto a different ClamAV build than the production service without a test catching it.
+* `tests/integration/test_intake_scanner.py`'s manual, human-typed disposable-container docstring command deliberately left on the bare `:stable` tag (never executed by CI/fixtures, so it cannot cause silent drift between two automated things) — documented as a considered choice, not an oversight.
+
+### 8.3 Local verification (delta Engineer, then independently re-run by the PL)
+
+Both runs green, matching:
+
+```
+pytest tests/app_api -v                                          -> 42 passed
+pytest tests/security tests/contract tests/integration tests/persistence -v  -> 341 passed, 24 skipped
+gitleaks detect --source . -v --redact  (full history)            -> no leaks found
+python3 scripts/generate_architecture_memory.py --check           -> up to date
+git diff --check                                                  -> clean
+```
+
+Real-stack verification (PL, independently, from a cold `make build && make start`): `bagman-scan` healthy on the pinned image (confirmed via `docker inspect bagman-scan --format='{{.Config.Image}}'`); `GET /ready` fully green; a real upload with a Unicode filename (`café-测试-invoice.pdf`) registered successfully; a real EICAR upload was genuinely quarantined by the digest-pinned daemon (`quarantine_reason: "content safety scanner verdict MALICIOUS: Eicar-Test-Signature"`); download of the registered evidence returned byte-identical content (SHA-256 matched) with both `Content-Disposition` (correctly percent-encoded, verified by decoding `filename*` back to the exact original Unicode string) and `X-Content-Type-Options: nosniff` present. Stack torn down fully afterward, zero `bagman-*` resources remaining.
+
+### 8.4 Focused delta Auditor (fresh, zero-context, delta-only per the Architect's instruction)
+
+Dispatched against the merged delta (commit `4953400`). **Verdict: `INTAKE_FOUNDATION_GREEN`.** Summary of independent work performed (full detail in the Auditor's own report, held in session record):
+
+* Read the actual diff (`git show 7868b48`), not summaries.
+* Wrote their own throwaway adversarial script (not copied from the delivered test file) exercising `safe_content_disposition_header` against inputs of their own devising — a CRLF+`Set-Cookie` injection attempt, a bare quote, backslash/quote breakout attempts, a Unicode bidi-override character, empty/`None`, an all-control-character string, a 10,004-character filename, and several more — and confirmed structurally (parsing the returned header, checking for raw CR/LF, checking quoted-string integrity) that no CRLF injection, quote-breakout, or path-separator smuggling was possible in any case tried.
+* Re-ran `tests/app_api/test_evidence_download_headers.py` against the real disposable stack (12 passed) and independently re-confirmed byte-identity.
+* Independently re-resolved the ClamAV digest (`docker pull` + `docker inspect`) and confirmed it matches `docker-compose.yml`'s pin exactly.
+* Independently stood up the real stack, confirmed `bagman-scan` is genuinely running the pinned image (`docker inspect bagman-scan --format='{{.Image}}'` matched `docker inspect clamav/clamav@sha256:...` exactly — not a stale cached layer), `/ready` green, a real upload registered successfully, a real EICAR upload was genuinely quarantined, and a real download carried both new headers correctly encoded with byte-identical content — then tore the stack down fully.
+* Re-ran the full regression suite (`tests/app_api` 42 passed; `tests/security`/`tests/contract`/`tests/integration`/`tests/persistence` 341 passed, 24 skipped, 0 failed), full-history gitleaks (clean, 45 commits scanned), architecture-memory check (clean), and confirmed the diff's scope touched only the 7 files expected from these two deltas — nothing unexpected.
+* **Two non-blocking observations recorded, neither a defect within the Architect's stated scope, neither fixed as part of this delta:**
+  1. Unicode bidi-override/isolate characters (U+202A–202E, U+2066–2069) are not stripped by the new header helper (correctly excluded from the ASCII fallback, but preserved percent-encoded in `filename*`) nor by the pre-existing upstream `filename_safety.py` validation — a filename-spoofing gap (e.g. a visually-reversed extension in a save dialog) that predates this delta (the GUI's own `download` attribute already carried the same unfiltered value before Delta A existed) and was not part of the Architect's CRLF/quoting/path-semantics remit. Flagged as a future hardening item, not fixed here.
+  2. `safe_content_disposition_header` has no independent length cap of its own, despite its docstring's "safe entirely on its own terms" framing — not currently reachable in practice, since `filename_safety.DEFAULT_MAX_FILENAME_LENGTH = 255` is enforced at intake before any `EvidenceItem.original_name` can exist. Noted for completeness, not fixed here (would only matter if a future change ever let an unvalidated `original_name` reach this code path).
+
+### 8.5 Live CI — observed at the final head, step-by-step (PID §64's standing lesson)
+
+Final PR head after the delta: **`4953400`** (merge of `7868b48` onto `cd-4/evidence-intake-and-manual-upload-foundation`), pushed to PR #4.
+
+```
+$ gh pr checks 4
+security	pass	1m44s	https://github.com/maff0000/bagman/actions/runs/34763110206/job/103739262417
+
+$ gh api repos/maff0000/bagman/actions/runs/34763110206/jobs
+job: security  conclusion=success
+  - Set up job:                                                              success
+  - Checkout:                                                                success
+  - Set up Python:                                                           success
+  - Install gitleaks (pinned release binary):                                success
+  - Run gitleaks scan:                                                       success
+  - Install dependencies:                                                    success
+  - Check architecture memory projection:                                   success
+  - Run non-Docker test suites (security + contract + domain + ...):        success
+  - Run PostgreSQL persistence test suite (own disposable container):        success
+  - Run bagman-api runtime test suite (own disposable Postgres + MinIO):     success
+  - Post Set up Python / Post Checkout / Complete job:                       success
+```
+
+Every individual step succeeded — gitleaks green, architecture-memory drift check green, all three test-suite steps (which now include the new download-header tests and the digest-pinned ClamAV container) green, nothing skipped. Not inferred from the aggregate "pass" alone — inspected step-by-step, per the standing CD-3 lesson that local/Auditor-green and live-CI-green are different claims that must each be checked directly.
+
+### 8.6 Working tree / PR state at close of this delta round
+
+* Final PR #4 head: **`4953400`**.
+* Working tree: clean (nothing uncommitted).
+* PR remains open, un-merged. **No merge has been performed or attempted.** The Architect's own ruling is required before any merge, guarded by this exact head SHA.
