@@ -26,6 +26,7 @@ EXPECTED_TABLES = {
     "evidence_items",
     "provenance",
     "audit_events",
+    "intake_records",  # CD-4 WI-1
 }
 
 
@@ -106,6 +107,25 @@ def test_external_references_and_evidence_items_source_id_foreign_keys_exist(pos
     assert evidence_source_fk["referred_table"] == "sources"
 
 
+def test_intake_records_source_and_evidence_foreign_keys_exist(postgres_container):
+    """CD-4 WI-1: `intake_records.source_id` is a real FK (an intake
+    attempt's source is resolved, not a hint); `intake_records.evidence_id`
+    is a real, nullable FK (set only once REGISTERED)."""
+    inspector = sa.inspect(get_engine())
+    fks = inspector.get_foreign_keys("intake_records")
+
+    source_fk = next(fk for fk in fks if fk["constrained_columns"] == ["source_id"])
+    assert source_fk["referred_table"] == "sources"
+
+    evidence_fk = next(fk for fk in fks if fk["constrained_columns"] == ["evidence_id"])
+    assert evidence_fk["referred_table"] == "evidence_items"
+
+    columns = {c["name"]: c for c in inspector.get_columns("intake_records")}
+    assert columns["source_id"]["nullable"] is False
+    assert columns["evidence_id"]["nullable"] is True
+    assert columns["entity_hint"]["nullable"] is True  # hint only, PID §9/§10 — no FK at all
+
+
 def test_every_canonical_primary_key_is_unique_by_construction(postgres_container):
     inspector = sa.inspect(get_engine())
     expected_pk_columns = {
@@ -115,6 +135,7 @@ def test_every_canonical_primary_key_is_unique_by_construction(postgres_containe
         "evidence_items": ["evidence_id"],
         "provenance": ["provenance_id"],
         "audit_events": ["audit_event_id"],
+        "intake_records": ["intake_id"],
     }
     for table, expected_columns in expected_pk_columns.items():
         pk = inspector.get_pk_constraint(table)
@@ -129,6 +150,7 @@ def test_all_canonical_timestamp_columns_are_timezone_aware(postgres_container):
         "external_references": ["first_observed_at"],
         "provenance": ["created_at"],
         "audit_events": ["occurred_at"],
+        "intake_records": ["received_at", "completed_at"],
     }
     for table, cols in timestamp_columns.items():
         columns = {c["name"]: c for c in inspector.get_columns(table)}

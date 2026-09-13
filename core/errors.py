@@ -113,6 +113,35 @@ class IntegrityError(BagmanError):
     error_code = "INTEGRITY_ERROR"
 
 
+class InvalidStateTransitionError(BagmanError):
+    """An attempted state-machine transition is not one of the
+    deterministic transitions the owning state machine allows (CD-4
+    WI-1, PID §7) — e.g. attempting to move an ``IntakeRecord`` from a
+    terminal state (``REGISTERED``, ``REJECTED``, ``QUARANTINED``,
+    ``FAILED``) to any other state, or skipping a required
+    intermediate state. Distinct from ``ValidationError`` (malformed
+    input shape) and ``ImmutabilityViolationError`` (an already-
+    resolved immutable field being changed again) — this is
+    specifically about an edge that the state machine's own transition
+    table does not contain.
+    """
+
+    error_code = "INVALID_STATE_TRANSITION"
+
+
+class IdempotencyConflictError(BagmanError):
+    """The same idempotency key (PID §25/§35) was reused for a request
+    whose identifying content differs from the first request that
+    established it — a genuine conflict, distinct from an idempotent
+    replay (which resolves to the existing record instead of raising).
+    See ``services.evidence.intake.intake`` module docstring for the
+    exact "same content" test CD-4 WI-1 applies at intake-creation
+    time.
+    """
+
+    error_code = "IDEMPOTENCY_CONFLICT"
+
+
 class PersistenceError(BagmanError):
     """A general persistence-layer failure distinct from a constraint
     violation — e.g. a database connectivity/operational failure (PID
