@@ -17,6 +17,13 @@ from alembic import context
 from persistence.postgres.models import Base
 from persistence.postgres.session import get_database_url
 
+# Registers IntakeRecordRow on the shared `Base.metadata` (CD-4 WI-1) —
+# intake_models.py lives in its own module (see its own docstring for
+# why), so it must be imported somewhere before `target_metadata` is
+# read below, or 'alembic revision --autogenerate' would never see
+# `intake_records` at all.
+from persistence.postgres import intake_models  # noqa: F401
+
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.
 config = context.config

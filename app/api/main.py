@@ -1,4 +1,5 @@
-"""``bagman-api`` — the FastAPI application instance (CD-3 WI-3, PID §24).
+"""``bagman-api`` — the FastAPI application instance (CD-3 WI-3, PID §24;
+static UI mounting added CD-4 WI-4, PID §36-42).
 
 Responsibilities of this module, and only this module:
 
@@ -8,6 +9,18 @@ Responsibilities of this module, and only this module:
 * attach one request-scoped correlation-id (PID §27) to every request/
   response, generating a fresh one when a caller does not supply
   ``X-Correlation-Id``;
+* serve the first BAGMAN Documents GUI (CD-4 WI-4) as plain static
+  assets (HTML/CSS/vanilla-JS — no framework, no build step, no Node
+  runtime; PID §42) from ``app/api/static/``, mounted at ``/`` via
+  Starlette's ``StaticFiles`` — deliberately mounted LAST, after every
+  ``app.include_router(...)`` call below, so every existing JSON route
+  (``/internal/*``, ``/health``, ``/ready``, ``/version``, plus
+  FastAPI's own ``/docs``/``/openapi.json``) is matched first and keeps
+  working exactly as before; the static mount only ever answers a
+  request no earlier route claimed. ``html=True`` makes ``GET /``
+  serve ``static/index.html`` (the BAGMAN shell) and any other
+  unmatched path fall through to a 404 from ``StaticFiles`` itself,
+  never from the JSON API;
 * centralise translation of ``core.errors.BagmanError`` (and any
   unexpected exception) into an HTTP response — the exact mapping the
   WI-3 contract specifies:
@@ -23,8 +36,22 @@ Responsibilities of this module, and only this module:
   ``InvalidProvenanceError``         422
   ``PersistenceError``               503
   ``StorageError``                   503
+  ``IdempotencyConflictError``       409
+  ``InvalidStateTransitionError``    500
   anything else (incl. IntegrityError)  500
   =================================  ===========
+
+  CD-4 WI-3 additions: ``IdempotencyConflictError`` (PID §25/§35/§53 —
+  "a conflicting reuse of a key with different content must fail
+  loudly") is a genuine, client-actionable conflict, exactly like
+  ``ConflictError``/``ImmutabilityViolationError`` above — 409.
+  ``InvalidStateTransitionError`` is explicitly listed here (rather
+  than left to fall through to the generic-exception 500 default)
+  because it signals an internal orchestration bug (this codebase's own
+  state machine attempting an edge its own transition table forbids),
+  never a caller error — 500 is the correct, and intentional, mapping,
+  spelled out so a future reader does not mistake the omission for an
+  oversight.
 
   A 5xx response body never contains the underlying exception's raw
   message (which, for ``PersistenceError``/``StorageError`` in
@@ -42,23 +69,27 @@ from __future__ import annotations
 import logging
 import os
 import uuid
+from pathlib import Path
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
+from starlette.staticfiles import StaticFiles
 
 from core.errors import (
     BagmanError,
     ConflictError,
     DuplicateExternalReferenceError,
+    IdempotencyConflictError,
     ImmutabilityViolationError,
     InvalidProvenanceError,
+    InvalidStateTransitionError,
     NotFoundError,
     PersistenceError,
     StorageError,
     ValidationError,
 )
 from app.api.logging_config import configure_logging
-from app.api.routers import health, internal, version
+from app.api.routers import health, intake, internal, version
 
 configure_logging(level=os.environ.get("BAGMAN_LOG_LEVEL", "INFO"))
 logger = logging.getLogger("bagman.runtime.api")
@@ -68,6 +99,14 @@ app = FastAPI(title="BAGMAN Runtime API", version="1")
 app.include_router(health.router)
 app.include_router(version.router)
 app.include_router(internal.router)
+app.include_router(intake.router)
+
+#: CD-4 WI-4 — the BAGMAN Documents GUI (PID §36-42), served as plain
+#: static assets. Mounted LAST and at "/" so it never shadows any
+#: route registered above (Starlette matches mounted/declared routes
+#: in registration order) — see this module's own docstring.
+_STATIC_DIR = Path(__file__).resolve().parent / "static"
+app.mount("/", StaticFiles(directory=str(_STATIC_DIR), html=True), name="ui")
 
 #: Ordered so a subclass is matched by the most specific applicable
 #: entry — every current core.errors.* type is a direct, flat subclass
@@ -85,6 +124,9 @@ _STATUS_BY_ERROR_TYPE: dict[type[BagmanError], int] = {
     InvalidProvenanceError: 422,
     PersistenceError: 503,
     StorageError: 503,
+    # CD-4 WI-3 additions — see module docstring.
+    IdempotencyConflictError: 409,
+    InvalidStateTransitionError: 500,
 }
 
 #: 5xx statuses never return the raw exception message to the client

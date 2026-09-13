@@ -1,5 +1,5 @@
-# OPT-IN override — publishes bagman-db/bagman-objects ports to
-# 127.0.0.1 for local debugging only (PID §32's "opt-in and
+# OPT-IN override — publishes bagman-db/bagman-objects/bagman-scan
+# ports to 127.0.0.1 for local debugging only (PID §32's "opt-in and
 # documented" allowance). NOT applied by default; apply it explicitly
 # alongside the base file:
 #
@@ -10,7 +10,7 @@
 #
 # Production doctrine remains closed by default (PID §32) — this file
 # exists only for a developer who needs to point `psql`/`mc`/an S3
-# client at these services directly from the host.
+# client/a raw `clamd` client at these services directly from the host.
 
 services:
   bagman-db:
@@ -21,3 +21,7 @@ services:
     ports:
       - "127.0.0.1:9000:9000"
       - "127.0.0.1:9001:9001"
+
+  bagman-scan:
+    ports:
+      - "127.0.0.1:3310:3310"

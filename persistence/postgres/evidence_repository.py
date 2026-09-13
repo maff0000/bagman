@@ -241,10 +241,35 @@ class PostgresEvidenceRepository(EvidenceRepository):
         except SQLAlchemyError as exc:
             raise PersistenceError(f"could not read EvidenceItem: {exc}") from exc
 
-    def list_evidence(self) -> list[EvidenceItem]:
+    def list_evidence(
+        self,
+        *,
+        entity_id: Optional[str] = None,
+        evidence_type: Optional[str] = None,
+        received_at_from=None,
+        received_at_to=None,
+        limit: Optional[int] = None,
+        offset: int = 0,
+    ) -> list[EvidenceItem]:
         try:
             with session_scope(self._engine) as session:
-                rows = session.query(EvidenceItemRow).order_by(EvidenceItemRow.evidence_id).all()
+                query = session.query(EvidenceItemRow)
+                if entity_id is not None:
+                    query = query.filter(EvidenceItemRow.entity_id == entity_id)
+                if evidence_type is not None:
+                    query = query.filter(EvidenceItemRow.evidence_type == evidence_type)
+                if received_at_from is not None:
+                    query = query.filter(EvidenceItemRow.received_at >= received_at_from)
+                if received_at_to is not None:
+                    query = query.filter(EvidenceItemRow.received_at <= received_at_to)
+                query = query.order_by(
+                    EvidenceItemRow.received_at.desc(), EvidenceItemRow.evidence_id.desc()
+                )
+                if offset:
+                    query = query.offset(offset)
+                if limit is not None:
+                    query = query.limit(limit)
+                rows = query.all()
                 return [_row_to_evidence(row) for row in rows]
         except SQLAlchemyError as exc:
             raise PersistenceError(f"could not list EvidenceItem rows: {exc}") from exc

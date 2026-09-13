@@ -150,6 +150,38 @@ def make_provenance(new_id, now_str) -> Callable[..., dict]:
 
 
 @pytest.fixture
+def make_intake_record(new_id, now_str) -> Callable[..., dict]:
+    """Factory for a minimal valid `bagman.intake_record.v1` instance dict
+    (CD-4 WI-1)."""
+
+    def _make(**overrides: Any) -> dict:
+        instance = {
+            "intake_id": new_id(),
+            "source_id": new_id(),
+            "entity_hint": None,
+            "status": "RECEIVED",
+            "received_at": now_str(),
+            "completed_at": None,
+            "original_filename": "synthetic-invoice.pdf",
+            "reported_mime_type": "application/pdf",
+            "detected_mime_type": None,
+            "size_bytes": None,
+            "content_hash": None,
+            "evidence_id": None,
+            "failure_code": None,
+            "quarantine_reason": None,
+            "correlation_id": new_id(),
+            "idempotency_key": None,
+            "metadata": {},
+            "schema_version": "bagman.intake_record.v1",
+        }
+        instance.update(overrides)
+        return instance
+
+    return _make
+
+
+@pytest.fixture
 def make_audit_event(new_id, now_str) -> Callable[..., dict]:
     """Factory for a minimal valid `bagman.audit_event.v1` instance dict."""
 

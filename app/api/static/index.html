@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>BAGMAN</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header class="shell-header">
+    <div class="shell-header__brand">
+      <span class="shell-header__mark">BAGMAN</span>
+      <span class="shell-header__sub">Evidence Intake</span>
+    </div>
+    <nav class="shell-header__nav" aria-label="Primary">
+      <button class="tab-btn" data-tab="overview" type="button" aria-current="page">Overview</button>
+      <button class="tab-btn" data-tab="documents" type="button">Documents</button>
+      <button class="tab-btn tab-btn--disabled" type="button" disabled title="Not part of this delivery">
+        Entities <span class="pill pill--muted">unavailable</span>
+      </button>
+      <button class="tab-btn tab-btn--disabled" type="button" disabled title="Not part of this delivery">
+        Audit <span class="pill pill--muted">unavailable</span>
+      </button>
+    </nav>
+  </header>
+
+  <main class="shell-main">
+
+    <!-- ============================= OVERVIEW ============================= -->
+    <section id="panel-overview" class="tab-panel">
+      <h1>Runtime Overview</h1>
+      <p class="muted">
+        A minimal liveness/readiness summary. This is not the focus of this delivery —
+        see the <button class="link-btn" data-goto-tab="documents" type="button">Documents</button> tab
+        for the governed evidence intake workflow.
+      </p>
+
+      <div class="card-grid" id="overview-cards">
+        <div class="card" data-card="health">
+          <div class="card__title">Liveness — <code>GET /health</code></div>
+          <div class="card__body">
+            <div class="status-line"><span class="dot dot--pending"></span><span class="status-text">checking…</span></div>
+          </div>
+        </div>
+        <div class="card" data-card="ready">
+          <div class="card__title">Readiness — <code>GET /ready</code></div>
+          <div class="card__body">
+            <div class="status-line"><span class="dot dot--pending"></span><span class="status-text">checking…</span></div>
+          </div>
+        </div>
+        <div class="card" data-card="version">
+          <div class="card__title">Build — <code>GET /version</code></div>
+          <div class="card__body">
+            <dl class="kv" id="version-kv"><dt>loading…</dt></dl>
+          </div>
+        </div>
+      </div>
+
+      <button class="btn btn--secondary" id="overview-refresh" type="button">Refresh</button>
+    </section>
+
+    <!-- ============================= DOCUMENTS ============================= -->
+    <section id="panel-documents" class="tab-panel" hidden>
+      <h1>Documents</h1>
+
+      <!-- ---------- Upload ---------- -->
+      <div class="upload-panel">
+        <h2>Upload evidence</h2>
+        <form id="upload-form" novalidate>
+          <div id="dropzone" class="dropzone" tabindex="0" role="button" aria-label="Choose or drop a file to upload">
+            <div class="dropzone__hint">
+              <strong>Drop a file here</strong> or
+              <label class="link-btn" for="file-input">choose a file</label>
+            </div>
+            <div class="dropzone__file" id="dropzone-file" hidden></div>
+            <input type="file" id="file-input" name="file" hidden />
+          </div>
+
+          <div class="form-grid">
+            <label class="field">
+              <span>Entity</span>
+              <select id="entity-select">
+                <option value="">UNRESOLVED (no entity yet)</option>
+                <option value="NOUSTAI_LIMITED">NoustAI Limited</option>
+                <option value="INFOSECURS_LIMITED">Infosecurs Limited</option>
+                <option value="MATTHEW_SCOTT_PERSONAL">Matthew Scott (personal)</option>
+                <option value="__custom__">Other (type below)…</option>
+              </select>
+              <input type="text" id="entity-custom" class="field-inline" placeholder="free-text entity hint" hidden />
+            </label>
+
+            <label class="field">
+              <span>Evidence type (hint)</span>
+              <select id="evidence-type-select">
+                <option value="">UNKNOWN (default)</option>
+                <option value="DOCUMENT">DOCUMENT</option>
+                <option value="INVOICE">INVOICE</option>
+                <option value="RECEIPT">RECEIPT</option>
+                <option value="STATEMENT">STATEMENT</option>
+                <option value="CONTRACT">CONTRACT</option>
+                <option value="TAX_DOCUMENT">TAX_DOCUMENT</option>
+                <option value="CORRESPONDENCE">CORRESPONDENCE</option>
+              </select>
+            </label>
+
+            <label class="field">
+              <span>Uploaded by (operator)</span>
+              <input type="text" id="actor-id-input" placeholder="e.g. matt" autocomplete="off" />
+            </label>
+
+            <label class="field field--wide">
+              <span>Note (optional)</span>
+              <input type="text" id="note-input" placeholder="operator note" autocomplete="off" />
+            </label>
+          </div>
+
+          <p class="muted small">
+            Actor identity above is a plain operator label, not a cryptographic login — BAGMAN's
+            UI/API are loopback/private-by-default in this delivery (no production authentication).
+          </p>
+
+          <div class="upload-actions">
+            <button class="btn btn--primary" id="upload-submit" type="submit" disabled>Upload</button>
+            <div class="upload-status" id="upload-status" aria-live="polite"></div>
+          </div>
+        </form>
+      </div>
+
+      <!-- ---------- List ---------- -->
+      <div class="list-panel">
+        <div class="list-panel__toolbar">
+          <h2>Intake &amp; Evidence</h2>
+          <div class="filters">
+            <label>
+              Status
+              <select id="filter-status">
+                <option value="">all</option>
+                <option value="RECEIVED">RECEIVED</option>
+                <option value="VALIDATING">VALIDATING</option>
+                <option value="ACCEPTED">ACCEPTED</option>
+                <option value="REGISTERED">REGISTERED</option>
+                <option value="QUARANTINED">QUARANTINED</option>
+                <option value="REJECTED">REJECTED</option>
+                <option value="FAILED">FAILED</option>
+              </select>
+            </label>
+            <label>
+              Entity hint
+              <input type="text" id="filter-entity" placeholder="e.g. NOUSTAI_LIMITED" />
+            </label>
+            <label>
+              From
+              <input type="date" id="filter-from" />
+            </label>
+            <label>
+              To
+              <input type="date" id="filter-to" />
+            </label>
+            <button class="btn btn--secondary" id="filter-apply" type="button">Apply</button>
+            <button class="btn btn--ghost" id="filter-clear" type="button">Clear</button>
+            <button class="btn btn--ghost" id="list-refresh" type="button" title="Reload">⟳</button>
+          </div>
+        </div>
+
+        <div class="table-wrap">
+          <table class="doc-table">
+            <thead>
+              <tr>
+                <th>Status</th>
+                <th>Evidence ID</th>
+                <th>Entity</th>
+                <th>Type</th>
+                <th>Filename</th>
+                <th>Received</th>
+                <th>Size</th>
+                <th>Integrity</th>
+                <th>Source</th>
+                <th>Download</th>
+              </tr>
+            </thead>
+            <tbody id="doc-table-body">
+              <tr><td colspan="10" class="muted">Loading…</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="pagination">
+          <button class="btn btn--ghost" id="page-prev" type="button">&larr; Prev</button>
+          <span id="page-info" class="muted small"></span>
+          <button class="btn btn--ghost" id="page-next" type="button">Next &rarr;</button>
+        </div>
+      </div>
+    </section>
+
+  </main>
+
+  <!-- ---------- Detail panel (slide-over) ---------- -->
+  <div id="detail-overlay" class="detail-overlay" hidden>
+    <div class="detail-panel" role="dialog" aria-modal="true" aria-labelledby="detail-title">
+      <div class="detail-panel__header">
+        <h2 id="detail-title">Intake detail</h2>
+        <button class="btn btn--ghost" id="detail-close" type="button" aria-label="Close">&times;</button>
+      </div>
+      <div class="detail-panel__body" id="detail-body">
+        <!-- populated by app.js -->
+      </div>
+    </div>
+  </div>
+
+  <script src="app.js" type="module"></script>
+</body>
+</html>

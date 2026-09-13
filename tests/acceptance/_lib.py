@@ -121,6 +121,14 @@ def compose_rm_service(service: str) -> None:
     run(compose_cmd("rm", "-sf", service))
 
 
+def compose_stop_service(service: str) -> None:
+    """Stop (but do not remove) exactly one service's container — used
+    by WI-5's dependency-failure proofs (PID §55-57) to simulate
+    ``bagman-scan``/``bagman-objects``/``bagman-db`` becoming
+    unavailable without disturbing any other running service."""
+    run(compose_cmd("stop", service))
+
+
 def compose_ps_service_id(service: str) -> str:
     result = run_capture(compose_cmd("ps", "-q", service))
     return result.stdout.strip()
@@ -210,42 +218,78 @@ def register_source(external_source_ref: str, governed_entity_hint: str, actor_i
 
 def register_evidence(
     *,
-    entity_id: Optional[str],
-    source_id: str,
     content: bytes,
     original_name: str,
-    external_reference_external_id: str,
     actor_id: str,
-    observed_at: Optional[str] = None,
-    received_at: Optional[str] = None,
+    entity_hint: Optional[str] = None,
+    evidence_type: str = "DOCUMENT",
+    note: Optional[str] = None,
+    idempotency_key: Optional[str] = None,
 ) -> dict:
-    observed_at = observed_at or utc_now_iso()
-    received_at = received_at or utc_now_iso()
+    """Create canonical evidence via the CD-4 governed intake endpoint
+    (``POST /internal/intake/evidence``) — CD-3's direct-upload bypass
+    this helper originally called (``POST /internal/evidence``) has
+    been REMOVED entirely (PID §26/§27; see
+    ``app/api/routers/internal.py``'s module docstring for the closure
+    rationale). This is CD-4 WI-3's real fix for that closure, not a
+    workaround: CD-3's acceptance scripts stood in for "the only
+    evidence producer that existed at the time"; CD-4 supersedes that
+    with a governed one.
+
+    Unlike the removed CD-3 route, CD-4 intake:
+
+    * never accepts an arbitrary caller-chosen ``source_id`` — every
+      manual-upload intake resolves to BAGMAN's own single stable
+      ``MANUAL_UPLOAD`` source automatically (PID §9);
+    * never accepts a real ``entity_id`` — CD-4's recorded
+      entity-resolution decision (see ``app/api/composition.py``'s and
+      ``app/api/routers/intake.py``'s own module docstrings) always
+      registers with ``entity_id=None``; ``entity_hint`` is carried
+      through as a free-text HINT only, never asserted ownership;
+    * uses an ``Idempotency-Key`` HTTP header, not an
+      ``external_reference`` tuple, as its idempotent-retry mechanism
+      (PID §25/§53) — a caller wanting the CD-3-style "same external
+      observation -> same evidence" proof supplies the SAME
+      ``idempotency_key`` on a retried call.
+
+    Raises if the intake did not actually produce canonical evidence
+    (e.g. REJECTED/QUARANTINED/FAILED) — every current acceptance
+    script's synthetic plain-text fixture is expected to be cleanly
+    ``ACCEPTED``/``REGISTERED``.
+
+    Returns the endpoint's ``evidence`` object (``EvidenceItem.to_dict()``),
+    with a synthetic ``_request_metadata`` key added (mirroring the
+    removed CD-3 helper's own convention) so a caller can byte-for-byte
+    replay this same call, and a synthetic ``_intake`` key carrying the
+    full ``IntakeRecord.to_dict()`` alongside it.
+    """
     metadata = {
-        "evidence_type": "INVOICE",
-        "source_id": source_id,
-        "observed_at": observed_at,
-        "received_at": received_at,
-        "mime_type": "text/plain",
+        "entity_hint": entity_hint,
+        "evidence_type": evidence_type,
         "actor_type": ACTOR_TYPE,
         "actor_id": actor_id,
-        "entity_id": entity_id,
-        "original_name": original_name,
-        "status": "OBSERVED",
-        "external_reference_provider": "INTERNAL",
-        "external_reference_resource_type": "MANUAL_UPLOAD_FILE",
-        "external_reference_external_id": external_reference_external_id,
+        "note": note,
     }
+    headers = {"Idempotency-Key": idempotency_key} if idempotency_key else {}
     response = requests.post(
-        f"{BASE_URL}/internal/evidence",
+        f"{BASE_URL}/internal/intake/evidence",
         data={"metadata": json.dumps(metadata)},
         files={"file": (original_name, content, "text/plain")},
+        headers=headers,
         timeout=10,
     )
     response.raise_for_status()
     body = response.json()
-    body["_request_metadata"] = metadata  # so a caller can byte-for-byte replay this same call
-    return body
+    evidence = body.get("evidence")
+    if evidence is None:
+        raise RuntimeError(
+            f"intake did not produce canonical evidence (intake status "
+            f"{body['intake']['status']!r}, failure_code="
+            f"{body['intake'].get('failure_code')!r}): {body}"
+        )
+    evidence["_request_metadata"] = {**metadata, "idempotency_key": idempotency_key}
+    evidence["_intake"] = body["intake"]
+    return evidence
 
 
 def get_evidence(evidence_id: str) -> dict:

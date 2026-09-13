@@ -317,4 +317,236 @@ def test_no_schema_file_hardcodes_a_provider_name_inside_a_structural_constraint
 
         _walk(data, [])
 
+    assert not violations, (
+        "no contracts/*.schema.json file may bake a provider name into a "
+        "structural constraint (enum/const/required) — provider names belong "
+        "only in free-text description/examples:\n" + "\n".join(violations)
+    )
+
+
+# ---------------------------------------------------------------------
+# CD-4 WI-5 (PID §67) — the required Evidence Intake architecture proof.
+# Extends this existing module rather than duplicating a parallel
+# import-boundary test file, per WI-5's own instruction.
+# ---------------------------------------------------------------------
+
+
+def test_static_ui_assets_contain_no_python_or_server_side_code():
+    """PID §67: 'GUI does not write DB/object storage directly'. The
+    strongest, most literal proof available by inspection: the GUI is
+    served entirely from ``app/api/static/`` (see ``app/api/main.py``'s
+    own docstring — a plain ``StaticFiles`` mount) and that directory
+    must contain ONLY client-side assets (HTML/CSS/JS) — no Python, no
+    server-side code of any kind that could reach a database or object
+    store directly instead of going through the existing ``/internal/*``
+    HTTP API."""
+    static_dir = REPO_ROOT / "app" / "api" / "static"
+    assert static_dir.is_dir(), f"expected {static_dir} to exist"
+
+    python_files = sorted(p.relative_to(REPO_ROOT).as_posix() for p in static_dir.rglob("*.py"))
+    assert python_files == [], (
+        f"app/api/static/ must contain no Python/server-side code — found: {python_files}"
+    )
+
+    allowed_suffixes = {".js", ".html", ".css"}
+    unexpected = sorted(
+        p.relative_to(REPO_ROOT).as_posix()
+        for p in static_dir.rglob("*")
+        if p.is_file() and p.suffix.lower() not in allowed_suffixes
+    )
+    assert unexpected == [], (
+        f"app/api/static/ contains file(s) outside the expected client-asset "
+        f"types {sorted(allowed_suffixes)}: {unexpected}"
+    )
+
+
+def test_static_ui_javascript_only_calls_the_existing_internal_http_api():
+    """Confirms, by inspection of the actual JS source (not merely by
+    absence of a database driver import — there is no such thing as an
+    'import' in plain browser JS to look for), that BAGMAN's own
+    ``app.js`` talks to the backend ONLY through relative
+    ``/internal/*`` (or ``/health``/``/ready``/``/version``) HTTP paths
+    via ``fetch`` — never a raw database connection string, an AWS/S3
+    SDK-shaped endpoint, or any other infrastructure address."""
+    app_js = (REPO_ROOT / "app" / "api" / "static" / "app.js").read_text(encoding="utf-8")
+
+    # Every literal path string this file references as an API target
+    # must be relative and rooted at one of the known, existing JSON
+    # surfaces — never an absolute external host, never anything
+    # database/object-store-shaped.
+    forbidden_tokens = [
+        "postgres://", "postgresql://", "mysql://", "mongodb://",
+        "s3://", "minio", ":5432", ":9000", ":3310",
+        "boto3", "psycopg", "sqlalchemy",
+    ]
+    lowered = app_js.lower()
+    violations = [token for token in forbidden_tokens if token in lowered]
+    assert violations == [], (
+        f"app/api/static/app.js appears to reference infrastructure directly: {violations}"
+    )
+    assert "/internal/" in app_js, "expected app.js to call the existing /internal/* HTTP API"
+
+
+# core/ and services/evidence/ must never import app/ (the HTTP/routing
+# layer) or persistence/ (infrastructure) — extends the existing
+# adapters/agent/ui check above with PID §67's "canonical core does not
+# import scanner/UI/infrastructure code".
+_FORBIDDEN_INFRASTRUCTURE_ROOTS = {"app", "persistence"}
+
+
+def test_core_and_services_evidence_never_import_app_or_persistence():
+    violations = []
+    for path in _py_files("core", "services/evidence"):
+        rel = path.relative_to(REPO_ROOT).as_posix()
+        for imp in _imports_of(path):
+            if imp.root in _FORBIDDEN_INFRASTRUCTURE_ROOTS:
+                violations.append(f"{rel}:{imp.lineno} imports {imp.full!r} (root {imp.root!r})")
+
+    assert not violations, (
+        "core/ and services/evidence/ must never import app/ (HTTP/routing) or "
+        "persistence/ (infrastructure) (PID §67) — persistence/*.py legitimately "
+        "imports FROM services/core, never the reverse; see "
+        "persistence/postgres/intake_repository.py's and "
+        "services/evidence/intake/validation_pipeline.py's own module "
+        "docstrings for the documented layering direction. Violations:\n"
+        + "\n".join(violations)
+    )
+
+
+def test_validation_pipeline_never_imports_concrete_scanner_implementation():
+    """PID §67: 'scanner implementation remains behind abstraction'.
+    ``services.evidence.intake.validation_pipeline`` must depend only on
+    the ``EvidenceSafetyScanner`` abstraction (plus the closed
+    ``ScanVerdict``/``ScanResult`` value types) — never import
+    ``ClamAVScanner`` (or any other concrete implementation) directly.
+    The one legitimate place that imports the concrete implementation is
+    ``app/api/composition.py`` (the composition root), which this test
+    does not touch."""
+    path = REPO_ROOT / "services" / "evidence" / "intake" / "validation_pipeline.py"
+    tree_source = path.read_text(encoding="utf-8")
+
+    import ast
+
+    tree = ast.parse(tree_source, filename=str(path))
+    imported_names = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                imported_names.add(alias.name)
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                imported_names.add(alias.name.split(".")[0])
+
+    assert "ClamAVScanner" not in imported_names, (
+        "services/evidence/intake/validation_pipeline.py must depend only on the "
+        "EvidenceSafetyScanner abstraction, never import ClamAVScanner directly "
+        f"(PID §19/§67) — found imported names: {sorted(imported_names)}"
+    )
+    assert "EvidenceSafetyScanner" in imported_names, (
+        "expected validation_pipeline.py to import the EvidenceSafetyScanner "
+        "abstraction it is supposed to depend on"
+    )
+
+
+def test_no_live_mailbox_adapter_code_exists_yet():
+    """PID §67: 'adapters do not exist yet for live email'. `adapters/`
+    is CD-4's own explicitly-reserved placeholder directory for a
+    FUTURE delivery (CD-5) — as of CD-4 it must contain no Python code
+    at all, only the placeholder README files each subdirectory already
+    has."""
+    adapters_dir = REPO_ROOT / "adapters"
+    python_files = sorted(p.relative_to(REPO_ROOT).as_posix() for p in adapters_dir.rglob("*.py"))
+    assert python_files == [], (
+        f"adapters/ must contain no Python code yet (CD-5's job, not CD-4's) — found: {python_files}"
+    )
+
+
+def test_internal_router_direct_upload_bypass_is_genuinely_gone():
+    """PID §67: 'direct upload route cannot bypass intake'. Confirms, by
+    AST inspection (not merely by grepping the module's own prose
+    docstring, which legitimately still narrates the historical removal
+    in plain text), that no function in
+    ``app/api/routers/internal.py`` declares an ``UploadFile`` parameter
+    or calls ``File(...)`` anywhere in its body — the CD-3
+    ``POST /internal/evidence`` byte-accepting route is genuinely gone,
+    not merely renamed/hidden."""
+    import ast
+
+    path = REPO_ROOT / "app" / "api" / "routers" / "internal.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+
+    violations = []
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            all_args = [
+                *node.args.posonlyargs,
+                *node.args.args,
+                *node.args.kwonlyargs,
+            ]
+            for arg in all_args:
+                if arg.annotation is not None and ast.dump(arg.annotation).find("UploadFile") != -1:
+                    violations.append(f"{node.name}({arg.arg}: ...) at line {node.lineno}")
+        if isinstance(node, ast.Call):
+            callee = node.func
+            callee_name = callee.id if isinstance(callee, ast.Name) else getattr(callee, "attr", None)
+            if callee_name == "File":
+                violations.append(f"File(...) call at line {node.lineno}")
+
+    assert violations == [], (
+        "app/api/routers/internal.py must never accept a raw file upload "
+        f"(the CD-3 bypass must stay closed, PID §26/§27/§67) — found: {violations}"
+    )
+
+
+# ---------------------------------------------------------------------
+# CD-4 WI-5 (PID §67/§69) — no forbidden live-provider SDK/mailbox-
+# polling library anywhere in the repository yet (grep across every
+# .py file, not just core/services — a stray import anywhere would
+# still represent exactly the "no mailbox integration" invariant being
+# broken).
+# ---------------------------------------------------------------------
+
+_FORBIDDEN_MAILBOX_AND_PROVIDER_IMPORT_ROOTS = {
+    "msal",
+    "googleapiclient",
+    "google_auth_oauthlib",
+    "imapclient",
+    "imaplib",
+    "exchangelib",
+    "O365",
+}
+
+
+def test_no_forbidden_mailbox_or_provider_sdk_imported_anywhere_in_the_repo():
+    """PID §67/§69: no Microsoft Graph/MSAL, Gmail/Google API client
+    library, or ``imapclient``/``imaplib``-based mailbox polling code
+    exists anywhere in the repository yet — CD-5's job, not CD-4's.
+    Scans every ``.py`` file under the repo (excluding
+    third-party-managed directories), via real ``ast`` import parsing,
+    not a text grep."""
+    violations = []
+    search_roots = ["core", "services", "persistence", "app", "adapters", "agent", "ui", "scripts", "tests", "ops"]
+    for path in _py_files(*search_roots):
+        rel = path.relative_to(REPO_ROOT).as_posix()
+        for imp in _imports_of(path):
+            if imp.root in _FORBIDDEN_MAILBOX_AND_PROVIDER_IMPORT_ROOTS:
+                violations.append(f"{rel}:{imp.lineno} imports {imp.full!r}")
+
+    assert not violations, (
+        "no Microsoft Graph/MSAL, Gmail/Google API client library, or "
+        "imapclient/imaplib mailbox-polling import may exist yet (PID §67/§69) "
+        "— CD-5's job, not CD-4's. Violations:\n" + "\n".join(violations)
+    )
+
+
+def test_requirements_files_do_not_mention_forbidden_mailbox_or_provider_sdks():
+    forbidden_package_tokens = [
+        "msal", "google-api-python-client", "google-auth", "imapclient",
+        "exchangelib", "o365",
+    ]
+    for req_file in ("requirements.txt", "requirements-dev.txt"):
+        text = (REPO_ROOT / req_file).read_text(encoding="utf-8").lower()
+        violations = [token for token in forbidden_package_tokens if token in text]
+        assert violations == [], f"{req_file} must not depend on: {violations}"
+
     assert not violations, "\n".join(violations)

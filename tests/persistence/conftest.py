@@ -88,7 +88,10 @@ DB_USER = "bagman_test"
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 
-#: The six canonical tables this work item's migration must create.
+#: The canonical tables the migrations under `alembic/versions/` must
+#: create. `intake_records` (CD-4 WI-1) added alongside the original
+#: six CD-2/CD-3 tables — truncated together in one statement below, so
+#: table order here does not matter (CASCADE handles FK ordering).
 CANONICAL_TABLES = (
     "audit_events",
     "governed_entities",
@@ -96,6 +99,7 @@ CANONICAL_TABLES = (
     "evidence_items",
     "external_references",
     "provenance",
+    "intake_records",
 )
 
 

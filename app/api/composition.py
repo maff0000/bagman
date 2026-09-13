@@ -57,8 +57,11 @@ from typing import Optional
 
 from sqlalchemy.engine import Engine
 
+from core import actor
 from core.api import BagmanCanonicalAPI
 from persistence.objects.store import EvidenceObjectStore
+from services.evidence.intake.intake import IntakeRepository
+from services.evidence.intake.scanner import EvidenceSafetyScanner, ScanResult, ScanVerdict
 
 #: Repo root, resolved once from this file's own location
 #: (``app/api/composition.py`` -> ``app/api`` -> ``app`` ->
@@ -110,6 +113,39 @@ def _read_secret_file(env_var: str, default_path: str) -> str:
         ) from exc
 
 
+class _AlwaysCleanDevelopmentScanner(EvidenceSafetyScanner):
+    """A DEVELOPMENT-ONLY ``EvidenceSafetyScanner`` stub (CD-4 WI-3,
+    PID §19/§20) — always reports ``CLEAN``/available, never actually
+    inspecting any content. Mirrors exactly how development/test
+    composition already substitutes
+    :class:`persistence.objects.memory_store.InMemoryObjectStore` for a
+    real MinIO endpoint (see this module's own docstring): something
+    cheap and dependency-free so the app/test suite can run with zero
+    external services, never mistaken for a real security control.
+
+    Deliberately defined here, in ``composition.py``, and NEVER
+    imported/exported anywhere else in the codebase — there is exactly
+    one place this stub is legitimately constructed
+    (:func:`_build_development_or_test`), and :func:`_build_production`
+    never substitutes it under any condition (the same hard "no
+    fallback" invariant this module's docstring already states for the
+    object store/repositories).
+
+    A stub scanner in dev composition must never become "the real
+    scanner is never exercised at all": this WI's own test suite
+    (``tests/app_api/test_intake_endpoint.py``) includes tests that
+    build a PRODUCTION-mode composition wired to a REAL, disposable
+    ``clamd`` daemon and drive the actual HTTP intake endpoint through
+    it end-to-end.
+    """
+
+    def scan(self, content) -> ScanResult:  # noqa: ANN001 - matches EvidenceSafetyScanner.scan's own signature
+        return ScanResult(ScanVerdict.CLEAN, detail="development-only stub scanner: always CLEAN")
+
+    def is_available(self) -> bool:
+        return True
+
+
 @dataclass(frozen=True)
 class RuntimeComposition:
     """Everything ``app/api/`` needs, wired for the current
@@ -119,22 +155,32 @@ class RuntimeComposition:
     liveness against) and the real, process-wide SQLAlchemy ``Engine``
     in production mode — ``routers/health.py``'s ``/ready`` handler
     uses it directly for a live ``SELECT 1`` check.
+
+    ``intake_repository``/``scanner`` (CD-4 WI-3) are wired the same
+    way: an in-memory/stub pair in development/test composition, a
+    real ``PostgresIntakeRepository``/``ClamAVScanner`` pair in
+    production — never mixed across modes.
     """
 
     runtime_environment: str
     api: BagmanCanonicalAPI
     object_store: EvidenceObjectStore
     engine: Optional[Engine]
+    intake_repository: IntakeRepository
+    scanner: EvidenceSafetyScanner
 
 
 def _build_development_or_test(runtime_environment: str) -> RuntimeComposition:
     from persistence.objects.memory_store import InMemoryObjectStore
+    from services.evidence.intake.intake import InMemoryIntakeRepository
 
     return RuntimeComposition(
         runtime_environment=runtime_environment,
         api=BagmanCanonicalAPI(),  # CD-2's own in-memory default construction
         object_store=InMemoryObjectStore(),
         engine=None,
+        intake_repository=InMemoryIntakeRepository(),
+        scanner=_AlwaysCleanDevelopmentScanner(),
     )
 
 
@@ -150,9 +196,11 @@ def _build_production() -> RuntimeComposition:
     from persistence.postgres.external_reference_repository import (
         PostgresExternalReferenceRepository,
     )
+    from persistence.postgres.intake_repository import PostgresIntakeRepository
     from persistence.postgres.provenance_repository import PostgresProvenanceRepository
     from persistence.postgres.session import get_engine
     from persistence.postgres.source_repository import PostgresSourceRepository
+    from services.evidence.intake.scanner import ClamAVScanner
 
     # `get_engine()` builds/returns a pooled SQLAlchemy Engine but never
     # itself opens a connection (PID §46 note above) — safe to call even
@@ -188,11 +236,31 @@ def _build_production() -> RuntimeComposition:
         )
     )
 
+    # CD-4 WI-3: durable intake repository, sharing the same engine as
+    # every other Postgres-backed repository above.
+    intake_repository = PostgresIntakeRepository(engine)
+
+    # CD-4 WI-3: a real ClamAV scanner — configured from
+    # BAGMAN_SCANNER_HOST/BAGMAN_SCANNER_PORT (mirroring the existing
+    # env-var-driven MinIO configuration pattern above), defaulting to
+    # the `bagman-scan` service name/port this WI adds to
+    # deployment/compose/docker-compose.yml. Constructing a
+    # ClamAVScanner performs no I/O itself (unlike MinIOObjectStore
+    # above) — it only stores host/port; reachability is proven live by
+    # `/ready` (routers/health.py), never here, so a down bagman-scan
+    # does not prevent composition from succeeding.
+    scanner = ClamAVScanner(
+        host=os.environ.get("BAGMAN_SCANNER_HOST", "bagman-scan"),
+        port=int(os.environ.get("BAGMAN_SCANNER_PORT", "3310")),
+    )
+
     return RuntimeComposition(
         runtime_environment=_PRODUCTION,
         api=api,
         object_store=object_store,
         engine=engine,
+        intake_repository=intake_repository,
+        scanner=scanner,
     )
 
 
@@ -232,7 +300,92 @@ def reset_composition_for_tests() -> None:
     """Test-only hook: forces the next :func:`get_composition` call to
     re-read ``BAGMAN_RUNTIME_ENV`` and rebuild from scratch — used by
     ``tests/app_api/`` to exercise both composition modes, and the
-    no-fallback proof, within a single test process."""
-    global _composition
+    no-fallback proof, within a single test process. Also clears the
+    memoized ``MANUAL_UPLOAD`` source id (CD-4 WI-3) — a source id
+    memoized against one composition (e.g. a prior test's disposable
+    Postgres database) would otherwise be silently stale/invalid
+    against the NEXT composition this process builds."""
+    global _composition, _manual_upload_source_id
     with _lock:
         _composition = None
+        _manual_upload_source_id = None
+
+
+# ---------------------------------------------------------------------
+# Stable MANUAL_UPLOAD Source lifecycle (CD-4 WI-3, PID §9)
+# ---------------------------------------------------------------------
+#
+# PID §9: "The implementation should not create a new Source for every
+# file... A stable manual-upload source for the BAGMAN operator/runtime
+# is preferable... Exact source lifecycle may be determined during
+# implementation but must remain explicit and idempotent."
+#
+# Chosen lifecycle (explicit, documented here since this IS the
+# decision): exactly one Source row, identified by the well-known,
+# closed pair (source_type="MANUAL_UPLOAD", provider=
+# "bagman-manual-upload"), created lazily the first time it is needed
+# and reused for every subsequent manual-upload intake for the rest of
+# this process's life. Resolution is:
+#
+#   1. an in-process memoized id (fast path, no query at all once
+#      warm) — mirrors get_composition()'s own _composition cache;
+#   2. a read-only find_by_provider() lookup (the source may already
+#      exist — created by an earlier process, or an earlier request in
+#      this same process before the memoized value was set);
+#   3. only if neither finds it, register_source() creates it.
+#
+# Known limitation, stated plainly rather than silently accepted: there
+# is no database-level uniqueness constraint on (source_type, provider)
+# backing this — unlike intake idempotency_key (a real partial unique
+# index) or evidence external_reference tuples (a real unique
+# constraint), a genuine multi-PROCESS race the very first time this
+# runs (two bagman-api processes/workers, both cold, both losing the
+# find_by_provider() race) could each independently create a distinct
+# MANUAL_UPLOAD Source row. This is judged acceptable for CD-4: BAGMAN
+# today runs as a single bagman-api process/container (see
+# deployment/compose/docker-compose.yml — no multi-replica deployment
+# exists yet), so the only race that matters in practice is
+# intra-process, which the module-level lock below fully closes. A
+# multi-replica deployment would need either a real unique constraint
+# on sources(source_type, provider) or an explicit migration-time seed
+# row — flagged here for whoever introduces multi-replica bagman-api,
+# not solved speculatively now.
+_MANUAL_UPLOAD_SOURCE_TYPE = "MANUAL_UPLOAD"
+_MANUAL_UPLOAD_SOURCE_PROVIDER = "bagman-manual-upload"
+
+_manual_upload_source_id: Optional[str] = None
+
+
+def get_manual_upload_source_id(composition: "RuntimeComposition") -> str:
+    """Resolve (or, on first use, create) the single stable
+    ``MANUAL_UPLOAD`` ``Source`` id (see module section docstring
+    above). Memoized for the life of the process once resolved."""
+    global _manual_upload_source_id
+    if _manual_upload_source_id is not None:
+        return _manual_upload_source_id
+
+    with _lock:
+        if _manual_upload_source_id is not None:
+            return _manual_upload_source_id
+
+        existing = composition.api.source_repository.find_by_provider(
+            source_type=_MANUAL_UPLOAD_SOURCE_TYPE,
+            provider=_MANUAL_UPLOAD_SOURCE_PROVIDER,
+        )
+        if existing is not None:
+            _manual_upload_source_id = existing.source_id
+            return _manual_upload_source_id
+
+        source = composition.api.register_source(
+            source_type=_MANUAL_UPLOAD_SOURCE_TYPE,
+            provider=_MANUAL_UPLOAD_SOURCE_PROVIDER,
+            status="ACTIVE",
+            actor_type=actor.SYSTEM,
+            actor_id="bagman-manual-upload-bootstrap",
+            metadata={
+                "note": "stable MANUAL_UPLOAD source, resolved-or-created once per "
+                "process (CD-4 WI-3, PID §9) — never one Source per uploaded file"
+            },
+        )
+        _manual_upload_source_id = source.source_id
+        return _manual_upload_source_id

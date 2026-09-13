@@ -7,16 +7,24 @@
 # component.yaml validation/projection for it.
 
 id: BAGMAN.PERSISTENCE.OBJECTS
-version: 1
+version: 2
 
 responsibility: >
-  Own the EvidenceObjectStore abstraction (put/get/exists/verify_hash)
-  for durable, immutable, content-addressed original-evidence-bytes
-  storage, its MinIO/S3-compatible boto3 implementation, and — added
-  by WI-3 — a narrow in-memory reference implementation used only by
-  the runtime composition root's development/test mode. Core/domain
-  code never depends on a storage-provider SDK directly (PID §53);
-  this component is the only place that does.
+  Own the EvidenceObjectStore abstraction (put/put_prefixed/get/exists/
+  verify_hash) for durable, immutable, content-addressed
+  original-evidence-bytes storage, its MinIO/S3-compatible boto3
+  implementation, and — added by WI-3 — a narrow in-memory reference
+  implementation used only by the runtime composition root's
+  development/test mode. Core/domain code never depends on a
+  storage-provider SDK directly (PID §53); this component is the only
+  place that does. CD-4 WI-2 added `put_prefixed()` plus the
+  `quarantine_object_key()`/`staging_object_key()` sibling key-shape
+  helpers (PID §21/§22): quarantined material and an ACCEPTED intake's
+  staged bytes are stored under `quarantine/<id>/<hash>` /
+  `intake-staging/<id>/<hash>` — deliberately distinct in shape from
+  `put()`'s canonical `evidence/<evidence_id>/<hash>` — so quarantined/
+  staged objects are never indistinguishable BY KEY SHAPE from normal
+  available evidence.
 
 owns: []
 

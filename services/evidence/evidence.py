@@ -136,7 +136,26 @@ class EvidenceRepository(abc.ABC):
         raise NotImplementedError
 
     @abc.abstractmethod
-    def list_evidence(self) -> list[EvidenceItem]:
+    def list_evidence(
+        self,
+        *,
+        entity_id: Optional[str] = None,
+        evidence_type: Optional[str] = None,
+        received_at_from: Optional[datetime] = None,
+        received_at_to: Optional[datetime] = None,
+        limit: Optional[int] = None,
+        offset: int = 0,
+    ) -> list[EvidenceItem]:
+        """List EvidenceItems, most-recently-received first (CD-4 WI-3,
+        PID §44-46). Same filter/pagination doctrine as
+        ``services.evidence.intake.intake.IntakeRepository.list_intake_records``:
+        default ordering ``received_at DESC`` with ``evidence_id`` as
+        deterministic tie-breaker; every filter is optional (omitted ==
+        match all); ``limit=None`` (default) returns every matching
+        record, preserving every existing caller's "no pagination"
+        behaviour — an explicit page-size boundary is the HTTP layer's
+        job (``app/api/routers/intake.py``'s ``GET /internal/evidence``).
+        """
         raise NotImplementedError
 
     @abc.abstractmethod
@@ -253,8 +272,31 @@ class InMemoryEvidenceRepository(EvidenceRepository):
         except KeyError:
             raise NotFoundError(f"no EvidenceItem with evidence_id '{evidence_id}'") from None
 
-    def list_evidence(self) -> list[EvidenceItem]:
-        return list(self._by_id.values())
+    def list_evidence(
+        self,
+        *,
+        entity_id: Optional[str] = None,
+        evidence_type: Optional[str] = None,
+        received_at_from: Optional[datetime] = None,
+        received_at_to: Optional[datetime] = None,
+        limit: Optional[int] = None,
+        offset: int = 0,
+    ) -> list[EvidenceItem]:
+        items = list(self._by_id.values())
+        if entity_id is not None:
+            items = [i for i in items if i.entity_id == entity_id]
+        if evidence_type is not None:
+            items = [i for i in items if i.evidence_type == evidence_type]
+        if received_at_from is not None:
+            items = [i for i in items if i.received_at >= received_at_from]
+        if received_at_to is not None:
+            items = [i for i in items if i.received_at <= received_at_to]
+
+        items.sort(key=lambda i: (i.received_at, i.evidence_id), reverse=True)
+
+        if limit is None:
+            return items[offset:]
+        return items[offset : offset + limit]
 
     def update_status(self, evidence_id: str, new_status: str) -> EvidenceItem:
         if new_status not in STATUSES:

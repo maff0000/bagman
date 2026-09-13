@@ -106,6 +106,59 @@ services:
       start_period: 10s
     restart: unless-stopped
 
+  bagman-scan:
+    # CD-4 WI-3 (PID §19/§20/§60): the content-safety scanning backend
+    # for Evidence Intake — a real `clamd` daemon, BAGMAN-owned,
+    # internal-only.
+    #
+    # CD-4 PR #4 Architect delta (2026-09-13): PR #4 originally pinned
+    # this to `clamav/clamav:stable` alone, on the reasoning that
+    # ClamAV publishes no per-build immutable version tag the way
+    # postgres/minio above do, so tracking the `stable` *release
+    # channel* was "the documented, deliberate choice ... not an
+    # oversight of the 'no :latest' rule." The Architect overrode that:
+    # a release channel is still a MOVING tag — the bytes behind
+    # `clamav/clamav:stable` can change upstream at any time without
+    # this file changing — which is not acceptable identity for a
+    # runtime dependency, regardless of how deliberately it was chosen.
+    #
+    # This is now pinned by immutable digest: the `@sha256:...` suffix,
+    # not the `stable` tag, is what actually fixes the exact image
+    # bytes BAGMAN runs (and the exact image this delivery's
+    # ClamAV-dependent tests were built/verified against — resolved
+    # independently on the host that ran those tests, via
+    # `docker inspect --format='{{index .RepoDigests 0}}'
+    # clamav/clamav:stable`, immediately before pinning here). Docker
+    # treats `repo@digest` as the canonical, immutable reference
+    # regardless of any tag also present; `:stable` is kept here purely
+    # as a human-readable release-channel label for operators reading
+    # this file, not as part of the pinning mechanism — if ClamAV's
+    # `stable` channel is ever intentionally moved forward, this digest
+    # (and this comment) must be updated deliberately, exactly like any
+    # other version bump, never implicitly by a background image pull.
+    image: clamav/clamav:stable@sha256:1fdfd24c6f0a0fb60788481487459a6d4eda8a9b448641594e04db8410d34422
+    container_name: bagman-scan
+    networks:
+      - bagman-net
+    # No host port publish (PID §32) — bagman-api reaches this over
+    # bagman-net only, at bagman-scan:3310, exactly like bagman-db/
+    # bagman-objects above.
+    environment:
+      TZ: UTC
+    healthcheck:
+      # clamd's own PING/PONG protocol, spoken directly over the port
+      # it already listens on, via `nc` — verified present in the
+      # `clamav/clamav:stable` image (Alpine-based; NO `bash`, so a
+      # `/dev/tcp` redirection trick does not work here, unlike a
+      # Debian/Ubuntu-based image — checked directly against this exact
+      # image during this delivery, not assumed).
+      test: ["CMD-SHELL", "echo -n 'PING' | nc -w 5 127.0.0.1 3310 | grep -q PONG"]
+      interval: 10s
+      timeout: 10s
+      retries: 20
+      start_period: 30s
+    restart: unless-stopped
+
   bagman-api:
     build:
       context: ../../
@@ -121,6 +174,8 @@ services:
         condition: service_healthy
       bagman-objects:
         condition: service_healthy
+      bagman-scan:
+        condition: service_healthy
     environment:
       BAGMAN_RUNTIME_ENV: production
       BAGMAN_DB_HOST: bagman-db
@@ -132,6 +187,8 @@ services:
       BAGMAN_OBJECT_STORE_BUCKET: bagman-evidence
       BAGMAN_OBJECT_STORE_ACCESS_KEY_FILE: /run/secrets/minio_root_user
       BAGMAN_OBJECT_STORE_SECRET_KEY_FILE: /run/secrets/minio_root_user_password
+      BAGMAN_SCANNER_HOST: bagman-scan
+      BAGMAN_SCANNER_PORT: "3310"
       BAGMAN_LOG_LEVEL: INFO
       TZ: UTC
     secrets:

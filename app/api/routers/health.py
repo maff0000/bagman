@@ -154,11 +154,37 @@ async def ready() -> JSONResponse:
             },
         )
 
+    # Production: prove the content-safety scanner is reachable, live,
+    # right now (CD-4 WI-3, PID §60 — "scanner required for manual
+    # upload readiness" is the PID's own stated preference for this
+    # delivery, and every production composition's scanner IS mandatory
+    # — DEFAULT_INTAKE_POLICY.scanner_required is True and CD-4 WI-2's
+    # pipeline does not implement an optional-scanner code path — so
+    # this check is unconditional here, exactly like postgres/
+    # object_store above, never behind a policy-read at this layer).
+    # EvidenceSafetyScanner.is_available() never raises (see
+    # services.evidence.intake.scanner's own fail-closed contract) — it
+    # returns False for "unreachable", so no try/except is needed here.
+    if not composition.scanner.is_available():
+        logger.warning(
+            "readiness check failed: content-safety scanner unreachable",
+            extra={"component": "bagman.runtime.api.health", "event_type": "READINESS_CHECK_FAILED"},
+        )
+        return JSONResponse(
+            status_code=503,
+            content={
+                "ready": False,
+                "runtime_environment": "production",
+                "failed_dependency": "scanner",
+                "detail": "content-safety scanner is_available() probe failed",
+            },
+        )
+
     return JSONResponse(
         status_code=200,
         content={
             "ready": True,
             "runtime_environment": "production",
-            "checks": {"postgres": "ok", "object_store": "ok"},
+            "checks": {"postgres": "ok", "object_store": "ok", "scanner": "ok"},
         },
     )
