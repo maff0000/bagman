@@ -46,8 +46,104 @@
 # choices, which could change in a future jsonschema release. Pinned to
 # the version that was already resolving and passing all 102 tests.
 #
+# boto3 - introduced by CD-3 WI-2, PL decision already made (not the
+# dedicated `minio` package): boto3 is the official, extremely
+# well-established AWS SDK for Python, and talks to any S3-compatible
+# endpoint (including MinIO) by pointing `endpoint_url` at it —
+# chosen for portability toward a future real cloud object store, per
+# PID §16's own stated goal ("this allows later migration to another
+# S3-compatible service or cloud object store without rewriting
+# evidence semantics"). Used by persistence/objects/minio_store.py
+# only; core/ and services/evidence/ never import it directly (PID
+# §53), and tests/integration/test_architecture_boundaries.py does not
+# scan persistence/ so this does not affect that boundary check.
+#
+# Pinned to 1.43.93, the latest stable release as of this work item
+# (2026-09-12; confirmed via `pip index versions boto3`). The
+# environment already had 1.34.46 installed as a transitive
+# dependency of nothing in particular; since no prior CD-2/CD-3 code
+# depended on that older version's behaviour, the latest stable
+# release is pinned here deliberately, matching the same rationale
+# WI-2 (CD-2) used for jsonschema above.
+#
+# persistence/objects/minio_store.py also imports
+# `botocore.exceptions` directly (to catch BotoCoreError/ClientError
+# and re-raise as the canonical StorageError rather than letting a
+# raw botocore exception escape) — but botocore's version is left to
+# boto3's own dependency resolution rather than pinned separately
+# here, since botocore is boto3's tightly-coupled low-level
+# transport and the two are always installed as a matched pair; there
+# is no independent version choice to make the way there was for
+# `referencing` (a jsonschema dependency imported for an unrelated
+# reason, cross-$ref resolution, that could in principle diverge from
+# jsonschema's own pin).
+#
+# SQLAlchemy, psycopg, alembic - introduced by CD-3 WI-1 (PostgreSQL
+# persistence), per the PL's explicit decision for that work item:
+#
+#   SQLAlchemy    - ORM/Core layer for the new persistence/postgres/
+#                   package (table definitions in
+#                   persistence/postgres/models.py, sessions/engine in
+#                   persistence/postgres/session.py). Chosen by PL
+#                   decision over a lighter/handwritten-SQL layer (PID
+#                   §54).
+#   psycopg[binary] - the PostgreSQL driver SQLAlchemy uses
+#                   (`postgresql+psycopg://` dialect), v3, per PL
+#                   decision. The `[binary]` extra bundles a
+#                   pre-compiled libpq so no system PostgreSQL
+#                   dev-headers/toolchain are required to install it.
+#   alembic       - migrations (`alembic.ini` at repo root,
+#                   `alembic/env.py`, `alembic/versions/`), per PL
+#                   decision (PID §12).
+#
+# Versions pinned to the current stable release of each as of this
+# work item (2026-09-12), verified via `pip index versions <pkg>`
+# against the live package index at delivery time:
+#   SQLAlchemy       2.0.52
+#   psycopg[binary]  3.3.5
+#   alembic          1.20.0
+#
+# FastAPI, Uvicorn, python-multipart - introduced by CD-3 WI-3 (Container
+# runtime), PL decision already made for this work item:
+#
+#   fastapi          - the HTTP framework for app/api/. Chosen (over a
+#                       bare WSGI app or Flask) because it gives typed
+#                       request/response models (Pydantic) for the
+#                       /internal/* marshalling layer almost for free, and
+#                       its ASGI foundation pairs directly with uvicorn
+#                       below. No domain logic lives in these models —
+#                       they exist purely for HTTP request/response
+#                       validation and translation to/from
+#                       core.api.BagmanCanonicalAPI calls (PID §24/§33).
+#   uvicorn[standard] - the ASGI server that actually runs the FastAPI
+#                       app (`uvicorn app.api.main:app`), invoked by
+#                       deployment/docker/api/entrypoint.sh after
+#                       migrations complete. The `[standard]` extra pulls
+#                       in uvloop/httptools for production-grade
+#                       performance rather than the pure-Python fallback
+#                       loop.
+#   python-multipart  - required by FastAPI/Starlette to parse
+#                       `multipart/form-data` request bodies — needed for
+#                       POST /internal/evidence, which accepts a JSON
+#                       metadata part alongside a raw file part (PID
+#                       §47/§48) in the same request.
+#
+# Versions pinned to the current stable release of each as of this work
+# item (2026-09-12), verified via `pip index versions <pkg>` against the
+# live package index at delivery time:
+#   fastapi           0.141.1
+#   uvicorn[standard] 0.52.4
+#   python-multipart  0.0.32
+#
 # Do not add anything else here without flagging it to the PL first.
 jsonschema==4.26.0
 rfc3339-validator==0.1.4
 PyYAML==6.0.2
 referencing==0.37.0
+boto3==1.43.93
+SQLAlchemy==2.0.52
+psycopg[binary]==3.3.5
+alembic==1.20.0
+fastapi==0.141.1
+uvicorn[standard]==0.52.4
+python-multipart==0.0.32

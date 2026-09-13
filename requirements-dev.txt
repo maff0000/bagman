@@ -6,3 +6,28 @@ pytest==8.3.4
 # PyYAML moved to requirements.txt by WI-3: it is now imported directly by
 # scripts/generate_architecture_memory.py, which is meant to run outside
 # test contexts (developer/CI drift-check usage), not only under pytest.
+#
+# httpx2 - added by CD-3 WI-3 PL-review re-verification: fastapi.testclient.
+# TestClient (used by tests/app_api/) requires it transitively via
+# starlette.testclient at test-collection time — the WI-3 dispatch that
+# introduced fastapi/starlette to requirements.txt never added this
+# dev-only test dependency, so `pytest tests/app_api/` failed to even
+# collect (`RuntimeError: ... requires the httpx2 package`) before this.
+# starlette 1.6.0 (pulled in transitively by fastapi==0.141.1) prefers
+# httpx2 over the now-deprecated `httpx`-with-starlette.testclient path.
+# Test-only (never imported by application code under app/), so it
+# belongs here, not in requirements.txt.
+httpx2==2.12.0
+#
+# requests - PL correction (CD-3 WI-4 review): tests/acceptance/_lib.py
+# imports `requests` directly to drive HTTP calls against the live
+# bagman-api for the restart/rebuild/restore-into-clean-target proof
+# scripts, but WI-4's own dispatch never declared it in either
+# requirements file — it only "worked" because `requests` happened to
+# already be installed on this host for something unrelated. Declared
+# here explicitly (test/ops tooling, never imported by app/) so a
+# clean environment built strictly from this repo's own pinned files
+# can actually run these scripts. Pinned to the current stable release
+# as of this correction (2026-09-12; verified via `pip index versions
+# requests`).
+requests==2.34.2

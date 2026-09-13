@@ -1,0 +1,157 @@
+"""``bagman-api`` — the FastAPI application instance (CD-3 WI-3, PID §24).
+
+Responsibilities of this module, and only this module:
+
+* build the ``FastAPI`` app and include every router in ``routers/``;
+* configure structured logging (``app.api.logging_config``) once,
+  at import time, before anything else runs;
+* attach one request-scoped correlation-id (PID §27) to every request/
+  response, generating a fresh one when a caller does not supply
+  ``X-Correlation-Id``;
+* centralise translation of ``core.errors.BagmanError`` (and any
+  unexpected exception) into an HTTP response — the exact mapping the
+  WI-3 contract specifies:
+
+  =================================  ===========
+  error                              HTTP status
+  =================================  ===========
+  ``ValidationError``                422
+  ``NotFoundError``                  404
+  ``ConflictError``                  409
+  ``DuplicateExternalReferenceError``409
+  ``ImmutabilityViolationError``     409
+  ``InvalidProvenanceError``         422
+  ``PersistenceError``               503
+  ``StorageError``                   503
+  anything else (incl. IntegrityError)  500
+  =================================  ===========
+
+  A 5xx response body never contains the underlying exception's raw
+  message (which, for ``PersistenceError``/``StorageError`` in
+  particular, may itself embed a driver/SQLAlchemy/botocore exception
+  string — see ``core/errors.py``) — only a generic, safe message plus
+  the correlation_id, so an operator can find the full detail in the
+  structured server-side log for that same correlation_id. A 4xx
+  response body (422/404/409) IS considered safe to return verbatim:
+  those messages are constructed by ``core``/``persistence`` from
+  caller-supplied field names and canonical IDs only (e.g. "entity_id
+  'x' already exists"), never from raw driver/provider exception text.
+"""
+from __future__ import annotations
+
+import logging
+import os
+import uuid
+
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+
+from core.errors import (
+    BagmanError,
+    ConflictError,
+    DuplicateExternalReferenceError,
+    ImmutabilityViolationError,
+    InvalidProvenanceError,
+    NotFoundError,
+    PersistenceError,
+    StorageError,
+    ValidationError,
+)
+from app.api.logging_config import configure_logging
+from app.api.routers import health, internal, version
+
+configure_logging(level=os.environ.get("BAGMAN_LOG_LEVEL", "INFO"))
+logger = logging.getLogger("bagman.runtime.api")
+
+app = FastAPI(title="BAGMAN Runtime API", version="1")
+
+app.include_router(health.router)
+app.include_router(version.router)
+app.include_router(internal.router)
+
+#: Ordered so a subclass is matched by the most specific applicable
+#: entry — every current core.errors.* type is a direct, flat subclass
+#: of BagmanError (see core/errors.py's own module docstring), so
+#: ordering does not currently matter for correctness, but the explicit
+#: per-type mapping (rather than an error_code string switch) is kept
+#: so a future error subclass fails loudly (falls through to the 500
+#: catch-all below) rather than silently inheriting an unrelated status.
+_STATUS_BY_ERROR_TYPE: dict[type[BagmanError], int] = {
+    ValidationError: 422,
+    NotFoundError: 404,
+    ConflictError: 409,
+    DuplicateExternalReferenceError: 409,
+    ImmutabilityViolationError: 409,
+    InvalidProvenanceError: 422,
+    PersistenceError: 503,
+    StorageError: 503,
+}
+
+#: 5xx statuses never return the raw exception message to the client
+#: (see module docstring) — only these client-actionable statuses do.
+_CLIENT_SAFE_STATUSES = frozenset({404, 409, 422})
+
+
+def _status_for(exc: BagmanError) -> int:
+    for error_type, status in _STATUS_BY_ERROR_TYPE.items():
+        if isinstance(exc, error_type):
+            return status
+    return 500  # anything else, e.g. IntegrityError — PID's literal mapping table
+
+
+@app.middleware("http")
+async def correlation_id_middleware(request: Request, call_next):
+    correlation_id = request.headers.get("x-correlation-id") or str(uuid.uuid4())
+    request.state.correlation_id = correlation_id
+    response = await call_next(request)
+    response.headers["X-Correlation-Id"] = correlation_id
+    return response
+
+
+@app.exception_handler(BagmanError)
+async def bagman_error_handler(request: Request, exc: BagmanError) -> JSONResponse:
+    status_code = _status_for(exc)
+    correlation_id = getattr(request.state, "correlation_id", None)
+
+    logger.log(
+        logging.WARNING if status_code < 500 else logging.ERROR,
+        "bagman_error",
+        extra={
+            "component": "bagman.runtime.api",
+            "correlation_id": correlation_id,
+            "event_type": exc.error_code,
+        },
+        exc_info=status_code >= 500,
+    )
+
+    if status_code in _CLIENT_SAFE_STATUSES:
+        body = {"error_code": exc.error_code, "message": exc.message}
+    else:
+        body = {
+            "error_code": exc.error_code,
+            "message": "an internal error occurred; see server logs for detail",
+            "correlation_id": correlation_id,
+        }
+    return JSONResponse(status_code=status_code, content=body)
+
+
+@app.exception_handler(Exception)
+async def unhandled_error_handler(request: Request, exc: Exception) -> JSONResponse:
+    correlation_id = getattr(request.state, "correlation_id", None)
+    logger.error(
+        "unhandled_error",
+        extra={
+            "component": "bagman.runtime.api",
+            "correlation_id": correlation_id,
+            "event_type": "UNHANDLED_ERROR",
+        },
+        exc_info=True,
+    )
+    return JSONResponse(
+        status_code=500,
+        content={
+            "error_code": "INTERNAL_ERROR",
+            "message": "an internal error occurred; see server logs for detail",
+            "correlation_id": correlation_id,
+        },
+    )

@@ -25,6 +25,39 @@ Own canonical identity, timestamp, error, contract-validation, and domain-model 
 - **External access:** `false`
 - **Prohibited:** `direct_email_access`, `direct_bank_access`, `direct_xero_access`, `direct_chargebee_access`
 
+### `BAGMAN.PERSISTENCE.OBJECTS` (v1)
+
+Own the EvidenceObjectStore abstraction (put/get/exists/verify_hash) for durable, immutable, content-addressed original-evidence-bytes storage, its MinIO/S3-compatible boto3 implementation, and — added by WI-3 — a narrow in-memory reference implementation used only by the runtime composition root's development/test mode. Core/domain code never depends on a storage-provider SDK directly (PID §53); this component is the only place that does.
+
+- **Owns:** _(none)_
+- **Consumes:** `BAGMAN.CORE`
+- **Produces:** _(none)_
+- **Dependencies:** `boto3`
+- **External access:** `false`
+- **Prohibited:** `direct_email_access`, `direct_bank_access`, `direct_xero_access`, `direct_chargebee_access`
+
+### `BAGMAN.PERSISTENCE.POSTGRES` (v1)
+
+Own durable, PostgreSQL-backed implementations of every CD-2 repository interface (GovernedEntity, Source, ExternalReference, EvidenceItem, Provenance, AuditEvent) plus the SQLAlchemy engine/ session factory and Alembic migration schema — preserving exactly the same canonical behaviour (immutability, idempotent external- reference/evidence-observation replay, append-only audit) as the in-memory reference implementations core/ and services/evidence/ ship, durably.
+
+- **Owns:** _(none)_
+- **Consumes:** `BAGMAN.CORE`, `BAGMAN.SERVICES.EVIDENCE`
+- **Produces:** _(none)_
+- **Dependencies:** `SQLAlchemy`, `psycopg`, `alembic`
+- **External access:** `false`
+- **Prohibited:** `direct_email_access`, `direct_bank_access`, `direct_xero_access`, `direct_chargebee_access`
+
+### `BAGMAN.RUNTIME.API` (v1)
+
+Own the FastAPI/Uvicorn HTTP-facing application layer that exposes BagmanCanonicalAPI as a runnable, containerised service: health/ readiness (with a hard no-fallback invariant on readiness failure), version metadata, structured logging, and thin internal HTTP wrappers around register_entity/register_source/register_evidence/ get_evidence/trace_provenance. Also owns the PID §14 composition root — the one place BAGMAN_RUNTIME_ENV is read to choose between in-memory and PostgreSQL+MinIO-backed repositories.
+
+- **Owns:** _(none)_
+- **Consumes:** `BAGMAN.CORE`, `BAGMAN.SERVICES.EVIDENCE`, `BAGMAN.PERSISTENCE.POSTGRES`, `BAGMAN.PERSISTENCE.OBJECTS`
+- **Produces:** _(none)_
+- **Dependencies:** `fastapi`, `uvicorn`, `python-multipart`, `SQLAlchemy`, `alembic`
+- **External access:** `false`
+- **Prohibited:** `direct_email_access`, `direct_bank_access`, `direct_xero_access`, `direct_chargebee_access`
+
 ### `BAGMAN.SERVICES.EVIDENCE` (v1)
 
 Own canonical EvidenceItem identity and its immutability and idempotent-observation semantics (an EvidenceItem, once recorded, is never mutated, and a replayed observation of the same external reference resolves to the existing record rather than creating a duplicate).
