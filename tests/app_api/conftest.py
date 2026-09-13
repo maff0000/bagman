@@ -52,7 +52,27 @@ MINIO_BUCKET = "bagman-test-wi3-objects"
 #: avoid any collision when both test modules happen to run in the
 #: same CI environment.
 CLAMAV_CONTAINER = "bagman-test-clamav-wi3"
-CLAMAV_IMAGE = "clamav/clamav:stable"
+#: CD-4 PR #4 Architect delta (2026-09-13): pinned to the SAME
+#: immutable digest as ``deployment/compose/docker-compose.yml``'s
+#: ``bagman-scan`` service, not merely the same ``:stable`` tag. This
+#: disposable fixture container is genuinely torn down after every test
+#: module run, so it is not itself the "proven CD-4 runtime" the
+#: Architect's delta is about — a case could be made that a
+#: throwaway, per-run container never needs an immutable identity the
+#: way a long-lived production service does. The call made here is to
+#: pin it anyway, for one concrete reason beyond "just match
+#: production": without a shared digest, this fixture and the real
+#: `bagman-scan` service could silently drift onto two different
+#: ClamAV builds (this one whenever `:stable` next moves upstream)
+#: without any test ever catching it — an intake test could then keep
+#: passing against a different scanner build than production actually
+#: runs, which defeats the point of these being real, non-mocked
+#: ClamAV tests at all. Keep this constant equal to
+#: docker-compose.yml's digest; update both together, deliberately,
+#: whenever the pin is intentionally moved forward.
+CLAMAV_IMAGE = (
+    "clamav/clamav:stable@sha256:1fdfd24c6f0a0fb60788481487459a6d4eda8a9b448641594e04db8410d34422"
+)
 CLAMAV_HOST_PORT = "33101"
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent

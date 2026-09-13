@@ -65,6 +65,7 @@ from fastapi.responses import Response
 from pydantic import BaseModel
 
 from app.api.composition import get_composition
+from app.api.http_headers import safe_content_disposition_header
 
 router = APIRouter(prefix="/internal")
 
@@ -177,6 +178,20 @@ async def get_evidence_content(evidence_id: str) -> Response:
     the way out, raising ``core.errors.IntegrityError`` (translated to
     an HTTP error by ``main.py``) if the stored bytes no longer match
     the hash encoded in the storage reference.
+
+    CD-4 PR #4 Architect delta (2026-09-13): the SERVER, not the GUI's
+    client-side ``<a download>`` attribute (``app/api/static/app.js``),
+    is now the actual safety boundary against this response being
+    rendered/navigated in-page rather than saved. Every response
+    carries a safely-encoded ``Content-Disposition: attachment`` header
+    (via ``safe_content_disposition_header`` — see
+    ``app/api/http_headers.py`` for why the encoding lives there,
+    isolated and independently tested) built from
+    ``evidence.original_name`` — untrusted, uploader-supplied input —
+    plus ``X-Content-Type-Options: nosniff`` so a browser never
+    MIME-sniffs the body against ``evidence.mime_type``. The bytes
+    served and the existing ``X-Bagman-*`` hash headers are unchanged
+    by this delta.
     """
     composition = get_composition()
     evidence = composition.api.get_evidence(evidence_id)
@@ -189,6 +204,20 @@ async def get_evidence_content(evidence_id: str) -> Response:
     data = composition.object_store.get(evidence.storage_reference)
     content_hash = dict(evidence.content_hash)
 
+    # Fallback used when no original_name was retained at all (or, per
+    # safe_content_disposition_header's own contract, if every
+    # character of one were somehow stripped as unsafe): a plain,
+    # already-safe, deterministic label derived from evidence_id alone
+    # — evidence_id is a BAGMAN-generated identifier, never
+    # uploader-controlled, so no further encoding of it is required. No
+    # attempt is made to guess a file extension from evidence.mime_type
+    # here (e.g. via the stdlib ``mimetypes`` module) — that mapping is
+    # inherently ambiguous/platform-dependent (several extensions can
+    # map to one MIME type and vice versa) and guessing wrong would be
+    # actively misleading; the client already receives the correct
+    # ``media_type`` on this same response for that purpose.
+    fallback_name = f"evidence-{evidence.evidence_id}"
+
     return Response(
         content=data,
         media_type=evidence.mime_type,
@@ -196,6 +225,11 @@ async def get_evidence_content(evidence_id: str) -> Response:
             "X-Bagman-Evidence-Id": evidence.evidence_id,
             "X-Bagman-Content-Hash-Algorithm": content_hash.get("algorithm", ""),
             "X-Bagman-Content-Hash-Value": content_hash.get("value", ""),
+            "Content-Disposition": safe_content_disposition_header(
+                evidence.original_name,
+                fallback=fallback_name,
+            ),
+            "X-Content-Type-Options": "nosniff",
         },
     )
 
