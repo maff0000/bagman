@@ -86,6 +86,20 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt -r requirements-dev.txt
 
+      - name: Check architecture memory projection
+        # PID.md §59 explicitly requires CI to continue running the
+        # architecture-memory drift check (established in CD-2,
+        # scripts/generate_architecture_memory.py --check). This was a
+        # real gap: the check was verified locally throughout CD-3's
+        # delivery but never wired into this workflow, so CI itself was
+        # never actually enforcing it. Architect-flagged during CD-3
+        # review; fixed here. Exits non-zero (fails the job) the moment
+        # any component.yaml/contract/entity-registry change drifts out
+        # of sync with the committed memory/generated/architecture-index.md.
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: python3 scripts/generate_architecture_memory.py --check
+
       - name: Run non-Docker test suites (security + contract + domain + architectural-boundary)
         env:
           # Belt-and-braces: pyproject.toml's [tool.pytest.ini_options]
