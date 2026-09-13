@@ -3,35 +3,57 @@
 # contracts/manifest/bagman.component_manifest.v1.schema.json.
 
 id: BAGMAN.EVIDENCE.INTAKE
-version: 1
+version: 2
 
 responsibility: >
   Own the single governed boundary through which untrusted, external/
   user-supplied bytes may become canonical BAGMAN evidence: the
   IntakeRecord domain object, its deterministic seven-state intake
   state machine (RECEIVED/VALIDATING/QUARANTINED/REJECTED/ACCEPTED/
-  REGISTERED/FAILED), and durable idempotency semantics for a
-  caller-supplied idempotency key. Does not itself perform content
-  validation, MIME detection, size enforcement, malware scanning, or
-  quarantine content handling (WI-2), expose any HTTP API (WI-3), or
-  own any GUI (WI-4) — CD-4 WI-1 is domain/persistence foundation only.
+  REGISTERED/FAILED), durable idempotency semantics for a
+  caller-supplied idempotency key (WI-1) — and, added by WI-2, the
+  actual content-validation/quarantine pipeline that runs while a
+  record is VALIDATING: filename safety (PID §14), bounded
+  streaming/spooling with incremental SHA-256 (PID §13/§23),
+  hand-rolled byte-level MIME/archive/executable detection (PID
+  §15-18), an explicit versionable intake policy (PID §34), the
+  EvidenceSafetyScanner abstraction plus a real ClamAV `clamd`-protocol
+  implementation (PID §19/§20), and quarantine/staging object storage
+  (PID §21/§22, via persistence/objects/store.py's prefixed key
+  scheme). WI-2's pipeline stops at ACCEPTED with bytes staged in the
+  object store — it does not itself register a canonical EvidenceItem,
+  expose any HTTP API (WI-3), or own any GUI (WI-4).
 
 owns:
   - IntakeRecord
 
-# What services/evidence/intake/intake.py actually imports from core/:
+# What services/evidence/intake/*.py actually imports from core/:
 # identity (id generation), timestamps (UTC handling), errors
 # (InvalidStateTransitionError, IdempotencyConflictError, NotFoundError,
-# ValidationError), and contract_validation (validate_against_contract).
+# ValidationError, FileTooLargeError, UnsupportedContentTypeError,
+# ContentTypeMismatchError, ScanFailedError), and contract_validation
+# (validate_against_contract). validation_pipeline.py depends on
+# persistence/objects/store.py's EvidenceObjectStore only structurally
+# (a local typing.Protocol naming the one method it needs,
+# put_prefixed) — it does not import persistence/ at all, preserving
+# the repo-wide layering direction (persistence/ depends on services/
+# contracts, never the reverse).
 consumes:
   - BAGMAN.CORE
 
-# This component does not itself emit audit events (WI-1 scope is
-# domain/persistence only — intake audit event emission is WI-3's
-# orchestration-layer responsibility, mirroring how core/api.py, not
-# services/evidence/, emits EVIDENCE_OBSERVED for EvidenceItem).
+# This component does not itself emit audit events (intake audit event
+# emission is WI-3's orchestration-layer responsibility, mirroring how
+# core/api.py, not services/evidence/, emits EVIDENCE_OBSERVED for
+# EvidenceItem).
 produces: []
 
+# No new third-party dependency was introduced by WI-2: MIME/archive/
+# executable detection is a hand-rolled byte sniffer (no python-magic —
+# see content_sniffing.py's module docstring for why libmagic's system-
+# package requirement was judged too risky for a clean-CI build), and
+# the ClamAV scanner talks to clamd's native TCP protocol directly via
+# the stdlib `socket` module (no `clamd` PyPI package — see scanner.py's
+# module docstring).
 dependencies:
   - jsonschema
   - rfc3339-validator

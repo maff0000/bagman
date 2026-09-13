@@ -108,6 +108,99 @@ def parse_object_key(storage_reference: str) -> Optional[Tuple[str, str]]:
     return match.group(1), match.group(2)
 
 
+# ---------------------------------------------------------------------
+# Quarantine / staging keys (CD-4 WI-2, PID §21/§22)
+# ---------------------------------------------------------------------
+#
+# Quarantined evidence (PID §21/§22) and an ACCEPTED-but-not-yet-
+# REGISTERED intake's validated bytes (PID §68 WI-2's "stored... ready
+# for WI-3 to pick up and register") both need a storage key that is
+# NEVER shaped like `object_key()`'s `evidence/<id>/<hash>` — mixing
+# them into the same key namespace as normal available evidence would
+# make quarantined/staged bytes indistinguishable BY KEY SHAPE from
+# canonical available evidence, which PID §22 explicitly requires stay
+# "logically separable". Rather than add two near-duplicate sibling
+# functions, both cases share one small, closed-vocabulary
+# `prefixed_object_key()` below — the prefix itself is restricted to
+# `_ALLOWED_PREFIXES` (never an arbitrary caller-supplied string), so
+# the full set of key shapes any BAGMAN object store can ever produce
+# stays small, fixed, and auditable.
+
+#: The only non-`evidence/` key prefixes CD-4 WI-2 introduces:
+#: `quarantine/<intake_id>/<hash>` (PID §21/§22) and
+#: `intake-staging/<intake_id>/<hash>` (an ACCEPTED intake's bytes,
+#: staged for WI-3's registration step to pick up — never itself a
+#: canonical `evidence/` key, since WI-2 never registers an
+#: `EvidenceItem`).
+_ALLOWED_PREFIXES = frozenset({"quarantine", "intake-staging"})
+
+_PREFIXED_KEY_PATTERN = re.compile(
+    r"^(quarantine|intake-staging)/([A-Za-z0-9._-]+)/([A-Za-z0-9._-]+)$"
+)
+
+
+def prefixed_object_key(prefix: str, object_id: str, content_hash_value: str) -> str:
+    """The deterministic, content-addressed storage key
+    ``<prefix>/<object_id>/<content_hash_value>`` for a non-canonical
+    (quarantine/staging) object (PID §21/§22). ``prefix`` must be one
+    of :data:`_ALLOWED_PREFIXES` — never an arbitrary string — so the
+    set of key shapes a BAGMAN object store can ever hold stays small
+    and fixed. ``object_id`` is an ``intake_id`` for both of today's
+    callers, but is named generically since a key under one of these
+    prefixes is never keyed by a canonical ``evidence_id``.
+    """
+    if prefix not in _ALLOWED_PREFIXES:
+        raise ValueError(
+            f"prefix must be one of {sorted(_ALLOWED_PREFIXES)}, got {prefix!r} — "
+            "object-store key shapes are a small, fixed, auditable set (PID §22)"
+        )
+    object_id = _validate_key_component("object_id", object_id)
+    content_hash_value = _validate_key_component("content_hash_value", content_hash_value.lower())
+    return f"{prefix}/{object_id}/{content_hash_value}"
+
+
+def parse_prefixed_object_key(storage_reference: str) -> Optional[Tuple[str, str, str]]:
+    """Recover ``(prefix, object_id, content_hash_value)`` from a
+    reference produced by :func:`prefixed_object_key`, or ``None`` if
+    ``storage_reference`` is not shaped that way."""
+    match = _PREFIXED_KEY_PATTERN.match(storage_reference)
+    if match is None:
+        return None
+    return match.group(1), match.group(2), match.group(3)
+
+
+def quarantine_object_key(intake_id: str, content_hash_value: str) -> str:
+    """``quarantine/<intake_id>/<content_hash_value>`` (PID §21/§22) —
+    the sibling of :func:`object_key` for quarantined material."""
+    return prefixed_object_key("quarantine", intake_id, content_hash_value)
+
+
+def staging_object_key(intake_id: str, content_hash_value: str) -> str:
+    """``intake-staging/<intake_id>/<content_hash_value>`` — an
+    ACCEPTED intake's validated bytes, stored ready for WI-3's
+    registration step to hand off to canonical evidence storage (CD-4
+    WI-2, PID §68). Deliberately never shaped like :func:`object_key`'s
+    `evidence/` prefix: WI-2 never registers an `EvidenceItem` itself."""
+    return prefixed_object_key("intake-staging", intake_id, content_hash_value)
+
+
+def expected_hash_from_reference(storage_reference: str) -> Optional[str]:
+    """The content-hash value encoded in ``storage_reference``,
+    regardless of whether it is a canonical :func:`object_key` or a
+    :func:`prefixed_object_key` (quarantine/staging) reference — or
+    ``None`` if it matches neither shape. Used by every
+    ``EvidenceObjectStore`` implementation's ``get()``/``_get_bytes()``
+    to self-check retrieved bytes against the hash the key itself
+    encodes, uniformly across all three key shapes."""
+    parsed = parse_object_key(storage_reference)
+    if parsed is not None:
+        return parsed[1]
+    prefixed = parse_prefixed_object_key(storage_reference)
+    if prefixed is not None:
+        return prefixed[2]
+    return None
+
+
 def normalize_hash_value(content_hash: Mapping[str, str]) -> str:
     """Extract and lower-case the ``value`` field of a
     ``{"algorithm": ..., "value": ...}`` content-hash mapping (the
@@ -154,6 +247,21 @@ class EvidenceObjectStore(abc.ABC):
         becomes the ``storage_reference`` field of a persisted
         ``EvidenceItem`` (wiring that persistence in is a different
         work item's responsibility).
+        """
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def put_prefixed(self, prefix: str, object_id: str, content_hash: Mapping[str, str], data: bytes) -> str:
+        """Same contract as :meth:`put` (hash verification before
+        accepting the write; a byte-identical re-put at the same key is
+        an idempotent no-op; different bytes at an already-occupied key
+        raise :class:`core.errors.ImmutabilityViolationError`), but
+        stores under :func:`prefixed_object_key`'s
+        ``<prefix>/<object_id>/<hash>`` shape instead of :meth:`put`'s
+        ``evidence/<evidence_id>/<hash>`` (PID §21/§22, CD-4 WI-2) —
+        used for quarantined material and for an ACCEPTED intake's
+        validated-but-not-yet-registered bytes. ``prefix`` must be one
+        of :func:`prefixed_object_key`'s allowed values.
         """
         raise NotImplementedError
 

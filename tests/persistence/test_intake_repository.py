@@ -189,6 +189,32 @@ def test_state_transition_persists_and_rejects_an_invalid_next_state(fresh_engin
     assert repo.get_intake_record(record.intake_id).status == "VALIDATING"
 
 
+def test_transition_status_persists_metadata_via_a_fresh_repository_instance(fresh_engine):
+    """PL reconciliation regression test (CD-4 WI-2): a `metadata`
+    field update passed to `transition_status` (e.g. the WI-2
+    validation pipeline stamping `storage_reference` into it on
+    ACCEPTED) must be durably persisted, not silently dropped — a gap
+    that a purely in-memory-repository test could never catch, since
+    `InMemoryIntakeRepository` stores the whole dataclass and would
+    mask exactly this defect."""
+    source = _make_source()
+    repo = PostgresIntakeRepository()
+    record = repo.create_intake_record(source_id=source.source_id)
+    repo.transition_status(record.intake_id, "VALIDATING")
+
+    updated_metadata = {"storage_reference": "intake-staging/some-intake-id/deadbeef"}
+    accepted = repo.transition_status(
+        record.intake_id,
+        "ACCEPTED",
+        metadata=updated_metadata,
+    )
+    assert accepted.metadata == updated_metadata
+
+    fresh_repo = PostgresIntakeRepository(engine=fresh_engine)
+    refetched = fresh_repo.get_intake_record(record.intake_id)
+    assert refetched.metadata == updated_metadata
+
+
 def test_quarantine_transition_persists_reason_and_completed_at():
     source = _make_source()
     repo = PostgresIntakeRepository()
