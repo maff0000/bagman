@@ -286,6 +286,40 @@ This is the same standard CD-1/CD-2/CD-3 held to: an Engineer's own report is ne
 
 ---
 
+## 6b. Independent Auditor (fresh, zero-context) — dispatched after all five WIs were merged
+
+A fresh Auditor with no prior context on this delivery was dispatched against the merged branch (head `66a7210` at dispatch time) to independently re-derive every PID §70 criterion from scratch — not trusting this evidence file's own claims, per Forge doctrine (PID §71). Summary of what the Auditor did and found:
+
+* Independently rebuilt a clean venv and re-ran every pytest suite (`tests/security`/`tests/contract`/`tests/integration` including the new PID §67 tests, `tests/persistence`, `tests/app_api`) — all green, matching the counts above.
+* Independently ran gitleaks twice (working-tree and full-history modes) — clean both times.
+* Independently stood up the real Docker Compose stack from a cold build and, themselves, drove a real upload/download/hash-compare, a path-traversal-filename rejection, a real EICAR upload/quarantine, an idempotency-conflict 409, and — with particular scrutiny, given this is where the delivery's own concurrency bug was found — **re-ran `idempotency_and_concurrency_proof.py` twice** (10 barrier-synchronized rounds total), confirming the fix holds under repeated independent reproduction, not just the original single run.
+* Independently ran `dependency_failure_proof.py` (all three dependencies stopped/recovered) and got Playwright/Chromium genuinely working for a real browser-level GUI check (not a fallback to HTTP-only reasoning).
+* Independently re-verified every PID §67 architecture claim by their own grep/AST inspection, not merely by re-running the delivery's own tests.
+* **Found one real, independent defect** this evidence file's own drafting had not caught: `tests/integration/test_architecture_boundaries.py::test_no_schema_file_hardcodes_a_provider_name_inside_a_structural_constraint` (pre-existing since CD-2, not one of WI-5's own nine new PID §67 tests, but living in the file WI-5 extended) built a `violations` list but contained **no `assert` statement at all** — it always passed regardless of content, providing zero actual enforcement. The Auditor confirmed the underlying property it is meant to protect currently holds (no live violation), but flagged the test itself as vacuous.
+* **Issued verdict: `BLOCKED`** — not `RED`, not `GREEN` — for exactly one reason: at audit time, **no pull request had ever been opened for any CD-4 branch**, and this repository's CI workflow only triggers on `pull_request`/`push:main`, so live CI had genuinely never executed against this code (confirmed via `gh api` against the real GitHub repository — zero PRs, zero Actions runs, zero check-runs for any `cd-4/*` branch or commit). PID §64's own standing lesson ("do not assume local green means CI green") and CD-3's own recorded history of real live-CI-only failures on this exact project make this a genuine, non-theoretical gap, not a formality. The Auditor was correct to refuse a self-issued `GREEN` in that circumstance, and explicitly noted this was the *only* blocking condition — every other §70 criterion they could independently test, they confirmed.
+
+**Both findings closed by the PL** (commit `3592c82`, on top of the audited `66a7210`): the vacuous test now has a real `assert not violations, ...` (re-verified: still passes — the property genuinely holds — and now actually enforces it going forward); PR #4 (`cd-4/evidence-intake-and-manual-upload-foundation` -> `main`) was opened, and live CI was observed directly by the PL — see §6c.
+
+## 6c. Live CI, observed (closing the Auditor's sole blocking finding)
+
+Per PID §64 and the standing lesson from CD-3 (local/Auditor-green and live-CI-green are different claims — always check the second directly): PR #4 was opened at `https://github.com/maff0000/bagman/pull/4`, head commit `3592c82`. The GitHub Actions "Security" workflow ran automatically on that PR and was watched directly by the PL to completion (`gh run watch`, not inferred from a webhook or assumed):
+
+```
+$ gh pr checks 4
+security	pass	1m35s	https://github.com/maff0000/bagman/actions/runs/34751927607/job/103709818157
+
+$ gh run view 34751927607
+✓ cd-4/evidence-intake-and-manual-upload-foundation Security #4 · 34751927607
+JOBS
+✓ security in 1m35s (ID 103709818157)
+```
+
+One benign annotation (GitHub's own Node.js 20 deprecation notice on the `actions/checkout`/`actions/setup-python` runner infrastructure — unrelated to BAGMAN's code, not a finding). Live CI is genuinely green at head `3592c82`, closing the independent Auditor's sole `BLOCKED` condition.
+
+With this, every PID §70 acceptance criterion has now been independently confirmed at least twice over (PL reconciliation + fresh Auditor + this live-CI observation) with no outstanding gap. Per Forge doctrine, the PL does not self-issue the final CD delivery verdict — that is the architect's ruling to make (as it was for CD-1/CD-2/CD-3) — but every precondition the PID's own verdict vocabulary (§72) requires for `INTAKE_FOUNDATION_GREEN` is, as of head `3592c82`, satisfied and independently evidenced above.
+
+---
+
 ## 7. Exit-gate statement (PID §73) — drafted, not issued
 
 Per PID §73, no live mailbox integration may begin until CD-4 reaches **INTAKE_FOUNDATION_GREEN**. This Engineer's own account of the evidence above supports that outcome — every PID §70 acceptance bullet was independently exercised against the real stack (not merely read about), the one genuine defect found during the whole delivery arc (§2.2) was fixed with a documented, narrow, root-cause fix rather than a workaround, and no mailbox/bank/accounting/billing connectivity or forbidden SDK exists anywhere in the tree. **The actual verdict — `INTAKE_FOUNDATION_GREEN`, `INTAKE_FOUNDATION_RED`, or `BLOCKED` — is the PL's to issue, after PL reconciliation and independent Auditor dispatch (PID §71), not this Engineer's.**

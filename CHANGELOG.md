@@ -107,8 +107,17 @@ All notable changes to BAGMAN will be documented in this file.
   acceptance via Playwright against the real Docker Compose stack);
   nine new architecture-boundary tests (PID §67).
 - No mailbox, bank, accounting, or billing connectivity implemented.
-- **Verdict: pending** — WI-5's own evidence trail drafted at
-  `memory/generated/CD4-EVIDENCE-INTAKE-AND-MANUAL-UPLOAD-FOUNDATION-EVIDENCE-2026-09-13.md`;
-  the PL reconciles, dispatches an independent Auditor (PID §71), and
-  issues the actual `INTAKE_FOUNDATION_GREEN`/`INTAKE_FOUNDATION_RED`/
-  `BLOCKED` verdict before this entry is finalised.
+- A fresh, independent Auditor reviewed the whole delivery cold,
+  re-ran everything from scratch, and found one additional real defect
+  (a pre-existing CD-2-era architecture test with no `assert`
+  statement, silently vacuous — fixed) and one blocking condition (no
+  live CI had ever run against any CD-4 branch, since no PR yet
+  existed). Both closed: PR #4 opened, live CI observed genuinely
+  green at head `3592c82`
+  (`https://github.com/maff0000/bagman/actions/runs/34751927607`).
+  Full evidence, including the Auditor's own report and the live-CI
+  confirmation, at
+  `memory/generated/CD4-EVIDENCE-INTAKE-AND-MANUAL-UPLOAD-FOUNDATION-EVIDENCE-2026-09-13.md`.
+- **Verdict: pending the architect's ruling** (PID §72/§73 — the same
+  standing as CD-1/CD-2/CD-3; the PL does not self-issue the final CD
+  delivery verdict).
