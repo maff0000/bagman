@@ -58,13 +58,13 @@ Own durable, PostgreSQL-backed implementations of every CD-2/CD-4 repository int
 - **External access:** `false`
 - **Prohibited:** `direct_email_access`, `direct_bank_access`, `direct_xero_access`, `direct_chargebee_access`
 
-### `BAGMAN.RUNTIME.API` (v1)
+### `BAGMAN.RUNTIME.API` (v2)
 
-Own the FastAPI/Uvicorn HTTP-facing application layer that exposes BagmanCanonicalAPI as a runnable, containerised service: health/ readiness (with a hard no-fallback invariant on readiness failure), version metadata, structured logging, and thin internal HTTP wrappers around register_entity/register_source/register_evidence/ get_evidence/trace_provenance. Also owns the PID §14 composition root — the one place BAGMAN_RUNTIME_ENV is read to choose between in-memory and PostgreSQL+MinIO-backed repositories.
+Own the FastAPI/Uvicorn HTTP-facing application layer that exposes BagmanCanonicalAPI as a runnable, containerised service: health/ readiness (with a hard no-fallback invariant on readiness failure, and — since CD-4 WI-3 — a mandatory content-safety scanner reachability check alongside PostgreSQL/object-store), version metadata, structured logging, thin internal HTTP wrappers around register_entity/register_source/get_evidence/list_evidence/ trace_provenance, and — CD-4 WI-3 — the governed Evidence Intake HTTP API (POST /internal/intake/evidence, GET /internal/intake[/{id}]): evidence-registration orchestration (staging bytes into canonical storage, registering the EvidenceItem, and the full intake audit causation chain) once WI-2's content-validation pipeline reaches ACCEPTED, plus closure of the CD-3 direct-upload bypass (the old byte-accepting POST /internal/evidence has been removed entirely). Also owns the PID §14 composition root — the one place BAGMAN_RUNTIME_ENV is read to choose between in-memory and PostgreSQL+MinIO+ClamAV-backed repositories/object-store/scanner — and the stable MANUAL_UPLOAD Source resolve-or-create lifecycle (PID §9).
 
 - **Owns:** _(none)_
-- **Consumes:** `BAGMAN.CORE`, `BAGMAN.SERVICES.EVIDENCE`, `BAGMAN.PERSISTENCE.POSTGRES`, `BAGMAN.PERSISTENCE.OBJECTS`
-- **Produces:** _(none)_
+- **Consumes:** `BAGMAN.CORE`, `BAGMAN.SERVICES.EVIDENCE`, `BAGMAN.EVIDENCE.INTAKE`, `BAGMAN.PERSISTENCE.POSTGRES`, `BAGMAN.PERSISTENCE.OBJECTS`
+- **Produces:** `INTAKE_RECEIVED`, `INTAKE_VALIDATION_STARTED`, `INTAKE_REJECTED`, `INTAKE_QUARANTINED`, `INTAKE_ACCEPTED`, `EVIDENCE_STORED`, `EVIDENCE_REGISTERED`, `INTAKE_COMPLETED`, `INTAKE_FAILED`
 - **Dependencies:** `fastapi`, `uvicorn`, `python-multipart`, `SQLAlchemy`, `alembic`
 - **External access:** `false`
 - **Prohibited:** `direct_email_access`, `direct_bank_access`, `direct_xero_access`, `direct_chargebee_access`

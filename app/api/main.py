@@ -23,8 +23,22 @@ Responsibilities of this module, and only this module:
   ``InvalidProvenanceError``         422
   ``PersistenceError``               503
   ``StorageError``                   503
+  ``IdempotencyConflictError``       409
+  ``InvalidStateTransitionError``    500
   anything else (incl. IntegrityError)  500
   =================================  ===========
+
+  CD-4 WI-3 additions: ``IdempotencyConflictError`` (PID §25/§35/§53 —
+  "a conflicting reuse of a key with different content must fail
+  loudly") is a genuine, client-actionable conflict, exactly like
+  ``ConflictError``/``ImmutabilityViolationError`` above — 409.
+  ``InvalidStateTransitionError`` is explicitly listed here (rather
+  than left to fall through to the generic-exception 500 default)
+  because it signals an internal orchestration bug (this codebase's own
+  state machine attempting an edge its own transition table forbids),
+  never a caller error — 500 is the correct, and intentional, mapping,
+  spelled out so a future reader does not mistake the omission for an
+  oversight.
 
   A 5xx response body never contains the underlying exception's raw
   message (which, for ``PersistenceError``/``StorageError`` in
@@ -50,15 +64,17 @@ from core.errors import (
     BagmanError,
     ConflictError,
     DuplicateExternalReferenceError,
+    IdempotencyConflictError,
     ImmutabilityViolationError,
     InvalidProvenanceError,
+    InvalidStateTransitionError,
     NotFoundError,
     PersistenceError,
     StorageError,
     ValidationError,
 )
 from app.api.logging_config import configure_logging
-from app.api.routers import health, internal, version
+from app.api.routers import health, intake, internal, version
 
 configure_logging(level=os.environ.get("BAGMAN_LOG_LEVEL", "INFO"))
 logger = logging.getLogger("bagman.runtime.api")
@@ -68,6 +84,7 @@ app = FastAPI(title="BAGMAN Runtime API", version="1")
 app.include_router(health.router)
 app.include_router(version.router)
 app.include_router(internal.router)
+app.include_router(intake.router)
 
 #: Ordered so a subclass is matched by the most specific applicable
 #: entry — every current core.errors.* type is a direct, flat subclass
@@ -85,6 +102,9 @@ _STATUS_BY_ERROR_TYPE: dict[type[BagmanError], int] = {
     InvalidProvenanceError: 422,
     PersistenceError: 503,
     StorageError: 503,
+    # CD-4 WI-3 additions — see module docstring.
+    IdempotencyConflictError: 409,
+    InvalidStateTransitionError: 500,
 }
 
 #: 5xx statuses never return the raw exception message to the client

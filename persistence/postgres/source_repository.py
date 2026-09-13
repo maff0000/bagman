@@ -112,3 +112,16 @@ class PostgresSourceRepository(SourceRepository):
                 return [_row_to_source(row) for row in rows]
         except SQLAlchemyError as exc:
             raise PersistenceError(f"could not list Source rows: {exc}") from exc
+
+    def find_by_provider(self, *, source_type: str, provider: str) -> Optional[Source]:
+        try:
+            with session_scope(self._engine) as session:
+                row = (
+                    session.query(SourceRow)
+                    .filter_by(source_type=source_type, provider=provider)
+                    .order_by(SourceRow.source_id)
+                    .first()
+                )
+                return _row_to_source(row) if row is not None else None
+        except SQLAlchemyError as exc:
+            raise PersistenceError(f"could not look up Source by provider: {exc}") from exc

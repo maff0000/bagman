@@ -292,7 +292,30 @@ class IntakeRepository(abc.ABC):
         raise NotImplementedError
 
     @abc.abstractmethod
-    def list_intake_records(self) -> list[IntakeRecord]:
+    def list_intake_records(
+        self,
+        *,
+        entity_hint: Optional[str] = None,
+        status: Optional[str] = None,
+        received_at_from: Optional[datetime] = None,
+        received_at_to: Optional[datetime] = None,
+        limit: Optional[int] = None,
+        offset: int = 0,
+    ) -> list[IntakeRecord]:
+        """List IntakeRecords, most-recently-received first (PID §44-45).
+
+        Default ordering is ``received_at DESC`` with ``intake_id`` as a
+        deterministic tie-breaker (PID §45's own recommendation).
+        ``entity_hint``/``status``/``received_at_from``/``received_at_to``
+        are optional equality/range filters (PID §44/§46) — omitted
+        filters match every record. ``limit``/``offset`` page the
+        result; ``limit=None`` (the default, preserved for every
+        existing caller that does not ask for pagination) returns every
+        matching record — a caller that wants CD-4 WI-3's "no unbounded
+        return everything" HTTP-boundary guarantee (PID §45) supplies an
+        explicit ``limit`` itself (as ``app/api/routers/intake.py``
+        always does).
+        """
         raise NotImplementedError
 
 
@@ -380,5 +403,28 @@ class InMemoryIntakeRepository(IntakeRepository):
         existing_id = self._by_idempotency_key.get(idempotency_key)
         return self._by_id[existing_id] if existing_id is not None else None
 
-    def list_intake_records(self) -> list[IntakeRecord]:
-        return sorted(self._by_id.values(), key=lambda r: r.intake_id)
+    def list_intake_records(
+        self,
+        *,
+        entity_hint: Optional[str] = None,
+        status: Optional[str] = None,
+        received_at_from: Optional[datetime] = None,
+        received_at_to: Optional[datetime] = None,
+        limit: Optional[int] = None,
+        offset: int = 0,
+    ) -> list[IntakeRecord]:
+        records = list(self._by_id.values())
+        if entity_hint is not None:
+            records = [r for r in records if r.entity_hint == entity_hint]
+        if status is not None:
+            records = [r for r in records if r.status == status]
+        if received_at_from is not None:
+            records = [r for r in records if r.received_at >= received_at_from]
+        if received_at_to is not None:
+            records = [r for r in records if r.received_at <= received_at_to]
+
+        records.sort(key=lambda r: (r.received_at, r.intake_id), reverse=True)
+
+        if limit is None:
+            return records[offset:]
+        return records[offset : offset + limit]

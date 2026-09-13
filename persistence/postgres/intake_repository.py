@@ -311,14 +311,35 @@ class PostgresIntakeRepository(IntakeRepository):
         except SQLAlchemyError as exc:
             raise PersistenceError(f"could not look up IntakeRecord by idempotency_key: {exc}") from exc
 
-    def list_intake_records(self) -> list[IntakeRecord]:
+    def list_intake_records(
+        self,
+        *,
+        entity_hint: Optional[str] = None,
+        status: Optional[str] = None,
+        received_at_from=None,
+        received_at_to=None,
+        limit: Optional[int] = None,
+        offset: int = 0,
+    ) -> list[IntakeRecord]:
         try:
             with session_scope(self._engine) as session:
-                rows = (
-                    session.query(IntakeRecordRow)
-                    .order_by(IntakeRecordRow.received_at.desc(), IntakeRecordRow.intake_id.desc())
-                    .all()
+                query = session.query(IntakeRecordRow)
+                if entity_hint is not None:
+                    query = query.filter(IntakeRecordRow.entity_hint == entity_hint)
+                if status is not None:
+                    query = query.filter(IntakeRecordRow.status == status)
+                if received_at_from is not None:
+                    query = query.filter(IntakeRecordRow.received_at >= received_at_from)
+                if received_at_to is not None:
+                    query = query.filter(IntakeRecordRow.received_at <= received_at_to)
+                query = query.order_by(
+                    IntakeRecordRow.received_at.desc(), IntakeRecordRow.intake_id.desc()
                 )
+                if offset:
+                    query = query.offset(offset)
+                if limit is not None:
+                    query = query.limit(limit)
+                rows = query.all()
                 return [_row_to_intake(row) for row in rows]
         except SQLAlchemyError as exc:
             raise PersistenceError(f"could not list IntakeRecord rows: {exc}") from exc

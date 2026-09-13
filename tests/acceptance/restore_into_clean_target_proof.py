@@ -64,18 +64,23 @@ def main() -> int:
     )
     content = f"BAGMAN WI-4 restore-into-clean-target-proof synthetic evidence bytes (run {rid})\n".encode("utf-8")
     external_id = f"wi4-restore-proof-{rid}-file"
+    # CD-4 WI-3: via the governed intake endpoint, not the removed CD-3
+    # direct route — see tests/acceptance/_lib.py's register_evidence()
+    # docstring. Manual upload always resolves to BAGMAN's own stable
+    # MANUAL_UPLOAD source and always registers entity_id=None;
+    # entity_hint/idempotency_key replace the old entity_id/source_id/
+    # external_reference parameters.
     evidence = _lib.register_evidence(
-        entity_id=entity["entity_id"],
-        source_id=source["source_id"],
+        entity_hint=entity["canonical_name"],
         content=content,
         original_name=f"wi4-restore-proof-{rid}.txt",
-        external_reference_external_id=external_id,
         actor_id=actor_id,
+        idempotency_key=external_id,
     )
     evidence_id = evidence["evidence_id"]
     content_hash = evidence["content_hash"]
-    print(f"    entity_id      = {entity['entity_id']}")
-    print(f"    source_id      = {source['source_id']}")
+    print(f"    entity_id (unresolved, CD-4) = {evidence['entity_id']}")
+    print(f"    source_id (MANUAL_UPLOAD)    = {evidence['source_id']}")
     print(f"    evidence_id    = {evidence_id}")
     print(f"    content_hash   = {content_hash}")
 
