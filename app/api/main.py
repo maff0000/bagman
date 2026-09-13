@@ -76,6 +76,7 @@ from fastapi.responses import JSONResponse
 from starlette.staticfiles import StaticFiles
 
 from core.errors import (
+    ActiveInvocationConflictError,
     BagmanError,
     ConflictError,
     DuplicateExternalReferenceError,
@@ -89,7 +90,7 @@ from core.errors import (
     ValidationError,
 )
 from app.api.logging_config import configure_logging
-from app.api.routers import health, intake, internal, version
+from app.api.routers import ai, health, intake, internal, version
 
 configure_logging(level=os.environ.get("BAGMAN_LOG_LEVEL", "INFO"))
 logger = logging.getLogger("bagman.runtime.api")
@@ -100,6 +101,7 @@ app.include_router(health.router)
 app.include_router(version.router)
 app.include_router(internal.router)
 app.include_router(intake.router)
+app.include_router(ai.router)
 
 #: CD-4 WI-4 — the BAGMAN Documents GUI (PID §36-42), served as plain
 #: static assets. Mounted LAST and at "/" so it never shadows any
@@ -127,6 +129,12 @@ _STATUS_BY_ERROR_TYPE: dict[type[BagmanError], int] = {
     # CD-4 WI-3 additions — see module docstring.
     IdempotencyConflictError: 409,
     InvalidStateTransitionError: 500,
+    # CD-5 WI-2 addition: a genuine, client-actionable conflict — a
+    # non-terminal AIInvocation already exists for this exact
+    # (task_id, task_version, primary_input_reference) subject (PID
+    # §73) — exactly the same class of thing ConflictError/
+    # IdempotencyConflictError above already map to 409 for.
+    ActiveInvocationConflictError: 409,
 }
 
 #: 5xx statuses never return the raw exception message to the client

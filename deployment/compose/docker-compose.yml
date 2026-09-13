@@ -47,6 +47,15 @@ secrets:
     file: /srv/bagman-secrets/minio_root_user
   minio_root_user_password:
     file: /srv/bagman-secrets/minio_root_user_password
+  # CD-5 WI-2 (PID §13): the BAGMAN-scoped virtual key for the EXISTING
+  # Trinity LiteLLM installation — never a second inference-control-plane
+  # deployment (PID §8). Provisioned externally by Matt directly, same
+  # discipline as the three secrets above. NOTE the real provisioned
+  # filename is `litellm_gateway_key`, not the `trinity_litellm_api_key`
+  # name PID §13's own text originally guessed (confirmed present at this
+  # path immediately before this WI began).
+  litellm_gateway_key:
+    file: /srv/bagman-secrets/litellm_gateway_key
 
 services:
   bagman-db:
@@ -189,12 +198,26 @@ services:
       BAGMAN_OBJECT_STORE_SECRET_KEY_FILE: /run/secrets/minio_root_user_password
       BAGMAN_SCANNER_HOST: bagman-scan
       BAGMAN_SCANNER_PORT: "3310"
+      # CD-5 WI-2 (PID §8/§15/§50): the existing Trinity LiteLLM
+      # installation's endpoint, alias-only requests
+      # (bagman-fast/bagman-core/bagman-deep — never a raw model name,
+      # never the Mac mini directly). The exact production network path
+      # between this Compose project's bagman-net and wherever the
+      # Trinity LiteLLM container actually runs is a deployment-level
+      # integration detail established by whoever wires the two Compose
+      # projects together (PID §15) — NOT invented here; this default
+      # matches what this WI's own local inspection found reachable at
+      # build time and must be reviewed/updated by whoever completes
+      # that wiring.
+      BAGMAN_LITELLM_ENDPOINT: http://localhost:4000
+      BAGMAN_LITELLM_API_KEY_FILE: /run/secrets/litellm_gateway_key
       BAGMAN_LOG_LEVEL: INFO
       TZ: UTC
     secrets:
       - postgres_password
       - minio_root_user
       - minio_root_user_password
+      - litellm_gateway_key
     # The one deliberate host-published entry point (PID §5) — bound to
     # loopback only, not 0.0.0.0.
     ports:

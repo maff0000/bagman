@@ -3,7 +3,7 @@
 # contracts/manifest/bagman.component_manifest.v1.schema.json.
 
 id: BAGMAN.AI
-version: 1
+version: 2
 
 responsibility: >
   Own the governed, provider-NEUTRAL AI invocation domain model and
@@ -11,19 +11,22 @@ responsibility: >
   machine and its one-active-invocation-per-subject concurrency
   guarantee (CD-5 PID §26-30/§73-76), and the TaskContract/TASK_REGISTRY
   framework naming CD-5's four initial tasks' metadata and real,
-  usable input/output JSON Schemas (PID §21-24/§55). WI-1 delivers only
+  usable input/output JSON Schemas (PID §21-24/§55). WI-1 delivered only
   the domain/contract/persistence slice of BAGMAN.AI's eventual
   responsibility (PID §7's full statement: "route typed BAGMAN
   intelligence tasks to an authorised AI provider/capability, enforce
   task contracts and policy, record invocation provenance, validate
   structured responses and return proposals without directly mutating
-  canonical business state") — it does NOT yet route anything to a
-  real provider: no gateway, no LiteLLM/Anthropic client, no prompt
-  content, no policy-enforcement dispatch loop. Those are WI-2
-  (`ai/providers/litellm/`, `ai/gateway/`), WI-3 (`ai/providers/claude/`,
-  plus `agent/`'s Claude-orchestration/tool-registry pieces), and WI-5
-  (`ai/evaluation/`) — this manifest will grow `owns`/`consumes` as
-  those work items land their own `ai/*` subpackages.
+  canonical business state"). WI-2 lands the BACKGROUND half of that:
+  `ai/providers/litellm/` (the one LiteLLM-speaking adapter, its
+  mechanical alias-only enforcement, and its deterministic fake) and
+  `ai/gateway/` (`run_background_task`'s full REQUESTED -> RUNNING ->
+  terminal orchestration, PID §57 audit emission) — each now has its
+  own `component.yaml`, consuming this one. Real prompt CONTENT for the
+  three BACKGROUND tasks lives at `ai/prompts/` (PID §31), loaded by
+  `ai/gateway/background.py`. Still outstanding: `ai/providers/claude/`
+  and the `agent/` Claude-orchestration/tool-registry pieces (WI-3), and
+  `ai/evaluation/` (WI-5).
 
 owns:
   - AIInvocation
