@@ -182,6 +182,41 @@ def make_intake_record(new_id, now_str) -> Callable[..., dict]:
 
 
 @pytest.fixture
+def make_ai_invocation(new_id, now_str) -> Callable[..., dict]:
+    """Factory for a minimal valid `bagman.ai_invocation.v1` instance
+    dict (CD-5 WI-1)."""
+
+    def _make(**overrides: Any) -> dict:
+        instance = {
+            "ai_invocation_id": new_id(),
+            "task_id": "DOCUMENT_TYPE_PROPOSAL",
+            "task_version": 1,
+            "role": "BACKGROUND",
+            "provider": "LITELLM",
+            "capability_alias": "bagman-fast",
+            "provider_model": None,
+            "started_at": now_str(),
+            "completed_at": None,
+            "status": "REQUESTED",
+            "correlation_id": new_id(),
+            "actor": {"actor_type": "SYSTEM", "actor_id": "bagman-test-harness"},
+            "input_references": {"evidence_id": new_id()},
+            "prompt_contract_version": None,
+            "output": None,
+            "confidence": None,
+            "validation_result": None,
+            "error_code": None,
+            "usage_metadata": {},
+            "latency_ms": None,
+            "schema_version": "bagman.ai_invocation.v1",
+        }
+        instance.update(overrides)
+        return instance
+
+    return _make
+
+
+@pytest.fixture
 def make_audit_event(new_id, now_str) -> Callable[..., dict]:
     """Factory for a minimal valid `bagman.audit_event.v1` instance dict."""
 

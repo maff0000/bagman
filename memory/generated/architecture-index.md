@@ -14,6 +14,17 @@
 
 ## Components
 
+### `BAGMAN.AI` (v1)
+
+Own the governed, provider-NEUTRAL AI invocation domain model and typed task contract/registry framework: the AIInvocation state machine and its one-active-invocation-per-subject concurrency guarantee (CD-5 PID §26-30/§73-76), and the TaskContract/TASK_REGISTRY framework naming CD-5's four initial tasks' metadata and real, usable input/output JSON Schemas (PID §21-24/§55). WI-1 delivers only the domain/contract/persistence slice of BAGMAN.AI's eventual responsibility (PID §7's full statement: "route typed BAGMAN intelligence tasks to an authorised AI provider/capability, enforce task contracts and policy, record invocation provenance, validate structured responses and return proposals without directly mutating canonical business state") — it does NOT yet route anything to a real provider: no gateway, no LiteLLM/Anthropic client, no prompt content, no policy-enforcement dispatch loop. Those are WI-2 (`ai/providers/litellm/`, `ai/gateway/`), WI-3 (`ai/providers/claude/`, plus `agent/`'s Claude-orchestration/tool-registry pieces), and WI-5 (`ai/evaluation/`) — this manifest will grow `owns`/`consumes` as those work items land their own `ai/*` subpackages.
+
+- **Owns:** `AIInvocation`, `TaskContract`
+- **Consumes:** `BAGMAN.CORE`
+- **Produces:** _(none)_
+- **Dependencies:** `jsonschema`, `rfc3339-validator`
+- **External access:** `false`
+- **Prohibited:** `direct_email_access`, `direct_bank_access`, `direct_xero_access`, `direct_chargebee_access`, `direct_litellm_client_outside_gateway`, `direct_anthropic_client_outside_gateway`, `trinity_star_alias_usage`
+
 ### `BAGMAN.CORE` (v1)
 
 Own canonical identity, timestamp, error, contract-validation, and domain-model primitives (GovernedEntity, Source, ExternalReference, Provenance, AuditEvent) plus their in-memory reference repositories, and expose the single BagmanCanonicalAPI orchestration facade (core/api.py) that composes these with services/evidence/ to record every canonical write's audit event — including EVIDENCE_OBSERVED, which is emitted from here even though EvidenceItem itself is owned by services/evidence/ (see the `produces` note below).
@@ -47,12 +58,12 @@ Own the EvidenceObjectStore abstraction (put/put_prefixed/get/exists/ verify_has
 - **External access:** `false`
 - **Prohibited:** `direct_email_access`, `direct_bank_access`, `direct_xero_access`, `direct_chargebee_access`
 
-### `BAGMAN.PERSISTENCE.POSTGRES` (v1)
+### `BAGMAN.PERSISTENCE.POSTGRES` (v2)
 
-Own durable, PostgreSQL-backed implementations of every CD-2/CD-4 repository interface (GovernedEntity, Source, ExternalReference, EvidenceItem, Provenance, AuditEvent, IntakeRecord) plus the SQLAlchemy engine/session factory and Alembic migration schema — preserving exactly the same canonical behaviour (immutability, idempotent external-reference/evidence-observation/intake replay, append-only audit) as the in-memory reference implementations core/ and services/evidence/ ship, durably.
+Own durable, PostgreSQL-backed implementations of every CD-2/CD-4/CD-5 repository interface (GovernedEntity, Source, ExternalReference, EvidenceItem, Provenance, AuditEvent, IntakeRecord, AIInvocation) plus the SQLAlchemy engine/session factory and Alembic migration schema — preserving exactly the same canonical behaviour (immutability, idempotent external-reference/evidence-observation/intake replay, append-only audit, one-active-invocation-per-subject concurrency, CD-5 PID §73) as the in-memory reference implementations core/, services/evidence/, and ai/ ship, durably.
 
 - **Owns:** _(none)_
-- **Consumes:** `BAGMAN.CORE`, `BAGMAN.SERVICES.EVIDENCE`, `BAGMAN.EVIDENCE.INTAKE`
+- **Consumes:** `BAGMAN.CORE`, `BAGMAN.SERVICES.EVIDENCE`, `BAGMAN.EVIDENCE.INTAKE`, `BAGMAN.AI`
 - **Produces:** _(none)_
 - **Dependencies:** `SQLAlchemy`, `psycopg`, `alembic`
 - **External access:** `false`
@@ -84,6 +95,7 @@ Own canonical EvidenceItem identity and its immutability and idempotent-observat
 
 | `$id` | Title | Path |
 |-------|-------|------|
+| `https://bagman.internal/contracts/ai/bagman.ai_invocation.v1.schema.json` | BAGMAN AIInvocation | `contracts/ai/bagman.ai_invocation.v1.schema.json` |
 | `https://bagman.internal/contracts/audit/bagman.audit_event.v1.schema.json` | BAGMAN AuditEvent | `contracts/audit/bagman.audit_event.v1.schema.json` |
 | `https://bagman.internal/contracts/common/bagman.identifier.v1.schema.json` | BAGMAN Canonical Identifier | `contracts/common/bagman.identifier.v1.schema.json` |
 | `https://bagman.internal/contracts/common/bagman.schema_version.v1.schema.json` | BAGMAN Contract Schema Version | `contracts/common/bagman.schema_version.v1.schema.json` |
