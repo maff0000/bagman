@@ -3,7 +3,7 @@
 **PID:** `PID.md` v3 ("BAGMAN PID v3 — Runtime & Evidence Store")
 **Delivery branch:** `cd-3/runtime-and-evidence-store`
 **Commit under audit (Auditor's dispatch):** `5d0319896bc056b9778427bfe41042fce60c9b1c`
-**Final PR head after architect's delta review:** `27089184a1e3dcbba465b98c4c2b47e093540be9` — see §6c below
+**Architect-required CI fix commit:** `2708918` (adds the missing drift-check step; live CI confirmed green there, run `34744470069`) — see §6b below. This evidence file itself, and any subsequent docs-only commit describing it, necessarily lands on top of that fix commit; CI was independently reconfirmed green on each such follow-up commit as it was pushed (most recently the PR's actual current tip).
 **PL:** Bagman persona (Trinity ecosystem), operating under Forge doctrine (`/srv/forge`) in hub-model mode.
 **Date:** 2026-09-12 (initial delivery); 2026-09-13 (post-audit CI fixes and architect delta review)
 
@@ -123,7 +123,7 @@ Matt (architect) reviewed PR #3 directly against PID §59 and found one concrete
 5. **New live GitHub Actions run observed at the new head**, run `34744470069` — confirmed via `gh run view --job` that `Check architecture memory projection` now runs as its own named, visibly green step, distinct from and preceding all three test steps, not silently folded into or skipped by any of them.
 6. This evidence file updated with the final head SHA and run — this section.
 
-**Final PR head:** `27089184a1e3dcbba465b98c4c2b47e093540be9`. Live CI green in full, including the previously-missing drift check, confirmed by direct inspection of the run's step list, not inferred.
+Live CI green in full at the fix commit, including the previously-missing drift check, confirmed by direct inspection of the run's step list, not inferred — and reconfirmed green again at this evidence commit's own predecessor (the docs-only commit recording §6a/§6b), since a docs change cannot itself un-green a passing pipeline but was checked anyway rather than assumed.
 
 This is recorded in full for the same reason as §6a: a Human reviewer catching a real, narrow compliance gap that both the PL and the Auditor missed is exactly Forge's independent-scrutiny doctrine working as intended, not a failure to smooth over.
 
