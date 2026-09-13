@@ -60,6 +60,62 @@ def test_unsafe_filenames_are_rejected(unsafe_name):
         assert_filename_safe(unsafe_name)
 
 
+@pytest.mark.parametrize(
+    "codepoint,label",
+    [
+        (0x061C, "ALM"),
+        (0x200E, "LRM"),
+        (0x200F, "RLM"),
+        (0x202A, "LRE"),
+        (0x202B, "RLE"),
+        (0x202C, "PDF"),
+        (0x202D, "LRO"),
+        (0x202E, "RLO"),
+        (0x2066, "LRI"),
+        (0x2067, "RLI"),
+        (0x2068, "FSI"),
+        (0x2069, "PDI"),
+    ],
+)
+def test_bidi_format_control_characters_are_rejected_anywhere_in_the_name(codepoint, label):
+    """CD-5 WI-5 (PID §66): every bidi/directional-format control
+    character this module documents must be rejected regardless of
+    position (start, middle, end) in an otherwise-ordinary filename."""
+    char = chr(codepoint)
+    for candidate in (f"{char}invoice.pdf", f"invoice{char}.pdf", f"invoice.pdf{char}"):
+        assert is_filename_safe(candidate) is False, f"{label} ({candidate!r}) should be rejected"
+        with pytest.raises(ValidationError):
+            assert_filename_safe(candidate)
+
+
+def test_bidi_override_spoofed_extension_attack_is_rejected():
+    """The canonical real-world attack this hardening item exists to
+    close (PID §66's own "invisible/rendering-altering" concern, and
+    CD-4's Auditor's own original finding): a filename using U+202E
+    (RLO) so that a dangerous true extension (`.exe`) is what a human
+    operator's save/download dialog actually WRITES to disk, while the
+    text visually appears to end in a harmless extension (`.png`) —
+    the classic "invoice<RLO>gnp.exe" pattern, which renders (RLO
+    onward) as "invoice" + the reverse of "exe.png" = "invoice" +
+    "gnp.exe" reversed-on-screen to read as "...exe.png"-shaped text,
+    while the actual on-disk/underlying character sequence still ends
+    literally in ".exe". BAGMAN must refuse to retain this filename at
+    all, exactly like the existing path-traversal/control-character
+    fixtures above — never attempt to "safely render" it.
+    """
+    rlo = "‮"
+    hostile = f"invoice{rlo}gnp.exe"
+    assert is_filename_safe(hostile) is False
+    with pytest.raises(ValidationError):
+        assert_filename_safe(hostile)
+    # The intake-level UNSAFE_FILENAME failure_code this rejection
+    # surfaces as end-to-end is proven at
+    # tests/integration/test_intake_validation_pipeline.py::
+    # test_bidi_override_spoofed_extension_filename_is_rejected_before_any_scanning
+    # — this module only owns is_filename_safe/assert_filename_safe
+    # themselves, not the pipeline's failure_code mapping.
+
+
 def test_ambiguous_unicode_normalisation_is_rejected():
     # U+FB01 LATIN SMALL LIGATURE FI normalises under NFC to "fi" — the
     # raw string differs from its own NFC form, which is exactly the
