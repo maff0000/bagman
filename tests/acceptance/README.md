@@ -112,6 +112,54 @@ python3 tests/acceptance/browser_acceptance_proof.py   # requires: pip install p
   playwright && python3 -m playwright install chromium`) — deliberately
   not added to `requirements-dev.txt`; see the CD-4 WI-5 evidence file.
 
+## CD-5 WI-5 additions (AI Foundation acceptance, PID §81-88)
+
+Same style/rigor, same reasons for NOT being `pytest`-collected. Each
+also independently brings the stack up first; run them in any order
+(none perform a final `down -v`):
+
+```bash
+python3 tests/acceptance/mac_mini_background_tier_live_proof.py
+python3 tests/acceptance/trinity_escalation_live_proof.py
+python3 tests/acceptance/claude_operator_live_proof.py
+python3 tests/acceptance/prompt_injection_live_proof.py
+python3 tests/acceptance/ai_gui_browser_acceptance_proof.py   # requires: pip install playwright && python3 -m playwright install chromium
+```
+
+* `mac_mini_background_tier_live_proof.py` — PID §14/§83/§87: real
+  `bagman-fast`/`bagman-core` calls via the real HTTP surface against
+  the real, existing Trinity LiteLLM installation. Proves this WI's own
+  `host.docker.internal`/`extra_hosts` container-network fix holds for
+  real, re-checks the (previously found down) LiteLLM-gateway backing
+  database live, and honestly reports either a genuine live completion
+  or the exact real blocked outcome. Also proves canonical-evidence
+  non-interference, no silent cross-tier fallback, restart survival,
+  and retry semantics.
+* `trinity_escalation_live_proof.py` — PID §81/§82/§87: the real
+  `bagman-deep` alias, exercised via the real `LiteLLMClient` directly
+  inside the real running `bagman-api` container (no CD-5 task
+  contract currently prefers `bagman-deep`, so no HTTP-level task
+  triggers it — a genuine, documented gap; see the script's own module
+  docstring for why this is still a real, non-fake proof of the alias/
+  adapter/gateway path).
+* `claude_operator_live_proof.py` — PID §81/§84/§88: re-checks
+  `/srv/bagman-secrets/anthropic_api_key`'s existence live and attempts
+  a real Ask BAGMAN call regardless; honestly reports
+  `CLAUDE_AUTHENTICATION_FAILED` (the expected, correct, fail-closed
+  outcome while the key remains absent) or completes the full real
+  proof if the key now exists.
+* `prompt_injection_live_proof.py` — PID §77-80/§85: synthetic evidence
+  containing hostile instructions, uploaded through the real intake
+  pipeline; a real `POST /internal/ai/tasks` attempt against whichever
+  tier is genuinely reachable; plus an explicitly fake-backed
+  structural proof (the real orchestration function, inside the real
+  container) for the part the real tier's own outage currently blocks.
+* `ai_gui_browser_acceptance_proof.py` — PID §86: real headless
+  Chromium against the real stack — Overview AI status, Documents
+  regression, the AI Analysis panel (real analysis attempt, real
+  provenance/capability-alias display), Ask BAGMAN (real or honestly
+  fallback-rendered), and clean failure-state rendering throughout.
+
 ## Failure proof (PID §45) — not duplicated here
 
 The hash-mismatch-rejection proof required by PID §45 is not

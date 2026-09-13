@@ -1,0 +1,47 @@
+# BAGMAN component manifest (CD-5 PID §19/§59-61) for ai/evaluation/.
+# Validated by scripts/generate_architecture_memory.py against
+# contracts/manifest/bagman.component_manifest.v1.schema.json.
+
+id: BAGMAN.AI.EVALUATION
+version: 1
+
+responsibility: >
+  Own the mandatory CD-5 evaluation harness (PID §59-61, WI-5): golden/
+  synthetic fixtures (ai/evaluation/fixtures.py) covering structured-
+  output validity, expected classification (a harness/contract-shape
+  self-test, not a live-model quality benchmark — no real model is
+  reachable today, see the WI-5 delivery report), abstention/
+  uncertainty distinguished from a confident wrong answer, malformed
+  output (not-JSON and schema-invalid), and timeout/transport error
+  handling — each run for real through the REAL
+  ai.gateway.background.run_background_task orchestration function
+  against a deterministic ai.providers.litellm.fake.FakeLiteLLMClient,
+  never a reimplementation of that logic. Reuses (never duplicates)
+  WI-2's/WI-3's own existing prompt-injection structural proofs
+  (ai/evaluation/injection_reuse.py, invoked as a real pytest
+  subprocess against their existing files) as this harness's
+  prompt-injection-resilience category. Runnable standalone
+  (`python3 -m ai.evaluation.run`) and pytest-collected
+  (tests/integration/test_ai_evaluation_harness.py). Entirely
+  deterministic — no live credentials, no network access (PID §61).
+
+owns: []
+
+consumes:
+  - BAGMAN.AI
+  - BAGMAN.AI.GATEWAY
+  - BAGMAN.AI.PROVIDERS.LITELLM
+
+produces: []
+
+dependencies: []
+
+external_access: false
+
+prohibited:
+  - direct_email_access
+  - direct_bank_access
+  - direct_xero_access
+  - direct_chargebee_access
+  - live_provider_credentials_required
+  - trinity_star_alias_usage

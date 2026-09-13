@@ -36,6 +36,17 @@ Own the governed, provider-NEUTRAL AI invocation domain model and typed task con
 - **External access:** `false`
 - **Prohibited:** `direct_email_access`, `direct_bank_access`, `direct_xero_access`, `direct_chargebee_access`, `direct_litellm_client_outside_gateway`, `direct_anthropic_client_outside_gateway`, `trinity_star_alias_usage`
 
+### `BAGMAN.AI.EVALUATION` (v1)
+
+Own the mandatory CD-5 evaluation harness (PID §59-61, WI-5): golden/ synthetic fixtures (ai/evaluation/fixtures.py) covering structured- output validity, expected classification (a harness/contract-shape self-test, not a live-model quality benchmark — no real model is reachable today, see the WI-5 delivery report), abstention/ uncertainty distinguished from a confident wrong answer, malformed output (not-JSON and schema-invalid), and timeout/transport error handling — each run for real through the REAL ai.gateway.background.run_background_task orchestration function against a deterministic ai.providers.litellm.fake.FakeLiteLLMClient, never a reimplementation of that logic. Reuses (never duplicates) WI-2's/WI-3's own existing prompt-injection structural proofs (ai/evaluation/injection_reuse.py, invoked as a real pytest subprocess against their existing files) as this harness's prompt-injection-resilience category. Runnable standalone (`python3 -m ai.evaluation.run`) and pytest-collected (tests/integration/test_ai_evaluation_harness.py). Entirely deterministic — no live credentials, no network access (PID §61).
+
+- **Owns:** _(none)_
+- **Consumes:** `BAGMAN.AI`, `BAGMAN.AI.GATEWAY`, `BAGMAN.AI.PROVIDERS.LITELLM`
+- **Produces:** _(none)_
+- **Dependencies:** _(none)_
+- **External access:** `false`
+- **Prohibited:** `direct_email_access`, `direct_bank_access`, `direct_xero_access`, `direct_chargebee_access`, `live_provider_credentials_required`, `trinity_star_alias_usage`
+
 ### `BAGMAN.AI.GATEWAY` (v1)
 
 Own BACKGROUND-role task orchestration (CD-5 PID §6/§21-30/§57-58/ §73-76, WI-2): run_background_task drives one AIInvocation through its full REQUESTED -> RUNNING -> {SUCCEEDED, FAILED} lifecycle against the ai.providers.litellm adapter, using ai.prompts' versioned prompt assets, validating output via ai.tasks.validate_task_output, and emitting AI_INVOCATION_REQUESTED / AI_INVOCATION_SUCCEEDED / AI_INVOCATION_FAILED / AI_OUTPUT_REJECTED with full causation chaining. Provider- and composition-agnostic by construction (the repository, LiteLLM client, and audit-event emitter are all dependency-injected, never imported from app/api/ or persistence/ directly) so this component is fully unit-testable against deterministic fakes (PID §61). The OPERATOR-role equivalent (Claude) is WI-3's own addition to this same package, not this manifest's current scope — run_background_task explicitly refuses any OPERATOR-role task_id.

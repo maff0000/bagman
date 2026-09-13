@@ -1,15 +1,16 @@
-"""PID §26-30/§73-74 'AI invocation persistence' proofs (CD-5 WI-1).
+"""PID §26-30/§73-74 'AI invocation persistence' proofs (CD-5 WI-1;
+genuine-threaded-race proof added CD-5 WI-5).
 
-The "genuine concurrent-create race" proof below deliberately does NOT
-use real threads/true concurrency (that full proof is WI-5's job,
-mirroring the same deferral CD-4 WI-1 documented for intake's
-idempotency-key race) — it simulates a race between two repository
-instances by making the SECOND instance's optimistic pre-check
-(`find_active_invocation`) report "nothing active yet" (via
-`unittest.mock.patch.object`), forcing it down the same
-insert-then-translate-the-real-constraint-violation code path a
-genuine concurrent caller would hit, deterministically and without
-flakiness.
+The "genuine concurrent-create race" proof immediately below deliberately
+does NOT use real threads/true concurrency (that full proof is WI-5's
+job — see `test_genuinely_concurrent_threads_racing_the_same_subject_...`
+near the bottom of this file — mirroring the same deferral CD-4 WI-1
+documented for intake's idempotency-key race) — it simulates a race
+between two repository instances by making the SECOND instance's
+optimistic pre-check (`find_active_invocation`) report "nothing active
+yet" (via `unittest.mock.patch.object`), forcing it down the same
+insert-then-translate-the-real-constraint-violation code path a genuine
+concurrent caller would hit, deterministically and without flakiness.
 
 Unlike CD-4 WI-1's intake idempotency-key race (which has a
 replay-vs-conflict ambiguity to resolve, requiring a second read of the
@@ -18,9 +19,32 @@ real unique-violation on `uq_ai_invocations_active_subject` always means
 exactly one thing — "an active invocation already exists for this
 subject" — so the repository never needs to re-read anything to decide
 the outcome; see `persistence/postgres/ai_invocation_repository.py`.
+
+CD-5 WI-5's own real-threaded proof (PID §73/§91's "Persistence" bullet:
+"retries/history durable; restart safe" and the WI-5 dispatch's own
+"a genuine race between multiple attempts to create/analyse the same
+subject, resolved cleanly via the real database constraint, never a
+silent duplicate")
+------------------------------------------------------------------------
+Unlike CD-4's own `idempotency_and_concurrency_proof.py` (which needed a
+`docker compose exec`-into-the-running-container trick to force genuine
+interleaving, because `bagman-api` itself runs as a single Uvicorn
+worker with no `await` in its own handler body — see that script's own
+module docstring), this proof does not need that: `pytest tests/
+persistence/` already talks to a REAL, disposable PostgreSQL container
+over a REAL TCP socket (`127.0.0.1:55432`, `tests/persistence/conftest.py`).
+Real Python `threading.Thread`s, each with their OWN
+`PostgresAIInvocationRepository`/SQLAlchemy `Engine`, calling
+`create_invocation` for the exact same subject at (as near as a
+`threading.Barrier` can arrange) the same instant, genuinely release the
+GIL during that socket I/O — so this IS a true concurrent race against
+the real database, not a simulation, proven by inspecting the actual
+wall-clock overlap of each thread's own call window below.
 """
 from __future__ import annotations
 
+import threading
+import time
 from unittest import mock
 
 import pytest
@@ -337,3 +361,83 @@ def test_list_invocations_by_primary_input_reference_includes_terminal_rows():
 def test_list_invocations_primary_input_reference_with_no_matches_returns_empty():
     found = PostgresAIInvocationRepository().list_invocations(primary_input_reference=identity.generate_id())
     assert found == []
+
+
+# ---------------------------------------------------------------------
+# CD-5 WI-5 — genuine real-threaded race against the real database (see
+# module docstring for why real threads talking to a real remote
+# PostgreSQL genuinely interleave here, unlike CD-4's own single-worker
+# HTTP-layer concurrency proof).
+# ---------------------------------------------------------------------
+
+
+def test_genuinely_concurrent_threads_racing_the_same_subject_resolve_to_exactly_one_active_invocation():
+    evidence_id = identity.generate_id()
+    n_workers = 8
+    barrier = threading.Barrier(n_workers)
+
+    results: list[dict] = [{} for _ in range(n_workers)]
+
+    def _worker(index: int) -> None:
+        # Each thread gets its OWN repository/engine — never shared —
+        # so this is genuinely n independent callers, not n threads
+        # sharing one connection (which would prove nothing about a
+        # real multi-caller race).
+        repo = PostgresAIInvocationRepository()
+        barrier.wait()  # all n_workers threads attempt create_invocation as close to simultaneously as possible
+        start = time.monotonic()
+        try:
+            invocation = _create_background(repo, evidence_id, task_id="DOCUMENT_TYPE_PROPOSAL")
+            results[index] = {
+                "outcome": "created",
+                "ai_invocation_id": invocation.ai_invocation_id,
+                "start": start,
+                "end": time.monotonic(),
+            }
+        except ActiveInvocationConflictError:
+            results[index] = {"outcome": "conflict", "start": start, "end": time.monotonic()}
+
+    threads = [threading.Thread(target=_worker, args=(i,)) for i in range(n_workers)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+
+    # Every thread must have finished and reported an outcome — none
+    # silently hung or crashed unhandled.
+    assert all(r for r in results), f"one or more worker threads did not complete: {results}"
+
+    created = [r for r in results if r["outcome"] == "created"]
+    conflicted = [r for r in results if r["outcome"] == "conflict"]
+
+    # This is the actual proof this test exists for: EXACTLY one winner,
+    # never zero (a bug that let the constraint block every attempt) and
+    # never more than one (a bug that let a duplicate active row
+    # through) — resolved by the real database constraint
+    # (`uq_ai_invocations_active_subject`), not merely by an
+    # application-level pre-check that could itself race.
+    assert len(created) == 1, (
+        f"expected exactly ONE winning create_invocation call for the same subject under a genuine "
+        f"concurrent race, got {len(created)}: {results}"
+    )
+    assert len(conflicted) == n_workers - 1, f"expected every other thread to receive a real conflict: {results}"
+
+    # Confirm genuine wall-clock overlap actually occurred — i.e. this
+    # was a real race, not an accidental serialisation where thread 2
+    # never even started until thread 1 had already finished (which
+    # would make the "conflict" outcomes trivial/meaningless).
+    windows = [(r["start"], r["end"]) for r in results]
+    overlap_found = any(
+        a_start < b_end and b_start < a_end
+        for i, (a_start, a_end) in enumerate(windows)
+        for j, (b_start, b_end) in enumerate(windows)
+        if i < j
+    )
+    assert overlap_found, f"no genuine wall-clock overlap detected between worker call windows: {windows}"
+
+    # Exactly one row exists for this subject at the database level —
+    # no orphaned duplicate, no silently-vanished row.
+    assert _invocation_count_for_subject("DOCUMENT_TYPE_PROPOSAL", 1, evidence_id) == 1
+
+    winner = PostgresAIInvocationRepository().get_invocation(created[0]["ai_invocation_id"])
+    assert winner.status == "REQUESTED"

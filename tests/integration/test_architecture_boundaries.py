@@ -558,6 +558,79 @@ def test_no_forbidden_mailbox_or_provider_sdk_imported_anywhere_in_the_repo():
     )
 
 
+# ---------------------------------------------------------------------
+# CD-5 WI-5 (PID §9/§75/§87/§92) — the full REPO-WIDE trinity-* alias
+# sweep. `tests/security/test_ai_litellm_alias_lockdown.py` already
+# proves this for WI-2's OWN new files
+# (`test_no_trinity_star_alias_literal_in_this_wis_new_files`); this is
+# the wider check PID §92's Auditor instruction and PID §9's own
+# "BAGMAN's own architecture-boundary tests must assert that no BAGMAN
+# source file references a trinity-* alias at all" require: every
+# application source file in the repository, not just ai/providers/
+# ai/gateway/ai/prompts/app/api/routers/ai.py.
+#
+# Deliberately EXCLUDES `tests/` itself: several existing test files
+# legitimately use `trinity-fast`/`trinity-core`/`trinity-deep`/
+# `trinity-embed` as literal ADVERSARIAL/NEGATIVE fixture values (e.g.
+# `tests/integration/test_litellm_client.py`'s own
+# "reject every forbidden alias" parametrisation, `tests/contract/
+# test_ai_invocation_contract.py`'s "this value must fail contract
+# validation" fixture) — a test proving BAGMAN rejects a trinity-*
+# alias necessarily contains that string once, and that is correct,
+# not a violation. What matters is that no APPLICATION source file
+# (everything BAGMAN actually ships/runs) contains one.
+# ---------------------------------------------------------------------
+
+_TRINITY_STAR_ALIASES_REPO_WIDE = ["trinity-fast", "trinity-core", "trinity-deep", "trinity-embed"]
+_APPLICATION_SOURCE_ROOTS = (
+    "ai",
+    "agent",
+    "app",
+    "core",
+    "persistence",
+    "services",
+    "adapters",
+    "ui",
+    "scripts",
+    "ops",
+    "config",
+    "deployment",
+    "contracts",
+)
+
+
+def test_no_trinity_star_alias_literal_anywhere_in_application_source():
+    """PID §9/§75/§87/§92: no `trinity-fast`/`trinity-core`/`trinity-deep`/
+    `trinity-embed` literal may exist anywhere in BAGMAN's own shipped
+    application source — only `bagman-fast`/`bagman-core`/`bagman-deep`
+    (`ai.invocation.BACKGROUND_CAPABILITY_ALIASES`) are ever permitted.
+    Scans every file (not just `.py`) under the application-source
+    roots, so a stray reference in a `.yml`/`.md`/`.json`/`.sh` file
+    would be caught too, not just a Python import."""
+    violations: list[str] = []
+    for root_name in _APPLICATION_SOURCE_ROOTS:
+        root = REPO_ROOT / root_name
+        if not root.is_dir():
+            continue
+        for path in sorted(root.rglob("*")):
+            if not path.is_file():
+                continue
+            try:
+                text = path.read_text(encoding="utf-8", errors="strict")
+            except (UnicodeDecodeError, OSError):
+                continue  # binary/unreadable file — not a source-literal concern
+            lowered = text.lower()
+            for bad_alias in _TRINITY_STAR_ALIASES_REPO_WIDE:
+                if bad_alias in lowered:
+                    violations.append(f"{path.relative_to(REPO_ROOT)} contains {bad_alias!r}")
+
+    assert violations == [], (
+        "no application source file may reference a trinity-* alias — only bagman-* aliases "
+        f"are permitted anywhere BAGMAN actually ships/runs (PID §9/§75/§87/§92):\n"
+        + "\n".join(violations)
+    )
+
+
 def test_requirements_files_do_not_mention_forbidden_mailbox_or_provider_sdks():
     forbidden_package_tokens = [
         "msal", "google-api-python-client", "google-auth", "imapclient",
