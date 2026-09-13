@@ -1,0 +1,89 @@
+# BAGMAN component manifest (PID §7/§19) for agent/.
+# Validated by scripts/generate_architecture_memory.py against
+# contracts/manifest/bagman.component_manifest.v1.schema.json.
+#
+# New component (CD-5 WI-3): agent/ existed since CD-1 as reserved,
+# empty scaffolding (agent/bagman/, agent/tools/, agent/policies/,
+# agent/memory/ — each a placeholder README only) with no
+# component.yaml of its own yet. This is the first work item to
+# populate it, so this is the first manifest for it.
+
+id: BAGMAN.AGENT
+version: 1
+
+responsibility: >
+  Own the BAGMAN AI agent's own reasoning/orchestration layer: the Ask
+  BAGMAN operator-orchestration loop (agent/bagman/ — system-prompt
+  construction, the bounded Claude tool-calling loop, AIInvocation
+  lifecycle management, PID §57 audit emission) and the fixed,
+  read-only/analyse-only governed tool registry Claude may invoke
+  (agent/tools/ — CD-5 PID §34's 8 named tools, mechanically
+  fail-closed dispatch per PID §63). This component decides WHICH of
+  BAGMAN's own internal APIs/repositories a registered tool may call
+  and HOW an Ask BAGMAN conversation is assembled/bounded (PID §53); it
+  never instantiates an Anthropic/LiteLLM client itself (that lives in
+  ai/providers/*/, consumed here only through the provider-neutral
+  ClaudeClientProtocol/BackgroundTaskRunner seams) and never allows
+  Claude to invoke anything outside the fixed tool set or to mutate
+  canonical state (PID §17/§56). agent/policies/ and agent/memory/
+  remain empty CD-1 placeholders as of this WI — WI-3 found no
+  genuinely CD-5-scoped content for either (see WI-3's delivery
+  report): no autonomous policy engine is authorised yet (PID §16 —
+  the tool registry's own fixed authority classes ARE this WI's
+  governance boundary), and Ask BAGMAN's conversation state is
+  in-request-only (PID §64 — no durable chat-memory-fabric integration
+  is built this WI).
+
+owns: []
+
+# agent/bagman/orchestrator.py depends on: ai.invocation
+# (AIInvocation/AIInvocationRepository — reused, never reimplemented),
+# ai.tasks (get_task_contract/validate_task_output — the ASK_BAGMAN v1
+# task contract this WI additively registered there),
+# ai.providers.claude.client (ClaudeClientProtocol and the Claude*Error
+# vocabulary — never a concrete ClaudeClient import here, only the
+# Protocol), agent.tools.registry (ToolRegistry/ToolExecutionContext),
+# and core.errors.ValidationError. agent/tools/handlers.py depends on
+# core.api.BagmanCanonicalAPI, services.evidence.intake.intake
+# .IntakeRepository, ai.invocation.AIInvocationRepository, and
+# agent.tools.background.BackgroundTaskRunner (a structural Protocol,
+# mirroring services/evidence/intake/validation_pipeline.py's own
+# _ObjectStore Protocol pattern) — never a WI-2 import (WI-2's real
+# background gateway does not exist in this worktree).
+consumes:
+  - BAGMAN.AI
+  - BAGMAN.CORE
+  - BAGMAN.SERVICES.EVIDENCE
+  - BAGMAN.EVIDENCE.INTAKE
+
+# agent/bagman/orchestrator.py is the orchestration layer that emits
+# the PID §57 AI-invocation audit events themselves (via
+# core.api.BagmanCanonicalAPI.record_audit_event(), not a new
+# repository — the same pattern app/api/routers/intake.py already
+# established for the intake-workflow events) — the event TYPES
+# themselves are minted here, not inside ai/ (see ai/component.yaml's
+# own `produces: []` and its docstring for why AIInvocation persistence
+# itself does not emit audit events).
+produces:
+  - AI_INVOCATION_REQUESTED
+  - AI_INVOCATION_SUCCEEDED
+  - AI_INVOCATION_FAILED
+  - AI_OUTPUT_REJECTED
+
+# No third-party dependency of its own — agent/ depends only on other
+# BAGMAN components (ai/, core/, services/evidence/); jsonschema is
+# used transitively via core.contract_validation, not imported directly
+# here.
+dependencies: []
+
+external_access: false
+
+prohibited:
+  - direct_email_access
+  - direct_bank_access
+  - direct_xero_access
+  - direct_chargebee_access
+  - direct_anthropic_client_outside_ai_providers_claude
+  - direct_litellm_client_outside_ai_providers_litellm
+  - arbitrary_tool_invocation
+  - canonical_state_mutation

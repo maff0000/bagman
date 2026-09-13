@@ -1,5 +1,6 @@
 """Filename safety validation for untrusted uploader-supplied filenames
-(PID §14, CD-4 WI-2).
+(PID §14, CD-4 WI-2; bidi/format-control hardening added CD-5 WI-5,
+PID §66).
 
 An ``original_filename`` is retained purely for operator DISPLAY (PID
 §14) — it must never be allowed to influence a filesystem or
@@ -13,6 +14,40 @@ all; it is intentionally defensive, since a filename is hostile input
 This module never itself touches a filesystem path with the untrusted
 value — no ``open()``, no ``os.path.join()``, nothing. It only
 inspects the string's characters/length/shape.
+
+Bidi/format-control hardening (CD-5 WI-5, PID §66)
+----------------------------------------------------
+Closes the CD-4 Auditor's carried-forward backlog item
+(``bagman:backlog:filename_bidi_spoofing_hardening``, first flagged
+during the CD-4 PR #4 delta round's focused Auditor pass — see
+``app/api/http_headers.py``'s own module docstring for the other half
+of that finding). The gap: this module's NFKC round-trip check (see
+:func:`is_filename_safe`) catches compatibility-equivalence tricks
+(ligatures, full/half-width variants) but a Unicode *bidi/format
+control* character is not touched by NFKC normalisation at all — it
+survives untouched, so a filename such as ``"invoice"
++ U+202E + "cod.exe"`` (the classic RLO attack: everything after the
+override renders right-to-left, so a human operator visually reads
+this as something ending in ``exe.doc`` while the actual byte sequence
+still ends ``...exe``) previously passed ``is_filename_safe`` cleanly.
+
+Chosen rejection set, and why: every code point in Unicode's own
+"Explicit Directional Formatting Characters" family, i.e. exactly the
+9 the PID names (U+202A LRE, U+202B RLE, U+202C PDF, U+202D LRO, U+202E
+RLO, U+2066 LRI, U+2067 RLI, U+2068 FSI, U+2069 PDI) plus the three
+narrower directional MARKS from the same functional family that are
+not covered by the C0/C1 control check above but exist for exactly the
+same "influence bidirectional rendering order" purpose and are
+documented by the Unicode Standard alongside the nine above (U+200E
+LRM, U+200F RLM, U+061C ALM). All twelve are zero-width-or-invisible
+formatting characters whose *entire* purpose is to change how
+surrounding text is rendered/ordered without changing what characters
+are "there" — precisely the property a display-only, security-relevant
+field must never trust. No other Unicode block is added: this module
+does not attempt a general confusable-script defence (a much larger,
+separate problem — homoglyph detection — deliberately out of this
+bounded item's scope, per the PID's own "bounded security-hardening
+item, not open-ended" framing).
 """
 from __future__ import annotations
 
@@ -50,6 +85,44 @@ def _has_control_character(name: str) -> bool:
 #: component anywhere regardless.
 _DANGEROUS_SEPARATORS = ("/", "\\")
 
+#: CD-5 WI-5 (PID §66) — Unicode bidi/directional-format control
+#: characters rejected outright, regardless of position. See this
+#: module's own docstring ("Bidi/format-control hardening") for the
+#: exact rationale for each member and why this set (not a broader
+#: confusable-script defence) is the right bounded scope.
+#: Built via `chr(codepoint)` rather than embedding the literal
+#: characters in this source file: these code points are, by
+#: definition, invisible-or-rendering-altering (that is the entire
+#: property this module exists to reject) — writing them literally
+#: into a `.py` file would make THIS file's own source visually
+#: reorder/hide itself in an editor or terminal, which is exactly the
+#: confusing effect being guarded against, not something to reproduce
+#: here for the sake of a slightly shorter literal.
+_BIDI_FORMAT_CONTROL_CHARACTERS = frozenset(
+    chr(codepoint)
+    for codepoint in (
+        0x061C,  # ALM — Arabic Letter Mark
+        0x200E,  # LRM — Left-to-Right Mark
+        0x200F,  # RLM — Right-to-Left Mark
+        0x202A,  # LRE — Left-to-Right Embedding
+        0x202B,  # RLE — Right-to-Left Embedding
+        0x202C,  # PDF — Pop Directional Formatting
+        0x202D,  # LRO — Left-to-Right Override
+        0x202E,  # RLO — Right-to-Left Override (the classic spoofed-
+                 # extension attack: "invoice" + RLO + "cod.exe" renders,
+                 # right-to-left from the override on, as something a
+                 # human reads left-to-right as ending "...exe.doc")
+        0x2066,  # LRI — Left-to-Right Isolate
+        0x2067,  # RLI — Right-to-Left Isolate
+        0x2068,  # FSI — First Strong Isolate
+        0x2069,  # PDI — Pop Directional Isolate
+    )
+)
+
+
+def _has_bidi_format_control_character(name: str) -> bool:
+    return any(ch in _BIDI_FORMAT_CONTROL_CHARACTERS for ch in name)
+
 
 def is_filename_safe(
     original_filename: Optional[str],
@@ -82,12 +155,19 @@ def is_filename_safe(
       round-trip comparison rather than attempting to allow-list
       "safe" Unicode ranges, which is an open-ended problem this
       narrow display-only field does not need to solve generally.
+    * any Unicode bidi/directional-format control character (CD-5 WI-5,
+      PID §66) — see this module's own docstring for the exact set and
+      rationale; these are not caught by the NFKC round-trip check
+      above (bidi controls are format characters, not compatibility-
+      equivalent ones) and must be checked independently.
     """
     if original_filename is None:
         return True
     if not isinstance(original_filename, str):
         return False
     if original_filename == "" or original_filename in (".", ".."):
+        return False
+    if _has_bidi_format_control_character(original_filename):
         return False
     if len(original_filename) > max_length:
         return False
@@ -129,8 +209,8 @@ def assert_filename_safe(
         return
     preview = "" if original_filename is None else repr(original_filename[:80])
     raise ValidationError(
-        "original_filename failed PID §14 safety validation (path traversal, "
-        "absolute path, control character, path separator, pathological "
-        "length, or ambiguous Unicode) — refusing to retain it even for "
-        f"display: {preview}"
+        "original_filename failed PID §14/§66 safety validation (path traversal, "
+        "absolute path, control character, bidi/directional-format control "
+        "character, path separator, pathological length, or ambiguous Unicode) "
+        f"— refusing to retain it even for display: {preview}"
     )

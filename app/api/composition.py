@@ -49,14 +49,23 @@ wedged "not ready" forever after one transient failure.
 """
 from __future__ import annotations
 
+import functools
 import os
 import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Any, Mapping, Optional
 
+from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
+from agent.tools.background import BackgroundTaskRunner, DeterministicFakeBackgroundTaskRunner
+from agent.tools.handlers import ToolDependencies, build_default_tool_registry
+from agent.tools.registry import ToolRegistry
+from ai.invocation import AIInvocationRepository
+from ai.providers.claude.client import ClaudeClientProtocol
+from ai.providers.claude.fake import FakeClaudeClient
+from ai.providers.litellm.client import LiteLLMClientProtocol
 from core import actor
 from core.api import BagmanCanonicalAPI
 from persistence.objects.store import EvidenceObjectStore
@@ -146,6 +155,80 @@ class _AlwaysCleanDevelopmentScanner(EvidenceSafetyScanner):
         return True
 
 
+def _dev_mode_litellm_default_response(system_instructions: str) -> "LiteLLMCompletionResult":
+    """`FakeLiteLLMClient`'s `default_response` for development/test
+    composition (CD-5 WI-4 gap closure).
+
+    Without this, `BAGMAN_RUNTIME_ENV=development uvicorn app.api.main:app`
+    plus a real click on the GUI's "Run analysis" button would 500
+    immediately: `FakeLiteLLMClient.complete()` raises `AssertionError`
+    when nothing was pre-scripted and no `default_response` exists (see
+    that module's own docstring) — there was previously no interactive/
+    manual way to see a background-task result without pre-scripting one
+    via a test harness, which does not exist in a live dev server.
+
+    Matches `agent/tools/background.py`'s own
+    `DeterministicFakeBackgroundTaskRunner._canned_output_for` in spirit
+    exactly: a small, fixed, structurally-valid-per-task canned output,
+    never phrased to look like a plausible real model answer (PID §61).
+    Since `FakeLiteLLMClient.complete()` hands `default_response` the
+    exact `system_instructions` string it was called with (rather than
+    a bare zero-arg factory), this can determine which of the three
+    CD-5 background tasks is actually running from that text — each
+    task's prompt asset names its own `task_id` verbatim (e.g. "task
+    DOCUMENT_SUMMARY" — see `ai/prompts/*/v1.md`) — and return an
+    output shaped to match THAT task's own `output_schema`, so a
+    genuine `SUCCEEDED` result renders in the GUI rather than an
+    `OUTPUT_SCHEMA_INVALID` failure caused merely by guessing wrong.
+    """
+    import json as _json
+
+    from ai.providers.litellm.client import LiteLLMCompletionResult, LiteLLMOutcomeStatus
+
+    _dev_warning = (
+        "(dev-mode fake response — not a real model result; no live LiteLLM/Mac-mini/"
+        "Trinity call was made)"
+    )
+    if "task DOCUMENT_TYPE_PROPOSAL" in system_instructions:
+        content: dict = {
+            "proposed_type": "UNKNOWN",
+            "confidence": 0.0,
+            "signals": [],
+            "warnings": [_dev_warning],
+        }
+    elif "task DOCUMENT_SUMMARY" in system_instructions:
+        content = {
+            "summary": f"{_dev_warning} — no real document summary was generated.",
+            "confidence": 0.0,
+            "signals": [],
+            "warnings": [_dev_warning],
+        }
+    elif "task ENTITY_PROPOSAL" in system_instructions:
+        content = {
+            "proposed_entity_hint": None,
+            "confidence": 0.0,
+            "signals": [],
+            "warnings": [_dev_warning],
+        }
+    else:
+        # No CD-5 BACKGROUND task registered today falls outside the
+        # three branches above (see ai/tasks.py::TASK_REGISTRY) — this
+        # is a defensive fallback only, for a future task this dev-mode
+        # default has not been taught about yet. It will legitimately
+        # fail that task's own output_schema validation (an honest,
+        # visible FAILED/OUTPUT_SCHEMA_INVALID state, PID §76), not a
+        # crash — never silently fabricated as a false SUCCEEDED.
+        content = {"warnings": [_dev_warning, "unrecognised task — dev-mode default has no shape for it"]}
+
+    return LiteLLMCompletionResult(
+        status=LiteLLMOutcomeStatus.OK,
+        content=_json.dumps(content),
+        provider_model="fake-litellm-dev-default-v1 (composition dev-mode default — not a real model)",
+        usage_metadata={},
+        latency_ms=1,
+    )
+
+
 @dataclass(frozen=True)
 class RuntimeComposition:
     """Everything ``app/api/`` needs, wired for the current
@@ -168,19 +251,74 @@ class RuntimeComposition:
     engine: Optional[Engine]
     intake_repository: IntakeRepository
     scanner: EvidenceSafetyScanner
+    #: CD-5 WI-2/WI-3 (PID §26-27/§6/§8) — a single
+    #: `AIInvocationRepository` shared by BOTH the `OPERATOR` role (Ask
+    #: BAGMAN, WI-3) and the `BACKGROUND` role (WI-2's own gateway) —
+    #: WI-1 already built both the in-memory and PostgreSQL
+    #: implementations; WI-2/WI-3 each wire it into `RuntimeComposition`.
+    #: `litellm_client` (WI-2) is `ai.providers.litellm.client
+    #: .LiteLLMClientProtocol`-shaped. `claude_client` (WI-3) is
+    #: `ai.providers.claude.client.ClaudeClientProtocol`-shaped. Both
+    #: follow the same dev/test-vs-production pairing as every field
+    #: above (fake in development/test, real adapter in production).
+    #: `tool_registry` (WI-3) is the fixed, closed
+    #: `agent.tools.registry.ToolRegistry` Claude may invoke (PID §34) —
+    #: identical construction in every `runtime_environment` (the tools
+    #: themselves are never environment-conditional; only the
+    #: `background_task_runner` dependency they close over differs — see
+    #: `_ProductionBackgroundTaskRunner` below, the PL reconciliation
+    #: that wires it to WI-2's real gateway in production).
+    ai_invocation_repository: AIInvocationRepository
+    litellm_client: LiteLLMClientProtocol
+    claude_client: ClaudeClientProtocol
+    tool_registry: ToolRegistry
 
 
 def _build_development_or_test(runtime_environment: str) -> RuntimeComposition:
+    from ai.invocation import InMemoryAIInvocationRepository
+    from ai.providers.litellm.fake import FakeLiteLLMClient
     from persistence.objects.memory_store import InMemoryObjectStore
     from services.evidence.intake.intake import InMemoryIntakeRepository
 
+    api = BagmanCanonicalAPI()  # CD-2's own in-memory default construction
+    object_store = InMemoryObjectStore()
+    scanner = _AlwaysCleanDevelopmentScanner()
+    intake_repository = InMemoryIntakeRepository()
+
+    ai_invocation_repository = InMemoryAIInvocationRepository()
+    # `default_response` closes the WI-4 dev-mode gap documented on
+    # `_dev_mode_litellm_default_response` above — without it, a real
+    # click on the GUI's "Run analysis" button in a live dev server
+    # 500s immediately (nothing pre-scripted, no default). Ordinary
+    # tests are unaffected: any test that wants a SPECIFIC scripted
+    # outcome still calls `queue_success()`/`queue_failure()`, which
+    # always takes priority over this default (see
+    # `FakeLiteLLMClient.complete()`).
+    litellm_client = FakeLiteLLMClient(default_response=_dev_mode_litellm_default_response)
+    claude_client = FakeClaudeClient()
+    tool_registry = _build_tool_registry(
+        api=api,
+        intake_repository=intake_repository,
+        ai_invocation_repository=ai_invocation_repository,
+        runtime_environment=runtime_environment,
+        engine=None,
+        object_store=object_store,
+        scanner=scanner,
+        claude_client=claude_client,
+        litellm_client=litellm_client,
+    )
+
     return RuntimeComposition(
         runtime_environment=runtime_environment,
-        api=BagmanCanonicalAPI(),  # CD-2's own in-memory default construction
-        object_store=InMemoryObjectStore(),
+        api=api,
+        object_store=object_store,
         engine=None,
-        intake_repository=InMemoryIntakeRepository(),
-        scanner=_AlwaysCleanDevelopmentScanner(),
+        intake_repository=intake_repository,
+        scanner=scanner,
+        ai_invocation_repository=ai_invocation_repository,
+        litellm_client=litellm_client,
+        claude_client=claude_client,
+        tool_registry=tool_registry,
     )
 
 
@@ -190,6 +328,7 @@ def _build_production() -> RuntimeComposition:
     # run — mirrors how `persistence/objects/minio_store.py` is only
     # ever imported by something that actually needs MinIO.
     from persistence.objects.minio_store import MinIOConfig, MinIOObjectStore
+    from persistence.postgres.ai_invocation_repository import PostgresAIInvocationRepository
     from persistence.postgres.audit_repository import PostgresAuditRepository
     from persistence.postgres.entity_repository import PostgresEntityRepository
     from persistence.postgres.evidence_repository import PostgresEvidenceRepository
@@ -201,6 +340,15 @@ def _build_production() -> RuntimeComposition:
     from persistence.postgres.session import get_engine
     from persistence.postgres.source_repository import PostgresSourceRepository
     from services.evidence.intake.scanner import ClamAVScanner
+
+    from ai.providers.litellm.client import DEFAULT_LITELLM_API_KEY_FILE, DEFAULT_LITELLM_ENDPOINT, LiteLLMClient
+    # CD-5 WI-3: imported lazily here too — `requests` (ClaudeClient's
+    # only real dependency) is already a base BAGMAN dependency, but
+    # keeping this import inside the production-only builder matches
+    # this function's existing "nothing production-only loads at plain
+    # `import app.api.composition` time" discipline.
+    from ai.providers.claude.client import ClaudeClient
+    from ai.gateway.background import run_background_task as _real_run_background_task
 
     # `get_engine()` builds/returns a pooled SQLAlchemy Engine but never
     # itself opens a connection (PID §46 note above) — safe to call even
@@ -254,6 +402,58 @@ def _build_production() -> RuntimeComposition:
         port=int(os.environ.get("BAGMAN_SCANNER_PORT", "3310")),
     )
 
+    # CD-5 WI-2: durable AIInvocation storage, sharing the same engine
+    # as every other Postgres-backed repository above, plus the one
+    # real LiteLLM-speaking adapter — see ai/providers/litellm/client.py
+    # for its endpoint/secret-file/timeout/retry configuration and its
+    # own documented "no eager I/O at construction" contract (mirrors
+    # ClamAVScanner immediately above: reachability is proven live by
+    # GET /internal/ai/health, never here, so a down/misconfigured
+    # LiteLLM gateway does not prevent composition from succeeding —
+    # PID §48's own "evidence/runtime services remain usable even when
+    # AI is unavailable").
+    ai_invocation_repository = PostgresAIInvocationRepository(engine)
+    litellm_client = LiteLLMClient(
+        endpoint=os.environ.get("BAGMAN_LITELLM_ENDPOINT", DEFAULT_LITELLM_ENDPOINT),
+        api_key_file=os.environ.get("BAGMAN_LITELLM_API_KEY_FILE", DEFAULT_LITELLM_API_KEY_FILE),
+    )
+
+    # CD-5 WI-3: the real Anthropic adapter. Constructing this performs
+    # NO I/O itself (mirrors ClamAVScanner above) — it only stores
+    # config; reachability is proven live by `is_available()`
+    # (`get_runtime_status_summary` below / `GET /internal/ai/health`),
+    # never here.
+    claude_client = ClaudeClient()
+
+    # PL RECONCILIATION (WI-2 and WI-3 were dispatched in parallel;
+    # neither could see the other's worktree): `run_background_analysis`
+    # now dispatches through WI-2's REAL gateway function in production
+    # composition via `_ProductionBackgroundTaskRunner` below, replacing
+    # WI-3's own `DeterministicFakeBackgroundTaskRunner` placeholder for
+    # this one `runtime_environment` only — development/test composition
+    # keeps using the deterministic fake unconditionally (PID §61; see
+    # `_build_development_or_test` above), exactly as WI-3's own
+    # `agent/tools/background.py` docstring anticipated this seam.
+    background_task_runner = _ProductionBackgroundTaskRunner(
+        api=api,
+        object_store=object_store,
+        ai_invocation_repository=ai_invocation_repository,
+        litellm_client=litellm_client,
+        run_background_task=_real_run_background_task,
+    )
+    tool_registry = _build_tool_registry(
+        api=api,
+        intake_repository=intake_repository,
+        ai_invocation_repository=ai_invocation_repository,
+        runtime_environment=_PRODUCTION,
+        engine=engine,
+        object_store=object_store,
+        scanner=scanner,
+        claude_client=claude_client,
+        litellm_client=litellm_client,
+        background_task_runner=background_task_runner,
+    )
+
     return RuntimeComposition(
         runtime_environment=_PRODUCTION,
         api=api,
@@ -261,7 +461,223 @@ def _build_production() -> RuntimeComposition:
         engine=engine,
         intake_repository=intake_repository,
         scanner=scanner,
+        ai_invocation_repository=ai_invocation_repository,
+        litellm_client=litellm_client,
+        claude_client=claude_client,
+        tool_registry=tool_registry,
     )
+
+
+# ---------------------------------------------------------------------
+# CD-5 WI-3 — agent/tools wiring + runtime status summary
+# ---------------------------------------------------------------------
+#
+# A fixed, well-formed, never-actually-registered object-storage key
+# used purely to prove the object store is reachable — the exact same
+# probe key `app/api/routers/health.py`'s `/ready` already uses (kept
+# as a second, deliberately duplicated constant rather than imported
+# from that module, so this file never depends on `app/api/routers/`;
+# see `get_runtime_status_summary`'s own docstring for why its checks
+# are duplicated rather than shared with `/ready` outright).
+_READINESS_PROBE_EVIDENCE_ID = "00000000-0000-0000-0000-000000000000"
+_READINESS_PROBE_HASH = "0" * 64
+
+
+def get_runtime_status_summary(
+    *,
+    runtime_environment: str,
+    engine: Optional[Engine],
+    object_store: EvidenceObjectStore,
+    scanner: EvidenceSafetyScanner,
+    claude_client: ClaudeClientProtocol,
+    litellm_client: LiteLLMClientProtocol,
+) -> Mapping[str, Any]:
+    """Read-only runtime status snapshot for `agent.tools`'
+    `get_runtime_status` tool (PID §34/§46-48). `GET /internal/ai/health`
+    (`app/api/routers/ai.py`, WI-2) is the separate, per-alias-granular
+    HTTP surface for the background tier specifically — this summary is
+    a coarser, tool-facing view spanning ALL of core runtime + every AI
+    tier (PID §47's "Matt must be able to distinguish these different
+    failure classes" applies to Claude's own `get_runtime_status` answer
+    just as much as to the GUI).
+
+    Deliberately never raises — every check is independently wrapped so
+    a caller always gets a full, structured snapshot back even if every
+    dependency is completely unreachable (a status TOOL must never
+    itself become the thing that crashes the Ask BAGMAN conversation
+    asking about status).
+
+    Mirrors, rather than calls directly, the same three checks
+    `app/api/routers/health.py`'s `/ready` performs in production mode
+    (PostgreSQL `SELECT 1`, object-store `exists()`, scanner
+    `is_available()`) — a deliberate, documented WI-3 judgment call: a
+    genuine shared-helper refactor of `/ready` itself was judged
+    higher-risk than its value for this WI (touching a small, already
+    covered-by-tests, production-critical readiness route to shave one
+    duplicated 3-check block), so the two call sites independently
+    perform conceptually the same checks rather than sharing one
+    function. Flagged for the PL/a future WI to consolidate if desired.
+    """
+    checks: dict[str, str] = {}
+
+    if runtime_environment != _PRODUCTION:
+        checks["postgres"] = "not_applicable (in-memory composition)"
+        checks["object_store"] = "not_applicable (in-memory composition)"
+        checks["scanner"] = "not_applicable (development stub scanner)"
+    else:
+        try:
+            assert engine is not None
+            with engine.connect() as conn:
+                conn.execute(text("SELECT 1"))
+            checks["postgres"] = "ok"
+        except Exception:  # noqa: BLE001 - a status probe must never raise
+            checks["postgres"] = "unreachable"
+
+        try:
+            object_store.exists(f"evidence/{_READINESS_PROBE_EVIDENCE_ID}/{_READINESS_PROBE_HASH}")
+            checks["object_store"] = "ok"
+        except Exception:  # noqa: BLE001
+            checks["object_store"] = "unreachable"
+
+        try:
+            checks["scanner"] = "ok" if scanner.is_available() else "unreachable"
+        except Exception:  # noqa: BLE001
+            checks["scanner"] = "unreachable"
+
+    try:
+        checks["claude_operator"] = "ok" if claude_client.is_available() else "unreachable"
+    except Exception:  # noqa: BLE001
+        checks["claude_operator"] = "unreachable"
+
+    try:
+        # Gateway-wide only (PID §9's three background aliases all
+        # share one LiteLLM installation) — see
+        # `ai.providers.litellm.client.LiteLLMClient.is_available`'s own
+        # docstring for why a genuinely per-alias check is not possible
+        # today.
+        checks["litellm_background_gateway"] = "ok" if litellm_client.is_available() else "unreachable"
+    except Exception:  # noqa: BLE001
+        checks["litellm_background_gateway"] = "unreachable"
+
+    return {"runtime_environment": runtime_environment, "checks": checks}
+
+
+class _ProductionBackgroundTaskRunner:
+    """PL reconciliation (WI-2 and WI-3 were dispatched in parallel;
+    neither worktree could see the other's code): the production
+    `agent.tools.background.BackgroundTaskRunner` implementation,
+    wiring `run_background_analysis` (Claude's tool, WI-3) to WI-2's
+    REAL `ai.gateway.background.run_background_task` orchestration
+    instead of WI-3's own `DeterministicFakeBackgroundTaskRunner`
+    placeholder — used only by `_build_production` below;
+    `_build_development_or_test` keeps the deterministic fake
+    unconditionally (PID §61).
+
+    Evidence-content resolution deliberately duplicates (a small
+    amount of) the same logic `app/api/routers/ai.py`'s own
+    `_resolve_evidence_content` helper already implements for the HTTP
+    path — refactoring that already-tested function to be shared was
+    judged out of scope for this reconciliation; both must be kept in
+    sync if evidence-content resolution ever changes.
+    """
+
+    def __init__(
+        self,
+        *,
+        api: BagmanCanonicalAPI,
+        object_store: EvidenceObjectStore,
+        ai_invocation_repository: AIInvocationRepository,
+        litellm_client: LiteLLMClientProtocol,
+        run_background_task: Any,
+    ) -> None:
+        self._api = api
+        self._object_store = object_store
+        self._repository = ai_invocation_repository
+        self._litellm_client = litellm_client
+        self._run_background_task = run_background_task
+
+    def _resolve_evidence_content(self, input_references: Mapping[str, Any]) -> str:
+        evidence_id = input_references.get("evidence_id")
+        if not isinstance(evidence_id, str) or not evidence_id:
+            return ""
+        evidence = self._api.get_evidence(evidence_id)
+        if not evidence.storage_reference:
+            return ""
+        raw_bytes = self._object_store.get(evidence.storage_reference)
+        return raw_bytes.decode("utf-8", errors="replace")
+
+    def run_background_task(
+        self,
+        *,
+        task_id: str,
+        task_version: int,
+        input_references: Mapping[str, Any],
+        actor_type: str,
+        actor_id: str,
+        correlation_id: Optional[str],
+    ):
+        evidence_content = self._resolve_evidence_content(input_references)
+        return self._run_background_task(
+            task_id=task_id,
+            task_version=task_version,
+            input_references=input_references,
+            evidence_content=evidence_content,
+            actor_type=actor_type,
+            actor_id=actor_id,
+            correlation_id=correlation_id,
+            repository=self._repository,
+            litellm_client=self._litellm_client,
+            record_audit_event=self._api.record_audit_event,
+        )
+
+
+def _build_tool_registry(
+    *,
+    api: BagmanCanonicalAPI,
+    intake_repository: IntakeRepository,
+    ai_invocation_repository: AIInvocationRepository,
+    runtime_environment: str,
+    engine: Optional[Engine],
+    object_store: EvidenceObjectStore,
+    scanner: EvidenceSafetyScanner,
+    claude_client: ClaudeClientProtocol,
+    litellm_client: LiteLLMClientProtocol,
+    background_task_runner: Optional[BackgroundTaskRunner] = None,
+) -> ToolRegistry:
+    """Build the fixed, closed `agent.tools.registry.ToolRegistry`
+    (PID §34) — identical construction regardless of
+    `runtime_environment` (see `RuntimeComposition.tool_registry`'s own
+    docstring); only `get_runtime_status_summary`'s OWN behaviour
+    branches on `runtime_environment` internally.
+
+    `background_task_runner` defaults to
+    `DeterministicFakeBackgroundTaskRunner` (development/test
+    composition, PID §61 — ordinary tests never depend on a live
+    LiteLLM/Mac-mini/Trinity call) when the caller does not supply one.
+    Production composition (`_build_production` below) passes a real
+    `_ProductionBackgroundTaskRunner`, wired to WI-2's actual
+    `ai.gateway.background.run_background_task` — the PL reconciliation
+    of the WI-2/WI-3 parallel-dispatch seam `agent/tools/background.py`
+    itself documents.
+    """
+    if background_task_runner is None:
+        background_task_runner = DeterministicFakeBackgroundTaskRunner(ai_invocation_repository)
+    deps = ToolDependencies(
+        api=api,
+        intake_repository=intake_repository,
+        ai_invocation_repository=ai_invocation_repository,
+        background_task_runner=background_task_runner,
+        runtime_health_check=functools.partial(
+            get_runtime_status_summary,
+            runtime_environment=runtime_environment,
+            engine=engine,
+            object_store=object_store,
+            scanner=scanner,
+            claude_client=claude_client,
+            litellm_client=litellm_client,
+        ),
+    )
+    return build_default_tool_registry(deps)
 
 
 _composition: Optional[RuntimeComposition] = None

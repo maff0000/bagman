@@ -1,0 +1,47 @@
+# BAGMAN component manifest (CD-5 PID §19) for ai/gateway/.
+# Validated by scripts/generate_architecture_memory.py against
+# contracts/manifest/bagman.component_manifest.v1.schema.json.
+
+id: BAGMAN.AI.GATEWAY
+version: 1
+
+responsibility: >
+  Own BACKGROUND-role task orchestration (CD-5 PID §6/§21-30/§57-58/
+  §73-76, WI-2): run_background_task drives one AIInvocation through
+  its full REQUESTED -> RUNNING -> {SUCCEEDED, FAILED} lifecycle against
+  the ai.providers.litellm adapter, using ai.prompts' versioned prompt
+  assets, validating output via ai.tasks.validate_task_output, and
+  emitting AI_INVOCATION_REQUESTED / AI_INVOCATION_SUCCEEDED /
+  AI_INVOCATION_FAILED / AI_OUTPUT_REJECTED with full causation
+  chaining. Provider- and composition-agnostic by construction (the
+  repository, LiteLLM client, and audit-event emitter are all
+  dependency-injected, never imported from app/api/ or persistence/
+  directly) so this component is fully unit-testable against
+  deterministic fakes (PID §61). The OPERATOR-role equivalent (Claude)
+  is WI-3's own addition to this same package, not this manifest's
+  current scope — run_background_task explicitly refuses any
+  OPERATOR-role task_id.
+
+owns: []
+
+consumes:
+  - BAGMAN.AI
+  - BAGMAN.AI.PROVIDERS.LITELLM
+
+produces:
+  - AI_INVOCATION_REQUESTED
+  - AI_INVOCATION_SUCCEEDED
+  - AI_INVOCATION_FAILED
+  - AI_OUTPUT_REJECTED
+
+dependencies: []
+
+external_access: false
+
+prohibited:
+  - direct_email_access
+  - direct_bank_access
+  - direct_xero_access
+  - direct_chargebee_access
+  - direct_litellm_client_outside_gateway_adapter
+  - trinity_star_alias_usage

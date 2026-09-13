@@ -47,6 +47,34 @@ secrets:
     file: /srv/bagman-secrets/minio_root_user
   minio_root_user_password:
     file: /srv/bagman-secrets/minio_root_user_password
+  # CD-5 WI-2 (PID §13): the BAGMAN-scoped virtual key for the EXISTING
+  # Trinity LiteLLM installation — never a second inference-control-plane
+  # deployment (PID §8). Provisioned externally by Matt directly, same
+  # discipline as the three secrets above. NOTE the real provisioned
+  # filename is `litellm_gateway_key`, not the `trinity_litellm_api_key`
+  # name PID §13's own text originally guessed (confirmed present at this
+  # path immediately before this WI began).
+  litellm_gateway_key:
+    file: /srv/bagman-secrets/litellm_gateway_key
+  # CD-5 WI-3 (PID §13/§17-18): the Claude operator provider's secret.
+  # NOT declared as a real Compose secret yet — as of this WI (CD-5
+  # WI-5), Matt has not yet provisioned
+  # /srv/bagman-secrets/anthropic_api_key (confirmed absent immediately
+  # before this WI began, and re-confirmed at WI-5's own acceptance
+  # step; see the WI-5 evidence file). A Compose file-based secret
+  # whose source file does not exist on the host makes `docker compose
+  # up` fail immediately for the WHOLE stack, not just the Claude path
+  # — so this is deliberately left commented out rather than declared,
+  # to avoid breaking bagman-db/bagman-objects/bagman-scan/every other
+  # already-working part of BAGMAN merely because one still-pending
+  # credential does not exist yet. Once Matt provisions the file,
+  # uncomment this block AND the matching `bagman-api.secrets` entry
+  # below (both already correctly named/pathed to match
+  # ai/providers/claude/client.py's own `_DEFAULT_API_KEY_FILE`) — no
+  # other change is required for the real Claude acceptance path to
+  # come alive.
+  # anthropic_api_key:
+  #   file: /srv/bagman-secrets/anthropic_api_key
 
 services:
   bagman-db:
@@ -189,12 +217,73 @@ services:
       BAGMAN_OBJECT_STORE_SECRET_KEY_FILE: /run/secrets/minio_root_user_password
       BAGMAN_SCANNER_HOST: bagman-scan
       BAGMAN_SCANNER_PORT: "3310"
+      # CD-5 WI-2 (PID §8/§15/§50): the existing Trinity LiteLLM
+      # installation's endpoint, alias-only requests
+      # (bagman-fast/bagman-core/bagman-deep — never a raw model name,
+      # never the Mac mini directly). The exact production network path
+      # between this Compose project's bagman-net and wherever the
+      # Trinity LiteLLM container actually runs is a deployment-level
+      # integration detail established by whoever wires the two Compose
+      # projects together (PID §15).
+      #
+      # CD-5 WI-5 fix (2026-09-13): WI-2's own original value here
+      # (`http://localhost:4000`) was verified, in this WI, to be
+      # genuinely broken for `bagman-api` itself — `localhost` inside
+      # `bagman-api`'s own container refers to that container, not the
+      # host machine, so a real Docker-Compose-stack acceptance attempt
+      # could never reach the gateway at all (WI-2's own local
+      # inspection tested this literally from the host's shell, not
+      # from inside the container it wrote this value for). The real
+      # Trinity LiteLLM gateway (a separate, pre-existing Docker
+      # container on this host, `local-ai-gateway`) publishes its port
+      # to the HOST's own network stack (`0.0.0.0:4000`), not to
+      # `bagman-net` — it is not a service of BAGMAN's own Compose
+      # project, and joining it to `bagman-net` (or vice versa) is
+      # infrastructure ownership outside this Compose file's own
+      # authority (PID §15's own "deployment-level integration detail
+      # established by whoever wires the two Compose projects
+      # together"). `host.docker.internal` (below, via `extra_hosts`)
+      # is the correct, safe fix that stays entirely within THIS
+      # service's own definition: it resolves, from inside
+      # `bagman-api`'s container, to the Docker host's own gateway IP —
+      # verified reachable on this host (Docker 29.3.0, Linux) via a
+      # throwaway `docker run --add-host=host.docker.internal:host-gateway
+      # alpine curl http://host.docker.internal:4000/health/readiness`,
+      # which returned the real gateway's own JSON response. This does
+      # NOT fix the SEPARATE, independently-verified LiteLLM-gateway
+      # database outage (`{"status":"healthy","db":"Not connected"}` /
+      # every real `/v1/chat/completions` call failing with
+      # `400 no_db_connection`) — that remains Helm/Trinity-owned
+      # infrastructure, entirely outside BAGMAN's authority, and is
+      # recorded as its own separate, still-open gap in the WI-5
+      # evidence file.
+      BAGMAN_LITELLM_ENDPOINT: http://host.docker.internal:4000
+      BAGMAN_LITELLM_API_KEY_FILE: /run/secrets/litellm_gateway_key
+      # CD-5 WI-3 (PID §13/§17-18): NOT set here yet — deliberately.
+      # ai/providers/claude/client.py's own `_DEFAULT_API_KEY_FILE`
+      # already defaults to exactly `/run/secrets/anthropic_api_key`,
+      # so this env var is redundant with that default; it is left
+      # unset (rather than pointed at a secret this compose file cannot
+      # yet declare — see the `anthropic_api_key` comment block above)
+      # until Matt provisions the real credential, at which point
+      # uncommenting the secret block above is sufficient on its own —
+      # ClaudeClient's own default path already matches.
       BAGMAN_LOG_LEVEL: INFO
       TZ: UTC
+    # host-gateway: a Docker-Engine-native (not Docker-Desktop-only)
+    # mechanism, supported since Docker 20.10 — this host runs 29.3.0 —
+    # that maps `host.docker.internal` to the real host gateway IP
+    # without any other infrastructure change. Scoped to this one
+    # service only; does not touch bagman-db/bagman-objects/bagman-scan,
+    # which have no need to reach the host.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     secrets:
       - postgres_password
       - minio_root_user
       - minio_root_user_password
+      - litellm_gateway_key
+      # - anthropic_api_key   # uncomment once /srv/bagman-secrets/anthropic_api_key exists (see above)
     # The one deliberate host-published entry point (PID §5) — bound to
     # loopback only, not 0.0.0.0.
     ports:

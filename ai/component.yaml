@@ -1,0 +1,87 @@
+# BAGMAN component manifest (CD-5 PID §7/§19) for ai/.
+# Validated by scripts/generate_architecture_memory.py against
+# contracts/manifest/bagman.component_manifest.v1.schema.json.
+
+id: BAGMAN.AI
+version: 2
+
+responsibility: >
+  Own the governed, provider-NEUTRAL AI invocation domain model and
+  typed task contract/registry framework: the AIInvocation state
+  machine and its one-active-invocation-per-subject concurrency
+  guarantee (CD-5 PID §26-30/§73-76), and the TaskContract/TASK_REGISTRY
+  framework naming CD-5's tasks' metadata and real, usable input/output
+  JSON Schemas (PID §21-24/§55) — WI-1 delivered the original four;
+  WI-3 additively registered a 5th, ASK_BAGMAN v1 (Ask BAGMAN's general
+  operator chat task — see ai/tasks.py's own docstring for why this is
+  a new task rather than a reuse of OPERATOR_DOCUMENT_REVIEW). WI-1
+  delivered only the domain/contract/persistence slice of BAGMAN.AI's
+  eventual responsibility (PID §7's full statement: "route typed
+  BAGMAN intelligence tasks to an authorised AI provider/capability,
+  enforce task contracts and policy, record invocation provenance,
+  validate structured responses and return proposals without directly
+  mutating canonical business state"). WI-2 lands the BACKGROUND half
+  of that: `ai/providers/litellm/` (the one LiteLLM-speaking adapter,
+  its mechanical alias-only enforcement, and its deterministic fake)
+  and `ai/gateway/` (`run_background_task`'s full REQUESTED -> RUNNING
+  -> terminal orchestration, PID §57 audit emission). WI-3 lands the
+  OPERATOR half's provider adapter: `ai/providers/claude/` — the ONE
+  Anthropic Messages API adapter (PID §6/§8): a pure, BAGMAN-agnostic
+  provider-neutral-result-producing HTTP client (ClaudeClient/
+  ClaudeClientProtocol) plus its deterministic test/dev double
+  (FakeClaudeClient, PID §61) — still no BAGMAN-specific orchestration
+  logic here (system prompt, tool registry, AIInvocation lifecycle
+  management); that lives in the separate `agent/` component
+  (BAGMAN.AGENT), which calls into this adapter. Each of
+  `ai/providers/litellm/`, `ai/gateway/`, `ai/providers/claude/` now
+  has its own `component.yaml`, consuming this one. Real prompt
+  CONTENT for the three BACKGROUND tasks lives at `ai/prompts/` (PID
+  §31), loaded by `ai/gateway/background.py`. `ai/policy/`,
+  `ai/evaluation/`, and `ai/provenance/` remain WI-5's job to populate.
+
+owns:
+  - AIInvocation
+  - TaskContract
+
+# ai/invocation.py depends on core/ exactly like every other CD-2/CD-4
+# domain module: identity (id generation), timestamps (UTC handling),
+# actor (closed actor_type vocabulary — reused exactly, no parallel
+# vocabulary invented), errors (ActiveInvocationConflictError,
+# InvalidStateTransitionError, NotFoundError, ValidationError), and
+# contract_validation (validate_against_contract). ai/tasks.py further
+# depends on core.contract_validation.describe_schema_errors (added by
+# this WI alongside validate_against_contract) and imports
+# ai.invocation.BACKGROUND_CAPABILITY_ALIASES as the single source of
+# truth for the closed background-alias set.
+consumes:
+  - BAGMAN.CORE
+
+# This component does not itself emit audit events — AI_INVOCATION_*
+# audit event emission (PID §57) is WI-2/WI-3's orchestration-layer
+# responsibility, mirroring how services/evidence/intake/ does not
+# emit its own audit events either (see that component's own
+# component.yaml).
+produces: []
+
+# No new third-party dependency was introduced by WI-1: schema
+# validation reuses core.contract_validation's existing jsonschema
+# wiring (a new describe_schema_errors function alongside it, not a
+# new dependency). WI-3's ai/providers/claude/ adds one: `requests`
+# (already a pre-existing BAGMAN dependency used elsewhere, e.g.
+# tests/acceptance/_lib.py — not newly introduced to the project by
+# this WI, only newly declared as an ai/-level dependency here).
+dependencies:
+  - jsonschema
+  - rfc3339-validator
+  - requests
+
+external_access: false
+
+prohibited:
+  - direct_email_access
+  - direct_bank_access
+  - direct_xero_access
+  - direct_chargebee_access
+  - direct_litellm_client_outside_gateway
+  - direct_anthropic_client_outside_gateway
+  - trinity_star_alias_usage

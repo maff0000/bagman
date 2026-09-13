@@ -117,3 +117,60 @@ def test_app_js_is_served(dev_client):
 def test_unknown_static_path_is_a_plain_404_not_a_json_api_error(dev_client):
     response = dev_client.get("/this-path-does-not-exist-anywhere")
     assert response.status_code == 404
+
+
+# ---------------------------------------------------------------------
+# CD-5 WI-4 modularisation — every new ES module is actually served,
+# and the "never innerHTML" discipline holds across ALL of them, not
+# just the (now much smaller) app.js entry point.
+# ---------------------------------------------------------------------
+
+_ALL_MODULE_PATHS = [
+    "app.js",
+    "shell/shell.js",
+    "shared/dom.js",
+    "shared/format.js",
+    "shared/api.js",
+    "shared/operator.js",
+    "features/overview/overview.js",
+    "features/documents/documents.js",
+    "features/documents/detail.js",
+    "features/ai/ai-api.js",
+    "features/ai/invocation-card.js",
+    "features/ai/ask-bagman.js",
+]
+
+
+@pytest.mark.parametrize("path", _ALL_MODULE_PATHS)
+def test_every_gui_module_is_served_as_javascript(dev_client, path):
+    response = dev_client.get(f"/{path}")
+    assert response.status_code == 200, f"{path} did not serve"
+    assert "javascript" in response.headers["content-type"]
+
+
+@pytest.mark.parametrize("path", _ALL_MODULE_PATHS)
+def test_no_gui_module_ever_uses_innerhtml(dev_client, path):
+    response = dev_client.get(f"/{path}")
+    assert ".innerHTML" not in response.text
+
+
+def test_app_js_is_now_a_thin_entry_point(dev_client):
+    """CD-5 WI-4's own modularisation goal (PID §41) — app.js itself
+    should no longer contain the Documents/Detail/Overview business
+    logic; that now lives under features/."""
+    response = dev_client.get("/app.js")
+    assert response.status_code == 200
+    # A thin entry point is short — the old monolith was 700+ lines.
+    assert response.text.count("\n") < 40
+
+
+def test_index_html_mounts_the_ask_bagman_drawer(dev_client):
+    response = dev_client.get("/")
+    assert "ask-bagman-drawer" in response.text
+    assert "ask-bagman-toggle" in response.text
+
+
+def test_index_html_still_mounts_the_documents_and_overview_panels(dev_client):
+    response = dev_client.get("/")
+    assert 'id="panel-documents"' in response.text
+    assert 'id="panel-overview"' in response.text

@@ -92,14 +92,21 @@ def test_core_and_services_evidence_never_import_adapters_agent_or_ui():
     )
 
 
-def test_agent_directory_currently_has_no_python_files():
-    agent_dir = REPO_ROOT / "agent"
-    agent_py_files = sorted(p.relative_to(REPO_ROOT).as_posix() for p in agent_dir.rglob("*.py"))
-    assert agent_py_files == [], (
-        f"expected agent/ to contain no .py files as of CD-2, found: {agent_py_files} "
-        "(if agent/ now legitimately has code, the import-boundary test below is what "
-        "must catch a future core/services -> agent import, not this one)"
-    )
+def test_agent_policies_and_memory_still_have_no_python_files():
+    """CD-5 WI-3 populates `agent/bagman/` and `agent/tools/` for real
+    (Ask BAGMAN orchestration + the fixed tool registry) — superseding
+    this test's original CD-2 "agent/ has no .py files at all" form.
+    `agent/policies/` and `agent/memory/` remain CD-1's original empty
+    placeholders as of WI-3 (see WI-3's own delivery report: no
+    genuinely CD-5-scoped content was found for either) — this narrower
+    assertion is what's still meaningful. The import-boundary test below
+    (`test_nothing_under_core_or_services_imports_from_agent`) is the
+    one that actually matters regardless of agent/'s file listing.
+    """
+    for sub in ("policies", "memory"):
+        subdir = REPO_ROOT / "agent" / sub
+        py_files = sorted(p.relative_to(REPO_ROOT).as_posix() for p in subdir.rglob("*.py"))
+        assert py_files == [], f"expected agent/{sub}/ to contain no .py files, found: {py_files}"
 
 
 def test_nothing_under_core_or_services_imports_from_agent():
@@ -363,14 +370,24 @@ def test_static_ui_assets_contain_no_python_or_server_side_code():
 def test_static_ui_javascript_only_calls_the_existing_internal_http_api():
     """Confirms, by inspection of the actual JS source (not merely by
     absence of a database driver import — there is no such thing as an
-    'import' in plain browser JS to look for), that BAGMAN's own
-    ``app.js`` talks to the backend ONLY through relative
-    ``/internal/*`` (or ``/health``/``/ready``/``/version``) HTTP paths
-    via ``fetch`` — never a raw database connection string, an AWS/S3
-    SDK-shaped endpoint, or any other infrastructure address."""
-    app_js = (REPO_ROOT / "app" / "api" / "static" / "app.js").read_text(encoding="utf-8")
+    'import' in plain browser JS to look for), that BAGMAN's own GUI
+    talks to the backend ONLY through relative ``/internal/*`` (or
+    ``/health``/``/ready``/``/version``) HTTP paths via ``fetch`` —
+    never a raw database connection string, an AWS/S3 SDK-shaped
+    endpoint, or any other infrastructure address.
 
-    # Every literal path string this file references as an API target
+    CD-5 WI-4 modularised the former single ``app.js`` monolith into
+    ``shell/``/``shared/``/``features/{overview,documents,ai}/`` (PID
+    §41) — ``app.js`` itself is now a thin entry point with no literal
+    endpoint strings of its own, so this test scans every ``*.js`` file
+    under ``app/api/static/`` (the same tree Starlette's ``StaticFiles``
+    serves), not just the one former monolith file.
+    """
+    static_dir = REPO_ROOT / "app" / "api" / "static"
+    js_files = sorted(static_dir.rglob("*.js"))
+    assert js_files, "expected at least one JS file under app/api/static/"
+
+    # Every literal path string these files reference as an API target
     # must be relative and rooted at one of the known, existing JSON
     # surfaces — never an absolute external host, never anything
     # database/object-store-shaped.
@@ -379,12 +396,14 @@ def test_static_ui_javascript_only_calls_the_existing_internal_http_api():
         "s3://", "minio", ":5432", ":9000", ":3310",
         "boto3", "psycopg", "sqlalchemy",
     ]
-    lowered = app_js.lower()
+
+    combined = "\n".join(path.read_text(encoding="utf-8") for path in js_files)
+    lowered = combined.lower()
     violations = [token for token in forbidden_tokens if token in lowered]
     assert violations == [], (
-        f"app/api/static/app.js appears to reference infrastructure directly: {violations}"
+        f"app/api/static/**/*.js appears to reference infrastructure directly: {violations}"
     )
-    assert "/internal/" in app_js, "expected app.js to call the existing /internal/* HTTP API"
+    assert "/internal/" in combined, "expected the GUI's JS to call the existing /internal/* HTTP API"
 
 
 # core/ and services/evidence/ must never import app/ (the HTTP/routing
@@ -536,6 +555,79 @@ def test_no_forbidden_mailbox_or_provider_sdk_imported_anywhere_in_the_repo():
         "no Microsoft Graph/MSAL, Gmail/Google API client library, or "
         "imapclient/imaplib mailbox-polling import may exist yet (PID §67/§69) "
         "— CD-5's job, not CD-4's. Violations:\n" + "\n".join(violations)
+    )
+
+
+# ---------------------------------------------------------------------
+# CD-5 WI-5 (PID §9/§75/§87/§92) — the full REPO-WIDE trinity-* alias
+# sweep. `tests/security/test_ai_litellm_alias_lockdown.py` already
+# proves this for WI-2's OWN new files
+# (`test_no_trinity_star_alias_literal_in_this_wis_new_files`); this is
+# the wider check PID §92's Auditor instruction and PID §9's own
+# "BAGMAN's own architecture-boundary tests must assert that no BAGMAN
+# source file references a trinity-* alias at all" require: every
+# application source file in the repository, not just ai/providers/
+# ai/gateway/ai/prompts/app/api/routers/ai.py.
+#
+# Deliberately EXCLUDES `tests/` itself: several existing test files
+# legitimately use `trinity-fast`/`trinity-core`/`trinity-deep`/
+# `trinity-embed` as literal ADVERSARIAL/NEGATIVE fixture values (e.g.
+# `tests/integration/test_litellm_client.py`'s own
+# "reject every forbidden alias" parametrisation, `tests/contract/
+# test_ai_invocation_contract.py`'s "this value must fail contract
+# validation" fixture) — a test proving BAGMAN rejects a trinity-*
+# alias necessarily contains that string once, and that is correct,
+# not a violation. What matters is that no APPLICATION source file
+# (everything BAGMAN actually ships/runs) contains one.
+# ---------------------------------------------------------------------
+
+_TRINITY_STAR_ALIASES_REPO_WIDE = ["trinity-fast", "trinity-core", "trinity-deep", "trinity-embed"]
+_APPLICATION_SOURCE_ROOTS = (
+    "ai",
+    "agent",
+    "app",
+    "core",
+    "persistence",
+    "services",
+    "adapters",
+    "ui",
+    "scripts",
+    "ops",
+    "config",
+    "deployment",
+    "contracts",
+)
+
+
+def test_no_trinity_star_alias_literal_anywhere_in_application_source():
+    """PID §9/§75/§87/§92: no `trinity-fast`/`trinity-core`/`trinity-deep`/
+    `trinity-embed` literal may exist anywhere in BAGMAN's own shipped
+    application source — only `bagman-fast`/`bagman-core`/`bagman-deep`
+    (`ai.invocation.BACKGROUND_CAPABILITY_ALIASES`) are ever permitted.
+    Scans every file (not just `.py`) under the application-source
+    roots, so a stray reference in a `.yml`/`.md`/`.json`/`.sh` file
+    would be caught too, not just a Python import."""
+    violations: list[str] = []
+    for root_name in _APPLICATION_SOURCE_ROOTS:
+        root = REPO_ROOT / root_name
+        if not root.is_dir():
+            continue
+        for path in sorted(root.rglob("*")):
+            if not path.is_file():
+                continue
+            try:
+                text = path.read_text(encoding="utf-8", errors="strict")
+            except (UnicodeDecodeError, OSError):
+                continue  # binary/unreadable file — not a source-literal concern
+            lowered = text.lower()
+            for bad_alias in _TRINITY_STAR_ALIASES_REPO_WIDE:
+                if bad_alias in lowered:
+                    violations.append(f"{path.relative_to(REPO_ROOT)} contains {bad_alias!r}")
+
+    assert violations == [], (
+        "no application source file may reference a trinity-* alias — only bagman-* aliases "
+        f"are permitted anywhere BAGMAN actually ships/runs (PID §9/§75/§87/§92):\n"
+        + "\n".join(violations)
     )
 
 

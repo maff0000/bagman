@@ -121,3 +121,68 @@ All notable changes to BAGMAN will be documented in this file.
 - **Verdict: pending the architect's ruling** (PID §72/§73 — the same
   standing as CD-1/CD-2/CD-3; the PL does not self-issue the final CD
   delivery verdict).
+
+## 2026-09-13 — CD-5 — AI Foundation, Claude Operator & GUI Integration
+
+- Locked three-tier AI topology (PID amendment, prior to WI-1 dispatch):
+  Claude as operator intelligence; a dedicated, BAGMAN-exclusive Mac
+  mini (`bagman-fast`/`bagman-core`) as primary background inference;
+  Trinity compute (`bagman-deep`) as an escalation tier — all reached
+  through the ONE existing Trinity LiteLLM installation, never a
+  second inference-control-plane architecture.
+- `ai/`: provider-neutral `AIInvocation` domain model + state machine,
+  a real database-enforced one-active-invocation-per-subject
+  concurrency guard, the typed task contract/registry
+  (`DOCUMENT_SUMMARY`/`DOCUMENT_TYPE_PROPOSAL`/`ENTITY_PROPOSAL`/
+  `OPERATOR_DOCUMENT_REVIEW`/`ASK_BAGMAN`), the one alias-only
+  LiteLLM adapter (mechanical `trinity-*`/raw-model-name rejection),
+  the Anthropic Messages API adapter, `run_background_task`'s full
+  orchestration lifecycle, and the mandatory evaluation harness
+  (`ai/evaluation/` — structured-output validity, expected
+  classification, abstention/uncertainty, malformed output, timeout/
+  error handling, and reused prompt-injection resilience proofs).
+- `agent/`: a fixed, closed 8-tool read-only/analyse-only registry
+  Claude may invoke, and Ask BAGMAN's bounded tool-calling
+  orchestration loop, with structural prompt-injection defences
+  (evidence/tool-result content is always DATA, never authority).
+- `POST /internal/ai/tasks`, `GET /internal/ai/invocations[/{id}]`,
+  `GET /internal/ai/health`, `POST /internal/operator/chat`.
+- GUI modularisation (`app/api/static/{shell,shared,features/
+  {overview,documents,ai}}`), the Documents AI panel, the Ask BAGMAN
+  drawer, and Overview AI status — all visually distinguishing
+  AI-proposed from canonical data.
+- Filename bidi/directional-format-control hardening (closing a CD-4
+  Auditor backlog item): a filename carrying a Unicode bidi-override
+  character (the classic visually-disguised-extension attack) is now
+  rejected at intake, structurally and adversarially tested.
+- Acceptance/hardening (WI-5): the mandatory evaluation harness (above);
+  a genuine real-threaded concurrency proof against a real disposable
+  PostgreSQL; a repo-wide `trinity-*`-alias-absence sweep; five new
+  real-Docker-Compose-stack acceptance scripts covering all three AI
+  tiers, live prompt injection, and AI-surfaces browser acceptance
+  (Playwright) — **found and fixed two real, previously-undiscovered
+  infrastructure defects**: the `bagman-api` Docker image was missing
+  the entire `ai/`/`agent/` packages (every real AI endpoint would have
+  crashed with `ModuleNotFoundError` in any actual deployment), and
+  `bagman-api`'s own container could not reach the real LiteLLM gateway
+  over the network at all (`localhost` inside a container is not the
+  host) — fixed via `host.docker.internal`/`extra_hosts: host-gateway`,
+  verified reachable from inside the real running container. Every real
+  external AI-tier acceptance attempt (Mac-mini, Trinity-escalation,
+  Claude) reached the real, now-fixed network/adapter/credential path
+  and received an honest, correctly-recorded `BLOCKED` outcome —
+  re-verified live, not assumed — from external infrastructure this
+  delivery does not own (the existing LiteLLM gateway's own backing
+  database; Matt's not-yet-provisioned Anthropic credential).
+- No mailbox, bank, accounting, or billing connectivity implemented.
+  No second LiteLLM/inference-control-plane architecture introduced.
+- Full evidence, including the honest per-tier BLOCKED findings and
+  the two infrastructure defects found and fixed, at
+  `memory/generated/CD5-EVIDENCE-AI-FOUNDATION-CLAUDE-OPERATOR-AND-GUI-INTEGRATION-2026-09-13.md`.
+- **Verdict: pending the architect's ruling** (PID §92/§93 — the same
+  standing as every prior CD delivery; the PL does not self-issue the
+  final CD delivery verdict). PID §91's own "an honest partial
+  `AI_FOUNDATION_GREEN`, with the Mac-mini/Trinity-escalation/Claude
+  tiers' genuine-completion criteria explicitly marked `BLOCKED`
+  pending external infrastructure/credentials, is an acceptable interim
+  verdict" is what this delivery's own evidence currently supports.

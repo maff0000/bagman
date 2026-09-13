@@ -203,6 +203,29 @@ def test_path_traversal_filename_is_rejected_before_any_scanning(repository, obj
     assert result.content_hash is None  # never even spooled
 
 
+def test_bidi_override_spoofed_extension_filename_is_rejected_before_any_scanning(
+    repository, object_store, source_id
+):
+    """CD-5 WI-5 (PID §66): the same end-to-end UNSAFE_FILENAME
+    rejection the path-traversal fixture above proves, for a filename
+    carrying a Unicode bidi-override character (U+202E RLO) that would
+    visually disguise its true, dangerous extension — see
+    services/evidence/intake/filename_safety.py's own module docstring
+    for the full "invoice + RLO + gnp.exe" attack description."""
+    hostile_filename = "invoice‮gnp.exe"
+    record = _received(repository, source_id, original_filename=hostile_filename)
+    result = run_intake_validation(
+        intake_id=record.intake_id,
+        stream=io.BytesIO(SYNTHETIC_PDF),
+        repository=repository,
+        object_store=object_store,
+        scanner=_RaisingScanner(),  # must never be reached
+    )
+    assert result.status == "REJECTED"
+    assert result.failure_code == "UNSAFE_FILENAME"
+    assert result.content_hash is None  # never even spooled
+
+
 # ---------------------------------------------------------------------
 # Size limit -> REJECTED (PID §63's oversized-stream fixture)
 # ---------------------------------------------------------------------
