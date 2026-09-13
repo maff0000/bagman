@@ -10,7 +10,7 @@
 # not a literal path.
 
 id: BAGMAN.RUNTIME.API
-version: 3
+version: 4
 
 responsibility: >
   Own the FastAPI/Uvicorn HTTP-facing application layer that exposes
@@ -43,6 +43,18 @@ responsibility: >
   dependency surface, or deployment unit of its own. The GUI itself
   owns/decides no evidence business logic (PID §40) — it is a pure
   client of the very API routes this same manifest already describes.
+  CD-5 WI-2 additionally owns `/internal/ai/tasks` (POST) /
+  `/internal/ai/invocations[/{id}]` (GET) / `/internal/ai/health`
+  (GET) — thin HTTP wrappers over `ai.gateway.background
+  .run_background_task` and `AIInvocationRepository`, wiring the new
+  `ai_invocation_repository`/`litellm_client` composition fields
+  (in-memory repository + deterministic fake in development/test,
+  PostgresAIInvocationRepository + the real LiteLLMClient in
+  production) — never a second inference-control-plane implementation
+  (PID §8), and never a new audit-event-producing responsibility here:
+  the AI_INVOCATION_*/AI_OUTPUT_REJECTED events are minted by
+  `ai/gateway/background.py` itself (see that component's own
+  `component.yaml`), not by this router.
 
 owns: []
 
@@ -59,12 +71,22 @@ owns: []
 # .EvidenceSafetyScanner/ClamAVScanner (composition.py wires the real
 # scanner in production; a small dev-only always-CLEAN stub, defined
 # and used only inside composition.py, backs development/test mode).
+# CD-5 WI-2 additionally imports ai.invocation.AIInvocationRepository/
+# InMemoryAIInvocationRepository, ai.gateway.background
+# .run_background_task, ai.invocation.BACKGROUND_CAPABILITY_ALIASES,
+# ai.providers.litellm.client.LiteLLMClient(Protocol) (production), and
+# ai.providers.litellm.fake.FakeLiteLLMClient (development/test),
+# plus persistence.postgres.ai_invocation_repository
+# .PostgresAIInvocationRepository (composition.py only).
 consumes:
   - BAGMAN.CORE
   - BAGMAN.SERVICES.EVIDENCE
   - BAGMAN.EVIDENCE.INTAKE
   - BAGMAN.PERSISTENCE.POSTGRES
   - BAGMAN.PERSISTENCE.OBJECTS
+  - BAGMAN.AI
+  - BAGMAN.AI.GATEWAY
+  - BAGMAN.AI.PROVIDERS.LITELLM
 
 # app/api/ does not itself emit AuditEvents for CD-2's own canonical
 # writes — those go through core.api.BagmanCanonicalAPI, which already

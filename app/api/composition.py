@@ -57,6 +57,8 @@ from typing import Optional
 
 from sqlalchemy.engine import Engine
 
+from ai.invocation import AIInvocationRepository
+from ai.providers.litellm.client import LiteLLMClientProtocol
 from core import actor
 from core.api import BagmanCanonicalAPI
 from persistence.objects.store import EvidenceObjectStore
@@ -168,9 +170,17 @@ class RuntimeComposition:
     engine: Optional[Engine]
     intake_repository: IntakeRepository
     scanner: EvidenceSafetyScanner
+    #: CD-5 WI-2 — durable AIInvocation storage and the one
+    #: LiteLLM-speaking adapter, wired the same dev/test-vs-production
+    #: way as every field above (in-memory/fake pair in development or
+    #: test composition, Postgres/real-adapter pair in production).
+    ai_invocation_repository: AIInvocationRepository
+    litellm_client: LiteLLMClientProtocol
 
 
 def _build_development_or_test(runtime_environment: str) -> RuntimeComposition:
+    from ai.invocation import InMemoryAIInvocationRepository
+    from ai.providers.litellm.fake import FakeLiteLLMClient
     from persistence.objects.memory_store import InMemoryObjectStore
     from services.evidence.intake.intake import InMemoryIntakeRepository
 
@@ -181,6 +191,8 @@ def _build_development_or_test(runtime_environment: str) -> RuntimeComposition:
         engine=None,
         intake_repository=InMemoryIntakeRepository(),
         scanner=_AlwaysCleanDevelopmentScanner(),
+        ai_invocation_repository=InMemoryAIInvocationRepository(),
+        litellm_client=FakeLiteLLMClient(),
     )
 
 
@@ -196,11 +208,14 @@ def _build_production() -> RuntimeComposition:
     from persistence.postgres.external_reference_repository import (
         PostgresExternalReferenceRepository,
     )
+    from persistence.postgres.ai_invocation_repository import PostgresAIInvocationRepository
     from persistence.postgres.intake_repository import PostgresIntakeRepository
     from persistence.postgres.provenance_repository import PostgresProvenanceRepository
     from persistence.postgres.session import get_engine
     from persistence.postgres.source_repository import PostgresSourceRepository
     from services.evidence.intake.scanner import ClamAVScanner
+
+    from ai.providers.litellm.client import DEFAULT_LITELLM_API_KEY_FILE, DEFAULT_LITELLM_ENDPOINT, LiteLLMClient
 
     # `get_engine()` builds/returns a pooled SQLAlchemy Engine but never
     # itself opens a connection (PID §46 note above) — safe to call even
@@ -254,6 +269,22 @@ def _build_production() -> RuntimeComposition:
         port=int(os.environ.get("BAGMAN_SCANNER_PORT", "3310")),
     )
 
+    # CD-5 WI-2: durable AIInvocation storage, sharing the same engine
+    # as every other Postgres-backed repository above, plus the one
+    # real LiteLLM-speaking adapter — see ai/providers/litellm/client.py
+    # for its endpoint/secret-file/timeout/retry configuration and its
+    # own documented "no eager I/O at construction" contract (mirrors
+    # ClamAVScanner immediately above: reachability is proven live by
+    # GET /internal/ai/health, never here, so a down/misconfigured
+    # LiteLLM gateway does not prevent composition from succeeding —
+    # PID §48's own "evidence/runtime services remain usable even when
+    # AI is unavailable").
+    ai_invocation_repository = PostgresAIInvocationRepository(engine)
+    litellm_client = LiteLLMClient(
+        endpoint=os.environ.get("BAGMAN_LITELLM_ENDPOINT", DEFAULT_LITELLM_ENDPOINT),
+        api_key_file=os.environ.get("BAGMAN_LITELLM_API_KEY_FILE", DEFAULT_LITELLM_API_KEY_FILE),
+    )
+
     return RuntimeComposition(
         runtime_environment=_PRODUCTION,
         api=api,
@@ -261,6 +292,8 @@ def _build_production() -> RuntimeComposition:
         engine=engine,
         intake_repository=intake_repository,
         scanner=scanner,
+        ai_invocation_repository=ai_invocation_repository,
+        litellm_client=litellm_client,
     )
 
 
