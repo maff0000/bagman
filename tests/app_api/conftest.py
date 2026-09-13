@@ -1,22 +1,31 @@
-"""Fixtures for ``tests/app_api/`` (CD-3 WI-3).
+"""Fixtures for ``tests/app_api/`` (CD-3 WI-3, extended by CD-4 WI-3).
 
 Proves ``app/api/composition.py``'s hard "no fallback" invariant
 (PID §45-46) against REAL, disposable PostgreSQL and MinIO containers
 this session starts, stops/restarts mid-test, and tears down itself —
 never mocks, exactly the same discipline
 ``tests/persistence/conftest.py`` already established for WI-1/WI-2.
+CD-4 WI-3 additionally stands up a REAL, disposable ``clamd`` daemon
+(same shape as WI-2's own ``tests/integration/test_intake_scanner.py``
+disposable container) so this module's production-mode composition has
+a genuinely reachable scanner too — ``/ready`` now checks it (PID §60),
+and this WI's own intake-endpoint tests exercise the REAL
+``ClamAVScanner`` end-to-end through the HTTP layer against it (never a
+mock), per PID §20/§63's "a stub is used in dev must never become the
+real scanner is never exercised" doctrine.
 
 Containers are named unmistakably as disposable WI-3 test fixtures
-(``bagman-test-postgres-wi3``, ``bagman-test-minio-wi3``) so they can
-never be confused with the real ``bagman-db``/``bagman-objects``
-runtime containers a developer might also have running locally, or
-with WI-1/WI-2's own ``bagman-test-postgres-wi1``/
-``bagman-test-minio-wi2`` fixtures.
+(``bagman-test-postgres-wi3``, ``bagman-test-minio-wi3``,
+``bagman-test-clamav-wi3``) so they can never be confused with the real
+``bagman-db``/``bagman-objects``/``bagman-scan`` runtime containers a
+developer might also have running locally, or with WI-2's own
+``bagman-test-clamav-wi2`` fixture.
 """
 from __future__ import annotations
 
 import os
 import secrets
+import socket
 import subprocess
 import time
 import urllib.error
@@ -37,6 +46,14 @@ MINIO_CONTAINER = "bagman-test-minio-wi3"
 MINIO_IMAGE = "quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z.hotfix.7aa24e772"
 MINIO_HOST_PORT = "19020"
 MINIO_BUCKET = "bagman-test-wi3-objects"
+
+#: CD-4 WI-3 addition — a differently-named/-ported disposable clamd
+#: container from WI-2's own ``bagman-test-clamav-wi2``/``33100``, to
+#: avoid any collision when both test modules happen to run in the
+#: same CI environment.
+CLAMAV_CONTAINER = "bagman-test-clamav-wi3"
+CLAMAV_IMAGE = "clamav/clamav:stable"
+CLAMAV_HOST_PORT = "33101"
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 
@@ -106,6 +123,32 @@ def wait_for_minio_container_healthy() -> None:
     _wait_for_minio()
 
 
+def _wait_for_clamav(timeout_s: float = 60.0) -> None:
+    """Block until the disposable ``clamd`` daemon answers a real
+    ``PING`` — same protocol check
+    ``services.evidence.intake.scanner.ClamAVScanner.is_available()``
+    itself performs, done directly here (not via importing that class)
+    so this fixture module stays a plain, dependency-light bootstrapping
+    layer."""
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        try:
+            with socket.create_connection(("127.0.0.1", int(CLAMAV_HOST_PORT)), timeout=2) as sock:
+                sock.sendall(b"zPING\0")
+                if sock.recv(64).strip(b"\0") == b"PONG":
+                    return
+        except OSError:
+            pass
+        time.sleep(0.5)
+    raise RuntimeError(f"{CLAMAV_CONTAINER} did not become ready (PING/PONG) in time")
+
+
+def wait_for_clamav_container_healthy() -> None:
+    """Public (module-level, no leading underscore) so test modules can
+    re-wait after they themselves restart the container mid-test."""
+    _wait_for_clamav()
+
+
 @pytest.fixture(scope="module")
 def runtime_stack(tmp_path_factory: pytest.TempPathFactory) -> Iterator[dict]:
     """Start disposable Postgres + MinIO containers, run `alembic
@@ -114,6 +157,7 @@ def runtime_stack(tmp_path_factory: pytest.TempPathFactory) -> Iterator[dict]:
     everything down (containers removed, environment restored)."""
     _docker("rm", "-f", PG_CONTAINER, check=False)
     _docker("rm", "-f", MINIO_CONTAINER, check=False)
+    _docker("rm", "-f", CLAMAV_CONTAINER, check=False)
 
     secret_dir = tmp_path_factory.mktemp("bagman-test-wi3-secrets")
 
@@ -146,6 +190,15 @@ def runtime_stack(tmp_path_factory: pytest.TempPathFactory) -> Iterator[dict]:
         "-p", f"127.0.0.1:{MINIO_HOST_PORT}:9000",
         MINIO_IMAGE, "server", "/data",
     )
+    # CD-4 WI-3: a real, disposable clamd daemon — production
+    # composition's scanner is mandatory (PID §60), so this test
+    # module's composition needs one genuinely reachable, exactly as it
+    # needs a genuinely reachable Postgres/MinIO.
+    _docker(
+        "run", "-d", "--name", CLAMAV_CONTAINER,
+        "-p", f"127.0.0.1:{CLAMAV_HOST_PORT}:3310",
+        CLAMAV_IMAGE,
+    )
 
     env_backup = dict(os.environ)
     os.environ["BAGMAN_RUNTIME_ENV"] = "production"
@@ -158,10 +211,13 @@ def runtime_stack(tmp_path_factory: pytest.TempPathFactory) -> Iterator[dict]:
     os.environ["BAGMAN_OBJECT_STORE_BUCKET"] = MINIO_BUCKET
     os.environ["BAGMAN_OBJECT_STORE_ACCESS_KEY_FILE"] = str(minio_user_file)
     os.environ["BAGMAN_OBJECT_STORE_SECRET_KEY_FILE"] = str(minio_password_file)
+    os.environ["BAGMAN_SCANNER_HOST"] = "127.0.0.1"
+    os.environ["BAGMAN_SCANNER_PORT"] = CLAMAV_HOST_PORT
 
     try:
         _wait_for_postgres()
         _wait_for_minio()
+        _wait_for_clamav()
 
         from alembic import command
         from alembic.config import Config
@@ -170,7 +226,11 @@ def runtime_stack(tmp_path_factory: pytest.TempPathFactory) -> Iterator[dict]:
         alembic_cfg.set_main_option("script_location", str(REPO_ROOT / "alembic"))
         command.upgrade(alembic_cfg, "head")
 
-        yield {"pg_container": PG_CONTAINER, "minio_container": MINIO_CONTAINER}
+        yield {
+            "pg_container": PG_CONTAINER,
+            "minio_container": MINIO_CONTAINER,
+            "clamav_container": CLAMAV_CONTAINER,
+        }
     finally:
         from persistence.postgres import session as pg_session
 
@@ -185,6 +245,7 @@ def runtime_stack(tmp_path_factory: pytest.TempPathFactory) -> Iterator[dict]:
 
         _docker("rm", "-f", PG_CONTAINER, check=False)
         _docker("rm", "-f", MINIO_CONTAINER, check=False)
+        _docker("rm", "-f", CLAMAV_CONTAINER, check=False)
 
 
 @pytest.fixture

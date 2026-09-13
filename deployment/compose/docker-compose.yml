@@ -106,6 +106,41 @@ services:
       start_period: 10s
     restart: unless-stopped
 
+  bagman-scan:
+    # CD-4 WI-3 (PID §19/§20/§60): the content-safety scanning backend
+    # for Evidence Intake — a real `clamd` daemon, BAGMAN-owned,
+    # internal-only. Pinned (not `:latest` — PID §7) to the same
+    # `clamav/clamav:stable` *release channel* WI-2 built/verified
+    # against (see services/evidence/intake/scanner.py and
+    # tests/integration/test_intake_scanner.py's module docstrings) —
+    # ClamAV does not publish per-build immutable version tags on this
+    # image the way postgres/minio above do, so `stable` is the
+    # documented, deliberate choice here (it still tracks one release
+    # channel, never a daily/nightly rebuild), not an oversight of the
+    # "no :latest" rule.
+    image: clamav/clamav:stable
+    container_name: bagman-scan
+    networks:
+      - bagman-net
+    # No host port publish (PID §32) — bagman-api reaches this over
+    # bagman-net only, at bagman-scan:3310, exactly like bagman-db/
+    # bagman-objects above.
+    environment:
+      TZ: UTC
+    healthcheck:
+      # clamd's own PING/PONG protocol, spoken directly over the port
+      # it already listens on, via `nc` — verified present in the
+      # `clamav/clamav:stable` image (Alpine-based; NO `bash`, so a
+      # `/dev/tcp` redirection trick does not work here, unlike a
+      # Debian/Ubuntu-based image — checked directly against this exact
+      # image during this delivery, not assumed).
+      test: ["CMD-SHELL", "echo -n 'PING' | nc -w 5 127.0.0.1 3310 | grep -q PONG"]
+      interval: 10s
+      timeout: 10s
+      retries: 20
+      start_period: 30s
+    restart: unless-stopped
+
   bagman-api:
     build:
       context: ../../
@@ -121,6 +156,8 @@ services:
         condition: service_healthy
       bagman-objects:
         condition: service_healthy
+      bagman-scan:
+        condition: service_healthy
     environment:
       BAGMAN_RUNTIME_ENV: production
       BAGMAN_DB_HOST: bagman-db
@@ -132,6 +169,8 @@ services:
       BAGMAN_OBJECT_STORE_BUCKET: bagman-evidence
       BAGMAN_OBJECT_STORE_ACCESS_KEY_FILE: /run/secrets/minio_root_user
       BAGMAN_OBJECT_STORE_SECRET_KEY_FILE: /run/secrets/minio_root_user_password
+      BAGMAN_SCANNER_HOST: bagman-scan
+      BAGMAN_SCANNER_PORT: "3310"
       BAGMAN_LOG_LEVEL: INFO
       TZ: UTC
     secrets:

@@ -72,14 +72,21 @@ def main() -> int:
     print(f"    source_id      = {source['source_id']}")
 
     content = f"BAGMAN WI-4 restart-proof synthetic evidence bytes (run {rid})\n".encode("utf-8")
-    external_id = f"wi4-restart-proof-{rid}-file"
+    # CD-4 WI-3: evidence is created via the governed intake endpoint
+    # (POST /internal/intake/evidence), not the removed CD-3 direct
+    # route. It never accepts a caller-chosen source_id (manual upload
+    # always resolves to BAGMAN's own stable MANUAL_UPLOAD source, PID
+    # §9) or a real entity_id (CD-4 always registers entity_id=None —
+    # see app/api/routers/intake.py's own module docstring); an
+    # idempotency_key is CD-4's retry mechanism, replacing CD-3's
+    # external_reference tuple.
+    idempotency_key = f"wi4-restart-proof-{rid}-file"
     evidence = _lib.register_evidence(
-        entity_id=entity["entity_id"],
-        source_id=source["source_id"],
+        entity_hint=entity["canonical_name"],
         content=content,
         original_name=f"wi4-restart-proof-{rid}.txt",
-        external_reference_external_id=external_id,
         actor_id=actor_id,
+        idempotency_key=idempotency_key,
     )
     evidence_id = evidence["evidence_id"]
     content_hash = evidence["content_hash"]
@@ -87,8 +94,12 @@ def main() -> int:
     print(f"    evidence_id       = {evidence_id}")
     print(f"    content_hash      = {content_hash}")
     print(f"    storage_reference = {storage_reference}")
-    assert evidence["entity_id"] == entity["entity_id"]
-    assert evidence["source_id"] == source["source_id"]
+    print(f"    resolved source_id (stable MANUAL_UPLOAD source) = {evidence['source_id']}")
+    # CD-4 entity-resolution decision (recorded, not relitigated here):
+    # intake always registers entity_id=None; the entity SELECTION is
+    # carried as entity_hint on the IntakeRecord instead.
+    assert evidence["entity_id"] is None
+    assert evidence["_intake"]["entity_hint"] == entity["canonical_name"]
     assert content_hash["value"] == __import__("hashlib").sha256(content).hexdigest()
 
     content_response = _lib.get_evidence_content(evidence_id)
@@ -116,13 +127,23 @@ def main() -> int:
     assert len(lineage_before) == 1
     assert lineage_before[0]["provenance"]["provenance_id"] == prov_result["provenance_id"]
     assert lineage_before[0]["evidence"]["evidence_id"] == evidence_id
-    assert lineage_before[0]["source"]["source_id"] == source["source_id"]
+    # CD-4: evidence resolves to BAGMAN's stable MANUAL_UPLOAD source
+    # (never the arbitrary `source` registered above), so this checks
+    # internal consistency (trace_provenance resolves the SAME source
+    # the EvidenceItem itself points to) rather than equality with a
+    # caller-created Source.
+    assert lineage_before[0]["source"]["source_id"] == evidence["source_id"]
 
     audit_before = _lib.audit_trail_snapshot(
         evidence_id=evidence_id, classification_subject_id=classification_subject_id
     )
     print(f"    audit trail before restart: {audit_before}")
-    assert len(audit_before["evidence_events"]) == 1
+    # CD-4 intake emits both EVIDENCE_OBSERVED (CD-2) and its own
+    # EVIDENCE_REGISTERED (PID §30/§31 causal-chain closure back to the
+    # IntakeRecord) against the EvidenceItem subject — see
+    # app/api/routers/intake.py's own module docstring for why both are
+    # kept.
+    assert len(audit_before["evidence_events"]) == 2
     assert len(audit_before["classification_events"]) == 2  # PROVENANCE_RECORDED + CLASSIFICATION_PROPOSED
 
     # -----------------------------------------------------------------
@@ -178,21 +199,18 @@ def main() -> int:
     # -----------------------------------------------------------------
     # [7] repeat the exact same external observation -> same evidence_id
     # -----------------------------------------------------------------
-    print(f"\n[7] REPEAT THE EXACT SAME EXTERNAL OBSERVATION (idempotency survives restart)")
+    print(f"\n[7] REPEAT THE EXACT SAME INTAKE REQUEST (idempotency survives restart)")
     retry_evidence = _lib.register_evidence(
-        entity_id=entity["entity_id"],
-        source_id=source["source_id"],
+        entity_hint=entity["canonical_name"],
         content=content,
         original_name=f"wi4-restart-proof-{rid}.txt",
-        external_reference_external_id=external_id,
         actor_id=actor_id,
-        observed_at=evidence["_request_metadata"]["observed_at"],
-        received_at=evidence["_request_metadata"]["received_at"],
+        idempotency_key=idempotency_key,
     )
     print(f"    original evidence_id = {evidence_id}")
     print(f"    retried  evidence_id = {retry_evidence['evidence_id']}")
     assert retry_evidence["evidence_id"] == evidence_id, (
-        "a bare retry of the same external_reference tuple after a full restart "
+        "a bare retry of the same Idempotency-Key after a full restart "
         "must resolve to the SAME EvidenceItem, not create a duplicate"
     )
     print(f"    SAME evidence_id returned — idempotency survived the restart.")
@@ -208,8 +226,8 @@ def main() -> int:
 
     _lib.section("PID §43 RUNTIME RESTART PROOF: ALL STEPS COMPLETED AND VERIFIED")
     print(f"    evidence_id            = {evidence_id}")
-    print(f"    entity_id              = {entity['entity_id']}")
-    print(f"    source_id              = {source['source_id']}")
+    print(f"    entity_id (unresolved, CD-4) = {evidence['entity_id']}")
+    print(f"    source_id (MANUAL_UPLOAD)    = {evidence['source_id']}")
     print(f"    provenance_id          = {prov_result['provenance_id']}")
     print(f"    content_hash           = {content_hash['value']}")
     print(f"    (stack left running — see container_rebuild_proof.py / restore_into_clean_target_proof.py)")

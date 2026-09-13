@@ -16,7 +16,7 @@ COMPOSE := docker compose -p bagman -f $(COMPOSE_FILE)
 build:
 	$(COMPOSE) build
 
-## Start the full BAGMAN runtime (bagman-db, bagman-objects, bagman-api).
+## Start the full BAGMAN runtime (bagman-db, bagman-objects, bagman-scan, bagman-api).
 start:
 	$(COMPOSE) up -d
 

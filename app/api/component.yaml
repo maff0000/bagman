@@ -10,36 +10,72 @@
 # not a literal path.
 
 id: BAGMAN.RUNTIME.API
-version: 1
+version: 2
 
 responsibility: >
   Own the FastAPI/Uvicorn HTTP-facing application layer that exposes
   BagmanCanonicalAPI as a runnable, containerised service: health/
-  readiness (with a hard no-fallback invariant on readiness failure),
-  version metadata, structured logging, and thin internal HTTP
-  wrappers around register_entity/register_source/register_evidence/
-  get_evidence/trace_provenance. Also owns the PID §14 composition
-  root — the one place BAGMAN_RUNTIME_ENV is read to choose between
-  in-memory and PostgreSQL+MinIO-backed repositories.
+  readiness (with a hard no-fallback invariant on readiness failure,
+  and — since CD-4 WI-3 — a mandatory content-safety scanner
+  reachability check alongside PostgreSQL/object-store), version
+  metadata, structured logging, thin internal HTTP wrappers around
+  register_entity/register_source/get_evidence/list_evidence/
+  trace_provenance, and — CD-4 WI-3 — the governed Evidence Intake HTTP
+  API (POST /internal/intake/evidence, GET /internal/intake[/{id}]):
+  evidence-registration orchestration (staging bytes into canonical
+  storage, registering the EvidenceItem, and the full intake audit
+  causation chain) once WI-2's content-validation pipeline reaches
+  ACCEPTED, plus closure of the CD-3 direct-upload bypass (the old
+  byte-accepting POST /internal/evidence has been removed entirely).
+  Also owns the PID §14 composition root — the one place
+  BAGMAN_RUNTIME_ENV is read to choose between in-memory and
+  PostgreSQL+MinIO+ClamAV-backed repositories/object-store/scanner —
+  and the stable MANUAL_UPLOAD Source resolve-or-create lifecycle (PID
+  §9).
 
 owns: []
 
 # What app/api/ actually imports: core.api.BagmanCanonicalAPI and
 # core.errors.* (the facade + error vocabulary), the durable
 # persistence/postgres/* repositories and persistence/objects/*
-# object-store implementations (composition.py only), and the
-# in-memory persistence/objects/memory_store.InMemoryObjectStore for
-# development/test composition.
+# object-store implementations (composition.py only), the in-memory
+# persistence/objects/memory_store.InMemoryObjectStore for
+# development/test composition, and — CD-4 WI-3 —
+# services.evidence.intake.intake.IntakeRepository/
+# InMemoryIntakeRepository, persistence.postgres.intake_repository
+# .PostgresIntakeRepository, services.evidence.intake.validation_pipeline
+# .run_intake_validation, and services.evidence.intake.scanner
+# .EvidenceSafetyScanner/ClamAVScanner (composition.py wires the real
+# scanner in production; a small dev-only always-CLEAN stub, defined
+# and used only inside composition.py, backs development/test mode).
 consumes:
   - BAGMAN.CORE
   - BAGMAN.SERVICES.EVIDENCE
+  - BAGMAN.EVIDENCE.INTAKE
   - BAGMAN.PERSISTENCE.POSTGRES
   - BAGMAN.PERSISTENCE.OBJECTS
 
-# app/api/ does not itself emit AuditEvents — every write it
-# performs goes through core.api.BagmanCanonicalAPI, which already
-# emits its own events (see core/component.yaml's `produces`).
-produces: []
+# app/api/ does not itself emit AuditEvents for CD-2's own canonical
+# writes — those go through core.api.BagmanCanonicalAPI, which already
+# emits its own events (see core/component.yaml's `produces`). CD-4
+# WI-3 is the one exception: app/api/routers/intake.py's governed
+# intake endpoint IS the orchestration layer that emits the
+# intake-workflow audit events themselves (INTAKE_RECEIVED,
+# INTAKE_VALIDATION_STARTED, INTAKE_REJECTED, INTAKE_QUARANTINED,
+# INTAKE_ACCEPTED, EVIDENCE_STORED, EVIDENCE_REGISTERED,
+# INTAKE_COMPLETED, INTAKE_FAILED) — via core.api.BagmanCanonicalAPI
+# .record_audit_event(), not a new repository, but the event TYPES
+# themselves are minted here, not inside core/ or services/evidence/.
+produces:
+  - INTAKE_RECEIVED
+  - INTAKE_VALIDATION_STARTED
+  - INTAKE_REJECTED
+  - INTAKE_QUARANTINED
+  - INTAKE_ACCEPTED
+  - EVIDENCE_STORED
+  - EVIDENCE_REGISTERED
+  - INTAKE_COMPLETED
+  - INTAKE_FAILED
 
 dependencies:
   - fastapi

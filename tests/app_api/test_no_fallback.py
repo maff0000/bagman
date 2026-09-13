@@ -20,7 +20,11 @@ from __future__ import annotations
 
 import subprocess
 
-from tests.app_api.conftest import wait_for_minio_container_healthy, wait_for_postgres_container_healthy
+from tests.app_api.conftest import (
+    wait_for_clamav_container_healthy,
+    wait_for_minio_container_healthy,
+    wait_for_postgres_container_healthy,
+)
 
 
 def _docker_stop(name: str) -> None:
@@ -37,7 +41,9 @@ def test_ready_is_green_with_both_dependencies_up(client):
     body = response.json()
     assert body["ready"] is True
     assert body["runtime_environment"] == "production"
-    assert body["checks"] == {"postgres": "ok", "object_store": "ok"}
+    # CD-4 WI-3: the scanner joined postgres/object_store as a
+    # mandatory production readiness check (PID §60).
+    assert body["checks"] == {"postgres": "ok", "object_store": "ok", "scanner": "ok"}
 
 
 def test_postgres_down_fails_ready_with_no_fallback(client, runtime_stack):
@@ -96,6 +102,37 @@ def test_object_store_down_fails_ready_with_no_fallback(client, runtime_stack):
     finally:
         _docker_start(runtime_stack["minio_container"])
         wait_for_minio_container_healthy()
+
+    response = client.get("/ready")
+    assert response.status_code == 200
+    assert response.json()["ready"] is True
+
+
+def test_scanner_down_fails_ready_with_no_fallback(client, runtime_stack):
+    """CD-4 WI-3 counterpart to the postgres/object_store proofs above
+    (PID §55/§60): stopping the mandatory content-safety scanner must
+    fail /ready closed, never silently mark readiness green anyway."""
+    assert client.get("/ready").status_code == 200
+
+    from services.evidence.intake.scanner import ClamAVScanner
+    from app.api.composition import get_composition
+
+    _docker_stop(runtime_stack["clamav_container"])
+    try:
+        response = client.get("/ready")
+        assert response.status_code == 503
+        body = response.json()
+        assert body["ready"] is False
+        assert body["failed_dependency"] == "scanner"
+        assert body["runtime_environment"] == "production"
+        composition = get_composition()
+        assert composition.runtime_environment == "production"
+        # Still the real ClamAVScanner — never silently replaced by a
+        # dev-only stub.
+        assert isinstance(composition.scanner, ClamAVScanner)
+    finally:
+        _docker_start(runtime_stack["clamav_container"])
+        wait_for_clamav_container_healthy()
 
     response = client.get("/ready")
     assert response.status_code == 200

@@ -25,74 +25,54 @@ handlers registered in ``app/api/main.py``, not by a per-route
 ``try``/``except`` here. That keeps the status-code mapping in exactly
 one place rather than duplicated across every handler.
 
-Evidence registration: transaction-semantics decision (PID §20)
-------------------------------------------------------------------
-``POST /internal/evidence`` must call ``EvidenceObjectStore.put()``
-(object storage) and ``BagmanCanonicalAPI.register_evidence()``
-(metadata persistence) as two separate systems that cannot be made
-atomic with each other. The order chosen here is: **store bytes
-first, then register metadata** — because ``put()`` is itself
-idempotent/immutable-safe (a retry that lands on the same content
-always resolves to the same key), so a partially-completed attempt can
-always be safely retried from scratch without risking silent
-corruption or overwrite.
-
-This creates exactly one possible partial-failure state, which PID §20
-requires this module to state plainly rather than paper over: **if
-``put()`` succeeds but the subsequent ``register_evidence()`` call
-fails** (e.g. a ``ValidationError``, or a genuine
-``DuplicateExternalReferenceError`` if an ``external_reference`` hint
-was supplied and conflicts with a different existing canonical
-object), the bytes just stored are now an *orphaned* object with no
-canonical ``EvidenceItem`` row pointing at it.
-
-The behaviour deliberately chosen for that case: **do nothing further
-— the orphaned object is left in place.** No best-effort delete is
-attempted, for a concrete reason beyond convenience:
-``persistence.objects.store.EvidenceObjectStore`` has no ``delete()``
-method in its contract at all (by design — PID §17's immutability
-doctrine), so "best-effort delete" is not even an operation available
-to this router without altering that protected abstraction, which is
-out of this work item's authority. This is safe rather than merely
-convenient: the object is content-addressed
-(``evidence/<key-id>/<sha256>``) and inert — nothing else in BAGMAN
-ever resolves to it without a canonical ``storage_reference`` pointing
-there first, so it cannot be mistaken for real evidence, and it is
-naturally eligible for a future garbage-collection or manual re-link
-pass (a later work item's concern, not this one's). No claim of
-cross-system atomicity is made anywhere in this module — PID §20 is
-explicit that pretending otherwise would be worse than stating the gap.
-
-Object-key id vs. canonical evidence_id (PID §19)
------------------------------------------------------
-``EvidenceObjectStore.put(evidence_id, content_hash, data)`` needs an
-id to build its ``evidence/<evidence_id>/<hash>`` key *before* storing
-anything — but ``BagmanCanonicalAPI.register_evidence()`` always mints
-its own fresh canonical ``evidence_id`` internally and has no parameter
-to accept a caller-supplied one (true of both the in-memory and
-PostgreSQL repository implementations; this router does not modify
-either). Consequently this handler pre-generates a fresh id via
-``core.identity.generate_id()`` purely to namespace the storage key —
-call it the *storage-key id* — which will differ from the canonical
-``EvidenceItem.evidence_id`` the domain layer mints moments later. The
-canonical record's own ``storage_reference`` field is the durable,
-always-present link between the two; nothing downstream ever needs to
-derive one id from the other by string-parsing.
+Direct-upload bypass CLOSED (CD-4 WI-3, PID §26/§27)
+--------------------------------------------------------
+CD-3 originally exposed a byte-accepting ``POST /internal/evidence``
+(``file: UploadFile`` + freeform ``metadata`` JSON) that registered
+canonical evidence directly from untrusted uploaded bytes with none of
+CD-4's governance (no size/filename/MIME/archive/executable policy, no
+malware scanning, no intake identity/state, no quarantine). PID §27 is
+explicit that this "must not remain a bypass around governance" once
+Evidence Intake exists. That route (and its request model,
+``RegisterEvidenceMetadata``) has been REMOVED entirely — not
+deprecated, not internally delegated — for a concrete reason beyond
+"the PID said so": there is no way to internally delegate it to
+``POST /internal/intake/evidence`` (``app/api/routers/intake.py``)
+without silently reintroducing exactly the bypass PID §27 forbids,
+because the intake endpoint's entire safety property comes from
+validating/scanning/staging bytes BEFORE canonical registration, on its
+own explicit ``IntakeRecord`` identity/state machine — collapsing that
+into a same-request internal call from this route would just be the
+same governed endpoint wearing this route's name, with none of this
+route's original (already-informally-relied-upon) simpler contract
+preserved either. Removing it outright is the only choice that avoids
+either outcome. ``tests/acceptance/_lib.py``'s ``register_evidence()``
+helper (CD-3's own acceptance-script producer of evidence, since it was
+the only one that existed at the time) has been updated to call the new
+governed endpoint instead (CD-4 WI-3) — see that module.
+``GET /internal/evidence/{evidence_id}``,
+``GET /internal/evidence/{evidence_id}/content``, and
+``GET /internal/provenance/...`` remain exactly as they were: reads,
+never the bypass.
 """
 from __future__ import annotations
 
 from datetime import datetime
 from typing import Any, Optional
 
-from fastapi import APIRouter, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, HTTPException
 from fastapi.responses import Response
-from pydantic import BaseModel, ValidationError as PydanticValidationError
+from pydantic import BaseModel
 
-from core import identity
-from persistence.objects.store import compute_sha256
 from app.api.composition import get_composition
 
 router = APIRouter(prefix="/internal")
+
+#: PID §45 — no unbounded "return everything" endpoint (mirrors
+#: app/api/routers/intake.py's own identical constants for
+#: GET /internal/intake).
+_DEFAULT_PAGE_SIZE = 50
+_MAX_PAGE_SIZE = 200
 
 
 # ---------------------------------------------------------------------
@@ -125,29 +105,6 @@ class RegisterSourceRequest(BaseModel):
     causation_id: Optional[str] = None
 
 
-class RegisterEvidenceMetadata(BaseModel):
-    """The JSON metadata part of the ``POST /internal/evidence``
-    multipart request (the ``file`` part carries the raw bytes
-    alongside it)."""
-
-    evidence_type: str
-    source_id: str
-    observed_at: datetime
-    received_at: datetime
-    mime_type: str
-    actor_type: str
-    actor_id: str
-    entity_id: Optional[str] = None
-    original_name: Optional[str] = None
-    status: str = "OBSERVED"
-    metadata: Optional[dict[str, Any]] = None
-    external_reference_provider: Optional[str] = None
-    external_reference_resource_type: Optional[str] = None
-    external_reference_external_id: Optional[str] = None
-    correlation_id: Optional[str] = None
-    causation_id: Optional[str] = None
-
-
 # ---------------------------------------------------------------------
 # routes
 # ---------------------------------------------------------------------
@@ -167,64 +124,41 @@ async def register_source(payload: RegisterSourceRequest) -> dict:
     return source.to_dict()
 
 
-@router.post("/evidence", status_code=201)
-async def register_evidence(
-    metadata: str = Form(..., description="JSON-encoded RegisterEvidenceMetadata"),
-    file: UploadFile = File(...),
-) -> dict:
-    try:
-        meta = RegisterEvidenceMetadata.model_validate_json(metadata)
-    except PydanticValidationError as exc:
-        # A malformed request body, not a canonical BAGMAN domain error
-        # — handled directly here (422) rather than via the centralised
-        # BagmanError translation in main.py, since no core.errors.*
-        # type applies to "the HTTP request itself was malformed".
-        raise HTTPException(status_code=422, detail=f"invalid 'metadata' part: {exc}") from exc
-
-    data = await file.read()
+@router.get("/evidence")
+async def list_evidence(
+    entity_id: Optional[str] = None,
+    evidence_type: Optional[str] = None,
+    received_at_from: Optional[datetime] = None,
+    received_at_to: Optional[datetime] = None,
+    limit: int = _DEFAULT_PAGE_SIZE,
+    offset: int = 0,
+) -> dict[str, Any]:
+    """Paginated ``EvidenceItem`` listing (PID §44-46, CD-4 WI-3 — CD-3
+    never added this; only ``get_evidence`` (single) existed). Same
+    ``received_at DESC`` + deterministic-tie-breaker ordering doctrine
+    as ``GET /internal/intake`` (``app/api/routers/intake.py``)."""
+    if limit <= 0 or limit > _MAX_PAGE_SIZE:
+        raise HTTPException(
+            status_code=422, detail=f"limit must be between 1 and {_MAX_PAGE_SIZE} (got {limit})"
+        )
+    if offset < 0:
+        raise HTTPException(status_code=422, detail=f"offset must be >= 0 (got {offset})")
 
     composition = get_composition()
-
-    # See this module's docstring: a fresh id used only to namespace
-    # the object-storage key, distinct from the canonical evidence_id
-    # register_evidence() will mint below.
-    storage_key_id = identity.generate_id()
-    content_hash = {"algorithm": "SHA-256", "value": compute_sha256(data)}
-
-    storage_reference = composition.object_store.put(storage_key_id, content_hash, data)
-
-    external_reference = None
-    if (
-        meta.external_reference_provider
-        and meta.external_reference_resource_type
-        and meta.external_reference_external_id
-    ):
-        external_reference = (
-            meta.external_reference_provider,
-            meta.external_reference_resource_type,
-            meta.external_reference_external_id,
-        )
-
-    evidence = composition.api.register_evidence(
-        entity_id=meta.entity_id,
-        evidence_type=meta.evidence_type,
-        source_id=meta.source_id,
-        observed_at=meta.observed_at,
-        received_at=meta.received_at,
-        content_hash=content_hash,
-        mime_type=meta.mime_type,
-        size_bytes=len(data),
-        actor_type=meta.actor_type,
-        actor_id=meta.actor_id,
-        original_name=meta.original_name or file.filename,
-        storage_reference=storage_reference,
-        status=meta.status,
-        metadata=meta.metadata,
-        external_reference=external_reference,
-        correlation_id=meta.correlation_id,
-        causation_id=meta.causation_id,
+    items = composition.api.evidence_repository.list_evidence(
+        entity_id=entity_id,
+        evidence_type=evidence_type,
+        received_at_from=received_at_from,
+        received_at_to=received_at_to,
+        limit=limit,
+        offset=offset,
     )
-    return evidence.to_dict()
+    return {
+        "items": [i.to_dict() for i in items],
+        "limit": limit,
+        "offset": offset,
+        "count": len(items),
+    }
 
 
 @router.get("/evidence/{evidence_id}")

@@ -80,6 +80,20 @@ class SourceRepository(abc.ABC):
     def list_sources(self) -> list[Source]:
         raise NotImplementedError
 
+    @abc.abstractmethod
+    def find_by_provider(self, *, source_type: str, provider: str) -> Optional[Source]:
+        """Read-only lookup for the first ``Source`` matching the exact
+        (``source_type``, ``provider``) pair, or ``None`` if none exists
+        (CD-4 WI-3, PID §9). Added so a caller (e.g.
+        ``app/api/composition.py``'s stable ``MANUAL_UPLOAD`` source
+        resolve-or-create helper) can idempotently discover an
+        already-registered well-known ``Source`` without creating a new
+        one for every intake attempt — a query, not a fetch-by-ID, so it
+        never raises ``NotFoundError``. Never raises for "not found";
+        only genuine infrastructure failure propagates.
+        """
+        raise NotImplementedError
+
 
 class InMemorySourceRepository(SourceRepository):
     """Narrow in-memory reference implementation (PID §21 Option A)."""
@@ -124,3 +138,9 @@ class InMemorySourceRepository(SourceRepository):
 
     def list_sources(self) -> list[Source]:
         return list(self._sources.values())
+
+    def find_by_provider(self, *, source_type: str, provider: str) -> Optional[Source]:
+        for source in self._sources.values():
+            if source.source_type == source_type and source.provider == provider:
+                return source
+        return None
