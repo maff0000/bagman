@@ -103,21 +103,52 @@ def _docker(*args: str, check: bool = True) -> subprocess.CompletedProcess:
     return subprocess.run(["docker", *args], capture_output=True, text=True, check=check)
 
 
-def _wait_for_postgres(timeout_s: float = 30.0) -> None:
+def _wait_for_postgres(timeout_s: float = 60.0) -> None:
+    """Block until PostgreSQL is genuinely ready for real queries — not
+    merely until `pg_isready` reports success once.
+
+    PL correction (2026-09-13): the official `postgres` image, on a
+    fresh (first-run) container, runs `initdb`, then briefly starts a
+    TEMPORARY server to execute init scripts, stops it, and only then
+    starts the FINAL long-lived server. `pg_isready` can report success
+    during that fleeting temporary-server window — it only checks that
+    something is accepting TCP connections on the port, not that it is
+    the final server. A caller's very first real query can then land
+    exactly as the temporary server is shutting down, surfacing as
+    `psycopg.OperationalError: ... server closed the connection
+    unexpectedly` — reproduced live in CI (a slower/more loaded runner
+    makes the race far more likely to bite than on a fast, idle
+    development host, which is why this never failed locally).
+
+    Fixed by waiting for an actual `SELECT 1` to succeed (not just
+    `pg_isready`), and requiring it to succeed on `_REQUIRED_CONSECUTIVE_OK`
+    consecutive attempts before declaring readiness — riding out the
+    brief window between the temporary server's shutdown and the final
+    server's startup, rather than trusting a single success.
+    """
+    _REQUIRED_CONSECUTIVE_OK = 3
     deadline = time.monotonic() + timeout_s
+    consecutive_ok = 0
     last_result = None
     while time.monotonic() < deadline:
         last_result = subprocess.run(
-            ["docker", "exec", CONTAINER_NAME, "pg_isready", "-U", DB_USER, "-d", DB_NAME],
+            [
+                "docker", "exec", CONTAINER_NAME,
+                "psql", "-U", DB_USER, "-d", DB_NAME, "-tAc", "SELECT 1",
+            ],
             capture_output=True,
             text=True,
         )
-        if last_result.returncode == 0:
-            return
+        if last_result.returncode == 0 and last_result.stdout.strip() == "1":
+            consecutive_ok += 1
+            if consecutive_ok >= _REQUIRED_CONSECUTIVE_OK:
+                return
+        else:
+            consecutive_ok = 0
         time.sleep(0.5)
     raise RuntimeError(
-        f"{CONTAINER_NAME} did not become ready within {timeout_s}s: "
-        f"{last_result.stdout if last_result else '<no attempt>'} "
+        f"{CONTAINER_NAME} did not become genuinely ready (real SELECT 1) within "
+        f"{timeout_s}s: {last_result.stdout if last_result else '<no attempt>'} "
         f"{last_result.stderr if last_result else ''}"
     )
 

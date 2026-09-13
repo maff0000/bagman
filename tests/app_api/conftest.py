@@ -45,19 +45,40 @@ def _docker(*args: str, check: bool = True) -> subprocess.CompletedProcess:
     return subprocess.run(["docker", *args], capture_output=True, text=True, check=check)
 
 
-def _wait_for_postgres(timeout_s: float = 30.0) -> None:
+def _wait_for_postgres(timeout_s: float = 60.0) -> None:
+    """Block until PostgreSQL is genuinely ready for real queries.
+
+    PL correction (2026-09-13, same fix as tests/persistence/conftest.py):
+    a fresh official-image container briefly runs a TEMPORARY server
+    (during `initdb`'s init-script phase) before the FINAL long-lived
+    server starts. `pg_isready` alone can report success during that
+    temporary window, so the first real query can land exactly as it's
+    shutting down (`server closed the connection unexpectedly`) —
+    reproduced live in CI. Requiring an actual `SELECT 1` to succeed on
+    several consecutive attempts rides out that window instead of
+    trusting a single `pg_isready` success.
+    """
+    _REQUIRED_CONSECUTIVE_OK = 3
     deadline = time.monotonic() + timeout_s
+    consecutive_ok = 0
     last = None
     while time.monotonic() < deadline:
         last = subprocess.run(
-            ["docker", "exec", PG_CONTAINER, "pg_isready", "-U", PG_USER, "-d", PG_DB],
+            ["docker", "exec", PG_CONTAINER, "psql", "-U", PG_USER, "-d", PG_DB, "-tAc", "SELECT 1"],
             capture_output=True,
             text=True,
         )
-        if last.returncode == 0:
-            return
+        if last.returncode == 0 and last.stdout.strip() == "1":
+            consecutive_ok += 1
+            if consecutive_ok >= _REQUIRED_CONSECUTIVE_OK:
+                return
+        else:
+            consecutive_ok = 0
         time.sleep(0.5)
-    raise RuntimeError(f"{PG_CONTAINER} did not become ready in time: {last.stdout if last else ''}")
+    raise RuntimeError(
+        f"{PG_CONTAINER} did not become genuinely ready (real SELECT 1) in time: "
+        f"{last.stdout if last else ''} {last.stderr if last else ''}"
+    )
 
 
 def _wait_for_minio(timeout_s: float = 30.0) -> None:
