@@ -121,6 +121,14 @@ def compose_rm_service(service: str) -> None:
     run(compose_cmd("rm", "-sf", service))
 
 
+def compose_stop_service(service: str) -> None:
+    """Stop (but do not remove) exactly one service's container — used
+    by WI-5's dependency-failure proofs (PID §55-57) to simulate
+    ``bagman-scan``/``bagman-objects``/``bagman-db`` becoming
+    unavailable without disturbing any other running service."""
+    run(compose_cmd("stop", service))
+
+
 def compose_ps_service_id(service: str) -> str:
     result = run_capture(compose_cmd("ps", "-q", service))
     return result.stdout.strip()
