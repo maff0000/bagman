@@ -146,6 +146,7 @@ async def list_ai_invocations(
     correlation_id: Optional[str] = None,
     started_at_from: Optional[datetime] = None,
     started_at_to: Optional[datetime] = None,
+    primary_input_reference: Optional[str] = None,
     limit: int = _DEFAULT_PAGE_SIZE,
     offset: int = 0,
 ) -> dict[str, Any]:
@@ -154,6 +155,16 @@ async def list_ai_invocations(
     parameters directly as query params (PID §68), same
     `{"items", "limit", "offset", "count"}` response shape CD-4 already
     established for `GET /internal/intake` / `GET /internal/evidence`.
+
+    `primary_input_reference` (WI-4 addition, PID §45): filters to every
+    invocation — of any `task_id`, in any status, terminal or not —
+    whose subject (`ai.invocation.derive_primary_input_reference`)
+    equals this value. In practice this is almost always an
+    `evidence_id` (the Documents AI panel's own use: "every AI analysis
+    that has ever run for this document"), but is named after the
+    domain concept rather than `evidence_id` specifically because the
+    same field also matches an `intake_id`- or `entity_id`-keyed
+    invocation (PID §29/§73's generalised "subject").
     """
     _validate_pagination(limit, offset)
     composition = get_composition()
@@ -165,6 +176,7 @@ async def list_ai_invocations(
         correlation_id=correlation_id,
         started_at_from=started_at_from,
         started_at_to=started_at_to,
+        primary_input_reference=primary_input_reference,
         limit=limit,
         offset=offset,
     )
@@ -201,9 +213,15 @@ async def ai_health() -> dict:
     probe cheaply. Every `bagman-*` key below therefore currently
     reflects the SAME underlying signal, not independently-measured
     per-alias health; this is a real limitation of what is cheaply
-    checkable today, not a fabricated per-alias distinction. A `claude`
-    key may be added additively alongside these by WI-3 — `checks` is a
-    plain, open dict for exactly that reason, not a fixed/closed model.
+    checkable today, not a fabricated per-alias distinction. `checks` is
+    a plain, open dict for exactly that reason, not a fixed/closed
+    model — WI-4 additively fills in the `claude` key this docstring
+    previously left as an open extension point (a genuinely SEPARATE
+    signal, not folded into the gateway-wide caveat above:
+    `claude_client.is_available()` probes the Claude operator provider,
+    not the LiteLLM background gateway, and can fail/recover completely
+    independently of it — PID §46-48's own "distinct failure classes"
+    doctrine).
     """
     composition = get_composition()
     gateway_reachable = composition.litellm_client.is_available()
@@ -211,11 +229,13 @@ async def ai_health() -> dict:
     checks: dict[str, str] = {
         alias.replace("-", "_"): status_value for alias in sorted(BACKGROUND_CAPABILITY_ALIASES)
     }
+    checks["claude"] = "ok" if composition.claude_client.is_available() else "unreachable"
     return {
         "checks": checks,
         "granularity": (
-            "gateway-wide: all bagman-* keys reflect one shared LiteLLM-gateway "
+            "gateway-wide for bagman-*: all three keys reflect one shared LiteLLM-gateway "
             "reachability signal, not independently-measured per-alias health "
-            "(see ai/providers/litellm/client.py::LiteLLMClient.is_available)"
+            "(see ai/providers/litellm/client.py::LiteLLMClient.is_available); 'claude' is a "
+            "genuinely separate, independently-measured signal for the Claude operator provider"
         ),
     }

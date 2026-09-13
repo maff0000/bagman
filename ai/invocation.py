@@ -429,6 +429,7 @@ class AIInvocationRepository(abc.ABC):
         correlation_id: Optional[str] = None,
         started_at_from: Optional[datetime] = None,
         started_at_to: Optional[datetime] = None,
+        primary_input_reference: Optional[str] = None,
         limit: Optional[int] = None,
         offset: int = 0,
     ) -> list[AIInvocation]:
@@ -443,6 +444,22 @@ class AIInvocationRepository(abc.ABC):
         record. `limit`/`offset` page the result; `limit=None` (the
         default, preserved for every existing caller that does not ask
         for pagination) returns every matching record.
+
+        ``primary_input_reference`` (CD-5 WI-4 addition): an optional
+        equality filter on exactly the same value
+        :func:`derive_primary_input_reference` computes for each record
+        at creation time — i.e. whichever of `evidence_id`/`intake_id`/
+        `entity_id` a given invocation's `input_references` carries
+        (PID §29/§73's "subject" — see this module's own docstring).
+        This is what lets a caller ask "every AIInvocation — of any
+        `task_id`, terminal or not — about THIS canonical subject",
+        which `find_active_invocation` deliberately cannot answer (that
+        method is scoped to one exact `(task_id, task_version)` pair and
+        only ever returns a single NON-terminal record). The Documents
+        AI panel (WI-4) is this filter's motivating caller: "what AI
+        analysis exists for this document" needs every invocation for
+        its `evidence_id`, across `DOCUMENT_SUMMARY`/
+        `DOCUMENT_TYPE_PROPOSAL`/`ENTITY_PROPOSAL`, in every status.
         """
         raise NotImplementedError
 
@@ -558,6 +575,7 @@ class InMemoryAIInvocationRepository(AIInvocationRepository):
         correlation_id: Optional[str] = None,
         started_at_from: Optional[datetime] = None,
         started_at_to: Optional[datetime] = None,
+        primary_input_reference: Optional[str] = None,
         limit: Optional[int] = None,
         offset: int = 0,
     ) -> list[AIInvocation]:
@@ -576,6 +594,17 @@ class InMemoryAIInvocationRepository(AIInvocationRepository):
             records = [r for r in records if r.started_at >= started_at_from]
         if started_at_to is not None:
             records = [r for r in records if r.started_at <= started_at_to]
+        if primary_input_reference is not None:
+            # Computed per-record (the in-memory repository has no
+            # separate indexed column for this — see module docstring)
+            # using the exact same derivation every record's subject was
+            # established with at create_invocation time. Every record
+            # reaching this repository was already proven to yield one
+            # (create_invocation refuses otherwise, PID §29), so this
+            # never raises here.
+            records = [
+                r for r in records if derive_primary_input_reference(r.input_references) == primary_input_reference
+            ]
 
         records.sort(key=lambda r: (r.started_at, r.ai_invocation_id), reverse=True)
 

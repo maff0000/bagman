@@ -22,6 +22,16 @@
         Audit <span class="pill pill--muted">unavailable</span>
       </button>
     </nav>
+    <div class="shell-header__actions">
+      <label class="operator-identity">
+        <span>Acting as</span>
+        <input type="text" id="operator-identity-input" autocomplete="off" />
+      </label>
+      <!-- Ask BAGMAN (PID §42) — reachable from anywhere in the shell,
+           not buried inside one tab; opens features/ai/ask-bagman.js's
+           drawer (markup below, just before </body>). -->
+      <button class="btn btn--primary" id="ask-bagman-toggle" type="button">Ask BAGMAN</button>
+    </div>
   </header>
 
   <main class="shell-main">
@@ -57,6 +67,30 @@
       </div>
 
       <button class="btn btn--secondary" id="overview-refresh" type="button">Refresh</button>
+
+      <!-- ---------- AI status (CD-5 WI-4, PID §46-48) ---------- -->
+      <h2 class="ai-status__heading">AI Status</h2>
+      <div class="card-grid" id="ai-status-cards">
+        <div class="card" data-card="ai-claude">
+          <div class="card__title">Claude operator</div>
+          <div class="card__body">
+            <div class="status-line"><span class="dot dot--pending"></span><span class="status-text">checking…</span></div>
+          </div>
+        </div>
+        <div class="card" data-card="ai-aliases">
+          <div class="card__title">Background gateway — <code>GET /internal/ai/health</code></div>
+          <div class="card__body" id="ai-aliases-body">
+            <p class="muted small">checking…</p>
+          </div>
+        </div>
+        <div class="card" data-card="ai-recent">
+          <div class="card__title">Recent AI activity</div>
+          <div class="card__body">
+            <p id="ai-pending-line" class="small"></p>
+            <div id="ai-recent-body"><p class="muted small">checking…</p></div>
+          </div>
+        </div>
+      </div>
     </section>
 
     <!-- ============================= DOCUMENTS ============================= -->
@@ -205,6 +239,25 @@
         <!-- populated by app.js -->
       </div>
     </div>
+  </div>
+
+  <!-- ---------- Ask BAGMAN drawer (PID §42-44) ---------- -->
+  <div id="ask-bagman-drawer" class="ask-bagman-drawer" hidden>
+    <div class="ask-bagman-drawer__header">
+      <h2>Ask BAGMAN</h2>
+      <button class="btn btn--ghost" id="ask-bagman-close" type="button" aria-label="Close">&times;</button>
+    </div>
+    <div id="ask-bagman-context-chip" class="ask-bagman-drawer__chip" hidden></div>
+    <p id="ask-bagman-no-context-notice" class="muted small ask-bagman-drawer__notice">
+      No document/intake/entity is attached — this delivery's Ask BAGMAN requires one canonical
+      subject per question. Open it via "Ask BAGMAN about this" from a document, or a general
+      question here will be rejected by the server.
+    </p>
+    <div id="ask-bagman-messages" class="ask-bagman-drawer__messages" aria-live="polite"></div>
+    <form id="ask-bagman-form" class="ask-bagman-drawer__form">
+      <input type="text" id="ask-bagman-input" placeholder="Ask about a document…" autocomplete="off" />
+      <button class="btn btn--primary" type="submit">Send</button>
+    </form>
   </div>
 
   <script src="app.js" type="module"></script>

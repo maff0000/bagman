@@ -63,7 +63,30 @@ responsibility: >
   RuntimeComposition, reusing the same ai_invocation_repository field
   WI-2 already added) — the actual Ask BAGMAN orchestration logic and
   tool registry live in the separate agent/ component (BAGMAN.AGENT),
-  consumed here, never reimplemented in app/api/.
+  consumed here, never reimplemented in app/api/. CD-5 WI-4 additively
+  extends both AI HTTP surfaces above rather than introducing new ones:
+  `GET /internal/ai/invocations` gains an optional
+  `primary_input_reference` query parameter (reusing WI-1's own
+  generalised-subject filter, added to `AIInvocationRepository
+  .list_invocations`'s ABC/in-memory/PostgreSQL implementations) so a
+  caller can ask "every AIInvocation — any task, any status — about
+  this one canonical subject", which the pre-existing filter set could
+  not answer; and `GET /internal/ai/health` gains the `claude` key
+  WI-2's own docstring had left as an open, additive extension point
+  (`composition.claude_client.is_available()`, a genuinely separate
+  signal from the gateway-wide `bagman-*` checks). `app/api/composition
+  .py`'s development/test builder also gains a `default_response` for
+  its `FakeLiteLLMClient` (task-shape-aware, matching whichever of the
+  three CD-5 background tasks' system prompt is actually running) so a
+  real dev-mode server's "Run analysis" button produces a genuine,
+  clearly-labelled fake result instead of a 500 — closing a gap that
+  blocked this WI's own interactive GUI testing, not a change to any
+  HTTP-visible contract. Finally, WI-4 reorganises `app/api/static/`
+  (previously one `app.js` monolith) into `shell/`/`shared/`/
+  `features/{overview,documents,ai}/` (PID §41) and adds the Ask BAGMAN
+  drawer, the Documents "AI Analysis" panel, and Overview's AI status
+  area — still plain vanilla ES modules served by the same
+  `StaticFiles` mount, no build step, no new runtime/dependency.
 
 owns: []
 

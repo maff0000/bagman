@@ -413,3 +413,56 @@ def test_list_invocations_respects_limit_and_offset_with_deterministic_ordering(
 
     assert [inv.ai_invocation_id for inv in page1] == created_ids_newest_first[0:2]
     assert [inv.ai_invocation_id for inv in page2] == created_ids_newest_first[2:4]
+
+
+# ---------------------------------------------------------------------
+# list_invocations(primary_input_reference=...) (WI-4, PID §45)
+# ---------------------------------------------------------------------
+
+
+def test_list_invocations_filters_by_primary_input_reference(repo, evidence_id):
+    a = _create_background(repo, evidence_id, task_id="DOCUMENT_TYPE_PROPOSAL")
+    b = _create_background(repo, evidence_id, task_id="DOCUMENT_SUMMARY")
+    other_evidence_id = identity.generate_id()
+    _create_background(repo, other_evidence_id, task_id="DOCUMENT_TYPE_PROPOSAL")
+
+    found = repo.list_invocations(primary_input_reference=evidence_id)
+    assert {inv.ai_invocation_id for inv in found} == {a.ai_invocation_id, b.ai_invocation_id}
+
+
+def test_list_invocations_by_primary_input_reference_spans_every_status_including_terminal(repo, evidence_id):
+    """Deliberately proves this is genuinely different from
+    `find_active_invocation` — it must include terminal invocations too
+    (module docstring's own "terminal or not" contract)."""
+    a = _create_background(repo, evidence_id, task_id="DOCUMENT_TYPE_PROPOSAL")
+    repo.transition_status(a.ai_invocation_id, "REJECTED")
+    b = _create_background(repo, evidence_id, task_id="DOCUMENT_SUMMARY")
+    repo.transition_status(b.ai_invocation_id, "RUNNING")
+    repo.transition_status(b.ai_invocation_id, "SUCCEEDED", output={"summary": "s", "confidence": 0.5, "signals": [], "warnings": []})
+
+    found = {inv.ai_invocation_id: inv.status for inv in repo.list_invocations(primary_input_reference=evidence_id)}
+    assert found == {a.ai_invocation_id: "REJECTED", b.ai_invocation_id: "SUCCEEDED"}
+
+
+def test_list_invocations_filters_by_primary_input_reference_for_intake_and_entity_subjects(repo):
+    """`primary_input_reference` is a generalised subject, not literally
+    `evidence_id` — an invocation keyed on `intake_id` alone must match
+    too (see `derive_primary_input_reference`'s precedence order)."""
+    intake_id = identity.generate_id()
+    matching = repo.create_invocation(
+        task_id="ASK_BAGMAN",
+        task_version=1,
+        role="OPERATOR",
+        provider="ANTHROPIC",
+        capability_alias=None,
+        input_references={"intake_id": intake_id},
+        actor_type="USER",
+        actor_id="matt",
+    )
+    found = repo.list_invocations(primary_input_reference=intake_id)
+    assert [inv.ai_invocation_id for inv in found] == [matching.ai_invocation_id]
+
+
+def test_list_invocations_primary_input_reference_with_no_matches_returns_empty(repo, evidence_id):
+    _create_background(repo, evidence_id)
+    assert repo.list_invocations(primary_input_reference=identity.generate_id()) == []

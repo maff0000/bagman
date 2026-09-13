@@ -370,14 +370,24 @@ def test_static_ui_assets_contain_no_python_or_server_side_code():
 def test_static_ui_javascript_only_calls_the_existing_internal_http_api():
     """Confirms, by inspection of the actual JS source (not merely by
     absence of a database driver import — there is no such thing as an
-    'import' in plain browser JS to look for), that BAGMAN's own
-    ``app.js`` talks to the backend ONLY through relative
-    ``/internal/*`` (or ``/health``/``/ready``/``/version``) HTTP paths
-    via ``fetch`` — never a raw database connection string, an AWS/S3
-    SDK-shaped endpoint, or any other infrastructure address."""
-    app_js = (REPO_ROOT / "app" / "api" / "static" / "app.js").read_text(encoding="utf-8")
+    'import' in plain browser JS to look for), that BAGMAN's own GUI
+    talks to the backend ONLY through relative ``/internal/*`` (or
+    ``/health``/``/ready``/``/version``) HTTP paths via ``fetch`` —
+    never a raw database connection string, an AWS/S3 SDK-shaped
+    endpoint, or any other infrastructure address.
 
-    # Every literal path string this file references as an API target
+    CD-5 WI-4 modularised the former single ``app.js`` monolith into
+    ``shell/``/``shared/``/``features/{overview,documents,ai}/`` (PID
+    §41) — ``app.js`` itself is now a thin entry point with no literal
+    endpoint strings of its own, so this test scans every ``*.js`` file
+    under ``app/api/static/`` (the same tree Starlette's ``StaticFiles``
+    serves), not just the one former monolith file.
+    """
+    static_dir = REPO_ROOT / "app" / "api" / "static"
+    js_files = sorted(static_dir.rglob("*.js"))
+    assert js_files, "expected at least one JS file under app/api/static/"
+
+    # Every literal path string these files reference as an API target
     # must be relative and rooted at one of the known, existing JSON
     # surfaces — never an absolute external host, never anything
     # database/object-store-shaped.
@@ -386,12 +396,14 @@ def test_static_ui_javascript_only_calls_the_existing_internal_http_api():
         "s3://", "minio", ":5432", ":9000", ":3310",
         "boto3", "psycopg", "sqlalchemy",
     ]
-    lowered = app_js.lower()
+
+    combined = "\n".join(path.read_text(encoding="utf-8") for path in js_files)
+    lowered = combined.lower()
     violations = [token for token in forbidden_tokens if token in lowered]
     assert violations == [], (
-        f"app/api/static/app.js appears to reference infrastructure directly: {violations}"
+        f"app/api/static/**/*.js appears to reference infrastructure directly: {violations}"
     )
-    assert "/internal/" in app_js, "expected app.js to call the existing /internal/* HTTP API"
+    assert "/internal/" in combined, "expected the GUI's JS to call the existing /internal/* HTTP API"
 
 
 # core/ and services/evidence/ must never import app/ (the HTTP/routing

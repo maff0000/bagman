@@ -223,10 +223,16 @@ def test_get_invocations_list_and_detail_round_trip(dev_client):
 def test_ai_health_reports_gateway_wide_checks_for_every_alias(dev_client):
     composition = get_composition()
     composition.litellm_client.set_available(True)
+    composition.claude_client._available = True
     response = dev_client.get("/internal/ai/health")
     assert response.status_code == 200
     body = response.json()
-    assert body["checks"] == {"bagman_fast": "ok", "bagman_core": "ok", "bagman_deep": "ok"}
+    assert body["checks"] == {
+        "bagman_fast": "ok",
+        "bagman_core": "ok",
+        "bagman_deep": "ok",
+        "claude": "ok",
+    }
     assert "gateway-wide" in body["granularity"]
 
     composition.litellm_client.set_available(False)
@@ -235,7 +241,62 @@ def test_ai_health_reports_gateway_wide_checks_for_every_alias(dev_client):
         "bagman_fast": "unreachable",
         "bagman_core": "unreachable",
         "bagman_deep": "unreachable",
+        "claude": "ok",
     }
+
+
+def test_ai_health_claude_key_is_independent_of_the_litellm_gateway(dev_client):
+    """WI-4 addition — `claude` must be a genuinely separate signal, not
+    folded into the gateway-wide bagman-* caveat (PID §46-48)."""
+    composition = get_composition()
+    composition.litellm_client.set_available(True)
+    composition.claude_client._available = False
+    response = dev_client.get("/internal/ai/health")
+    body = response.json()
+    assert body["checks"]["claude"] == "unreachable"
+    assert body["checks"]["bagman_fast"] == "ok"
+
+
+def test_list_invocations_filters_by_primary_input_reference_query_param(dev_client):
+    composition = get_composition()
+    evidence_id = _register_text_evidence(composition)
+    other_evidence_id = _register_text_evidence(composition, content=b"other doc")
+
+    composition.litellm_client.queue_success(
+        capability_alias="bagman-fast",
+        content=json.dumps({"proposed_type": "INVOICE", "confidence": 0.9, "signals": [], "warnings": []}),
+    )
+    created = dev_client.post(
+        "/internal/ai/tasks",
+        json={
+            "task_id": "DOCUMENT_TYPE_PROPOSAL",
+            "task_version": 1,
+            "input_references": {"evidence_id": evidence_id},
+            "actor_type": ACTOR_TYPE,
+            "actor_id": ACTOR_ID,
+        },
+    ).json()
+
+    composition.litellm_client.queue_success(
+        capability_alias="bagman-fast",
+        content=json.dumps({"proposed_type": "RECEIPT", "confidence": 0.5, "signals": [], "warnings": []}),
+    )
+    dev_client.post(
+        "/internal/ai/tasks",
+        json={
+            "task_id": "DOCUMENT_TYPE_PROPOSAL",
+            "task_version": 1,
+            "input_references": {"evidence_id": other_evidence_id},
+            "actor_type": ACTOR_TYPE,
+            "actor_id": ACTOR_ID,
+        },
+    )
+
+    listed = dev_client.get("/internal/ai/invocations", params={"primary_input_reference": evidence_id})
+    assert listed.status_code == 200
+    body = listed.json()
+    assert body["count"] == 1
+    assert body["items"][0]["ai_invocation_id"] == created["ai_invocation_id"]
 
 
 def test_request_body_has_no_model_or_alias_override_field(dev_client):
