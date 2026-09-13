@@ -210,6 +210,22 @@ class ScanFailedError(BagmanError):
     error_code = "SCAN_FAILED"
 
 
+class ActiveInvocationConflictError(BagmanError):
+    """A caller attempted to create a new `AIInvocation` (CD-5 PID §73,
+    WI-1) for a `(task_id, task_version, primary_input_reference)`
+    subject that already has a NON-terminal (`REQUESTED`/`RUNNING`)
+    invocation in flight — a genuine conflict, distinct from a retry
+    (which is always allowed once the prior invocation has reached a
+    terminal state, and always creates a new, distinct `AIInvocation`
+    row rather than reusing the old one). See
+    ``ai.invocation`` module docstring for the full concurrency
+    doctrine, and its own idempotency-vs-concurrency contrast with
+    ``services.evidence.intake.intake``'s ``IdempotencyConflictError``.
+    """
+
+    error_code = "ACTIVE_INVOCATION_CONFLICT"
+
+
 class PersistenceError(BagmanError):
     """A general persistence-layer failure distinct from a constraint
     violation — e.g. a database connectivity/operational failure (PID

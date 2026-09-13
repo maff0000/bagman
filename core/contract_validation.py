@@ -21,6 +21,7 @@ from __future__ import annotations
 import functools
 import json
 from pathlib import Path
+from typing import Any
 
 from jsonschema import Draft202012Validator, FormatChecker
 from referencing import Registry, Resource
@@ -91,3 +92,43 @@ def validate_against_contract(instance: dict, schema_relative_path: str) -> None
         raise ValidationError(
             f"instance failed validation against contract '{schema_relative_path}': {detail}"
         )
+
+
+def describe_schema_errors(instance: Any, schema: dict) -> list[str]:
+    """Validate ``instance`` against an in-memory JSON Schema ``schema``
+    dict — as opposed to :func:`validate_against_contract`, which loads
+    its schema from a file under ``contracts/`` and raises on failure.
+
+    Added for CD-5 WI-1 (PID §24/§76): a task's structured-output
+    validation must produce a non-raising, storable
+    ``{"valid": ..., "errors": [...]}``-shaped result (see
+    ``ai.tasks.validate_task_output``) rather than crash the caller —
+    "do not repair malformed output silently; record validation
+    failure" (PID §76) requires the failure to be data, not an
+    exception. This function is the shared, non-raising primitive that
+    makes that possible without ``ai.tasks`` duplicating any
+    ``jsonschema`` wiring of its own.
+
+    Returns a list of human-readable error strings (``path: message``),
+    empty if ``instance`` conforms. Reuses the same cross-referencing
+    :func:`_registry` (so a task schema could ``$ref`` a
+    ``contracts/common/`` primitive if it ever needed to) and the same
+    ``FormatChecker`` :func:`validate_against_contract` uses.
+
+    Raises:
+        ValidationError: only if the schema/validator machinery itself
+            is broken (e.g. a malformed ``schema`` dict) — never for an
+            ordinary validation failure, which is returned as data
+            instead (mirrors :func:`validate_against_contract`'s own
+            "never leak a raw jsonschema exception" discipline for
+            this specific failure mode only).
+    """
+    try:
+        validator = Draft202012Validator(schema, registry=_registry(), format_checker=FormatChecker())
+        errors = sorted(validator.iter_errors(instance), key=lambda e: list(map(str, e.path)))
+    except ValidationError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - defensive: never leak third-party errors
+        raise ValidationError(f"schema validation machinery failed: {exc}") from exc
+
+    return [f"{'/'.join(str(p) for p in e.path) or '<root>'}: {e.message}" for e in errors]

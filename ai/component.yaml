@@ -1,0 +1,69 @@
+# BAGMAN component manifest (CD-5 PID §7/§19) for ai/.
+# Validated by scripts/generate_architecture_memory.py against
+# contracts/manifest/bagman.component_manifest.v1.schema.json.
+
+id: BAGMAN.AI
+version: 1
+
+responsibility: >
+  Own the governed, provider-NEUTRAL AI invocation domain model and
+  typed task contract/registry framework: the AIInvocation state
+  machine and its one-active-invocation-per-subject concurrency
+  guarantee (CD-5 PID §26-30/§73-76), and the TaskContract/TASK_REGISTRY
+  framework naming CD-5's four initial tasks' metadata and real,
+  usable input/output JSON Schemas (PID §21-24/§55). WI-1 delivers only
+  the domain/contract/persistence slice of BAGMAN.AI's eventual
+  responsibility (PID §7's full statement: "route typed BAGMAN
+  intelligence tasks to an authorised AI provider/capability, enforce
+  task contracts and policy, record invocation provenance, validate
+  structured responses and return proposals without directly mutating
+  canonical business state") — it does NOT yet route anything to a
+  real provider: no gateway, no LiteLLM/Anthropic client, no prompt
+  content, no policy-enforcement dispatch loop. Those are WI-2
+  (`ai/providers/litellm/`, `ai/gateway/`), WI-3 (`ai/providers/claude/`,
+  plus `agent/`'s Claude-orchestration/tool-registry pieces), and WI-5
+  (`ai/evaluation/`) — this manifest will grow `owns`/`consumes` as
+  those work items land their own `ai/*` subpackages.
+
+owns:
+  - AIInvocation
+  - TaskContract
+
+# ai/invocation.py depends on core/ exactly like every other CD-2/CD-4
+# domain module: identity (id generation), timestamps (UTC handling),
+# actor (closed actor_type vocabulary — reused exactly, no parallel
+# vocabulary invented), errors (ActiveInvocationConflictError,
+# InvalidStateTransitionError, NotFoundError, ValidationError), and
+# contract_validation (validate_against_contract). ai/tasks.py further
+# depends on core.contract_validation.describe_schema_errors (added by
+# this WI alongside validate_against_contract) and imports
+# ai.invocation.BACKGROUND_CAPABILITY_ALIASES as the single source of
+# truth for the closed background-alias set.
+consumes:
+  - BAGMAN.CORE
+
+# This component does not itself emit audit events — AI_INVOCATION_*
+# audit event emission (PID §57) is WI-2/WI-3's orchestration-layer
+# responsibility, mirroring how services/evidence/intake/ does not
+# emit its own audit events either (see that component's own
+# component.yaml).
+produces: []
+
+# No new third-party dependency was introduced by WI-1: schema
+# validation reuses core.contract_validation's existing jsonschema
+# wiring (a new describe_schema_errors function alongside it, not a
+# new dependency).
+dependencies:
+  - jsonschema
+  - rfc3339-validator
+
+external_access: false
+
+prohibited:
+  - direct_email_access
+  - direct_bank_access
+  - direct_xero_access
+  - direct_chargebee_access
+  - direct_litellm_client_outside_gateway
+  - direct_anthropic_client_outside_gateway
+  - trinity_star_alias_usage
