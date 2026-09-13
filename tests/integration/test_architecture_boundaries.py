@@ -92,14 +92,21 @@ def test_core_and_services_evidence_never_import_adapters_agent_or_ui():
     )
 
 
-def test_agent_directory_currently_has_no_python_files():
-    agent_dir = REPO_ROOT / "agent"
-    agent_py_files = sorted(p.relative_to(REPO_ROOT).as_posix() for p in agent_dir.rglob("*.py"))
-    assert agent_py_files == [], (
-        f"expected agent/ to contain no .py files as of CD-2, found: {agent_py_files} "
-        "(if agent/ now legitimately has code, the import-boundary test below is what "
-        "must catch a future core/services -> agent import, not this one)"
-    )
+def test_agent_policies_and_memory_still_have_no_python_files():
+    """CD-5 WI-3 populates `agent/bagman/` and `agent/tools/` for real
+    (Ask BAGMAN orchestration + the fixed tool registry) — superseding
+    this test's original CD-2 "agent/ has no .py files at all" form.
+    `agent/policies/` and `agent/memory/` remain CD-1's original empty
+    placeholders as of WI-3 (see WI-3's own delivery report: no
+    genuinely CD-5-scoped content was found for either) — this narrower
+    assertion is what's still meaningful. The import-boundary test below
+    (`test_nothing_under_core_or_services_imports_from_agent`) is the
+    one that actually matters regardless of agent/'s file listing.
+    """
+    for sub in ("policies", "memory"):
+        subdir = REPO_ROOT / "agent" / sub
+        py_files = sorted(p.relative_to(REPO_ROOT).as_posix() for p in subdir.rglob("*.py"))
+        assert py_files == [], f"expected agent/{sub}/ to contain no .py files, found: {py_files}"
 
 
 def test_nothing_under_core_or_services_imports_from_agent():

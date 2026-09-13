@@ -10,7 +10,7 @@
 # not a literal path.
 
 id: BAGMAN.RUNTIME.API
-version: 4
+version: 5
 
 responsibility: >
   Own the FastAPI/Uvicorn HTTP-facing application layer that exposes
@@ -54,7 +54,16 @@ responsibility: >
   (PID §8), and never a new audit-event-producing responsibility here:
   the AI_INVOCATION_*/AI_OUTPUT_REJECTED events are minted by
   `ai/gateway/background.py` itself (see that component's own
-  `component.yaml`), not by this router.
+  `component.yaml`), not by this router. CD-5 WI-3 additionally owns
+  the Ask BAGMAN HTTP surface (POST /internal/operator/chat,
+  app/api/routers/operator.py — a new file, deliberately never added
+  to routers/ai.py, WI-2's own in-parallel file) and composition-root
+  wiring for the Claude operator provider adapter and the fixed
+  agent/tools tool registry (claude_client/tool_registry on
+  RuntimeComposition, reusing the same ai_invocation_repository field
+  WI-2 already added) — the actual Ask BAGMAN orchestration logic and
+  tool registry live in the separate agent/ component (BAGMAN.AGENT),
+  consumed here, never reimplemented in app/api/.
 
 owns: []
 
@@ -77,7 +86,14 @@ owns: []
 # ai.providers.litellm.client.LiteLLMClient(Protocol) (production), and
 # ai.providers.litellm.fake.FakeLiteLLMClient (development/test),
 # plus persistence.postgres.ai_invocation_repository
-# .PostgresAIInvocationRepository (composition.py only).
+# .PostgresAIInvocationRepository (composition.py only). CD-5 WI-3
+# additionally consumes: ai.providers.claude.client
+# .ClaudeClient(Protocol)/ai.providers.claude.fake.FakeClaudeClient,
+# and agent.tools.{registry,handlers,background} (composition.py wires
+# the real ClaudeClient in production, the deterministic
+# FakeClaudeClient in development/test — PID §61) — reusing the same
+# AIInvocationRepository/PostgresAIInvocationRepository WI-2 already
+# wired in, never a second one.
 consumes:
   - BAGMAN.CORE
   - BAGMAN.SERVICES.EVIDENCE
@@ -87,6 +103,7 @@ consumes:
   - BAGMAN.AI
   - BAGMAN.AI.GATEWAY
   - BAGMAN.AI.PROVIDERS.LITELLM
+  - BAGMAN.AGENT
 
 # app/api/ does not itself emit AuditEvents for CD-2's own canonical
 # writes — those go through core.api.BagmanCanonicalAPI, which already
