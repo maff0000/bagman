@@ -109,16 +109,34 @@ services:
   bagman-scan:
     # CD-4 WI-3 (PID §19/§20/§60): the content-safety scanning backend
     # for Evidence Intake — a real `clamd` daemon, BAGMAN-owned,
-    # internal-only. Pinned (not `:latest` — PID §7) to the same
-    # `clamav/clamav:stable` *release channel* WI-2 built/verified
-    # against (see services/evidence/intake/scanner.py and
-    # tests/integration/test_intake_scanner.py's module docstrings) —
-    # ClamAV does not publish per-build immutable version tags on this
-    # image the way postgres/minio above do, so `stable` is the
-    # documented, deliberate choice here (it still tracks one release
-    # channel, never a daily/nightly rebuild), not an oversight of the
-    # "no :latest" rule.
-    image: clamav/clamav:stable
+    # internal-only.
+    #
+    # CD-4 PR #4 Architect delta (2026-09-13): PR #4 originally pinned
+    # this to `clamav/clamav:stable` alone, on the reasoning that
+    # ClamAV publishes no per-build immutable version tag the way
+    # postgres/minio above do, so tracking the `stable` *release
+    # channel* was "the documented, deliberate choice ... not an
+    # oversight of the 'no :latest' rule." The Architect overrode that:
+    # a release channel is still a MOVING tag — the bytes behind
+    # `clamav/clamav:stable` can change upstream at any time without
+    # this file changing — which is not acceptable identity for a
+    # runtime dependency, regardless of how deliberately it was chosen.
+    #
+    # This is now pinned by immutable digest: the `@sha256:...` suffix,
+    # not the `stable` tag, is what actually fixes the exact image
+    # bytes BAGMAN runs (and the exact image this delivery's
+    # ClamAV-dependent tests were built/verified against — resolved
+    # independently on the host that ran those tests, via
+    # `docker inspect --format='{{index .RepoDigests 0}}'
+    # clamav/clamav:stable`, immediately before pinning here). Docker
+    # treats `repo@digest` as the canonical, immutable reference
+    # regardless of any tag also present; `:stable` is kept here purely
+    # as a human-readable release-channel label for operators reading
+    # this file, not as part of the pinning mechanism — if ClamAV's
+    # `stable` channel is ever intentionally moved forward, this digest
+    # (and this comment) must be updated deliberately, exactly like any
+    # other version bump, never implicitly by a background image pull.
+    image: clamav/clamav:stable@sha256:1fdfd24c6f0a0fb60788481487459a6d4eda8a9b448641594e04db8410d34422
     container_name: bagman-scan
     networks:
       - bagman-net

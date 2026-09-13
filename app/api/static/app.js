@@ -383,11 +383,15 @@ const Documents = {
           text: "Download",
           attrs: {
             href: API.evidenceContent(record.evidence_id),
-            // Client-side defense-in-depth (PID §48): forces a save
-            // rather than in-page navigation/inline rendering, since
-            // the underlying GET /internal/evidence/{id}/content
-            // response does not itself set Content-Disposition — see
-            // the WI-4 report's flagged gap.
+            // CD-4 PR #4 Architect delta (2026-09-13): the server's own
+            // `Content-Disposition: attachment` header (set by
+            // GET /internal/evidence/{id}/content itself — see
+            // app/api/http_headers.py) is now the actual safety
+            // boundary that forces a save rather than in-page
+            // navigation/inline rendering. This `download` attribute is
+            // defense-in-depth only from here on — a same-origin hint
+            // for browsers, not something the safety property depends
+            // on.
             download: record.original_filename || record.evidence_id,
           },
         })
