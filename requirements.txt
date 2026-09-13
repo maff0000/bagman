@@ -159,3 +159,20 @@ alembic==1.20.0
 fastapi==0.141.1
 uvicorn[standard]==0.52.4
 python-multipart==0.0.32
+#
+# requests - CD-5 WI-3 PL reconciliation fix (2026-09-13): moved here
+# from requirements-dev.txt. ai/providers/claude/client.py imports it
+# directly to speak the Anthropic Messages API — a genuine runtime
+# application dependency, not test/ops tooling, so it belongs in this
+# file per its own established discipline (see the starlette/boto3
+# notes above). WI-3's own dispatch never declared it here, so a truly
+# clean `pip install -r requirements.txt` (no requirements-dev.txt)
+# venv raised `ModuleNotFoundError: No module named 'requests'` the
+# moment `ai.providers.claude.client` was imported — caught by the PL
+# building exactly that clean production-only venv before accepting
+# this work item (the same discipline that caught CD-3's httpx2/
+# requests test-only gaps). Same version already pinned in
+# requirements-dev.txt for the acceptance scripts (2.34.2) — kept
+# identical rather than re-verified separately, since both now resolve
+# from the same one declaration.
+requests==2.34.2

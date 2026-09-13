@@ -7,15 +7,19 @@ shape, registered by exact ``(task_id, task_version)`` in
 :data:`TASK_REGISTRY`. Callers request the TASK, never the model (PID
 §22).
 
-This module defines task *metadata* only — the four CD-5 tasks' actual
-prompt CONTENT (the wording sent to a model) is explicitly out of WI-1
-scope (PID §31: prompts are versioned assets, but authoring them
-belongs to whichever work item actually calls the provider — WI-2 for
-the three ``BACKGROUND`` tasks, WI-3 for ``OPERATOR_DOCUMENT_REVIEW``).
-What WI-1 DOES own is the contract SHAPE those prompts/outputs must
-conform to: `input_schema`, `output_schema`, `timeout_seconds`,
-`confidence_policy`, `data_policy` — real, usable JSON Schemas, not
-placeholders, so WI-2/WI-3 can build directly on them.
+This module defines task *metadata* only — the original four CD-5 WI-1
+tasks' actual prompt CONTENT (the wording sent to a model) is
+explicitly out of WI-1 scope (PID §31: prompts are versioned assets,
+but authoring them belongs to whichever work item actually calls the
+provider — WI-2 for the three ``BACKGROUND`` tasks, WI-3 for
+``OPERATOR_DOCUMENT_REVIEW``). What WI-1 DOES own is the contract SHAPE
+those prompts/outputs must conform to: `input_schema`, `output_schema`,
+`timeout_seconds`, `confidence_policy`, `data_policy` — real, usable
+JSON Schemas, not placeholders, so WI-2/WI-3 can build directly on
+them. WI-3 additively registers a 5th task, ``ASK_BAGMAN`` v1, further
+down this module — the registry is deliberately OPEN (PID §22/§29's own
+"open, not a closed enum" doctrine), so this is expected, additive
+growth, not a WI-1 change.
 
 Output shape convention
 ------------------------
@@ -94,9 +98,10 @@ class TaskContract:
     PID §22 lists is present; construction validates the closed-set/
     cross-field rules documented on each field below and raises
     `core.errors.ValidationError` if violated — this runs for every
-    `TaskContract` at module-import time (the four CD-5 tasks below),
-    so a shape mistake in this file fails immediately and loudly, not
-    silently at first use.
+    `TaskContract` at module-import time (the five CD-5 tasks below —
+    WI-1's original four plus WI-3's additive `ASK_BAGMAN`), so a shape
+    mistake in this file fails immediately and loudly, not silently at
+    first use.
     """
 
     task_id: str
@@ -360,6 +365,109 @@ OPERATOR_DOCUMENT_REVIEW_V1 = TaskContract(
 )
 
 
+_ASK_BAGMAN_INPUT_SCHEMA: Mapping[str, Any] = {
+    "type": "object",
+    "properties": {
+        "message": {
+            "type": "string",
+            "minLength": 1,
+            "description": (
+                "The operator's free-text Ask BAGMAN message (PID §42-43) — untrusted "
+                "operator input, not a task instruction override."
+            ),
+        },
+        "evidence_id": {
+            "oneOf": [{"type": "string", "minLength": 1}, {"type": "null"}],
+            "description": "Canonical evidence_id in context, if the operator is asking about a specific document.",
+        },
+        "intake_id": {
+            "oneOf": [{"type": "string", "minLength": 1}, {"type": "null"}],
+            "description": "Canonical intake_id in context, if the operator is asking about a specific intake attempt.",
+        },
+        "entity_id": {
+            "oneOf": [{"type": "string", "minLength": 1}, {"type": "null"}],
+            "description": "Canonical entity_id in context, if the operator is asking about a specific GovernedEntity.",
+        },
+    },
+    "required": ["message", "evidence_id", "intake_id", "entity_id"],
+    "additionalProperties": False,
+}
+
+_ASK_BAGMAN_OUTPUT_SCHEMA: Mapping[str, Any] = {
+    "type": "object",
+    "properties": {
+        "response_text": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Claude's final natural-language answer (PID §25 — the conclusion, never hidden chain-of-thought).",
+        },
+        "tool_calls": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "tool": {"type": "string", "minLength": 1},
+                    "input": {"type": "object"},
+                    "summary": {"type": "string"},
+                },
+                "required": ["tool", "input", "summary"],
+                "additionalProperties": False,
+            },
+            "description": (
+                "Structured, auditable record of which registered tools were called and "
+                "with what inputs/outputs (PID §25/§62) — never raw model scratch reasoning."
+            ),
+        },
+        "referenced_evidence_ids": {
+            "type": "array",
+            "items": {"type": "string", "minLength": 1},
+            "description": "Canonical evidence_ids the response refers to (PID §44) — so the GUI can render them as clickable references.",
+        },
+        "warnings": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Caveats — e.g. the bounded tool-call iteration limit was reached (PID §24/§35).",
+        },
+    },
+    "required": ["response_text", "tool_calls", "referenced_evidence_ids", "warnings"],
+    "additionalProperties": False,
+}
+
+#: CD-5 WI-3 addition (additive, PID §21's registry stays open by
+#: design — see this module's own docstring). Ask BAGMAN's general,
+#: potentially-multi-turn-tool-calling conversational task: distinct
+#: from `OPERATOR_DOCUMENT_REVIEW` (a single-shot, always-about-one-
+#: `evidence_id` review) because Ask BAGMAN may reason about an
+#: intake_id/entity_id instead, may call zero-or-more tools before
+#: answering, and its output is conversational rather than a per-
+#: document review. See `agent/bagman/orchestrator.py`'s module
+#: docstring for the full "general chat has no evidence_id" tension
+#: this task's `input_schema` resolves: `evidence_id`/`intake_id`/
+#: `entity_id` are each optional (nullable), but
+#: `ai.invocation.derive_primary_input_reference` still requires at
+#: least one non-null — a genuinely subject-less "what needs my
+#: attention?" query is explicitly out of WI-3's scope (documented,
+#: not silently papered over).
+ASK_BAGMAN_V1 = TaskContract(
+    task_id="ASK_BAGMAN",
+    task_version=1,
+    role="OPERATOR",
+    preferred_capability=None,
+    input_schema=_ASK_BAGMAN_INPUT_SCHEMA,
+    output_schema=_ASK_BAGMAN_OUTPUT_SCHEMA,
+    timeout_seconds=90,
+    confidence_policy={
+        "meaning": (
+            "Not applicable — Ask BAGMAN's conversational response does not carry a single "
+            "numeric confidence value; per-tool-call results and `warnings` communicate "
+            "uncertainty instead (PID §55 forbids one universal confidence threshold anyway)."
+        ),
+        "notes": "AIInvocation.confidence is left null for this task.",
+    },
+    data_policy="CLOUD_OPERATOR_OK",
+)
+
+
 #: The single source of truth for every registered task (PID §21),
 #: keyed by exact `(task_id, task_version)` — callers request the
 #: task, never the model (PID §22).
@@ -370,6 +478,7 @@ TASK_REGISTRY: Mapping[tuple[str, int], TaskContract] = {
         DOCUMENT_TYPE_PROPOSAL_V1,
         ENTITY_PROPOSAL_V1,
         OPERATOR_DOCUMENT_REVIEW_V1,
+        ASK_BAGMAN_V1,
     )
 }
 

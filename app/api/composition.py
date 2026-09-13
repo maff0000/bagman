@@ -49,14 +49,22 @@ wedged "not ready" forever after one transient failure.
 """
 from __future__ import annotations
 
+import functools
 import os
 import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Any, Mapping, Optional
 
+from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
+from agent.tools.background import BackgroundTaskRunner, DeterministicFakeBackgroundTaskRunner
+from agent.tools.handlers import ToolDependencies, build_default_tool_registry
+from agent.tools.registry import ToolRegistry
+from ai.invocation import AIInvocationRepository, InMemoryAIInvocationRepository
+from ai.providers.claude.client import ClaudeClientProtocol
+from ai.providers.claude.fake import FakeClaudeClient
 from core import actor
 from core.api import BagmanCanonicalAPI
 from persistence.objects.store import EvidenceObjectStore
@@ -168,19 +176,58 @@ class RuntimeComposition:
     engine: Optional[Engine]
     intake_repository: IntakeRepository
     scanner: EvidenceSafetyScanner
+    #: CD-5 WI-3 additions (PID §26-27/§6/§8) — a single
+    #: `AIInvocationRepository` shared by BOTH the `OPERATOR` role (Ask
+    #: BAGMAN, wired here) and the `BACKGROUND` role (WI-2's own
+    #: gateway, once reconciled) — WI-1 already built both the in-memory
+    #: and PostgreSQL implementations; this WI is the first to actually
+    #: wire either into `RuntimeComposition`. `claude_client` is
+    #: `ai.providers.claude.client.ClaudeClientProtocol`-shaped (the real
+    #: `ClaudeClient` in production, `FakeClaudeClient` in development/
+    #: test, PID §61). `tool_registry` is the fixed, closed
+    #: `agent.tools.registry.ToolRegistry` Claude may invoke (PID §34) —
+    #: identical construction in every runtime_environment (the tools
+    #: themselves are never environment-conditional; only the
+    #: `background_task_runner` dependency they close over could
+    #: eventually differ once WI-2's real gateway is reconciled in — see
+    #: `agent/tools/background.py`'s own docstring for that seam).
+    ai_invocation_repository: AIInvocationRepository
+    claude_client: ClaudeClientProtocol
+    tool_registry: ToolRegistry
 
 
 def _build_development_or_test(runtime_environment: str) -> RuntimeComposition:
     from persistence.objects.memory_store import InMemoryObjectStore
     from services.evidence.intake.intake import InMemoryIntakeRepository
 
+    api = BagmanCanonicalAPI()  # CD-2's own in-memory default construction
+    object_store = InMemoryObjectStore()
+    scanner = _AlwaysCleanDevelopmentScanner()
+    intake_repository = InMemoryIntakeRepository()
+
+    ai_invocation_repository = InMemoryAIInvocationRepository()
+    claude_client = FakeClaudeClient()
+    tool_registry = _build_tool_registry(
+        api=api,
+        intake_repository=intake_repository,
+        ai_invocation_repository=ai_invocation_repository,
+        runtime_environment=runtime_environment,
+        engine=None,
+        object_store=object_store,
+        scanner=scanner,
+        claude_client=claude_client,
+    )
+
     return RuntimeComposition(
         runtime_environment=runtime_environment,
-        api=BagmanCanonicalAPI(),  # CD-2's own in-memory default construction
-        object_store=InMemoryObjectStore(),
+        api=api,
+        object_store=object_store,
         engine=None,
-        intake_repository=InMemoryIntakeRepository(),
-        scanner=_AlwaysCleanDevelopmentScanner(),
+        intake_repository=intake_repository,
+        scanner=scanner,
+        ai_invocation_repository=ai_invocation_repository,
+        claude_client=claude_client,
+        tool_registry=tool_registry,
     )
 
 
@@ -190,6 +237,7 @@ def _build_production() -> RuntimeComposition:
     # run — mirrors how `persistence/objects/minio_store.py` is only
     # ever imported by something that actually needs MinIO.
     from persistence.objects.minio_store import MinIOConfig, MinIOObjectStore
+    from persistence.postgres.ai_invocation_repository import PostgresAIInvocationRepository
     from persistence.postgres.audit_repository import PostgresAuditRepository
     from persistence.postgres.entity_repository import PostgresEntityRepository
     from persistence.postgres.evidence_repository import PostgresEvidenceRepository
@@ -201,6 +249,13 @@ def _build_production() -> RuntimeComposition:
     from persistence.postgres.session import get_engine
     from persistence.postgres.source_repository import PostgresSourceRepository
     from services.evidence.intake.scanner import ClamAVScanner
+
+    # CD-5 WI-3: imported lazily here too — `requests` (ClaudeClient's
+    # only real dependency) is already a base BAGMAN dependency, but
+    # keeping this import inside the production-only builder matches
+    # this function's existing "nothing production-only loads at plain
+    # `import app.api.composition` time" discipline.
+    from ai.providers.claude.client import ClaudeClient
 
     # `get_engine()` builds/returns a pooled SQLAlchemy Engine but never
     # itself opens a connection (PID §46 note above) — safe to call even
@@ -254,6 +309,37 @@ def _build_production() -> RuntimeComposition:
         port=int(os.environ.get("BAGMAN_SCANNER_PORT", "3310")),
     )
 
+    # CD-5 WI-3: durable AIInvocation persistence, sharing the same
+    # engine as every other Postgres-backed repository above (WI-1
+    # already built PostgresAIInvocationRepository; this WI is the
+    # first to wire it into RuntimeComposition).
+    ai_invocation_repository = PostgresAIInvocationRepository(engine)
+
+    # CD-5 WI-3: the real Anthropic adapter. Constructing this performs
+    # NO I/O itself (mirrors ClamAVScanner above) — it only stores
+    # config; reachability is proven live by `is_available()`
+    # (`get_runtime_status_summary` below / the eventual
+    # `/internal/ai/health`), never here.
+    claude_client = ClaudeClient()
+
+    # PL RECONCILIATION SEAM (see agent/tools/background.py's own
+    # docstring): this worktree cannot see WI-2's real LiteLLM gateway,
+    # so `run_background_analysis` is wired to the SAME deterministic
+    # stub in production as in development/test for now. Replace this
+    # one argument with WI-2's real BackgroundTaskRunner-shaped object
+    # during reconciliation — nothing else in this function needs to
+    # change.
+    tool_registry = _build_tool_registry(
+        api=api,
+        intake_repository=intake_repository,
+        ai_invocation_repository=ai_invocation_repository,
+        runtime_environment=_PRODUCTION,
+        engine=engine,
+        object_store=object_store,
+        scanner=scanner,
+        claude_client=claude_client,
+    )
+
     return RuntimeComposition(
         runtime_environment=_PRODUCTION,
         api=api,
@@ -261,7 +347,131 @@ def _build_production() -> RuntimeComposition:
         engine=engine,
         intake_repository=intake_repository,
         scanner=scanner,
+        ai_invocation_repository=ai_invocation_repository,
+        claude_client=claude_client,
+        tool_registry=tool_registry,
     )
+
+
+# ---------------------------------------------------------------------
+# CD-5 WI-3 — agent/tools wiring + runtime status summary
+# ---------------------------------------------------------------------
+#
+# A fixed, well-formed, never-actually-registered object-storage key
+# used purely to prove the object store is reachable — the exact same
+# probe key `app/api/routers/health.py`'s `/ready` already uses (kept
+# as a second, deliberately duplicated constant rather than imported
+# from that module, so this file never depends on `app/api/routers/`;
+# see `get_runtime_status_summary`'s own docstring for why its checks
+# are duplicated rather than shared with `/ready` outright).
+_READINESS_PROBE_EVIDENCE_ID = "00000000-0000-0000-0000-000000000000"
+_READINESS_PROBE_HASH = "0" * 64
+
+
+def get_runtime_status_summary(
+    *,
+    runtime_environment: str,
+    engine: Optional[Engine],
+    object_store: EvidenceObjectStore,
+    scanner: EvidenceSafetyScanner,
+    claude_client: ClaudeClientProtocol,
+) -> Mapping[str, Any]:
+    """Read-only runtime status snapshot for `agent.tools`'
+    `get_runtime_status` tool (PID §34) and, per this WI's delivery
+    report, the eventual `/internal/ai/health` (PID §46-48) once WI-2
+    adds that route.
+
+    Deliberately never raises — every check is independently wrapped so
+    a caller always gets a full, structured snapshot back even if every
+    dependency is completely unreachable (a status TOOL must never
+    itself become the thing that crashes the Ask BAGMAN conversation
+    asking about status).
+
+    Mirrors, rather than calls directly, the same three checks
+    `app/api/routers/health.py`'s `/ready` performs in production mode
+    (PostgreSQL `SELECT 1`, object-store `exists()`, scanner
+    `is_available()`) — a deliberate, documented WI-3 judgment call: a
+    genuine shared-helper refactor of `/ready` itself was judged
+    higher-risk than its value for this WI (touching a small, already
+    covered-by-tests, production-critical readiness route to shave one
+    duplicated 3-check block), so the two call sites independently
+    perform conceptually the same checks rather than sharing one
+    function. Flagged for the PL/a future WI to consolidate if desired.
+    """
+    checks: dict[str, str] = {}
+
+    if runtime_environment != _PRODUCTION:
+        checks["postgres"] = "not_applicable (in-memory composition)"
+        checks["object_store"] = "not_applicable (in-memory composition)"
+        checks["scanner"] = "not_applicable (development stub scanner)"
+    else:
+        try:
+            assert engine is not None
+            with engine.connect() as conn:
+                conn.execute(text("SELECT 1"))
+            checks["postgres"] = "ok"
+        except Exception:  # noqa: BLE001 - a status probe must never raise
+            checks["postgres"] = "unreachable"
+
+        try:
+            object_store.exists(f"evidence/{_READINESS_PROBE_EVIDENCE_ID}/{_READINESS_PROBE_HASH}")
+            checks["object_store"] = "ok"
+        except Exception:  # noqa: BLE001
+            checks["object_store"] = "unreachable"
+
+        try:
+            checks["scanner"] = "ok" if scanner.is_available() else "unreachable"
+        except Exception:  # noqa: BLE001
+            checks["scanner"] = "unreachable"
+
+    try:
+        checks["claude_operator"] = "ok" if claude_client.is_available() else "unreachable"
+    except Exception:  # noqa: BLE001
+        checks["claude_operator"] = "unreachable"
+
+    return {"runtime_environment": runtime_environment, "checks": checks}
+
+
+def _build_tool_registry(
+    *,
+    api: BagmanCanonicalAPI,
+    intake_repository: IntakeRepository,
+    ai_invocation_repository: AIInvocationRepository,
+    runtime_environment: str,
+    engine: Optional[Engine],
+    object_store: EvidenceObjectStore,
+    scanner: EvidenceSafetyScanner,
+    claude_client: ClaudeClientProtocol,
+) -> ToolRegistry:
+    """Build the fixed, closed `agent.tools.registry.ToolRegistry`
+    (PID §34) — identical construction regardless of
+    `runtime_environment` (see `RuntimeComposition.tool_registry`'s own
+    docstring); only `get_runtime_status_summary`'s OWN behaviour
+    branches on `runtime_environment` internally.
+
+    `background_task_runner` is always
+    `DeterministicFakeBackgroundTaskRunner` today — see
+    `agent/tools/background.py`'s module docstring for the PL
+    reconciliation seam this represents in production composition.
+    """
+    background_task_runner: BackgroundTaskRunner = DeterministicFakeBackgroundTaskRunner(
+        ai_invocation_repository
+    )
+    deps = ToolDependencies(
+        api=api,
+        intake_repository=intake_repository,
+        ai_invocation_repository=ai_invocation_repository,
+        background_task_runner=background_task_runner,
+        runtime_health_check=functools.partial(
+            get_runtime_status_summary,
+            runtime_environment=runtime_environment,
+            engine=engine,
+            object_store=object_store,
+            scanner=scanner,
+            claude_client=claude_client,
+        ),
+    )
+    return build_default_tool_registry(deps)
 
 
 _composition: Optional[RuntimeComposition] = None

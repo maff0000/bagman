@@ -10,7 +10,7 @@
 # not a literal path.
 
 id: BAGMAN.RUNTIME.API
-version: 3
+version: 4
 
 responsibility: >
   Own the FastAPI/Uvicorn HTTP-facing application layer that exposes
@@ -43,6 +43,16 @@ responsibility: >
   dependency surface, or deployment unit of its own. The GUI itself
   owns/decides no evidence business logic (PID §40) — it is a pure
   client of the very API routes this same manifest already describes.
+  CD-5 WI-3 additionally owns the Ask BAGMAN HTTP surface
+  (POST /internal/operator/chat, app/api/routers/operator.py — a new
+  file, deliberately never added to routers/ai.py, WI-2's own
+  in-parallel file) and composition-root wiring for the AI invocation
+  repository, the Claude operator provider adapter, and the fixed
+  agent/tools tool registry (ai_invocation_repository/claude_client/
+  tool_registry on RuntimeComposition) — the actual Ask BAGMAN
+  orchestration logic and tool registry live in the separate agent/
+  component (BAGMAN.AGENT), consumed here, never reimplemented in
+  app/api/.
 
 owns: []
 
@@ -59,12 +69,21 @@ owns: []
 # .EvidenceSafetyScanner/ClamAVScanner (composition.py wires the real
 # scanner in production; a small dev-only always-CLEAN stub, defined
 # and used only inside composition.py, backs development/test mode).
+# CD-5 WI-3 additionally consumes: ai.invocation.AIInvocationRepository/
+# InMemoryAIInvocationRepository, persistence.postgres
+# .ai_invocation_repository.PostgresAIInvocationRepository,
+# ai.providers.claude.client.ClaudeClient(Protocol)/ai.providers.claude
+# .fake.FakeClaudeClient, and agent.tools.{registry,handlers,background}
+# (composition.py wires the real ClaudeClient in production, the
+# deterministic FakeClaudeClient in development/test — PID §61).
 consumes:
   - BAGMAN.CORE
   - BAGMAN.SERVICES.EVIDENCE
   - BAGMAN.EVIDENCE.INTAKE
   - BAGMAN.PERSISTENCE.POSTGRES
   - BAGMAN.PERSISTENCE.OBJECTS
+  - BAGMAN.AI
+  - BAGMAN.AGENT
 
 # app/api/ does not itself emit AuditEvents for CD-2's own canonical
 # writes — those go through core.api.BagmanCanonicalAPI, which already

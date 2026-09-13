@@ -3,27 +3,29 @@
 # contracts/manifest/bagman.component_manifest.v1.schema.json.
 
 id: BAGMAN.AI
-version: 1
+version: 2
 
 responsibility: >
   Own the governed, provider-NEUTRAL AI invocation domain model and
   typed task contract/registry framework: the AIInvocation state
   machine and its one-active-invocation-per-subject concurrency
   guarantee (CD-5 PID §26-30/§73-76), and the TaskContract/TASK_REGISTRY
-  framework naming CD-5's four initial tasks' metadata and real,
-  usable input/output JSON Schemas (PID §21-24/§55). WI-1 delivers only
-  the domain/contract/persistence slice of BAGMAN.AI's eventual
-  responsibility (PID §7's full statement: "route typed BAGMAN
-  intelligence tasks to an authorised AI provider/capability, enforce
-  task contracts and policy, record invocation provenance, validate
-  structured responses and return proposals without directly mutating
-  canonical business state") — it does NOT yet route anything to a
-  real provider: no gateway, no LiteLLM/Anthropic client, no prompt
-  content, no policy-enforcement dispatch loop. Those are WI-2
-  (`ai/providers/litellm/`, `ai/gateway/`), WI-3 (`ai/providers/claude/`,
-  plus `agent/`'s Claude-orchestration/tool-registry pieces), and WI-5
-  (`ai/evaluation/`) — this manifest will grow `owns`/`consumes` as
-  those work items land their own `ai/*` subpackages.
+  framework naming CD-5's tasks' metadata and real, usable input/output
+  JSON Schemas (PID §21-24/§55) — WI-1 delivered the original four; WI-3
+  additively registered a 5th, ASK_BAGMAN v1 (Ask BAGMAN's general
+  operator chat task — see ai/tasks.py's own docstring for why this is
+  a new task rather than a reuse of OPERATOR_DOCUMENT_REVIEW). CD-5 WI-3
+  additionally delivers `ai/providers/claude/` — the ONE Anthropic
+  Messages API adapter (PID §6/§8): a pure, BAGMAN-agnostic
+  provider-neutral-result-producing HTTP client (ClaudeClient/
+  ClaudeClientProtocol) plus its deterministic test/dev double
+  (FakeClaudeClient, PID §61) — still no BAGMAN-specific orchestration
+  logic here (system prompt, tool registry, AIInvocation lifecycle
+  management); that lives in the separate `agent/` component
+  (BAGMAN.AGENT), which calls into this adapter. `ai/gateway/`,
+  `ai/providers/litellm/`, `ai/prompts/`, `ai/policy/`,
+  `ai/evaluation/`, and `ai/provenance/` remain WI-2/WI-5's job to
+  populate.
 
 owns:
   - AIInvocation
@@ -52,10 +54,14 @@ produces: []
 # No new third-party dependency was introduced by WI-1: schema
 # validation reuses core.contract_validation's existing jsonschema
 # wiring (a new describe_schema_errors function alongside it, not a
-# new dependency).
+# new dependency). WI-3's ai/providers/claude/ adds one: `requests`
+# (already a pre-existing BAGMAN dependency used elsewhere, e.g.
+# tests/acceptance/_lib.py — not newly introduced to the project by
+# this WI, only newly declared as an ai/-level dependency here).
 dependencies:
   - jsonschema
   - rfc3339-validator
+  - requests
 
 external_access: false
 

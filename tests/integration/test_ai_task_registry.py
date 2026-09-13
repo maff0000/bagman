@@ -36,12 +36,20 @@ def test_every_cd5_initial_task_is_registered_at_version_1(task_id, role, prefer
     assert contract.preferred_capability == preferred_capability
 
 
-def test_task_registry_has_exactly_the_four_pid_section_21_tasks():
+def test_task_registry_has_exactly_the_four_pid_section_21_tasks_plus_wi3s_ask_bagman():
+    # WI-1 registered the four PID §21 tasks. CD-5 WI-3 additively
+    # registers a 5th, ASK_BAGMAN v1 (Ask BAGMAN's general operator
+    # chat task — see ai/tasks.py's own docstring for why this is a
+    # new task rather than a reuse of OPERATOR_DOCUMENT_REVIEW) — the
+    # registry is deliberately OPEN by design (this module's own
+    # docstring), so this is an expected, additive registry growth, not
+    # a WI-1 regression.
     assert set(TASK_REGISTRY.keys()) == {
         ("DOCUMENT_SUMMARY", 1),
         ("DOCUMENT_TYPE_PROPOSAL", 1),
         ("ENTITY_PROPOSAL", 1),
         ("OPERATOR_DOCUMENT_REVIEW", 1),
+        ("ASK_BAGMAN", 1),
     }
 
 
