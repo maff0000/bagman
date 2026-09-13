@@ -1,0 +1,158 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://bagman.internal/contracts/intake/bagman.intake_record.v1.schema.json",
+  "title": "BAGMAN IntakeRecord",
+  "description": "Canonical `IntakeRecord` (PID §5-8, CD-4 WI-1). Represents a single untrusted upload/observation ATTEMPT — distinct from, and never automatically, a canonical `EvidenceItem` (PID §5). An `IntakeRecord` is created the moment BAGMAN receives an upload attempt and is durably updated as it moves through the intake state machine (PID §7); it may fail, be rejected, be quarantined, or eventually resolve to exactly one `EvidenceItem` once `ACCEPTED` content is `REGISTERED`. Every field that is not yet known when the record is created (e.g. `detected_mime_type`, which WI-2's content inspection determines, or `evidence_id`, which is only set once registration succeeds) is modelled as an explicitly nullable, but always-REQUIRED, key — the same 'state the question, even if unanswered' doctrine `bagman.evidence.v1`'s `entity_id` already uses — so a caller/reader can never confuse 'not yet known' with 'field omitted by accident'.",
+  "type": "object",
+  "properties": {
+    "intake_id": {
+      "$ref": "https://bagman.internal/contracts/common/bagman.identifier.v1.schema.json",
+      "description": "Canonical BAGMAN identifier for this intake attempt. Distinct from `evidence_id` (PID §6): an intake attempt may fail, be quarantined, or never produce evidence at all, so it is never overloaded onto `EvidenceItem.evidence_id`."
+    },
+    "source_id": {
+      "$ref": "https://bagman.internal/contracts/common/bagman.identifier.v1.schema.json",
+      "description": "Canonical identifier of the `Source` this intake attempt was observed through (PID §9) — for CD-4 WI-1, always a stable `MANUAL_UPLOAD` source."
+    },
+    "entity_hint": {
+      "oneOf": [
+        { "type": "string", "minLength": 1 },
+        { "type": "null" }
+      ],
+      "description": "Optional entity-ownership HINT supplied with the upload (e.g. an operator's selection of `NOUSTAI_LIMITED`, or explicit `UNRESOLVED`), never an asserted `GovernedEntity` foreign key — the same 'hint, not ownership assertion' doctrine as `sources.governed_entity_hint` (PID §9/§10). Required key, explicit `null` when no hint was supplied, so omission can never be mistaken for a deliberate absence of a hint."
+    },
+    "status": {
+      "type": "string",
+      "enum": ["RECEIVED", "VALIDATING", "QUARANTINED", "REJECTED", "ACCEPTED", "REGISTERED", "FAILED"],
+      "description": "Intake workflow state (PID §7). Deliberately a CLOSED enum (unlike `EvidenceItem.status`, which is open) — PID §7 gives an exact, deterministic, non-extensible state machine for intake, and `services.evidence.intake.intake.ALLOWED_TRANSITIONS` is the single source of truth for which transitions between these values are valid."
+    },
+    "received_at": {
+      "$ref": "https://bagman.internal/contracts/common/bagman.utc_timestamp.v1.schema.json",
+      "description": "UTC timestamp at which BAGMAN first received this intake attempt (the moment the `IntakeRecord` entered `RECEIVED`)."
+    },
+    "completed_at": {
+      "oneOf": [
+        { "$ref": "https://bagman.internal/contracts/common/bagman.utc_timestamp.v1.schema.json" },
+        { "type": "null" }
+      ],
+      "description": "UTC timestamp at which this intake attempt reached a terminal state (`QUARANTINED`, `REJECTED`, `REGISTERED`, or `FAILED`). Required key, explicit `null` while the record is still in a non-terminal state (`RECEIVED`, `VALIDATING`, `ACCEPTED`)."
+    },
+    "original_filename": {
+      "oneOf": [
+        { "type": "string" },
+        { "type": "null" }
+      ],
+      "description": "Filename as supplied by the uploader, retained for display ONLY (PID §14) — untrusted metadata that must never control filesystem/object-store paths. `null` if none was supplied. Filename safety validation itself is WI-2 scope; this contract only carries the raw value through."
+    },
+    "reported_mime_type": {
+      "oneOf": [
+        { "type": "string", "minLength": 1 },
+        { "type": "null" }
+      ],
+      "description": "Client/uploader-supplied MIME type — a HINT only (PID §15), never trusted content-type truth. `null` if none was supplied."
+    },
+    "detected_mime_type": {
+      "oneOf": [
+        { "type": "string", "minLength": 1 },
+        { "type": "null" }
+      ],
+      "description": "Content type actually detected from the bytes (PID §15) by WI-2's inspection step. `null` until that inspection has run — CD-4 WI-1 never performs detection itself, it only carries this field through the state machine for WI-2 to populate."
+    },
+    "size_bytes": {
+      "oneOf": [
+        { "type": "integer", "minimum": 0 },
+        { "type": "null" }
+      ],
+      "description": "Size of the received content in bytes. `null` until known (e.g. before streaming/spooling completes — WI-2 scope)."
+    },
+    "content_hash": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "algorithm": {
+              "type": "string",
+              "minLength": 1,
+              "default": "SHA-256",
+              "description": "Hash algorithm identifier, matching `bagman.evidence.v1`'s `content_hash.algorithm` exactly."
+            },
+            "value": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$",
+              "description": "Lowercase hex-encoded digest, 64 characters for SHA-256."
+            }
+          },
+          "required": ["algorithm", "value"],
+          "additionalProperties": false
+        },
+        { "type": "null" }
+      ],
+      "description": "SHA-256 content hash of the exact original bytes (PID §23), same shape as `bagman.evidence.v1`'s `content_hash`. `null` until computed — CD-4 WI-1 does not itself hash bytes (WI-2 scope, computed incrementally during streaming); this field only carries the value once known, and the SAME value must later appear on the `EvidenceItem` this intake produces, never a re-derived one."
+    },
+    "evidence_id": {
+      "oneOf": [
+        { "$ref": "https://bagman.internal/contracts/common/bagman.identifier.v1.schema.json" },
+        { "type": "null" }
+      ],
+      "description": "Canonical identifier of the `EvidenceItem` this intake attempt produced, set ONLY once the record transitions `ACCEPTED` -> `REGISTERED` (PID §6/§32). `null` for every other state, including every terminal state that is not `REGISTERED` — a rejected/quarantined/failed intake must never carry an `evidence_id`."
+    },
+    "failure_code": {
+      "oneOf": [
+        { "type": "string", "minLength": 1 },
+        { "type": "null" }
+      ],
+      "description": "Short machine-readable reason this intake reached `FAILED` (or, for a REJECTED request-validation failure, the rejection reason) — e.g. an error_code from `core.errors` (PID §35). `null` unless the record is `FAILED` or `REJECTED`."
+    },
+    "quarantine_reason": {
+      "oneOf": [
+        { "type": "string", "minLength": 1 },
+        { "type": "null" }
+      ],
+      "description": "Human-readable reason this intake was `QUARANTINED` (PID §21), e.g. 'unsupported executable content'. `null` unless the record is `QUARANTINED`."
+    },
+    "correlation_id": {
+      "$ref": "https://bagman.internal/contracts/common/bagman.identifier.v1.schema.json",
+      "description": "Identifier shared by every audit event and downstream canonical write belonging to this one intake workflow (PID §31) — the same correlation doctrine `bagman.audit_event.v1.correlation_id` already establishes."
+    },
+    "idempotency_key": {
+      "oneOf": [
+        { "type": "string", "minLength": 1 },
+        { "type": "null" }
+      ],
+      "description": "Caller-supplied idempotency key (PID §25), e.g. an `Idempotency-Key` request header value from WI-3's future governed intake API. A manual upload may not always supply one (`null`); when one IS supplied, a replay of the same key with the same identifying request content must resolve to this same `IntakeRecord` (durably, across restart — PID §52/§53), and a replay of the same key with genuinely different content must fail loudly with a conflict rather than silently reusing this record — see `services.evidence.intake.intake`'s module docstring for the exact 'same content' test this layer applies."
+    },
+    "metadata": {
+      "type": "object",
+      "description": "Free-form, genuinely open metadata about this intake attempt. Must never contain secret/sensitive content bodies (PID §8) — original evidence bytes themselves are never stored here.",
+      "additionalProperties": true,
+      "default": {}
+    },
+    "schema_version": {
+      "allOf": [
+        { "$ref": "https://bagman.internal/contracts/common/bagman.schema_version.v1.schema.json" }
+      ],
+      "const": "bagman.intake_record.v1",
+      "description": "Contract version identifier for this IntakeRecord. Must literally equal `\"bagman.intake_record.v1\"` for instances of this schema version."
+    }
+  },
+  "required": [
+    "intake_id",
+    "source_id",
+    "entity_hint",
+    "status",
+    "received_at",
+    "completed_at",
+    "original_filename",
+    "reported_mime_type",
+    "detected_mime_type",
+    "size_bytes",
+    "content_hash",
+    "evidence_id",
+    "failure_code",
+    "quarantine_reason",
+    "correlation_id",
+    "idempotency_key",
+    "metadata",
+    "schema_version"
+  ],
+  "additionalProperties": false
+}

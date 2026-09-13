@@ -1,0 +1,45 @@
+# BAGMAN component manifest (PID §19, §61) for services/evidence/intake/.
+# Validated by scripts/generate_architecture_memory.py against
+# contracts/manifest/bagman.component_manifest.v1.schema.json.
+
+id: BAGMAN.EVIDENCE.INTAKE
+version: 1
+
+responsibility: >
+  Own the single governed boundary through which untrusted, external/
+  user-supplied bytes may become canonical BAGMAN evidence: the
+  IntakeRecord domain object, its deterministic seven-state intake
+  state machine (RECEIVED/VALIDATING/QUARANTINED/REJECTED/ACCEPTED/
+  REGISTERED/FAILED), and durable idempotency semantics for a
+  caller-supplied idempotency key. Does not itself perform content
+  validation, MIME detection, size enforcement, malware scanning, or
+  quarantine content handling (WI-2), expose any HTTP API (WI-3), or
+  own any GUI (WI-4) — CD-4 WI-1 is domain/persistence foundation only.
+
+owns:
+  - IntakeRecord
+
+# What services/evidence/intake/intake.py actually imports from core/:
+# identity (id generation), timestamps (UTC handling), errors
+# (InvalidStateTransitionError, IdempotencyConflictError, NotFoundError,
+# ValidationError), and contract_validation (validate_against_contract).
+consumes:
+  - BAGMAN.CORE
+
+# This component does not itself emit audit events (WI-1 scope is
+# domain/persistence only — intake audit event emission is WI-3's
+# orchestration-layer responsibility, mirroring how core/api.py, not
+# services/evidence/, emits EVIDENCE_OBSERVED for EvidenceItem).
+produces: []
+
+dependencies:
+  - jsonschema
+  - rfc3339-validator
+
+external_access: false
+
+prohibited:
+  - direct_email_access
+  - direct_bank_access
+  - direct_xero_access
+  - direct_chargebee_access

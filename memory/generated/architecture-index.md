@@ -25,6 +25,17 @@ Own canonical identity, timestamp, error, contract-validation, and domain-model 
 - **External access:** `false`
 - **Prohibited:** `direct_email_access`, `direct_bank_access`, `direct_xero_access`, `direct_chargebee_access`
 
+### `BAGMAN.EVIDENCE.INTAKE` (v1)
+
+Own the single governed boundary through which untrusted, external/ user-supplied bytes may become canonical BAGMAN evidence: the IntakeRecord domain object, its deterministic seven-state intake state machine (RECEIVED/VALIDATING/QUARANTINED/REJECTED/ACCEPTED/ REGISTERED/FAILED), and durable idempotency semantics for a caller-supplied idempotency key. Does not itself perform content validation, MIME detection, size enforcement, malware scanning, or quarantine content handling (WI-2), expose any HTTP API (WI-3), or own any GUI (WI-4) — CD-4 WI-1 is domain/persistence foundation only.
+
+- **Owns:** `IntakeRecord`
+- **Consumes:** `BAGMAN.CORE`
+- **Produces:** _(none)_
+- **Dependencies:** `jsonschema`, `rfc3339-validator`
+- **External access:** `false`
+- **Prohibited:** `direct_email_access`, `direct_bank_access`, `direct_xero_access`, `direct_chargebee_access`
+
 ### `BAGMAN.PERSISTENCE.OBJECTS` (v1)
 
 Own the EvidenceObjectStore abstraction (put/get/exists/verify_hash) for durable, immutable, content-addressed original-evidence-bytes storage, its MinIO/S3-compatible boto3 implementation, and — added by WI-3 — a narrow in-memory reference implementation used only by the runtime composition root's development/test mode. Core/domain code never depends on a storage-provider SDK directly (PID §53); this component is the only place that does.
@@ -38,10 +49,10 @@ Own the EvidenceObjectStore abstraction (put/get/exists/verify_hash) for durable
 
 ### `BAGMAN.PERSISTENCE.POSTGRES` (v1)
 
-Own durable, PostgreSQL-backed implementations of every CD-2 repository interface (GovernedEntity, Source, ExternalReference, EvidenceItem, Provenance, AuditEvent) plus the SQLAlchemy engine/ session factory and Alembic migration schema — preserving exactly the same canonical behaviour (immutability, idempotent external- reference/evidence-observation replay, append-only audit) as the in-memory reference implementations core/ and services/evidence/ ship, durably.
+Own durable, PostgreSQL-backed implementations of every CD-2/CD-4 repository interface (GovernedEntity, Source, ExternalReference, EvidenceItem, Provenance, AuditEvent, IntakeRecord) plus the SQLAlchemy engine/session factory and Alembic migration schema — preserving exactly the same canonical behaviour (immutability, idempotent external-reference/evidence-observation/intake replay, append-only audit) as the in-memory reference implementations core/ and services/evidence/ ship, durably.
 
 - **Owns:** _(none)_
-- **Consumes:** `BAGMAN.CORE`, `BAGMAN.SERVICES.EVIDENCE`
+- **Consumes:** `BAGMAN.CORE`, `BAGMAN.SERVICES.EVIDENCE`, `BAGMAN.EVIDENCE.INTAKE`
 - **Produces:** _(none)_
 - **Dependencies:** `SQLAlchemy`, `psycopg`, `alembic`
 - **External access:** `false`
@@ -79,6 +90,7 @@ Own canonical EvidenceItem identity and its immutability and idempotent-observat
 | `https://bagman.internal/contracts/common/bagman.utc_timestamp.v1.schema.json` | BAGMAN Canonical UTC Timestamp | `contracts/common/bagman.utc_timestamp.v1.schema.json` |
 | `https://bagman.internal/contracts/entity/bagman.entity.v1.schema.json` | BAGMAN GovernedEntity | `contracts/entity/bagman.entity.v1.schema.json` |
 | `https://bagman.internal/contracts/evidence/bagman.evidence.v1.schema.json` | BAGMAN EvidenceItem | `contracts/evidence/bagman.evidence.v1.schema.json` |
+| `https://bagman.internal/contracts/intake/bagman.intake_record.v1.schema.json` | BAGMAN IntakeRecord | `contracts/intake/bagman.intake_record.v1.schema.json` |
 | `https://bagman.internal/contracts/manifest/bagman.component_manifest.v1.schema.json` | BAGMAN Component Manifest | `contracts/manifest/bagman.component_manifest.v1.schema.json` |
 | `https://bagman.internal/contracts/provenance/bagman.provenance.v1.schema.json` | BAGMAN Provenance | `contracts/provenance/bagman.provenance.v1.schema.json` |
 | `https://bagman.internal/contracts/source/bagman.external_reference.v1.schema.json` | BAGMAN ExternalReference | `contracts/source/bagman.external_reference.v1.schema.json` |
