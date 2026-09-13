@@ -25,9 +25,9 @@ Own canonical identity, timestamp, error, contract-validation, and domain-model 
 - **External access:** `false`
 - **Prohibited:** `direct_email_access`, `direct_bank_access`, `direct_xero_access`, `direct_chargebee_access`
 
-### `BAGMAN.EVIDENCE.INTAKE` (v1)
+### `BAGMAN.EVIDENCE.INTAKE` (v2)
 
-Own the single governed boundary through which untrusted, external/ user-supplied bytes may become canonical BAGMAN evidence: the IntakeRecord domain object, its deterministic seven-state intake state machine (RECEIVED/VALIDATING/QUARANTINED/REJECTED/ACCEPTED/ REGISTERED/FAILED), and durable idempotency semantics for a caller-supplied idempotency key. Does not itself perform content validation, MIME detection, size enforcement, malware scanning, or quarantine content handling (WI-2), expose any HTTP API (WI-3), or own any GUI (WI-4) — CD-4 WI-1 is domain/persistence foundation only.
+Own the single governed boundary through which untrusted, external/ user-supplied bytes may become canonical BAGMAN evidence: the IntakeRecord domain object, its deterministic seven-state intake state machine (RECEIVED/VALIDATING/QUARANTINED/REJECTED/ACCEPTED/ REGISTERED/FAILED), durable idempotency semantics for a caller-supplied idempotency key (WI-1) — and, added by WI-2, the actual content-validation/quarantine pipeline that runs while a record is VALIDATING: filename safety (PID §14), bounded streaming/spooling with incremental SHA-256 (PID §13/§23), hand-rolled byte-level MIME/archive/executable detection (PID §15-18), an explicit versionable intake policy (PID §34), the EvidenceSafetyScanner abstraction plus a real ClamAV `clamd`-protocol implementation (PID §19/§20), and quarantine/staging object storage (PID §21/§22, via persistence/objects/store.py's prefixed key scheme). WI-2's pipeline stops at ACCEPTED with bytes staged in the object store — it does not itself register a canonical EvidenceItem, expose any HTTP API (WI-3), or own any GUI (WI-4).
 
 - **Owns:** `IntakeRecord`
 - **Consumes:** `BAGMAN.CORE`
@@ -36,9 +36,9 @@ Own the single governed boundary through which untrusted, external/ user-supplie
 - **External access:** `false`
 - **Prohibited:** `direct_email_access`, `direct_bank_access`, `direct_xero_access`, `direct_chargebee_access`
 
-### `BAGMAN.PERSISTENCE.OBJECTS` (v1)
+### `BAGMAN.PERSISTENCE.OBJECTS` (v2)
 
-Own the EvidenceObjectStore abstraction (put/get/exists/verify_hash) for durable, immutable, content-addressed original-evidence-bytes storage, its MinIO/S3-compatible boto3 implementation, and — added by WI-3 — a narrow in-memory reference implementation used only by the runtime composition root's development/test mode. Core/domain code never depends on a storage-provider SDK directly (PID §53); this component is the only place that does.
+Own the EvidenceObjectStore abstraction (put/put_prefixed/get/exists/ verify_hash) for durable, immutable, content-addressed original-evidence-bytes storage, its MinIO/S3-compatible boto3 implementation, and — added by WI-3 — a narrow in-memory reference implementation used only by the runtime composition root's development/test mode. Core/domain code never depends on a storage-provider SDK directly (PID §53); this component is the only place that does. CD-4 WI-2 added `put_prefixed()` plus the `quarantine_object_key()`/`staging_object_key()` sibling key-shape helpers (PID §21/§22): quarantined material and an ACCEPTED intake's staged bytes are stored under `quarantine/<id>/<hash>` / `intake-staging/<id>/<hash>` — deliberately distinct in shape from `put()`'s canonical `evidence/<evidence_id>/<hash>` — so quarantined/ staged objects are never indistinguishable BY KEY SHAPE from normal available evidence.
 
 - **Owns:** _(none)_
 - **Consumes:** `BAGMAN.CORE`

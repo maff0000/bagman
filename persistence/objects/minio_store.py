@@ -31,9 +31,10 @@ from core.errors import ImmutabilityViolationError, IntegrityError, NotFoundErro
 from persistence.objects.store import (
     EvidenceObjectStore,
     compute_sha256,
+    expected_hash_from_reference,
     normalize_hash_value,
     object_key,
-    parse_object_key,
+    prefixed_object_key,
 )
 
 #: botocore ClientError codes meaning "the key/bucket doesn't exist".
@@ -147,11 +148,43 @@ class MinIOObjectStore(EvidenceObjectStore):
 
         return key
 
+    def put_prefixed(self, prefix: str, object_id: str, content_hash: Mapping[str, str], data: bytes) -> str:
+        expected_value = normalize_hash_value(content_hash)
+        actual_value = compute_sha256(data)
+        if actual_value != expected_value:
+            raise IntegrityError(
+                f"put_prefixed() rejected for prefix '{prefix}'/object_id '{object_id}': "
+                f"the SHA-256 of the bytes given ('{actual_value}') does not match the "
+                f"caller-supplied content_hash value ('{expected_value}') — nothing was stored"
+            )
+
+        key = prefixed_object_key(prefix, object_id, expected_value)
+
+        try:
+            existing = self._get_bytes(key)
+        except NotFoundError:
+            existing = None  # nothing stored yet at this key — the ordinary case
+
+        if existing is not None:
+            if existing == data:
+                return key  # idempotent no-op: identical bytes already stored
+            raise ImmutabilityViolationError(
+                f"refusing to overwrite existing object at '{key}' with different "
+                "bytes — quarantine/staging storage is immutable in exactly the "
+                "same sense as canonical evidence storage (PID §17/§21)"
+            )
+
+        try:
+            self._client.put_object(Bucket=self._bucket, Key=key, Body=data)
+        except (BotoCoreError, ClientError) as exc:
+            raise StorageError(f"put_prefixed() failed for key '{key}': {_safe_str(exc)}") from exc
+
+        return key
+
     def get(self, storage_reference: str) -> bytes:
         data = self._get_bytes(storage_reference)
-        parsed = parse_object_key(storage_reference)
-        if parsed is not None:
-            _evidence_id, expected_hash = parsed
+        expected_hash = expected_hash_from_reference(storage_reference)
+        if expected_hash is not None:
             actual_hash = compute_sha256(data)
             if actual_hash != expected_hash:
                 raise IntegrityError(

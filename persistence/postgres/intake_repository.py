@@ -275,6 +275,17 @@ class PostgresIntakeRepository(IntakeRepository):
                 row.evidence_id = updated.evidence_id
                 row.failure_code = updated.failure_code
                 row.quarantine_reason = updated.quarantine_reason
+                # PL reconciliation fix (CD-4 WI-2): `transition()` can
+                # legitimately update `metadata` via `field_updates` (e.g.
+                # the CD-4 WI-2 validation pipeline stamps
+                # `storage_reference` into it on ACCEPTED) — this was
+                # previously never copied back to the row, so a durable
+                # PostgreSQL-backed transition silently dropped any
+                # metadata change while the in-memory repository (which
+                # stores the whole dataclass) masked the gap. Without
+                # this, WI-3 would have no durable way to find the
+                # staged bytes an ACCEPTED IntakeRecord points to.
+                row.metadata_ = dict(updated.metadata)
                 session.flush()
         except (NotFoundError, InvalidStateTransitionError, ValidationError):
             raise

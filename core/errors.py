@@ -142,6 +142,74 @@ class IdempotencyConflictError(BagmanError):
     error_code = "IDEMPOTENCY_CONFLICT"
 
 
+class FileTooLargeError(BagmanError):
+    """An intake upload exceeded a configured size limit (PID §12/§35,
+    CD-4 WI-2) — either the per-file limit or the request-level limit.
+    Raised by ``services.evidence.intake.streaming.spool_stream`` the
+    moment the running total exceeds the limit (never after buffering
+    the whole oversized stream first), and turned into an intake
+    ``REJECTED`` transition (never ``QUARANTINED``) by
+    ``services.evidence.intake.validation_pipeline`` — an oversized
+    request carries no investigative value worth retaining.
+    """
+
+    error_code = "FILE_TOO_LARGE"
+
+
+class UnsupportedContentTypeError(BagmanError):
+    """Intake content's detected type is not one this policy accepts,
+    and policy says to reject rather than quarantine it (PID §16/§17/
+    §34/§35, CD-4 WI-2) — e.g. an archive/unsupported binary format
+    under the default policy. Distinct from a scanner verdict: this is
+    a content-TYPE policy decision, made before any malware scan runs.
+    """
+
+    error_code = "UNSUPPORTED_CONTENT_TYPE"
+
+
+class ContentTypeMismatchError(BagmanError):
+    """The uploader-reported MIME type and the byte-sniffed detected
+    MIME type disagree, and the active
+    ``services.evidence.intake.policy.IntakePolicy.mime_mismatch_policy``
+    is the strict ``"REJECT"`` setting rather than the default
+    ``"OBSERVE"`` (PID §15/§35, CD-4 WI-2). Under the default policy, a
+    mismatch is recorded/observable (both MIME fields are always
+    populated distinctly) rather than raised — see
+    ``services.evidence.intake.validation_pipeline`` module docstring.
+    """
+
+    error_code = "CONTENT_TYPE_MISMATCH"
+
+
+class MalwareDetectedError(BagmanError):
+    """Reserved canonical error for a confirmed malware verdict (PID
+    §20/§35, CD-4 WI-2). CD-4 WI-2's own pipeline does not raise this
+    itself — a scanner ``MALICIOUS``/``SUSPICIOUS`` verdict is routed
+    to intake ``QUARANTINED`` (retained for investigation, PID §21)
+    rather than treated as a hard failure — but the vocabulary entry is
+    declared here per PID §35 for any future caller that needs to
+    signal this condition as a raised error rather than a quarantined
+    intake state.
+    """
+
+    error_code = "MALWARE_DETECTED"
+
+
+class ScanFailedError(BagmanError):
+    """The content-safety scanner could not produce a verdict at all —
+    unreachable, timed out, or returned ``SCAN_ERROR`` (PID §19/§20/
+    §35, CD-4 WI-2). This is an INFRASTRUCTURE failure, distinct from a
+    content verdict: ``services.evidence.intake.validation_pipeline``
+    fails closed by routing this to intake ``FAILED`` (retryable
+    infrastructure failure), never to ``ACCEPTED`` — see that module's
+    docstring for the full fail-closed contract and why a scanner
+    ``UNSUPPORTED`` verdict is routed to ``QUARANTINED`` instead of
+    this error (it is content ambiguity, not an infrastructure fault).
+    """
+
+    error_code = "SCAN_FAILED"
+
+
 class PersistenceError(BagmanError):
     """A general persistence-layer failure distinct from a constraint
     violation — e.g. a database connectivity/operational failure (PID
