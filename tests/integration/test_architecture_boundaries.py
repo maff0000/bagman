@@ -317,6 +317,12 @@ def test_no_schema_file_hardcodes_a_provider_name_inside_a_structural_constraint
 
         _walk(data, [])
 
+    assert not violations, (
+        "no contracts/*.schema.json file may bake a provider name into a "
+        "structural constraint (enum/const/required) — provider names belong "
+        "only in free-text description/examples:\n" + "\n".join(violations)
+    )
+
 
 # ---------------------------------------------------------------------
 # CD-4 WI-5 (PID §67) — the required Evidence Intake architecture proof.
