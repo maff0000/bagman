@@ -310,9 +310,30 @@ A fresh Auditor with no prior context on this delivery was dispatched against th
 * **Found no defect** beyond what this file already disclosed. One environmental limitation of the audit itself, not a delivery defect: the Auditor's own sandbox had no outbound network access to GitHub, so live CI observation (PID §91's own explicit CI-checklist item) could not be independently performed by the Auditor — exactly as with every prior CD delivery in this project, that step remains the PL's own job, done next (§6c).
 * **Issued verdict: `AI_FOUNDATION_GREEN`, explicitly scoped as the PID §91-sanctioned partial form** — the Mac-mini tier's and Trinity-escalation tier's genuine-completion criteria, and Claude's success-path criterion, remain honestly `BLOCKED` by external conditions the Auditor re-verified live themselves (not assumed from this file), which PID §91's own closing note explicitly sanctions as a valid `AI_FOUNDATION_GREEN` rather than a `RED` or a generic `BLOCKED`.
 
-## 6c. Live CI — to be observed by the PL after this evidence update is pushed
+## 6c. Live CI — observed by the PL
 
-Per PID §80/§91 and the standing lesson carried from CD-3/CD-4 (local/Auditor-green and live-CI-green are different claims — always check the second directly, never assume it), the PL will open the CD-5 pull request, push this final evidence update to it, and observe the GitHub Actions "Security" workflow run to completion, step-by-step, before reporting the final state to the architect. This section is completed by the PL directly in the pull-request description / final report, not fabricated here in advance of that observation actually happening.
+Per PID §80/§91 and the standing lesson carried from CD-3/CD-4 (local/Auditor-green and live-CI-green are different claims — always check the second directly, never assume it): PR #5 (`cd-5/ai-foundation-claude-operator-and-gui-integration` → `main`) was opened at `https://github.com/maff0000/bagman/pull/5`, head commit `e758b5f`. The GitHub Actions "Security" workflow ran automatically and was watched directly by the PL to completion (`gh run watch`, not inferred):
+
+```
+$ gh pr checks 5
+security	pass	1m43s	https://github.com/maff0000/bagman/actions/runs/34786940092/job/103804011632
+
+$ gh api repos/maff0000/bagman/actions/runs/34786940092/jobs
+job: security  conclusion=success
+  - Set up job:                                                              success
+  - Checkout:                                                                success
+  - Set up Python:                                                           success
+  - Install gitleaks (pinned release binary):                                success
+  - Run gitleaks scan:                                                       success
+  - Install dependencies:                                                    success
+  - Check architecture memory projection:                                   success
+  - Run non-Docker test suites (security + contract + domain + ...):        success
+  - Run PostgreSQL persistence test suite (own disposable container):        success
+  - Run bagman-api runtime test suite (own disposable Postgres + MinIO):     success
+  - Post Set up Python / Post Checkout / Complete job:                       success
+```
+
+Every individual step succeeded — gitleaks green, architecture-memory drift check green, all three test-suite steps (which now include every CD-5 AI test: the evaluation harness, the real-threaded concurrency proof, the bidi-hardening tests, the repo-wide `trinity-*` sweep) green, nothing skipped. Confirmed via `gh pr view 5`: `mergeable: MERGEABLE`, `mergeStateStatus: CLEAN`, working tree clean.
 
 ---
 
