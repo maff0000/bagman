@@ -54,13 +54,25 @@ class FakeLiteLLMClient:
     `complete()` raises `AssertionError` loudly — a test/dev-composition
     bug (an unscripted call), never silently returns a fabricated
     success.
+
+    `default_response` receives the exact `system_instructions` string
+    `complete()` was called with (CD-5 WI-4 addition) — not a bare
+    zero-arg factory — specifically so a caller like
+    `app/api/composition.py`'s development-mode wiring can return a
+    result shaped correctly for WHICHEVER task is actually being
+    exercised (each CD-5 background task's prompt names its own
+    `task_id` verbatim in its system instructions, e.g. "task
+    DOCUMENT_SUMMARY" — see `ai/prompts/*/v1.md`), without needing to
+    know in advance which one will be called next. Nothing before this
+    WI ever constructed `FakeLiteLLMClient` with a `default_response` at
+    all, so this is a safe, additive signature change.
     """
 
     def __init__(
         self,
         *,
         available: bool = True,
-        default_response: Optional[Callable[[], LiteLLMCompletionResult]] = None,
+        default_response: Optional[Callable[[str], LiteLLMCompletionResult]] = None,
     ) -> None:
         self._available = available
         self._default_response = default_response
@@ -136,7 +148,7 @@ class FakeLiteLLMClient:
         if queue:
             return queue.pop(0)
         if self._default_response is not None:
-            return self._default_response()
+            return self._default_response(system_instructions)
         raise AssertionError(
             f"FakeLiteLLMClient.complete(): no scripted response queued for "
             f"capability_alias={capability_alias!r} and no default_response configured — "

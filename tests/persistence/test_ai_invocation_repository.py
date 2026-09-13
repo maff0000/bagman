@@ -305,3 +305,35 @@ def test_list_invocations_limit_and_offset_page_correctly():
     )
     assert [inv.ai_invocation_id for inv in page1] == newest_first_ids[0:2]
     assert [inv.ai_invocation_id for inv in page2] == newest_first_ids[2:4]
+
+
+# ---------------------------------------------------------------------
+# list_invocations(primary_input_reference=...) (WI-4, PID §45) — the
+# REAL stored-generated column, not a computed-in-Python comparison
+# (contrast the in-memory repository's own equivalent test).
+# ---------------------------------------------------------------------
+
+
+def test_list_invocations_filters_by_primary_input_reference():
+    evidence_id = identity.generate_id()
+    a = _create_background(evidence_id=evidence_id, task_id="DOCUMENT_TYPE_PROPOSAL")
+    b = _create_background(evidence_id=evidence_id, task_id="DOCUMENT_SUMMARY")
+    _create_background()  # unrelated evidence_id — must not match
+
+    found = PostgresAIInvocationRepository().list_invocations(primary_input_reference=evidence_id)
+    assert {inv.ai_invocation_id for inv in found} == {a.ai_invocation_id, b.ai_invocation_id}
+
+
+def test_list_invocations_by_primary_input_reference_includes_terminal_rows():
+    evidence_id = identity.generate_id()
+    created = _create_background(evidence_id=evidence_id)
+    PostgresAIInvocationRepository().transition_status(created.ai_invocation_id, "REJECTED")
+
+    found = PostgresAIInvocationRepository().list_invocations(primary_input_reference=evidence_id)
+    assert [inv.ai_invocation_id for inv in found] == [created.ai_invocation_id]
+    assert found[0].status == "REJECTED"
+
+
+def test_list_invocations_primary_input_reference_with_no_matches_returns_empty():
+    found = PostgresAIInvocationRepository().list_invocations(primary_input_reference=identity.generate_id())
+    assert found == []

@@ -286,6 +286,7 @@ class PostgresAIInvocationRepository(AIInvocationRepository):
         correlation_id: Optional[str] = None,
         started_at_from=None,
         started_at_to=None,
+        primary_input_reference: Optional[str] = None,
         limit: Optional[int] = None,
         offset: int = 0,
     ) -> list[AIInvocation]:
@@ -306,6 +307,13 @@ class PostgresAIInvocationRepository(AIInvocationRepository):
                     query = query.filter(AIInvocationRow.started_at >= started_at_from)
                 if started_at_to is not None:
                     query = query.filter(AIInvocationRow.started_at <= started_at_to)
+                if primary_input_reference is not None:
+                    # The REAL stored-generated column (see
+                    # persistence/postgres/ai_invocation_models.py's own
+                    # "Concurrency guard" docstring section) — a plain
+                    # indexed equality filter, not a derived/computed
+                    # comparison as the in-memory repository must do.
+                    query = query.filter(AIInvocationRow.primary_input_reference == primary_input_reference)
                 query = query.order_by(
                     AIInvocationRow.started_at.desc(), AIInvocationRow.ai_invocation_id.desc()
                 )

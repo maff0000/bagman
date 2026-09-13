@@ -155,6 +155,80 @@ class _AlwaysCleanDevelopmentScanner(EvidenceSafetyScanner):
         return True
 
 
+def _dev_mode_litellm_default_response(system_instructions: str) -> "LiteLLMCompletionResult":
+    """`FakeLiteLLMClient`'s `default_response` for development/test
+    composition (CD-5 WI-4 gap closure).
+
+    Without this, `BAGMAN_RUNTIME_ENV=development uvicorn app.api.main:app`
+    plus a real click on the GUI's "Run analysis" button would 500
+    immediately: `FakeLiteLLMClient.complete()` raises `AssertionError`
+    when nothing was pre-scripted and no `default_response` exists (see
+    that module's own docstring) — there was previously no interactive/
+    manual way to see a background-task result without pre-scripting one
+    via a test harness, which does not exist in a live dev server.
+
+    Matches `agent/tools/background.py`'s own
+    `DeterministicFakeBackgroundTaskRunner._canned_output_for` in spirit
+    exactly: a small, fixed, structurally-valid-per-task canned output,
+    never phrased to look like a plausible real model answer (PID §61).
+    Since `FakeLiteLLMClient.complete()` hands `default_response` the
+    exact `system_instructions` string it was called with (rather than
+    a bare zero-arg factory), this can determine which of the three
+    CD-5 background tasks is actually running from that text — each
+    task's prompt asset names its own `task_id` verbatim (e.g. "task
+    DOCUMENT_SUMMARY" — see `ai/prompts/*/v1.md`) — and return an
+    output shaped to match THAT task's own `output_schema`, so a
+    genuine `SUCCEEDED` result renders in the GUI rather than an
+    `OUTPUT_SCHEMA_INVALID` failure caused merely by guessing wrong.
+    """
+    import json as _json
+
+    from ai.providers.litellm.client import LiteLLMCompletionResult, LiteLLMOutcomeStatus
+
+    _dev_warning = (
+        "(dev-mode fake response — not a real model result; no live LiteLLM/Mac-mini/"
+        "Trinity call was made)"
+    )
+    if "task DOCUMENT_TYPE_PROPOSAL" in system_instructions:
+        content: dict = {
+            "proposed_type": "UNKNOWN",
+            "confidence": 0.0,
+            "signals": [],
+            "warnings": [_dev_warning],
+        }
+    elif "task DOCUMENT_SUMMARY" in system_instructions:
+        content = {
+            "summary": f"{_dev_warning} — no real document summary was generated.",
+            "confidence": 0.0,
+            "signals": [],
+            "warnings": [_dev_warning],
+        }
+    elif "task ENTITY_PROPOSAL" in system_instructions:
+        content = {
+            "proposed_entity_hint": None,
+            "confidence": 0.0,
+            "signals": [],
+            "warnings": [_dev_warning],
+        }
+    else:
+        # No CD-5 BACKGROUND task registered today falls outside the
+        # three branches above (see ai/tasks.py::TASK_REGISTRY) — this
+        # is a defensive fallback only, for a future task this dev-mode
+        # default has not been taught about yet. It will legitimately
+        # fail that task's own output_schema validation (an honest,
+        # visible FAILED/OUTPUT_SCHEMA_INVALID state, PID §76), not a
+        # crash — never silently fabricated as a false SUCCEEDED.
+        content = {"warnings": [_dev_warning, "unrecognised task — dev-mode default has no shape for it"]}
+
+    return LiteLLMCompletionResult(
+        status=LiteLLMOutcomeStatus.OK,
+        content=_json.dumps(content),
+        provider_model="fake-litellm-dev-default-v1 (composition dev-mode default — not a real model)",
+        usage_metadata={},
+        latency_ms=1,
+    )
+
+
 @dataclass(frozen=True)
 class RuntimeComposition:
     """Everything ``app/api/`` needs, wired for the current
@@ -212,7 +286,15 @@ def _build_development_or_test(runtime_environment: str) -> RuntimeComposition:
     intake_repository = InMemoryIntakeRepository()
 
     ai_invocation_repository = InMemoryAIInvocationRepository()
-    litellm_client = FakeLiteLLMClient()
+    # `default_response` closes the WI-4 dev-mode gap documented on
+    # `_dev_mode_litellm_default_response` above — without it, a real
+    # click on the GUI's "Run analysis" button in a live dev server
+    # 500s immediately (nothing pre-scripted, no default). Ordinary
+    # tests are unaffected: any test that wants a SPECIFIC scripted
+    # outcome still calls `queue_success()`/`queue_failure()`, which
+    # always takes priority over this default (see
+    # `FakeLiteLLMClient.complete()`).
+    litellm_client = FakeLiteLLMClient(default_response=_dev_mode_litellm_default_response)
     claude_client = FakeClaudeClient()
     tool_registry = _build_tool_registry(
         api=api,
