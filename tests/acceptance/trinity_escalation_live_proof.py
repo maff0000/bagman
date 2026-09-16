@@ -93,6 +93,15 @@ result = client.complete(
     capability_alias="bagman-deep",
     system_instructions="You are a background analysis component. Respond with the single word: OK.",
     evidence_content="WI-5 Trinity-escalation live acceptance proof {tag}",
+    # CD-5 Gate-1 closure delta (2026-09-16): every real call site now
+    # supplies an output_schema. No CD-5 TaskContract currently prefers
+    # bagman-deep (see this module's own docstring), so there is no
+    # real task contract to source one from here — a minimal, permissive
+    # schema is used instead; this script's own point is proving the
+    # adapter/alias/gateway path itself, not exercising structured-
+    # output enforcement (mac_mini_background_tier_live_proof.py, via
+    # the real task registry, is what proves that for bagman-fast/core).
+    output_schema={{"type": "object"}},
     timeout_seconds=30.0,
 )
 print({_RESULT_MARKER!r} + json.dumps({{

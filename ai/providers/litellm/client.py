@@ -23,6 +23,43 @@ exposes for every alias it fronts. The response is normalised into
 :class:`LiteLLMCompletionResult` (PID §70) — nothing outside this
 module ever sees the raw LiteLLM/OpenAI JSON shape.
 
+Structured-output request (CD-5 Gate-1 closure delta, 2026-09-16)
+--------------------------------------------------------------------
+Matt's ruling on the real `bagman-fast`/`bagman-core` reliability gap
+found during Gate-1 acceptance (empty/malformed output under real
+appliance latency, after HELM's own `think:false` + plain-JSON-mode
+fixes): BAGMAN already owns the exact per-task output shape in
+``ai.tasks.TaskContract.output_schema`` before it ever calls a
+provider, so THIS is the correct place to pass it down as a per-request
+constraint, not something to hard-code into an alias/appliance config.
+
+:meth:`complete` therefore takes a required ``output_schema`` argument
+and, when present, attaches it to the request body as
+``response_format`` in the standard OpenAI-compatible
+"JSON-schema-constrained" shape (`{"type": "json_schema", "json_schema":
+{"name": ..., "schema": <output_schema>}}` — a stronger contract than
+plain `{"type": "json_object"}` "JSON mode", which only guarantees
+syntactic JSON, never the caller's actual shape). LiteLLM translates
+this into whatever the real backend natively supports (e.g. Ollama's
+own `format: <json schema>` grammar-constrained generation, per
+https://ollama.com/blog/structured-outputs). ``name`` is a fixed,
+generic label (`"bagman_task_output"`) — it is bookkeeping metadata
+for the wire protocol, not a routing/identity decision, so no
+per-task-name plumbing is needed here; the actual constraint is the
+``schema`` value itself, always exactly ``task_contract.output_schema``
+verbatim (never hand-reconstructed — see
+``ai.gateway.background.run_background_task``, which passes it
+straight through).
+
+This is a **reliability improvement to the model-generation step
+only**. It is explicitly NOT a substitute for
+``ai.tasks.validate_task_output`` — a provider claiming structured-
+output support is not proof the response actually conforms (a
+non-conforming provider, or one that ignores ``response_format``
+entirely, must still be caught); BAGMAN's own deterministic
+post-response validation in ``ai.gateway.background`` remains the one
+canonical safety boundary and is entirely unchanged by this delta.
+
 Dependency choice — stdlib ``urllib`` only, no new requirement
 ------------------------------------------------------------------
 BAGMAN's ``requirements.txt`` currently has no HTTP client library at
@@ -197,6 +234,7 @@ class LiteLLMClientProtocol(Protocol):
         capability_alias: str,
         system_instructions: str,
         evidence_content: str,
+        output_schema: Mapping[str, Any],
         timeout_seconds: float,
     ) -> LiteLLMCompletionResult: ...
 
@@ -246,6 +284,29 @@ def build_messages(system_instructions: str, evidence_content: str) -> list[dict
         {"role": "system", "content": system_instructions},
         {"role": "user", "content": evidence_content},
     ]
+
+
+#: Fixed, generic label for the ``response_format.json_schema.name``
+#: field (CD-5 Gate-1 closure delta) — see module docstring's
+#: "Structured-output request" section for why this does not need to
+#: vary per task.
+_RESPONSE_FORMAT_SCHEMA_NAME = "bagman_task_output"
+
+
+def build_response_format(output_schema: Mapping[str, Any]) -> dict[str, Any]:
+    """Build the OpenAI-compatible ``response_format`` value that
+    requests JSON-schema-CONSTRAINED generation (not merely syntactic
+    "JSON mode") — see module docstring. ``output_schema`` is always
+    ``task_contract.output_schema`` verbatim; this function does not
+    interpret, validate, or modify it in any way — schema authority
+    stays entirely with ``ai.tasks`` (PID §21-22)."""
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": _RESPONSE_FORMAT_SCHEMA_NAME,
+            "schema": dict(output_schema),
+        },
+    }
 
 
 def _read_api_key(api_key_file: str) -> str:
@@ -311,11 +372,20 @@ class LiteLLMClient:
         capability_alias: str,
         system_instructions: str,
         evidence_content: str,
+        output_schema: Mapping[str, Any],
         timeout_seconds: float,
     ) -> LiteLLMCompletionResult:
         """Speak `POST {endpoint}/v1/chat/completions` for exactly one
         BAGMAN background task attempt. Never raises for a transport/
         timeout/auth/provider-side failure — see module docstring.
+
+        `output_schema` (CD-5 Gate-1 closure delta) is always
+        `task_contract.output_schema` verbatim, attached to the request
+        as a `response_format` JSON-schema constraint (see module
+        docstring's "Structured-output request" section) — this is a
+        generation-reliability improvement only; the caller
+        (`ai.gateway.background.run_background_task`) still validates
+        the response against the same schema independently afterwards.
 
         Raises:
             core.errors.ValidationError: if `capability_alias` is not
@@ -336,6 +406,7 @@ class LiteLLMClient:
             {
                 "model": capability_alias,
                 "messages": build_messages(system_instructions, evidence_content),
+                "response_format": build_response_format(output_schema),
             }
         ).encode("utf-8")
 

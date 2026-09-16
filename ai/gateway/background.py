@@ -78,6 +78,19 @@ simply calling `run_background_task` again once the prior attempt has
 reached a terminal state — WI-1's own concurrency guard already
 permits that cleanly and creates a genuinely new, distinct
 `AIInvocation` row.
+
+Structured-output request (CD-5 Gate-1 closure delta, 2026-09-16)
+--------------------------------------------------------------------
+This function passes `task_contract.output_schema` to
+`litellm_client.complete()` as a per-request generation constraint
+(see `ai.providers.litellm.client`'s own module docstring) — a
+reliability improvement for real-provider completions found necessary
+during Gate-1 acceptance (real appliance responses were sometimes
+empty or malformed under plain "JSON mode"). This changes NOTHING
+about outcome 2a/2b above: `json.loads` + `validate_task_output`
+against that exact same schema remain mandatory and unconditional — a
+provider claiming/attempting structured-output support is never
+treated as sufficient proof of a conforming response.
 """
 from __future__ import annotations
 
@@ -181,6 +194,13 @@ def run_background_task(
         capability_alias=invocation.capability_alias,
         system_instructions=system_instructions,
         evidence_content=evidence_content,
+        # CD-5 Gate-1 closure delta: the task contract this function
+        # already resolved above is the one and only schema authority
+        # (PID §21-22) — passed straight through, never
+        # hand-reconstructed, so the provider-side generation
+        # constraint and the post-response validate_task_output call
+        # below are always checking the SAME schema.
+        output_schema=task_contract.output_schema,
         timeout_seconds=float(task_contract.timeout_seconds),
     )
 

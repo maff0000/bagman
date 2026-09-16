@@ -38,6 +38,7 @@ class RecordedCall:
     capability_alias: str
     system_instructions: str
     evidence_content: str
+    output_schema: Mapping[str, Any]
     timeout_seconds: float
     messages: list[dict[str, str]]
 
@@ -126,6 +127,7 @@ class FakeLiteLLMClient:
         capability_alias: str,
         system_instructions: str,
         evidence_content: str,
+        output_schema: Mapping[str, Any],
         timeout_seconds: float,
     ) -> LiteLLMCompletionResult:
         # Exactly the same mechanical enforcement the real client uses
@@ -134,11 +136,21 @@ class FakeLiteLLMClient:
         validate_capability_alias(capability_alias)
 
         messages = build_messages(system_instructions, evidence_content)
+        # `output_schema` is recorded, exactly as received, for test
+        # inspection (CD-5 Gate-1 closure delta — proves the exact task
+        # schema reached the adapter, see
+        # tests/integration/test_litellm_client.py). The fake never
+        # itself enforces/constrains against it — enforcement is either
+        # the real provider's job (best-effort generation reliability)
+        # or ai.gateway.background's own validate_task_output call
+        # (the canonical safety boundary) — staying deterministic and
+        # scripted is this class's entire purpose (PID §61).
         self.calls.append(
             RecordedCall(
                 capability_alias=capability_alias,
                 system_instructions=system_instructions,
                 evidence_content=evidence_content,
+                output_schema=output_schema,
                 timeout_seconds=timeout_seconds,
                 messages=messages,
             )

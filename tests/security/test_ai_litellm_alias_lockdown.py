@@ -54,6 +54,27 @@ def test_run_background_task_request_has_no_field_naming_a_model_provider_or_ali
     }
 
 
+def test_run_background_task_request_has_no_field_naming_a_schema_or_response_format():
+    """CD-5 Gate-1 closure delta (2026-09-16): `output_schema` is now
+    threaded through to the provider, exactly like `preferred_capability`
+    already was — this must be sourced ENTIRELY from
+    `ai.tasks.TaskContract.output_schema` (resolved server-side from
+    `task_id`), never from anything a caller supplies on this HTTP
+    surface. Same closed-field-set discipline as the alias/model/
+    provider check above, extended to cover this new provider-call
+    parameter."""
+    field_names = set(RunBackgroundTaskRequest.model_fields.keys())
+    forbidden_substrings = ("schema", "format", "output_schema", "response_format")
+    suspicious = [
+        name for name in field_names if any(token in name.lower() for token in forbidden_substrings)
+    ]
+    assert suspicious == [], (
+        f"POST /internal/ai/tasks request model has a field that could let a caller inject/"
+        f"override the structured-output schema directly: {suspicious} — the schema must come "
+        "ENTIRELY from the resolved TaskContract.output_schema (PID §21-22)"
+    )
+
+
 # ---------------------------------------------------------------------
 # 2. the client's own alias validation rejects every forbidden value
 # ---------------------------------------------------------------------
@@ -76,6 +97,7 @@ def test_fake_client_also_rejects_the_same_forbidden_values(bad_alias):
             capability_alias=bad_alias,
             system_instructions="irrelevant",
             evidence_content="irrelevant",
+            output_schema={"type": "object"},
             timeout_seconds=1.0,
         )
 
@@ -143,6 +165,21 @@ def test_run_background_task_capability_alias_comes_only_from_task_contract():
         "expected run_background_task's create_invocation(...) call to pass "
         "capability_alias=task_contract.preferred_capability literally — routing must be "
         "decided entirely by the registered TaskContract, never a caller-supplied value"
+    )
+
+
+def test_run_background_task_output_schema_comes_only_from_task_contract():
+    """CD-5 Gate-1 closure delta (2026-09-16): confirms, by source
+    inspection, that `litellm_client.complete(...)`'s `output_schema=`
+    argument is `task_contract.output_schema` literally — never
+    reconstructed, never caller-supplied — same discipline as the
+    capability_alias proof above."""
+    path = REPO_ROOT / "ai" / "gateway" / "background.py"
+    source = path.read_text(encoding="utf-8")
+    assert "output_schema=task_contract.output_schema" in source, (
+        "expected run_background_task's litellm_client.complete(...) call to pass "
+        "output_schema=task_contract.output_schema literally — the schema must be decided "
+        "entirely by the registered TaskContract, never hand-reconstructed or caller-supplied"
     )
 
 

@@ -11,6 +11,9 @@ against a real socket.
 """
 from __future__ import annotations
 
+import json
+import urllib.request
+
 import pytest
 
 from ai.invocation import BACKGROUND_CAPABILITY_ALIASES
@@ -19,10 +22,23 @@ from ai.providers.litellm.client import (
     LiteLLMCompletionResult,
     LiteLLMOutcomeStatus,
     build_messages,
+    build_response_format,
     validate_capability_alias,
 )
 from ai.providers.litellm.fake import FakeLiteLLMClient
 from core.errors import ValidationError
+
+#: A minimal, realistic stand-in for a real `TaskContract.output_schema`
+#: — used everywhere below a test needs *some* schema but does not care
+#: about its exact shape. Real call sites always pass the task's own
+#: registered schema verbatim (see `ai/gateway/background.py`); nothing
+#: here reconstructs or guesses one.
+_SAMPLE_OUTPUT_SCHEMA = {
+    "type": "object",
+    "properties": {"proposed_type": {"type": "string"}},
+    "required": ["proposed_type"],
+    "additionalProperties": False,
+}
 
 
 # ---------------------------------------------------------------------
@@ -67,6 +83,7 @@ def test_real_client_rejects_bad_alias_before_any_network_io(bad_alias):
             capability_alias=bad_alias,
             system_instructions="irrelevant",
             evidence_content="irrelevant",
+            output_schema=_SAMPLE_OUTPUT_SCHEMA,
             timeout_seconds=1.0,
         )
 
@@ -79,6 +96,7 @@ def test_fake_client_rejects_bad_alias_identically(bad_alias):
             capability_alias=bad_alias,
             system_instructions="irrelevant",
             evidence_content="irrelevant",
+            output_schema=_SAMPLE_OUTPUT_SCHEMA,
             timeout_seconds=1.0,
         )
 
@@ -95,6 +113,7 @@ def test_real_client_reports_config_error_for_unreadable_key_file():
         capability_alias="bagman-fast",
         system_instructions="sys",
         evidence_content="data",
+        output_schema=_SAMPLE_OUTPUT_SCHEMA,
         timeout_seconds=1.0,
     )
     assert result.status == LiteLLMOutcomeStatus.CONFIG_ERROR
@@ -114,6 +133,7 @@ def test_real_client_reports_transport_error_for_unreachable_endpoint(tmp_path):
         capability_alias="bagman-fast",
         system_instructions="sys",
         evidence_content="data",
+        output_schema=_SAMPLE_OUTPUT_SCHEMA,
         timeout_seconds=1.0,
     )
     assert result.status in (LiteLLMOutcomeStatus.TRANSPORT_ERROR, LiteLLMOutcomeStatus.TIMEOUT)
@@ -146,6 +166,85 @@ def test_build_messages_never_concatenates_the_two_strings():
 
 
 # ---------------------------------------------------------------------
+# structured-output request (CD-5 Gate-1 closure delta, 2026-09-16) —
+# the exact task schema must reach the wire request as a
+# JSON-schema-constrained response_format, not merely generic "JSON
+# mode", and the schema value itself must be passed through verbatim,
+# never reconstructed.
+# ---------------------------------------------------------------------
+
+
+def test_build_response_format_wraps_the_schema_as_a_json_schema_constraint():
+    response_format = build_response_format(_SAMPLE_OUTPUT_SCHEMA)
+    assert response_format == {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "bagman_task_output",
+            "schema": _SAMPLE_OUTPUT_SCHEMA,
+        },
+    }
+    # Not the weaker, syntax-only "JSON mode" shape — schema-constrained
+    # generation is the whole point of this delta (Ollama structured
+    # outputs: https://ollama.com/blog/structured-outputs).
+    assert response_format["type"] != "json_object"
+
+
+def test_build_response_format_passes_the_exact_schema_through_unmodified():
+    """Never reconstructed/reshaped — proves object identity of the
+    nested values, not just equality, so a future change accidentally
+    copying/mutating the schema fails loudly."""
+    schema = {"type": "object", "properties": {"x": {"type": "string"}}, "required": ["x"]}
+    response_format = build_response_format(schema)
+    assert response_format["json_schema"]["schema"] == schema
+    assert response_format["json_schema"]["schema"] is not schema  # dict(...) copy, but equal
+    assert response_format["json_schema"]["schema"]["properties"] is schema["properties"]  # not deep-copied either
+
+
+def test_real_client_sends_output_schema_as_response_format_on_the_wire(tmp_path, monkeypatch):
+    """No real network I/O (PID §61) — intercepts `urllib.request.urlopen`
+    exactly at the boundary, the same technique
+    `tests/integration/test_claude_provider_client.py` already
+    establishes for `requests.Session.post`, so this proves what the
+    REAL client actually sends without depending on a live gateway."""
+    key_file = tmp_path / "key"
+    key_file.write_text("fake-key", encoding="utf-8")
+    captured: dict = {}
+
+    class _FakeResponse:
+        status = 200
+
+        def read(self):
+            return json.dumps(
+                {"id": "x", "model": "bagman-fast", "choices": [{"message": {"content": "{}"}}]}
+            ).encode("utf-8")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def _fake_urlopen(request, timeout):  # noqa: ARG001 - signature must match real call site
+        captured["body"] = json.loads(request.data.decode("utf-8"))
+        return _FakeResponse()
+
+    monkeypatch.setattr(urllib.request, "urlopen", _fake_urlopen)
+
+    client = LiteLLMClient(endpoint="http://192.168.11.4:4100", api_key_file=str(key_file))
+    result = client.complete(
+        capability_alias="bagman-fast",
+        system_instructions="sys",
+        evidence_content="data",
+        output_schema=_SAMPLE_OUTPUT_SCHEMA,
+        timeout_seconds=5.0,
+    )
+
+    assert result.status == LiteLLMOutcomeStatus.OK
+    assert captured["body"]["response_format"] == build_response_format(_SAMPLE_OUTPUT_SCHEMA)
+    assert captured["body"]["model"] == "bagman-fast"
+
+
+# ---------------------------------------------------------------------
 # FakeLiteLLMClient — deterministic scripting
 # ---------------------------------------------------------------------
 
@@ -157,6 +256,7 @@ def test_fake_client_returns_queued_success_and_records_the_call():
         capability_alias="bagman-fast",
         system_instructions="sys",
         evidence_content="evidence",
+        output_schema=_SAMPLE_OUTPUT_SCHEMA,
         timeout_seconds=5.0,
     )
     assert result == LiteLLMCompletionResult(
@@ -171,6 +271,7 @@ def test_fake_client_returns_queued_success_and_records_the_call():
     assert fake.calls[0].capability_alias == "bagman-fast"
     assert fake.calls[0].system_instructions == "sys"
     assert fake.calls[0].evidence_content == "evidence"
+    assert fake.calls[0].output_schema == _SAMPLE_OUTPUT_SCHEMA
 
 
 def test_fake_client_returns_queued_failure():
@@ -180,6 +281,7 @@ def test_fake_client_returns_queued_failure():
         capability_alias="bagman-deep",
         system_instructions="sys",
         evidence_content="evidence",
+        output_schema=_SAMPLE_OUTPUT_SCHEMA,
         timeout_seconds=1.0,
     )
     assert result.status == LiteLLMOutcomeStatus.TIMEOUT
@@ -193,6 +295,7 @@ def test_fake_client_raises_loudly_when_nothing_is_scripted():
             capability_alias="bagman-fast",
             system_instructions="sys",
             evidence_content="evidence",
+            output_schema=_SAMPLE_OUTPUT_SCHEMA,
             timeout_seconds=1.0,
         )
 

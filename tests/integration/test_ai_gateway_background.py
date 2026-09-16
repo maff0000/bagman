@@ -14,6 +14,7 @@ from ai.gateway.background import run_background_task
 from ai.invocation import InMemoryAIInvocationRepository
 from ai.providers.litellm.client import LiteLLMOutcomeStatus
 from ai.providers.litellm.fake import FakeLiteLLMClient
+from ai.tasks import get_task_contract
 from core.api import BagmanCanonicalAPI
 from core.errors import ActiveInvocationConflictError, ValidationError
 
@@ -101,6 +102,75 @@ def test_success_sends_task_preferred_capability_not_a_caller_supplied_value(api
     invocation = _run(api=api, repository=repository, litellm=litellm, task_id="ENTITY_PROPOSAL")
     assert invocation.capability_alias == "bagman-core"  # ENTITY_PROPOSAL_V1.preferred_capability
     assert litellm.calls[0].capability_alias == "bagman-core"
+
+
+# ---------------------------------------------------------------------
+# structured-output request (CD-5 Gate-1 closure delta, 2026-09-16) —
+# the exact task_contract.output_schema must reach the provider call,
+# and different tasks sharing the same alias must each get THEIR OWN
+# schema, never a shared/generic one.
+# ---------------------------------------------------------------------
+
+
+def test_output_schema_sent_is_exactly_the_resolved_task_contracts_schema(api, repository, litellm):
+    litellm.queue_success(
+        capability_alias="bagman-fast",
+        content=json.dumps({"proposed_type": "INVOICE", "confidence": 0.9, "signals": [], "warnings": []}),
+    )
+    _run(api=api, repository=repository, litellm=litellm, task_id="DOCUMENT_TYPE_PROPOSAL")
+    expected = get_task_contract("DOCUMENT_TYPE_PROPOSAL", 1).output_schema
+    assert litellm.calls[0].output_schema == expected
+
+
+def test_document_type_proposal_and_document_summary_share_bagman_fast_but_get_different_schemas(api, repository, litellm):
+    """PID §21-22: the alias is a routing decision only — the schema is
+    an entirely separate, per-task decision. Two tasks preferring the
+    SAME capability alias must still each receive THEIR OWN
+    output_schema, never a shared/generic/most-recently-used one."""
+    litellm.queue_success(
+        capability_alias="bagman-fast",
+        content=json.dumps({"proposed_type": "INVOICE", "confidence": 0.9, "signals": [], "warnings": []}),
+    )
+    _run(api=api, repository=repository, litellm=litellm, task_id="DOCUMENT_TYPE_PROPOSAL", evidence_id="ev-a")
+
+    litellm.queue_success(
+        capability_alias="bagman-fast",
+        content=json.dumps({"summary": "An invoice.", "confidence": 0.9, "signals": [], "warnings": []}),
+    )
+    _run(api=api, repository=repository, litellm=litellm, task_id="DOCUMENT_SUMMARY", evidence_id="ev-b")
+
+    assert len(litellm.calls) == 2
+    assert litellm.calls[0].capability_alias == litellm.calls[1].capability_alias == "bagman-fast"
+    type_proposal_schema = get_task_contract("DOCUMENT_TYPE_PROPOSAL", 1).output_schema
+    summary_schema = get_task_contract("DOCUMENT_SUMMARY", 1).output_schema
+    assert litellm.calls[0].output_schema == type_proposal_schema
+    assert litellm.calls[1].output_schema == summary_schema
+    assert litellm.calls[0].output_schema != litellm.calls[1].output_schema
+
+
+def test_entity_proposal_gets_its_own_schema_distinct_from_document_tasks(api, repository, litellm):
+    litellm.queue_success(
+        capability_alias="bagman-core",
+        content=json.dumps({"proposed_entity_hint": "NOUSTAI_LIMITED", "confidence": 0.5, "signals": [], "warnings": []}),
+    )
+    _run(api=api, repository=repository, litellm=litellm, task_id="ENTITY_PROPOSAL")
+    entity_schema = get_task_contract("ENTITY_PROPOSAL", 1).output_schema
+    type_proposal_schema = get_task_contract("DOCUMENT_TYPE_PROPOSAL", 1).output_schema
+    assert litellm.calls[0].output_schema == entity_schema
+    assert litellm.calls[0].output_schema != type_proposal_schema
+
+
+def test_malformed_output_still_rejected_even_though_structured_output_was_requested(api, repository, litellm):
+    """Provider-side structured-output support is never treated as
+    sufficient proof of a conforming response (Matt's explicit ruling)
+    — BAGMAN's own validate_task_output remains the canonical safety
+    boundary regardless of what response_format was sent."""
+    litellm.queue_success(capability_alias="bagman-fast", content=json.dumps({"nonsense": True}))
+    invocation = _run(api=api, repository=repository, litellm=litellm, task_id="DOCUMENT_TYPE_PROPOSAL")
+    assert invocation.status == "FAILED"
+    assert invocation.error_code == "OUTPUT_SCHEMA_INVALID"
+    # The request DID carry the real schema — the provider just didn't honour it.
+    assert litellm.calls[0].output_schema == get_task_contract("DOCUMENT_TYPE_PROPOSAL", 1).output_schema
 
 
 # ---------------------------------------------------------------------
