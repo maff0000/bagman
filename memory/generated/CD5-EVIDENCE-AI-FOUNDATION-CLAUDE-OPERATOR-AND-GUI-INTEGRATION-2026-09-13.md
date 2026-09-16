@@ -589,6 +589,28 @@ Per the architect's explicit instruction, the full expensive Gate-1 acceptance b
 
 ---
 
+## 6o. Fresh focused Auditor — cleanup delta only (dispatched, no inherited conclusion)
+
+A fresh Auditor with no prior context — explicitly instructed not to inherit any prior conclusion, scoped strictly to the removal commit (`8c87c49`), Gate 1 and Gate 2 themselves explicitly out of scope — was dispatched against an isolated worktree pinned exactly to `8c87c49`.
+
+**What it independently verified, live:**
+
+1. **No required live code accidentally deleted**: repo-wide grep for `agent.bagman`, `agent.tools`, `ai.providers.claude`, `orchestrator` found zero live `import`/`from` references to the deleted paths anywhere in the tree; confirmed `tests/integration/test_architecture_boundaries.py`'s own assertions do not depend on the deleted packages existing.
+2. **No direct-Anthropic runtime path remains**: no `anthropic_api_key`/`ANTHROPIC_API_KEY` reference in live code; `BAGMAN_OPERATOR_PROVIDER=anthropic` appears only in historical prose (`PID.md`, this evidence file), never in `docker-compose.yml`/`composition.py`; the compose file's commented-out `anthropic_api_key` secrets block confirmed genuinely gone.
+3. **Exactly one operator architecture**: confirmed `RuntimeComposition` (in `composition.py`) has only `claude_code_operator_runner`, no `claude_client`/`tool_registry` field anywhere in the file; `operator.py` imports and calls only `agent.claude_code.orchestrator.handle_operator_message`.
+4. **Ask BAGMAN live proof, real**: built and ran its own isolated Docker Compose stack (distinct project name/network/ports to avoid colliding with a separate, already-running, pre-cleanup `bagman` stack on the host, which it independently confirmed still contained the old packages and left completely untouched). Confirmed the built image genuinely lacks `agent/tools`/`ai/providers/claude`; `GET /internal/ai/health` returns exactly `claude_code` with no `claude` key; a real, non-mocked `POST /internal/operator/chat` call against real synthetic evidence returned a genuine response with real token/cost accounting; an adversarial `/etc/passwd`/`/etc/shadow`/prompt-injection attempt was correctly refused with `permission_denials: []` and no leaked content. Tore its stack down fully afterward; left the worktree clean.
+5. **Authority restrictions unchanged**: confirmed via `git show 8c87c49 -- agent/claude_code/runner.py` that the file was not touched by this commit at all; independently re-read the file and confirmed list-form `subprocess.Popen`, `--tools ""` + `--restricted` + `--strict-mcp-config`, `start_new_session=True` + `os.killpg(..., SIGKILL)`, and a from-scratch controlled `env` dict are all still present.
+
+**Also checked**: fresh-venv full suite — 686 passed/24 skipped, exact match; `gitleaks detect --source . --no-git -v` — no leaks found; confirmed `PID.md` §96/§97 and this file's own §6l/§6n preserve their original text unedited with additive, dated correction notes; confirmed `architecture-index.md` is genuinely regenerated, not stale/hand-edited.
+
+**Defect found**: three live-code module docstrings, untouched by commit `8c87c49` itself, still asserted the removed implementation "is NOT deleted" — now factually false: `app/api/routers/operator.py`, `agent/claude_code/orchestrator.py`, and `tests/acceptance/claude_code_operator_live_proof.py`. Also flagged a lower-severity dangling reference in `ai/tasks.py` pointing a reader to the now-removed `agent/bagman/orchestrator.py`'s module docstring. Purely a documentation-accuracy defect (no functional/security/test-coverage impact), but a real, concrete, checkable inaccuracy in live code a future reader would be misled by — correctly distinguished by the Auditor from `PID.md`/this evidence file, which were explicitly and correctly required to *preserve* their original "NOT deleted" text as history rather than rewrite it (those two documents were confirmed honest).
+
+**Fixed** (commit `82d9482`, follow-up to `8c87c49`): all four references corrected to state the current, true fact — the superseded implementation was removed 2026-09-16, not merely "no longer called". Re-verified after the fix: 686 passed/24 skipped (unchanged), gitleaks clean, repo-wide grep confirms zero remaining "NOT deleted" claims about the removed code anywhere in live code. Live CI green at the resulting head.
+
+**Verdict: `CD5_CLEANUP_DELTA_GREEN_CONFIRMED`**, scoped strictly to this delta, after the one defect found was fixed and independently re-verified by the PL. No opinion offered on Gate 1, Gate 2 themselves, or the overall CD-5 verdict (both already closed GREEN prior to this delta).
+
+---
+
 ## 7. Exit-gate statement (PID §93) — drafted, not issued
 
 Per PID §93, no live mailbox integration may begin until **AI_FOUNDATION_GREEN**. §6b's original engineer-drafted framing (below, superseded) argued for an explicitly-scoped partial-GREEN; **the architect has since corrected that framing as broader than PID §91 permits (§6b's correction note, 2026-09-16)** — the honest state of a delivery with any tier's genuine-completion criterion unproven is `BLOCKED`, not any form of `GREEN`.
