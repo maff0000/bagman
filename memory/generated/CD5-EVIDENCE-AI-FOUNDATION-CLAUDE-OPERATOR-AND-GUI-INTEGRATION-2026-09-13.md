@@ -457,7 +457,24 @@ Claude remains a wholly independent Anthropic operator path. The existing/shared
 
 ## 6h. Focused independent Auditor — final Gate-1 verification, against the exact post-GREEN-ruling head
 
-*(to be completed once dispatched and returned — see this file's own commit history for the exact head SHA it was run against)*
+A fresh Auditor with no prior context — explicitly instructed NOT to inherit the architect's GREEN conclusion, but to independently verify it — was dispatched against an isolated worktree pinned to head `302f7f5` (the §6g evidence-alignment commit). Scope, per the architect's own exact list: per-request schema propagation; distinct schemas per task on a shared alias; unconditional post-response validation; no BAGMAN-side static-override reintroduction; alias enforcement; live fast/core/deep topology; §6b–§7 narrative consistency; PR/evidence wording vs. deployed reality.
+
+**What it independently verified (code read directly, not relayed):**
+
+1. **Schema propagation** — confirmed `output_schema=task_contract.output_schema` reaches `LiteLLMClient.complete()` verbatim and is built into `response_format` exactly as `build_response_format` defines it; nothing else in the wire body. Structurally proven by the closed-HTTP-field-set test.
+2. **Distinct schemas per shared alias** — confirmed `DOCUMENT_TYPE_PROPOSAL`/`DOCUMENT_SUMMARY` (both `bagman-fast`) are genuinely different schema objects, both in code and in a **live check**: read the actual persisted `output` rows from `bagman-db` directly and confirmed `DOCUMENT_SUMMARY` responses contain `summary`/no `proposed_type` and vice versa.
+3. **Unconditional validation** — confirmed `validate_task_output` runs after every `OK`-status provider response regardless of what was requested; the "still rejected even though structured output was requested" test is real, not vacuous.
+4. **No BAGMAN-side competing override** — confirmed `LiteLLMClient.complete()`'s request body is exactly `{model, messages, response_format}`, no `format`/`extra_body` key anywhere in this repo (the stale override HELM fixed was entirely appliance-side, correctly out of this repo's scope).
+5. **Alias enforcement, live** — confirmed `validate_capability_alias` is the single shared source of truth for both real and fake clients; independently sent a raw physical model name directly to the real appliance (via a safe temp-file curl, key never printed) and reproduced the same `403 key_model_access_denied` defense-in-depth result.
+6. **Live fast/core/deep topology** — ran its **own** ad hoc 21-fixture live sample (not a rerun of the repo's script): **10/10** `ENTITY_PROPOSAL`/`bagman-core`, **5/5** `DOCUMENT_TYPE_PROPOSAL`/`bagman-fast`, **5/5** `DOCUMENT_SUMMARY`/`bagman-fast` (20/20 total, verified by reading the persisted `output` rows directly, not trusting its own script's report), plus one real `bagman-deep` call (real HTTP 200, 309ms — content was an off-topic JSON error message rather than the literal instructed reply; transport/adapter path succeeded regardless, and the Auditor correctly scoped this as a minor Trinity-escalation-backend quality curiosity worth flagging, not a Gate-1 defect, matching the existing `trinity_escalation_live_proof.py` script's own documented "proves the path, not response quality" scope).
+7. **§6b–§7 narrative consistency** — diffed the evidence file across every Gate-1 commit and confirmed §6b through §6f are byte-for-byte unedited by the final commit; cross-checked `tests/acceptance/entity_proposal_isolation_phase_a.jsonl` directly against §6f's prose (49 `SUCCEEDED`/1 `FAILED` with the exact described `confidence_score` root cause) — matches exactly, not a fabricated summary.
+8. **Topology wording vs. deployed reality** — live `GET /health/readiness` on the appliance, live `docker exec bagman-api env | grep -i litellm` confirming `BAGMAN_LITELLM_ENDPOINT=http://192.168.11.4:4100`, and a direct read of the PR #5 body and `PID.md` §96 — all consistent with each other and with the real deployed state; confirmed the docstring/manifest changes in the final commit are genuinely doc-only (diffed each file, zero executable-line changes).
+
+**Supporting environment checks, all independently re-run:** full non-Docker suite 736 passed/24 skipped (exact match); `python3 -m ai.evaluation.run` 9/9 GREEN; gitleaks clean; architecture-memory check up to date; confirmed `/srv/bagman-secrets/anthropic_api_key` still absent (Gate 2 correctly untouched).
+
+**Defects found: none.**
+
+**Verdict: `GATE1_FINAL_GREEN_CONFIRMED`**, scoped strictly to Gate 1 as of commit `302f7f5`. No opinion offered on Gate 2 or the overall CD-5 verdict.
 
 ---
 
