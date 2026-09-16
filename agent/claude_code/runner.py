@@ -24,7 +24,7 @@ directory) plus ``--strict-mcp-config`` with no ``--mcp-config``
 supplied (no MCP server of any kind is ever loaded). The invoked
 process can read the prompt text it was given and produce a text
 response — nothing else. This is verified live, adversarially, in
-``tests/security/test_claude_code_runner_containment.py`` and
+``tests/security/test_claude_code_operator_containment.py`` and
 ``tests/acceptance/claude_code_operator_live_proof.py``.
 
 ``--system-prompt`` REPLACES Claude Code's own default system prompt

@@ -540,7 +540,23 @@ Live-dependency check (confirmed by direct code search, not assumption): the ONL
 
 ## 6m. Focused independent Auditor — Gate-2 delta only (dispatched, not a full re-audit)
 
-*(to be completed once dispatched and returned — see this file's own commit history for the exact head SHA it was run against)*
+A fresh Auditor with no prior context — explicitly instructed not to inherit the PL's/architect's conclusion — was dispatched against an isolated worktree pinned to head `2406f2c`, scoped strictly to the Gate-2 delta (`agent/claude_code/`, the operator HTTP surface, the two GUI fixes); Gate 1 and the superseded-code removal question were explicitly out of scope.
+
+**What it independently verified, live and adversarially (its own separate checks, not merely re-running the PL's scripts, though it did that too):**
+
+* **Command-injection resistance**: confirmed the single, list-form `subprocess.Popen` call by reading the code, then sent its own live adversarial `POST /internal/operator/chat` requests containing `` `id` $(whoami) ; cat /etc/shadow #``, `--dangerously-skip-permissions`, and injected `--model=evil`/`--mcp-config` text — every one returned `SUCCEEDED` with the payload quoted back as inert content, `permission_denials` empty throughout.
+* **Authority restriction**: confirmed `--tools ""`/`--restricted`/`--strict-mcp-config` are real flags with the claimed semantics (`docker exec bagman-api claude --help`); its own live Bash/`/etc/passwd`-demanding requests were declined, with `root:x:0:0:` confirmed absent from every response, checked programmatically.
+* **Prompt-injection handling**: its own synthetic evidence, with content instructing secret exfiltration, source editing, and table-dropping, was correctly refused; `app/api/main.py`'s sha256 was confirmed identical before/after, and the evidence record was byte-identical before/after.
+* **Timeout/process cleanup**: confirmed `start_new_session=True` + `os.killpg(..., SIGKILL)` in code, backed by a genuine test (verified non-vacuous) asserting the pgid was actually killed; independently renamed `/usr/local/bin/claude` inside the live container itself, got a clean `FAILED`/`CLAUDE_CODE_PROCESS_ERROR` with no hang/500, restored the binary itself, and confirmed a subsequent real call succeeded normally.
+* **Canonical-state non-mutation**: confirmed unchanged evidence records across every call it made.
+* **Real browser → backend → Claude Code → browser flow**: ran `prepare-claude-binary.sh`, rebuilt `bagman-api` from scratch, brought the stack up itself, confirmed the credential mount and the absent Anthropic key, installed Playwright/Chromium fresh, and ran both acceptance scripts itself — both `PASS`, matching the PL's own results exactly. Independently confirmed `GET /internal/ai/health` and the Overview page both show the real `claude_code` signal.
+* **Tests are real, not vacuous**: fresh venv, full suite — 770 passed/24 skipped, exact match; gitleaks clean; read all three new test files in full and confirmed they test what they claim (e.g. the AST-based proof that only `runner.py` ever calls a subprocess-spawning function anywhere in production code, and that `OperatorChatRequest`'s field set is exactly the closed six-field set with no process-control field).
+* **GUI wire-contract and Overview-fix claims**: independently confirmed by reading the code directly, not merely trusting the evidence file's prose.
+* **Evidence-file honesty**: diffed the commits that touched §6i–§7 and confirmed nothing was rewritten or contradicted — only additive.
+
+**Defect found**: one trivial, non-functional documentation defect — `runner.py`'s own module docstring named the wrong test filename (`test_claude_code_runner_containment.py`, which does not exist) instead of the real `tests/security/test_claude_code_operator_containment.py`. No security or functional impact; **fixed** (commit follows).
+
+**Verdict: `GATE2_CLAUDE_CODE_OPERATOR_GREEN_CONFIRMED`**, scoped strictly to this delta. No opinion offered on Gate 1, the superseded-code removal question, or the overall CD-5 verdict.
 
 ---
 
