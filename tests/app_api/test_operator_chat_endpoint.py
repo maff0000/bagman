@@ -1,5 +1,13 @@
 """``POST /internal/operator/chat`` HTTP-level tests (CD-5 PID §42-44/
-§68, WI-3).
+§68/§97).
+
+CD-5 Gate-2 closure (2026-09-16): this endpoint now calls
+``agent.claude_code.orchestrator.handle_operator_message`` (the bounded
+headless Claude Code runner), not the superseded direct-Anthropic
+``agent.bagman.orchestrator`` — see ``app/api/routers/operator.py``'s
+own module docstring for the full correction history. Tests below
+script ``composition.claude_code_operator_runner``
+(`FakeClaudeCodeOperatorRunner`), not `composition.claude_client`.
 
 Deliberately independent of ``tests/app_api/conftest.py``'s
 ``runtime_stack``/``client`` fixtures (real disposable Postgres/MinIO/
@@ -77,11 +85,9 @@ def test_chat_with_an_empty_message_returns_422(dev_client):
     assert resp.status_code == 422
 
 
-def test_chat_about_a_document_succeeds_against_the_fake_claude_client(dev_client):
+def test_chat_about_a_document_succeeds_against_the_fake_claude_code_runner(dev_client):
     composition, evidence = _register_evidence(dev_client)
-    from ai.providers.claude.fake import text_turn
-
-    composition.claude_client._queue.append(text_turn("This appears to be an invoice."))
+    composition.claude_code_operator_runner.queue_success(text="This appears to be an invoice.")
 
     resp = dev_client.post(
         "/internal/operator/chat",
@@ -102,18 +108,17 @@ def test_chat_about_a_document_succeeds_against_the_fake_claude_client(dev_clien
     assert body["response_text"] == "This appears to be an invoice."
     assert evidence.evidence_id in body["referenced_evidence_ids"]
     assert body["schema_version"] == "bagman.ai_invocation.v1"
+    assert body["output"]["tool_calls"] == []  # PID §97 — no live tool-calling loop in this design
 
 
-def test_chat_with_a_tool_call_returns_the_tool_call_record(dev_client):
+def test_chat_sends_bounded_governed_context_to_the_runner_not_a_live_tool_call(dev_client):
+    """PID §97: BAGMAN's own application layer assembles context BEFORE
+    the one bounded invocation — no live tool call happens. Proves the
+    trusted evidence summary and the evidence's own content both
+    reached the runner's `user_prompt`, and the fixed operator
+    instructions reached `system_prompt`."""
     composition, evidence = _register_evidence(dev_client)
-    from ai.providers.claude.fake import text_turn, tool_use_turn
-
-    composition.claude_client._queue.extend(
-        [
-            tool_use_turn(("c1", "get_document", {"evidence_id": evidence.evidence_id})),
-            text_turn("It is an invoice, confirmed via get_document."),
-        ]
-    )
+    composition.claude_code_operator_runner.queue_success(text="It is an invoice.")
 
     resp = dev_client.post(
         "/internal/operator/chat",
@@ -125,8 +130,13 @@ def test_chat_with_a_tool_call_returns_the_tool_call_record(dev_client):
         },
     )
     assert resp.status_code == 200
-    body = resp.json()
-    assert body["output"]["tool_calls"][0]["tool"] == "get_document"
+
+    calls = composition.claude_code_operator_runner.calls
+    assert len(calls) == 1
+    assert evidence.evidence_id in calls[0].user_prompt  # governed context reached the prompt
+    assert "What is this?" in calls[0].user_prompt  # the operator's own question, last
+    assert "BAGMAN's operator intelligence" in calls[0].system_prompt
+    assert "NO tools available" in calls[0].system_prompt
 
 
 def test_a_duplicate_concurrent_chat_about_the_same_subject_returns_409(dev_client):
@@ -162,11 +172,13 @@ def test_a_duplicate_concurrent_chat_about_the_same_subject_returns_409(dev_clie
     assert resp.json()["error_code"] == "ACTIVE_INVOCATION_CONFLICT"
 
 
-def test_claude_auth_failure_surfaces_as_a_failed_invocation_not_a_500(dev_client):
+def test_claude_code_timeout_surfaces_as_a_failed_invocation_not_a_500(dev_client):
     composition, evidence = _register_evidence(dev_client)
-    from ai.providers.claude.client import ClaudeAuthenticationError
+    from agent.claude_code.runner import ClaudeCodeOutcomeStatus
 
-    composition.claude_client._queue.append(ClaudeAuthenticationError("simulated"))
+    composition.claude_code_operator_runner.queue_failure(
+        status=ClaudeCodeOutcomeStatus.TIMEOUT, error_detail="simulated timeout"
+    )
 
     resp = dev_client.post(
         "/internal/operator/chat",
@@ -180,5 +192,29 @@ def test_claude_auth_failure_surfaces_as_a_failed_invocation_not_a_500(dev_clien
     assert resp.status_code == 200  # the HTTP call itself succeeded — it returns a FAILED AIInvocation
     body = resp.json()
     assert body["status"] == "FAILED"
-    assert body["error_code"] == "CLAUDE_AUTHENTICATION_FAILED"
+    assert body["error_code"] == "CLAUDE_CODE_TIMEOUT"
+    assert body["response_text"] is None
+
+
+def test_claude_code_process_error_surfaces_as_a_failed_invocation_not_a_500(dev_client):
+    composition, evidence = _register_evidence(dev_client)
+    from agent.claude_code.runner import ClaudeCodeOutcomeStatus
+
+    composition.claude_code_operator_runner.queue_failure(
+        status=ClaudeCodeOutcomeStatus.PROCESS_ERROR, error_detail="simulated process failure"
+    )
+
+    resp = dev_client.post(
+        "/internal/operator/chat",
+        json={
+            "message": "What is this?",
+            "actor_type": "USER",
+            "actor_id": "matt",
+            "evidence_id": evidence.evidence_id,
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "FAILED"
+    assert body["error_code"] == "CLAUDE_CODE_PROCESS_ERROR"
     assert body["response_text"] is None

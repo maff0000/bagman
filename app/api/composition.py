@@ -59,6 +59,8 @@ from typing import Any, Mapping, Optional
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
+from agent.claude_code.fake import FakeClaudeCodeOperatorRunner
+from agent.claude_code.runner import ClaudeCodeOperatorRunner, ClaudeCodeOperatorRunnerProtocol
 from agent.tools.background import BackgroundTaskRunner, DeterministicFakeBackgroundTaskRunner
 from agent.tools.handlers import ToolDependencies, build_default_tool_registry
 from agent.tools.registry import ToolRegistry
@@ -229,6 +231,30 @@ def _dev_mode_litellm_default_response(system_instructions: str) -> "LiteLLMComp
     )
 
 
+def _dev_mode_claude_code_default_response(system_prompt: str, user_prompt: str):
+    """CD-5 Gate-2 closure dev-mode usability fix, mirroring
+    `_dev_mode_litellm_default_response` immediately above exactly: a
+    real click on Ask BAGMAN in a live dev server, with nothing
+    pre-scripted on `FakeClaudeCodeOperatorRunner`, should still return
+    a genuine, clearly-labelled `SUCCEEDED` result the GUI can render —
+    never a 500, never a fabricated real answer.
+    """
+    from agent.claude_code.runner import ClaudeCodeInvocationResult, ClaudeCodeOutcomeStatus
+
+    return ClaudeCodeInvocationResult(
+        status=ClaudeCodeOutcomeStatus.OK,
+        text=(
+            "(dev-mode fake response — no real headless Claude Code invocation was made; "
+            "this is composition's own default response for local development)"
+        ),
+        session_id="dev-mode-fake-session",
+        model_usage={"fake-claude-code-dev-default-v1": {}},
+        total_cost_usd=0.0,
+        duration_ms=1,
+        num_turns=1,
+    )
+
+
 @dataclass(frozen=True)
 class RuntimeComposition:
     """Everything ``app/api/`` needs, wired for the current
@@ -270,8 +296,23 @@ class RuntimeComposition:
     #: that wires it to WI-2's real gateway in production).
     ai_invocation_repository: AIInvocationRepository
     litellm_client: LiteLLMClientProtocol
+    #: SUPERSEDED (CD-5 Gate-2 closure, 2026-09-16) — `claude_client`/
+    #: `tool_registry` back the old direct-Anthropic tool-calling-loop
+    #: path (`agent.bagman.orchestrator`), no longer reachable from
+    #: `POST /internal/operator/chat`. Left wired (not removed) per the
+    #: architect's own "do not delete blindly" instruction — see
+    #: `agent/component.yaml`'s own correction note and the CD-5
+    #: evidence file's classification finding. `claude_code_operator_runner`
+    #: below is the field the live operator path actually uses now.
     claude_client: ClaudeClientProtocol
     tool_registry: ToolRegistry
+    #: CD-5 Gate-2 closure (2026-09-16, PID §97) — the ONE bounded
+    #: headless Claude Code invocation seam `agent.claude_code
+    #: .orchestrator.handle_operator_message` uses. Fake in
+    #: development/test (PID §61 — no real subprocess in ordinary
+    #: tests/dev server), the real `ClaudeCodeOperatorRunner` in
+    #: production.
+    claude_code_operator_runner: ClaudeCodeOperatorRunnerProtocol
 
 
 def _build_development_or_test(runtime_environment: str) -> RuntimeComposition:
@@ -296,6 +337,9 @@ def _build_development_or_test(runtime_environment: str) -> RuntimeComposition:
     # `FakeLiteLLMClient.complete()`).
     litellm_client = FakeLiteLLMClient(default_response=_dev_mode_litellm_default_response)
     claude_client = FakeClaudeClient()
+    claude_code_operator_runner = FakeClaudeCodeOperatorRunner(
+        default_response=_dev_mode_claude_code_default_response
+    )
     tool_registry = _build_tool_registry(
         api=api,
         intake_repository=intake_repository,
@@ -306,6 +350,7 @@ def _build_development_or_test(runtime_environment: str) -> RuntimeComposition:
         scanner=scanner,
         claude_client=claude_client,
         litellm_client=litellm_client,
+        claude_code_operator_runner=claude_code_operator_runner,
     )
 
     return RuntimeComposition(
@@ -319,6 +364,7 @@ def _build_development_or_test(runtime_environment: str) -> RuntimeComposition:
         litellm_client=litellm_client,
         claude_client=claude_client,
         tool_registry=tool_registry,
+        claude_code_operator_runner=claude_code_operator_runner,
     )
 
 
@@ -418,12 +464,22 @@ def _build_production() -> RuntimeComposition:
         api_key_file=os.environ.get("BAGMAN_LITELLM_API_KEY_FILE", DEFAULT_LITELLM_API_KEY_FILE),
     )
 
-    # CD-5 WI-3: the real Anthropic adapter. Constructing this performs
-    # NO I/O itself (mirrors ClamAVScanner above) — it only stores
-    # config; reachability is proven live by `is_available()`
-    # (`get_runtime_status_summary` below / `GET /internal/ai/health`),
-    # never here.
+    # CD-5 WI-3: the real Anthropic adapter — SUPERSEDED (2026-09-16,
+    # Gate-2 closure), no longer consumed by the live operator path;
+    # still constructed and wired here only because `claude_client` is
+    # a required RuntimeComposition field the (now-unreachable)
+    # tool_registry construction below still takes. See
+    # `agent/component.yaml`'s own correction note.
     claude_client = ClaudeClient()
+
+    # CD-5 Gate-2 closure (2026-09-16, PID §97): the real bounded
+    # headless Claude Code operator runner. Constructing this performs
+    # NO I/O itself (same "no eager I/O at construction" discipline as
+    # every other adapter in this function) — reachability
+    # (`shutil.which("claude")`) is proven live by `is_available()`,
+    # never here; a real invocation is only ever attempted inside a
+    # real Ask BAGMAN request.
+    claude_code_operator_runner = ClaudeCodeOperatorRunner()
 
     # PL RECONCILIATION (WI-2 and WI-3 were dispatched in parallel;
     # neither could see the other's worktree): `run_background_analysis`
@@ -452,6 +508,7 @@ def _build_production() -> RuntimeComposition:
         claude_client=claude_client,
         litellm_client=litellm_client,
         background_task_runner=background_task_runner,
+        claude_code_operator_runner=claude_code_operator_runner,
     )
 
     return RuntimeComposition(
@@ -465,6 +522,7 @@ def _build_production() -> RuntimeComposition:
         litellm_client=litellm_client,
         claude_client=claude_client,
         tool_registry=tool_registry,
+        claude_code_operator_runner=claude_code_operator_runner,
     )
 
 
@@ -491,6 +549,7 @@ def get_runtime_status_summary(
     scanner: EvidenceSafetyScanner,
     claude_client: ClaudeClientProtocol,
     litellm_client: LiteLLMClientProtocol,
+    claude_code_operator_runner: Optional[ClaudeCodeOperatorRunnerProtocol] = None,
 ) -> Mapping[str, Any]:
     """Read-only runtime status snapshot for `agent.tools`'
     `get_runtime_status` tool (PID §34/§46-48). `GET /internal/ai/health`
@@ -545,9 +604,23 @@ def get_runtime_status_summary(
             checks["scanner"] = "unreachable"
 
     try:
+        # SUPERSEDED (2026-09-16, Gate-2 closure) — the direct-Anthropic
+        # path this checks is no longer reachable from the live
+        # operator surface; kept reporting for now since removal is a
+        # separate, not-yet-ruled-on decision (see agent/component.yaml's
+        # correction note). `claude_code_operator` below is the key the
+        # live path's own health actually reflects.
         checks["claude_operator"] = "ok" if claude_client.is_available() else "unreachable"
     except Exception:  # noqa: BLE001
         checks["claude_operator"] = "unreachable"
+
+    if claude_code_operator_runner is not None:
+        try:
+            checks["claude_code_operator"] = (
+                "ok" if claude_code_operator_runner.is_available() else "unreachable"
+            )
+        except Exception:  # noqa: BLE001
+            checks["claude_code_operator"] = "unreachable"
 
     try:
         # Gateway-wide only (PID §9's three background aliases all
@@ -643,6 +716,7 @@ def _build_tool_registry(
     claude_client: ClaudeClientProtocol,
     litellm_client: LiteLLMClientProtocol,
     background_task_runner: Optional[BackgroundTaskRunner] = None,
+    claude_code_operator_runner: Optional[ClaudeCodeOperatorRunnerProtocol] = None,
 ) -> ToolRegistry:
     """Build the fixed, closed `agent.tools.registry.ToolRegistry`
     (PID §34) — identical construction regardless of
@@ -675,6 +749,7 @@ def _build_tool_registry(
             scanner=scanner,
             claude_client=claude_client,
             litellm_client=litellm_client,
+            claude_code_operator_runner=claude_code_operator_runner,
         ),
     )
     return build_default_tool_registry(deps)

@@ -232,6 +232,7 @@ def test_ai_health_reports_gateway_wide_checks_for_every_alias(dev_client):
         "bagman_core": "ok",
         "bagman_deep": "ok",
         "claude": "ok",
+        "claude_code": "ok",
     }
     assert "gateway-wide" in body["granularity"]
 
@@ -242,6 +243,7 @@ def test_ai_health_reports_gateway_wide_checks_for_every_alias(dev_client):
         "bagman_core": "unreachable",
         "bagman_deep": "unreachable",
         "claude": "ok",
+        "claude_code": "ok",
     }
 
 

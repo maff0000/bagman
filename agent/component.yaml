@@ -9,15 +9,40 @@
 # populate it, so this is the first manifest for it.
 
 id: BAGMAN.AGENT
-version: 1
+version: 2
+
+# ---------------------------------------------------------------------
+# ARCHITECTURE CORRECTION (2026-09-16, CD-5 Gate-2 closure) — read this
+# before agent/bagman/ or agent/tools/. The architect ruled BAGMAN's
+# operator intelligence is NOT a direct-Anthropic-API tool-calling
+# loop under BAGMAN's own API key — it is a bounded, headless Claude
+# Code invocation (see the NEW sibling component
+# agent/claude_code/component.yaml, BAGMAN.AGENT.CLAUDE_CODE).
+# `POST /internal/operator/chat` (app/api/routers/operator.py) now
+# calls agent.claude_code.orchestrator.handle_operator_message, NOT
+# agent.bagman.orchestrator.handle_operator_message.
+#
+# agent/bagman/ and agent/tools/ are NOT deleted — per the architect's
+# own explicit instruction not to remove code blindly. As of this
+# correction, nothing in the live HTTP-reachable path depends on
+# either package any more (composition.py still constructs
+# `claude_client`/`tool_registry` for now, but the operator router no
+# longer consumes them for anything reachable from the GUI) — this
+# is recorded as an explicit classification finding for the architect's
+# ruling in the CD-5 evidence file (§ "ai/providers/claude/ and
+# agent/tools/+agent/bagman/ classification"), not decided here.
+# History preserved below exactly as WI-3 originally wrote it.
+# ---------------------------------------------------------------------
 
 responsibility: >
-  Own the BAGMAN AI agent's own reasoning/orchestration layer: the Ask
-  BAGMAN operator-orchestration loop (agent/bagman/ — system-prompt
-  construction, the bounded Claude tool-calling loop, AIInvocation
-  lifecycle management, PID §57 audit emission) and the fixed,
-  read-only/analyse-only governed tool registry Claude may invoke
-  (agent/tools/ — CD-5 PID §34's 8 named tools, mechanically
+  [SUPERSEDED 2026-09-16 — see the correction note above; text below is
+  WI-3's own original, preserved verbatim as history, not current
+  fact.] Own the BAGMAN AI agent's own reasoning/orchestration layer:
+  the Ask BAGMAN operator-orchestration loop (agent/bagman/ —
+  system-prompt construction, the bounded Claude tool-calling loop,
+  AIInvocation lifecycle management, PID §57 audit emission) and the
+  fixed, read-only/analyse-only governed tool registry Claude may
+  invoke (agent/tools/ — CD-5 PID §34's 8 named tools, mechanically
   fail-closed dispatch per PID §63). This component decides WHICH of
   BAGMAN's own internal APIs/repositories a registered tool may call
   and HOW an Ask BAGMAN conversation is assembled/bounded (PID §53); it

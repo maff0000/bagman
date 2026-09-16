@@ -14,9 +14,9 @@
 
 ## Components
 
-### `BAGMAN.AGENT` (v1)
+### `BAGMAN.AGENT` (v2)
 
-Own the BAGMAN AI agent's own reasoning/orchestration layer: the Ask BAGMAN operator-orchestration loop (agent/bagman/ — system-prompt construction, the bounded Claude tool-calling loop, AIInvocation lifecycle management, PID §57 audit emission) and the fixed, read-only/analyse-only governed tool registry Claude may invoke (agent/tools/ — CD-5 PID §34's 8 named tools, mechanically fail-closed dispatch per PID §63). This component decides WHICH of BAGMAN's own internal APIs/repositories a registered tool may call and HOW an Ask BAGMAN conversation is assembled/bounded (PID §53); it never instantiates an Anthropic/LiteLLM client itself (that lives in ai/providers/*/, consumed here only through the provider-neutral ClaudeClientProtocol/BackgroundTaskRunner seams) and never allows Claude to invoke anything outside the fixed tool set or to mutate canonical state (PID §17/§56). agent/policies/ and agent/memory/ remain empty CD-1 placeholders as of this WI — WI-3 found no genuinely CD-5-scoped content for either (see WI-3's delivery report): no autonomous policy engine is authorised yet (PID §16 — the tool registry's own fixed authority classes ARE this WI's governance boundary), and Ask BAGMAN's conversation state is in-request-only (PID §64 — no durable chat-memory-fabric integration is built this WI).
+[SUPERSEDED 2026-09-16 — see the correction note above; text below is WI-3's own original, preserved verbatim as history, not current fact.] Own the BAGMAN AI agent's own reasoning/orchestration layer: the Ask BAGMAN operator-orchestration loop (agent/bagman/ — system-prompt construction, the bounded Claude tool-calling loop, AIInvocation lifecycle management, PID §57 audit emission) and the fixed, read-only/analyse-only governed tool registry Claude may invoke (agent/tools/ — CD-5 PID §34's 8 named tools, mechanically fail-closed dispatch per PID §63). This component decides WHICH of BAGMAN's own internal APIs/repositories a registered tool may call and HOW an Ask BAGMAN conversation is assembled/bounded (PID §53); it never instantiates an Anthropic/LiteLLM client itself (that lives in ai/providers/*/, consumed here only through the provider-neutral ClaudeClientProtocol/BackgroundTaskRunner seams) and never allows Claude to invoke anything outside the fixed tool set or to mutate canonical state (PID §17/§56). agent/policies/ and agent/memory/ remain empty CD-1 placeholders as of this WI — WI-3 found no genuinely CD-5-scoped content for either (see WI-3's delivery report): no autonomous policy engine is authorised yet (PID §16 — the tool registry's own fixed authority classes ARE this WI's governance boundary), and Ask BAGMAN's conversation state is in-request-only (PID §64 — no durable chat-memory-fabric integration is built this WI).
 
 - **Owns:** _(none)_
 - **Consumes:** `BAGMAN.AI`, `BAGMAN.CORE`, `BAGMAN.SERVICES.EVIDENCE`, `BAGMAN.EVIDENCE.INTAKE`
@@ -24,6 +24,17 @@ Own the BAGMAN AI agent's own reasoning/orchestration layer: the Ask BAGMAN oper
 - **Dependencies:** _(none)_
 - **External access:** `false`
 - **Prohibited:** `direct_email_access`, `direct_bank_access`, `direct_xero_access`, `direct_chargebee_access`, `direct_anthropic_client_outside_ai_providers_claude`, `direct_litellm_client_outside_ai_providers_litellm`, `arbitrary_tool_invocation`, `canonical_state_mutation`
+
+### `BAGMAN.AGENT.CLAUDE_CODE` (v1)
+
+Own BAGMAN's ONE bounded, headless Claude Code operator invocation path (CD-5 Gate-2 closure, 2026-09-16 — supersedes BAGMAN.AGENT's original agent/bagman/+agent/tools/ direct-Anthropic tool-calling-loop design; see PID.md §97 and the CD-5 evidence file for the full architecture-correction history). agent/claude_code/runner.py is the ONE place in the whole repository that ever constructs a `claude` subprocess invocation — fixed executable/argument contract, never a shell, `--tools ""` + `--restricted` + `--strict-mcp-config` strip the invoked process of every tool/MCP/ambient-settings capability, so its authority is a strict SUBSET of this host's own normal Claude Code development-agent authority, never inherited from it. agent/claude_code/context.py assembles bounded, governed context (evidence/intake/entity, fetched directly from BAGMAN's own canonical services — never a live tool call) BEFORE the one synchronous invocation; agent/claude_code/orchestrator.py owns the AIInvocation lifecycle (REQUESTED -> RUNNING -> SUCCEEDED/FAILED), the ASK_BAGMAN v1 task contract (reused unchanged from BAGMAN.AGENT's own original registration in ai.tasks), and PID §57 audit emission — same public AskBagmanResult shape and same HTTP contract the superseded implementation used, so app/api/routers/operator.py needed no response-shape change. Claude Code owns its own authentication/session mechanism entirely (PID §97) — this component never reads, writes, or transmits an Anthropic API key.
+
+- **Owns:** _(none)_
+- **Consumes:** `BAGMAN.AI`, `BAGMAN.CORE`, `BAGMAN.SERVICES.EVIDENCE`, `BAGMAN.EVIDENCE.INTAKE`
+- **Produces:** `AI_INVOCATION_REQUESTED`, `AI_INVOCATION_SUCCEEDED`, `AI_INVOCATION_FAILED`, `AI_OUTPUT_REJECTED`
+- **Dependencies:** _(none)_
+- **External access:** `true`
+- **Prohibited:** `direct_email_access`, `direct_bank_access`, `direct_xero_access`, `direct_chargebee_access`, `direct_anthropic_api_key_usage`, `shell_true_subprocess_invocation`, `caller_controlled_executable_or_flags`, `canonical_state_mutation`
 
 ### `BAGMAN.AI` (v2)
 

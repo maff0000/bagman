@@ -1,0 +1,85 @@
+# BAGMAN component manifest (PID §97) for agent/claude_code/.
+# Validated by scripts/generate_architecture_memory.py against
+# contracts/manifest/bagman.component_manifest.v1.schema.json.
+
+id: BAGMAN.AGENT.CLAUDE_CODE
+version: 1
+
+responsibility: >
+  Own BAGMAN's ONE bounded, headless Claude Code operator invocation
+  path (CD-5 Gate-2 closure, 2026-09-16 — supersedes
+  BAGMAN.AGENT's original agent/bagman/+agent/tools/ direct-Anthropic
+  tool-calling-loop design; see PID.md §97 and the CD-5 evidence file
+  for the full architecture-correction history). agent/claude_code/runner.py
+  is the ONE place in the whole repository that ever constructs a
+  `claude` subprocess invocation — fixed executable/argument contract,
+  never a shell, `--tools ""` + `--restricted` + `--strict-mcp-config`
+  strip the invoked process of every tool/MCP/ambient-settings
+  capability, so its authority is a strict SUBSET of this host's own
+  normal Claude Code development-agent authority, never inherited from
+  it. agent/claude_code/context.py assembles bounded, governed context
+  (evidence/intake/entity, fetched directly from BAGMAN's own
+  canonical services — never a live tool call) BEFORE the one
+  synchronous invocation; agent/claude_code/orchestrator.py owns the
+  AIInvocation lifecycle (REQUESTED -> RUNNING -> SUCCEEDED/FAILED),
+  the ASK_BAGMAN v1 task contract (reused unchanged from
+  BAGMAN.AGENT's own original registration in ai.tasks), and PID §57
+  audit emission — same public AskBagmanResult shape and same HTTP
+  contract the superseded implementation used, so
+  app/api/routers/operator.py needed no response-shape change.
+  Claude Code owns its own authentication/session mechanism entirely
+  (PID §97) — this component never reads, writes, or transmits an
+  Anthropic API key.
+
+owns: []
+
+# agent/claude_code/orchestrator.py depends on: ai.invocation
+# (AIInvocation/AIInvocationRepository — reused, never reimplemented),
+# ai.tasks (get_task_contract/validate_task_output — the SAME
+# ASK_BAGMAN v1 contract BAGMAN.AGENT originally registered; this
+# component does not re-register it), core.api.BagmanCanonicalAPI and
+# core.errors.ValidationError (context assembly + input validation),
+# persistence.objects.store.EvidenceObjectStore and
+# services.evidence.intake.intake.IntakeRepository (governed context
+# fetch — the same repositories app/api/composition.py already wires
+# for the BACKGROUND-task path). agent/claude_code/runner.py depends
+# on nothing else in this repository — it is a pure process-execution
+# boundary (stdlib subprocess/json/os/signal only).
+consumes:
+  - BAGMAN.AI
+  - BAGMAN.CORE
+  - BAGMAN.SERVICES.EVIDENCE
+  - BAGMAN.EVIDENCE.INTAKE
+
+# Same audit-event vocabulary BAGMAN.AGENT's own orchestrator already
+# emitted — this component supersedes that emitter, not the event
+# types themselves (unchanged, PID §57).
+produces:
+  - AI_INVOCATION_REQUESTED
+  - AI_INVOCATION_SUCCEEDED
+  - AI_INVOCATION_FAILED
+  - AI_OUTPUT_REJECTED
+
+# No third-party dependency — stdlib subprocess/json/os/signal/shutil
+# only.
+dependencies: []
+
+# Unlike BAGMAN.AGENT (external_access: false — it never itself opened
+# a network connection, only called through ai/providers/*), this
+# component DOES reach outside the process boundary: it execs a real
+# `claude` subprocess, which itself talks to Anthropic's API using its
+# own authentication. BAGMAN's own code here never holds that
+# credential — see the responsibility text above — but the component
+# genuinely does cause external access to occur, so this is marked
+# honestly rather than following BAGMAN.AGENT's `false` by rote.
+external_access: true
+
+prohibited:
+  - direct_email_access
+  - direct_bank_access
+  - direct_xero_access
+  - direct_chargebee_access
+  - direct_anthropic_api_key_usage
+  - shell_true_subprocess_invocation
+  - caller_controlled_executable_or_flags
+  - canonical_state_mutation

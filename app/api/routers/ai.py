@@ -229,13 +229,27 @@ async def ai_health() -> dict:
     checks: dict[str, str] = {
         alias.replace("-", "_"): status_value for alias in sorted(BACKGROUND_CAPABILITY_ALIASES)
     }
+    # SUPERSEDED (2026-09-16, Gate-2 closure): the direct-Anthropic path
+    # this checks is no longer reachable from the live Ask BAGMAN
+    # surface — kept reporting since removal is a separate, not-yet-
+    # ruled-on decision (see agent/component.yaml's correction note).
     checks["claude"] = "ok" if composition.claude_client.is_available() else "unreachable"
+    # CD-5 Gate-2 closure (PID §97): the real signal Ask BAGMAN's own
+    # availability now reflects — the bounded headless Claude Code
+    # runner (`claude` executable on PATH; does not itself prove
+    # authentication is valid, see
+    # ClaudeCodeOperatorRunner.is_available's own docstring).
+    checks["claude_code"] = (
+        "ok" if composition.claude_code_operator_runner.is_available() else "unreachable"
+    )
     return {
         "checks": checks,
         "granularity": (
             "gateway-wide for bagman-*: all three keys reflect one shared LiteLLM-gateway "
             "reachability signal, not independently-measured per-alias health "
-            "(see ai/providers/litellm/client.py::LiteLLMClient.is_available); 'claude' is a "
-            "genuinely separate, independently-measured signal for the Claude operator provider"
+            "(see ai/providers/litellm/client.py::LiteLLMClient.is_available); 'claude' is "
+            "SUPERSEDED (2026-09-16) — the direct-Anthropic path it checks is no longer used "
+            "by the live Ask BAGMAN surface; 'claude_code' is the current, independently-"
+            "measured signal for the Claude operator provider"
         ),
     }
