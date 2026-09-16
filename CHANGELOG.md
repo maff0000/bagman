@@ -181,8 +181,45 @@ All notable changes to BAGMAN will be documented in this file.
   `memory/generated/CD5-EVIDENCE-AI-FOUNDATION-CLAUDE-OPERATOR-AND-GUI-INTEGRATION-2026-09-13.md`.
 - **Verdict: pending the architect's ruling** (PID §92/§93 — the same
   standing as every prior CD delivery; the PL does not self-issue the
-  final CD delivery verdict). PID §91's own "an honest partial
-  `AI_FOUNDATION_GREEN`, with the Mac-mini/Trinity-escalation/Claude
-  tiers' genuine-completion criteria explicitly marked `BLOCKED`
-  pending external infrastructure/credentials, is an acceptable interim
-  verdict" is what this delivery's own evidence currently supports.
+  final CD delivery verdict).
+
+### 2026-09-16 — Gate-1 real-provider-acceptance closure
+
+- **Architect correction**: the partial-`AI_FOUNDATION_GREEN` framing
+  above was ruled broader than PID §91 permits — until real-provider
+  acceptance is proven per tier, the honest state is `BLOCKED`, not any
+  form of `GREEN`.
+- HELM retired the shared Trinity LiteLLM gateway (its backing database
+  outage traced to `user_api_key_auth()`'s own DB dependency, not
+  merely a bad credential) in favour of a new, BAGMAN-exclusive
+  dedicated AI appliance (`BAGMAN_AI_APPLIANCE_GREEN`,
+  `http://192.168.11.4:4100` on the dedicated Mac mini) —
+  `BAGMAN_LITELLM_ENDPOINT` repointed accordingly; the WI-5
+  `host.docker.internal`/`extra_hosts` fix removed as no longer needed
+  (a real LAN address).
+- Real acceptance against the new appliance surfaced a genuine
+  application-layer reliability gap (not fabricated success, not
+  silently tuned around): `bagman-core` exceeded its task SLA under
+  real latency; `bagman-fast` returned empty content after exhausting
+  its token budget. HELM's `think:false` + plain-JSON-mode fix
+  (`BAGMAN_LOCAL_AI_TASKS_RED` — infrastructure genuinely fixed, an
+  application-layer contract gap correctly exposed rather than hidden)
+  plus an authorised, narrow BAGMAN delta closed it: `ai.gateway.
+  background.run_background_task` now passes each task's own
+  `output_schema` to the LiteLLM adapter as a per-request
+  JSON-schema-constrained `response_format` (Ollama structured
+  outputs), while BAGMAN's own `validate_task_output` remains the
+  unconditional, canonical safety boundary regardless of provider-side
+  structured-generation support. No `timeout_seconds` changed.
+- Real 20x acceptance, against the real rebuilt `bagman-api` and the
+  real appliance: `DOCUMENT_TYPE_PROPOSAL`/`bagman-fast` 20/20
+  SUCCEEDED (p95 9.06s vs 20s SLA); `DOCUMENT_SUMMARY`/`bagman-fast`
+  5/5 SUCCEEDED with its own distinct schema explicitly confirmed;
+  `ENTITY_PROPOSAL`/`bagman-core` 20/20 SUCCEEDED (p95 13.95s vs 30s
+  SLA); `bagman-deep` reconfirmed GREEN, unaffected.
+- **Gate 1 (all three background tiers) is CLOSED.** Gate 2 (Claude)
+  remains OPEN pending `/srv/bagman-secrets/anthropic_api_key`. Full
+  evidence at
+  `memory/generated/CD5-EVIDENCE-AI-FOUNDATION-CLAUDE-OPERATOR-AND-GUI-INTEGRATION-2026-09-13.md`
+  §6b (correction note), §6d, §6e. **CD-5 remains `BLOCKED`, not
+  `GREEN`, until Gate 2 also closes.**
