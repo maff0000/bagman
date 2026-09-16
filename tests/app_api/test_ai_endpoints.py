@@ -223,7 +223,7 @@ def test_get_invocations_list_and_detail_round_trip(dev_client):
 def test_ai_health_reports_gateway_wide_checks_for_every_alias(dev_client):
     composition = get_composition()
     composition.litellm_client.set_available(True)
-    composition.claude_client._available = True
+    composition.claude_code_operator_runner.set_available(True)
     response = dev_client.get("/internal/ai/health")
     assert response.status_code == 200
     body = response.json()
@@ -231,7 +231,6 @@ def test_ai_health_reports_gateway_wide_checks_for_every_alias(dev_client):
         "bagman_fast": "ok",
         "bagman_core": "ok",
         "bagman_deep": "ok",
-        "claude": "ok",
         "claude_code": "ok",
     }
     assert "gateway-wide" in body["granularity"]
@@ -242,20 +241,19 @@ def test_ai_health_reports_gateway_wide_checks_for_every_alias(dev_client):
         "bagman_fast": "unreachable",
         "bagman_core": "unreachable",
         "bagman_deep": "unreachable",
-        "claude": "ok",
         "claude_code": "ok",
     }
 
 
-def test_ai_health_claude_key_is_independent_of_the_litellm_gateway(dev_client):
-    """WI-4 addition — `claude` must be a genuinely separate signal, not
-    folded into the gateway-wide bagman-* caveat (PID §46-48)."""
+def test_ai_health_claude_code_key_is_independent_of_the_litellm_gateway(dev_client):
+    """`claude_code` must be a genuinely separate signal, not folded
+    into the gateway-wide bagman-* caveat (PID §46-48)."""
     composition = get_composition()
     composition.litellm_client.set_available(True)
-    composition.claude_client._available = False
+    composition.claude_code_operator_runner.set_available(False)
     response = dev_client.get("/internal/ai/health")
     body = response.json()
-    assert body["checks"]["claude"] == "unreachable"
+    assert body["checks"]["claude_code"] == "unreachable"
     assert body["checks"]["bagman_fast"] == "ok"
 
 

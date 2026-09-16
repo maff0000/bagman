@@ -1,104 +1,85 @@
 # BAGMAN component manifest (PID §7/§19) for agent/.
 # Validated by scripts/generate_architecture_memory.py against
 # contracts/manifest/bagman.component_manifest.v1.schema.json.
-#
-# New component (CD-5 WI-3): agent/ existed since CD-1 as reserved,
-# empty scaffolding (agent/bagman/, agent/tools/, agent/policies/,
-# agent/memory/ — each a placeholder README only) with no
-# component.yaml of its own yet. This is the first work item to
-# populate it, so this is the first manifest for it.
 
 id: BAGMAN.AGENT
-version: 2
+version: 3
 
 # ---------------------------------------------------------------------
-# ARCHITECTURE CORRECTION (2026-09-16, CD-5 Gate-2 closure) — read this
-# before agent/bagman/ or agent/tools/. The architect ruled BAGMAN's
-# operator intelligence is NOT a direct-Anthropic-API tool-calling
-# loop under BAGMAN's own API key — it is a bounded, headless Claude
-# Code invocation (see the NEW sibling component
-# agent/claude_code/component.yaml, BAGMAN.AGENT.CLAUDE_CODE).
-# `POST /internal/operator/chat` (app/api/routers/operator.py) now
-# calls agent.claude_code.orchestrator.handle_operator_message, NOT
-# agent.bagman.orchestrator.handle_operator_message.
+# ARCHITECTURE CORRECTION AND CLEANUP (2026-09-16, CD-5 Gate-2 closure,
+# final delta before merge) — read this before the history below.
 #
-# agent/bagman/ and agent/tools/ are NOT deleted — per the architect's
-# own explicit instruction not to remove code blindly. As of this
-# correction, nothing in the live HTTP-reachable path depends on
-# either package any more (composition.py still constructs
-# `claude_client`/`tool_registry` for now, but the operator router no
-# longer consumes them for anything reachable from the GUI) — this
-# is recorded as an explicit classification finding for the architect's
-# ruling in the CD-5 evidence file (§ "ai/providers/claude/ and
-# agent/tools/+agent/bagman/ classification"), not decided here.
-# History preserved below exactly as WI-3 originally wrote it.
+# The architect ruled BAGMAN's operator intelligence is NOT a
+# direct-Anthropic-API tool-calling loop under BAGMAN's own API key —
+# it is a bounded, headless Claude Code invocation, owned entirely by
+# the sibling component agent/claude_code/ (see that package's own
+# component.yaml, BAGMAN.AGENT.CLAUDE_CODE). `POST /internal/operator/chat`
+# (app/api/routers/operator.py) calls
+# agent.claude_code.orchestrator.handle_operator_message — the ONE,
+# sole authoritative operator implementation.
+#
+# `agent/bagman/` and `agent/tools/` — the original CD-5 WI-3
+# implementation this manifest's `responsibility` text below describes
+# — were first superseded (2026-09-16, still present but no longer
+# reachable from any live HTTP route) and then, once a fresh Auditor
+# and the PL both independently confirmed zero remaining live
+# dependents anywhere in the repository, REMOVED ENTIRELY as this same
+# day's final closure delta (not merely left unreferenced) — the
+# architect's own explicit instruction: "removed before merge to
+# prevent dual-authority ambiguity." `ai/providers/claude/` (the
+# direct Anthropic Messages API adapter these packages depended on)
+# was removed in the same delta — see `ai/component.yaml`'s own
+# equivalent note.
+#
+# PRESERVE HISTORY, do not pretend this never existed: the
+# `responsibility` text below is WI-3's own original description,
+# kept verbatim, of what `agent/bagman/`+`agent/tools/` WERE before
+# removal — it is history, not a description of anything present in
+# this repository today. `agent/` today owns only the empty CD-1
+# placeholder directories (`agent/policies/`, `agent/memory/`) and the
+# separately-manifested `agent/claude_code/` — see PID.md §97 and the
+# CD-5 evidence file for the full chronological account (architecture
+# correction → classification finding → this removal).
 # ---------------------------------------------------------------------
 
 responsibility: >
-  [SUPERSEDED 2026-09-16 — see the correction note above; text below is
-  WI-3's own original, preserved verbatim as history, not current
-  fact.] Own the BAGMAN AI agent's own reasoning/orchestration layer:
-  the Ask BAGMAN operator-orchestration loop (agent/bagman/ —
-  system-prompt construction, the bounded Claude tool-calling loop,
-  AIInvocation lifecycle management, PID §57 audit emission) and the
-  fixed, read-only/analyse-only governed tool registry Claude may
-  invoke (agent/tools/ — CD-5 PID §34's 8 named tools, mechanically
-  fail-closed dispatch per PID §63). This component decides WHICH of
-  BAGMAN's own internal APIs/repositories a registered tool may call
-  and HOW an Ask BAGMAN conversation is assembled/bounded (PID §53); it
-  never instantiates an Anthropic/LiteLLM client itself (that lives in
-  ai/providers/*/, consumed here only through the provider-neutral
-  ClaudeClientProtocol/BackgroundTaskRunner seams) and never allows
+  [REMOVED 2026-09-16 — see the correction/cleanup note above; text
+  below is WI-3's own original `responsibility` text for
+  agent/bagman/+agent/tools/, preserved verbatim as history. Neither
+  directory exists in this repository any more.] Own the BAGMAN AI
+  agent's own reasoning/orchestration layer: the Ask BAGMAN
+  operator-orchestration loop (agent/bagman/ — system-prompt
+  construction, the bounded Claude tool-calling loop, AIInvocation
+  lifecycle management, PID §57 audit emission) and the fixed,
+  read-only/analyse-only governed tool registry Claude may invoke
+  (agent/tools/ — CD-5 PID §34's 8 named tools, mechanically
+  fail-closed dispatch per PID §63). This component decided WHICH of
+  BAGMAN's own internal APIs/repositories a registered tool could call
+  and HOW an Ask BAGMAN conversation was assembled/bounded (PID §53);
+  it never instantiated an Anthropic/LiteLLM client itself (that lived
+  in ai/providers/*/, consumed here only through the provider-neutral
+  ClaudeClientProtocol/BackgroundTaskRunner seams) and never allowed
   Claude to invoke anything outside the fixed tool set or to mutate
   canonical state (PID §17/§56). agent/policies/ and agent/memory/
-  remain empty CD-1 placeholders as of this WI — WI-3 found no
-  genuinely CD-5-scoped content for either (see WI-3's delivery
-  report): no autonomous policy engine is authorised yet (PID §16 —
-  the tool registry's own fixed authority classes ARE this WI's
-  governance boundary), and Ask BAGMAN's conversation state is
+  remain empty CD-1 placeholders — no autonomous policy engine is
+  authorised yet, and Ask BAGMAN's conversation state remains
   in-request-only (PID §64 — no durable chat-memory-fabric integration
-  is built this WI).
+  exists).
 
+# Today, `agent/` owns only the empty CD-1 placeholder directories
+# (agent/policies/, agent/memory/) — no code. The live operator
+# implementation is entirely owned by the separately-manifested
+# agent/claude_code/ (BAGMAN.AGENT.CLAUDE_CODE).
 owns: []
 
-# agent/bagman/orchestrator.py depends on: ai.invocation
-# (AIInvocation/AIInvocationRepository — reused, never reimplemented),
-# ai.tasks (get_task_contract/validate_task_output — the ASK_BAGMAN v1
-# task contract this WI additively registered there),
-# ai.providers.claude.client (ClaudeClientProtocol and the Claude*Error
-# vocabulary — never a concrete ClaudeClient import here, only the
-# Protocol), agent.tools.registry (ToolRegistry/ToolExecutionContext),
-# and core.errors.ValidationError. agent/tools/handlers.py depends on
-# core.api.BagmanCanonicalAPI, services.evidence.intake.intake
-# .IntakeRepository, ai.invocation.AIInvocationRepository, and
-# agent.tools.background.BackgroundTaskRunner (a structural Protocol,
-# mirroring services/evidence/intake/validation_pipeline.py's own
-# _ObjectStore Protocol pattern) — never a WI-2 import (WI-2's real
-# background gateway does not exist in this worktree).
-consumes:
-  - BAGMAN.AI
-  - BAGMAN.CORE
-  - BAGMAN.SERVICES.EVIDENCE
-  - BAGMAN.EVIDENCE.INTAKE
+consumes: []
 
-# agent/bagman/orchestrator.py is the orchestration layer that emits
-# the PID §57 AI-invocation audit events themselves (via
-# core.api.BagmanCanonicalAPI.record_audit_event(), not a new
-# repository — the same pattern app/api/routers/intake.py already
-# established for the intake-workflow events) — the event TYPES
-# themselves are minted here, not inside ai/ (see ai/component.yaml's
-# own `produces: []` and its docstring for why AIInvocation persistence
-# itself does not emit audit events).
-produces:
-  - AI_INVOCATION_REQUESTED
-  - AI_INVOCATION_SUCCEEDED
-  - AI_INVOCATION_FAILED
-  - AI_OUTPUT_REJECTED
+# No audit events are minted at this level any more — that is entirely
+# agent/claude_code/orchestrator.py's job now (see that component's
+# own manifest for its produces: list, unchanged from what this
+# component used to claim).
+produces: []
 
-# No third-party dependency of its own — agent/ depends only on other
-# BAGMAN components (ai/, core/, services/evidence/); jsonschema is
-# used transitively via core.contract_validation, not imported directly
-# here.
 dependencies: []
 
 external_access: false
@@ -108,7 +89,3 @@ prohibited:
   - direct_bank_access
   - direct_xero_access
   - direct_chargebee_access
-  - direct_anthropic_client_outside_ai_providers_claude
-  - direct_litellm_client_outside_ai_providers_litellm
-  - arbitrary_tool_invocation
-  - canonical_state_mutation

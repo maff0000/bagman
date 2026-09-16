@@ -56,25 +56,18 @@ secrets:
   # path immediately before this WI began).
   litellm_gateway_key:
     file: /srv/bagman-secrets/litellm_gateway_key
-  # CD-5 WI-3 (PID §13/§17-18): the Claude operator provider's secret.
-  # NOT declared as a real Compose secret yet — as of this WI (CD-5
-  # WI-5), Matt has not yet provisioned
-  # /srv/bagman-secrets/anthropic_api_key (confirmed absent immediately
-  # before this WI began, and re-confirmed at WI-5's own acceptance
-  # step; see the WI-5 evidence file). A Compose file-based secret
-  # whose source file does not exist on the host makes `docker compose
-  # up` fail immediately for the WHOLE stack, not just the Claude path
-  # — so this is deliberately left commented out rather than declared,
-  # to avoid breaking bagman-db/bagman-objects/bagman-scan/every other
-  # already-working part of BAGMAN merely because one still-pending
-  # credential does not exist yet. Once Matt provisions the file,
-  # uncomment this block AND the matching `bagman-api.secrets` entry
-  # below (both already correctly named/pathed to match
-  # ai/providers/claude/client.py's own `_DEFAULT_API_KEY_FILE`) — no
-  # other change is required for the real Claude acceptance path to
-  # come alive.
-  # anthropic_api_key:
-  #   file: /srv/bagman-secrets/anthropic_api_key
+  # CD-5 WI-3 (PID §13/§17-18) originally reserved an `anthropic_api_key`
+  # Compose secret here for a direct Anthropic-API operator provider.
+  # REMOVED 2026-09-16 (Gate-2 closure, final cleanup delta before
+  # merge): the architect ruled BAGMAN does not use a direct Anthropic
+  # API key at all — the sole authoritative operator path is the
+  # bounded headless Claude Code runner (`agent/claude_code/`), which
+  # authenticates via its own OAuth/session credential (see the
+  # `volumes:` mount on `bagman-api` below,
+  # `/srv/bagman-secrets/claude_code_home`), never an API key. No
+  # `anthropic_api_key` secret is declared here, commented or
+  # otherwise — see `PID.md` §97 and the CD-5 evidence file for the
+  # full, preserved history of this correction.
 
 services:
   bagman-db:
@@ -267,21 +260,14 @@ services:
       # now superseded entirely with the dedicated appliance above.
       BAGMAN_LITELLM_ENDPOINT: http://192.168.11.4:4100
       BAGMAN_LITELLM_API_KEY_FILE: /run/secrets/litellm_gateway_key
-      # CD-5 WI-3 (PID §13/§17-18): NOT set here yet — deliberately.
-      # ai/providers/claude/client.py's own `_DEFAULT_API_KEY_FILE`
-      # already defaults to exactly `/run/secrets/anthropic_api_key`,
-      # so this env var is redundant with that default; it is left
-      # unset (rather than pointed at a secret this compose file cannot
-      # yet declare — see the `anthropic_api_key` comment block above)
-      # until Matt provisions the real credential, at which point
-      # uncommenting the secret block above is sufficient on its own —
-      # ClaudeClient's own default path already matches.
       # CD-5 Gate-2 closure (2026-09-16, PID §97): the bounded headless
       # Claude Code operator runner (agent/claude_code/runner.py) needs
       # its own HOME so `claude` can find its own OAuth/session
-      # credential — never an Anthropic API key (see the now-superseded
-      # `anthropic_api_key` block below, kept commented out/unused).
-      # Mounted read-only from the host below (`volumes:`); a bounded,
+      # credential — never an Anthropic API key (the original CD-5
+      # WI-3 direct-Anthropic-API design's own secret declaration was
+      # removed entirely as part of this closure — see the `secrets:`
+      # list below and `PID.md` §97 for the full history). Mounted
+      # read-only from the host below (`volumes:`); a bounded,
       # dedicated working directory is created by the runner itself
       # inside the container's own writable layer, no host mount
       # needed for it.
@@ -301,7 +287,6 @@ services:
       - minio_root_user
       - minio_root_user_password
       - litellm_gateway_key
-      # - anthropic_api_key   # SUPERSEDED (2026-09-16, Gate-2 closure) — no longer needed; BAGMAN does not hold an Anthropic API key (see PID.md §97)
     # CD-5 Gate-2 closure: a dedicated Claude Code OAuth/session
     # credential directory — NOT an Anthropic API key, NOT a Compose
     # `secrets:` entry (those are single-file only; this is a small

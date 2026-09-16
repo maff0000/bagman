@@ -202,10 +202,10 @@ def test_build_response_format_passes_the_exact_schema_through_unmodified():
 
 def test_real_client_sends_output_schema_as_response_format_on_the_wire(tmp_path, monkeypatch):
     """No real network I/O (PID §61) — intercepts `urllib.request.urlopen`
-    exactly at the boundary, the same technique
-    `tests/integration/test_claude_provider_client.py` already
-    establishes for `requests.Session.post`, so this proves what the
-    REAL client actually sends without depending on a live gateway."""
+    exactly at the boundary (the same "monkeypatch the exact transport
+    call" technique `tests/integration/test_claude_code_runner.py`
+    uses for `subprocess.Popen`), so this proves what the REAL client
+    actually sends without depending on a live gateway."""
     key_file = tmp_path / "key"
     key_file.write_text("fake-key", encoding="utf-8")
     captured: dict = {}

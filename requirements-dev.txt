@@ -19,11 +19,17 @@ pytest==8.3.4
 # belongs here, not in requirements.txt.
 httpx2==2.12.0
 #
-# requests - moved to requirements.txt by CD-5 WI-3 PL reconciliation
-# (2026-09-13): originally declared here (CD-3 WI-4 review) because only
-# tests/acceptance/_lib.py imported it. CD-5 WI-3's ai/providers/claude/
-# client.py now imports it directly from application code
-# (app/api/composition.py's production path constructs a real
-# ClaudeClient), so per this file's own header discipline ("never a
-# runtime application dependency here"), it no longer belongs in this
-# file at all — see requirements.txt for the current pin and rationale.
+# requests - moved BACK here by CD-5 Gate-2 closure's final cleanup
+# delta (2026-09-16): originally declared here (CD-3 WI-4 review)
+# because only tests/acceptance/_lib.py imported it; CD-5 WI-3 moved it
+# to requirements.txt (2026-09-13) because ai/providers/claude/client.py
+# had started importing it directly from application code. That
+# package has now been removed entirely (the architect's operator-
+# architecture correction superseded it with agent/claude_code/, which
+# has no `requests` dependency of its own — it shells out to `claude`,
+# never speaks HTTP directly). No file under app/, agent/, ai/, core/,
+# services/, or persistence/ imports `requests` any more (checked
+# directly, repo-wide) — only tests/acceptance/*.py does, so per this
+# file's own header discipline it belongs here again, not in
+# requirements.txt.
+requests==2.34.2

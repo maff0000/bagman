@@ -121,12 +121,15 @@ also independently brings the stack up first; run them in any order
 ```bash
 python3 tests/acceptance/mac_mini_background_tier_live_proof.py
 python3 tests/acceptance/trinity_escalation_live_proof.py
-python3 tests/acceptance/claude_operator_live_proof.py
 python3 tests/acceptance/prompt_injection_live_proof.py
 python3 tests/acceptance/ai_gui_browser_acceptance_proof.py   # requires: pip install playwright && python3 -m playwright install chromium
 python3 tests/acceptance/structured_output_20x_proof.py       # Gate-1 closure — 20x/5x/20x/1 real structured-output acceptance
 python3 tests/acceptance/entity_proposal_isolation_experiment.py  # Gate-1 controlled isolation experiment (Phase A)
+python3 tests/acceptance/claude_code_operator_live_proof.py   # Gate-2 closure — real bounded headless Claude Code operator proof
+python3 tests/acceptance/ai_gui_claude_code_acceptance_proof.py  # Gate-2 closure — real Ask BAGMAN browser proof (requires playwright)
 ```
+
+**Gate-2 closure note (2026-09-16):** `claude_operator_live_proof.py` (this WI's original Claude acceptance script, targeting a direct Anthropic-API operator provider) was removed — the architect ruled BAGMAN never uses a direct Anthropic API key; the sole authoritative operator path is a bounded headless Claude Code invocation (`agent/claude_code/`), replaced by `claude_code_operator_live_proof.py`/`ai_gui_claude_code_acceptance_proof.py` below. See the CD-5 evidence file and `PID.md` §97 for the full, preserved history.
 
 **Final topology note (CD-5 Gate-1 closure, 2026-09-16):** the scripts below originally targeted the shared Trinity LiteLLM installation (CD-5 WI-2's initial dispatch); BAGMAN's background inference now goes through HELM's dedicated, BAGMAN-exclusive Mac AI appliance instead (its own LiteLLM + PostgreSQL, `http://192.168.11.4:4100`) — see the CD-5 evidence file for the full, preserved history of how the topology arrived here. Descriptions below are updated to match; nothing about the scripts' own methodology/rigor changed.
 
@@ -145,12 +148,24 @@ python3 tests/acceptance/entity_proposal_isolation_experiment.py  # Gate-1 contr
   triggers it — a genuine, documented gap; see the script's own module
   docstring for why this is still a real, non-fake proof of the alias/
   adapter/gateway path).
-* `claude_operator_live_proof.py` — PID §81/§84/§88: re-checks
-  `/srv/bagman-secrets/anthropic_api_key`'s existence live and attempts
-  a real Ask BAGMAN call regardless; honestly reports
-  `CLAUDE_AUTHENTICATION_FAILED` (the expected, correct, fail-closed
-  outcome while the key remains absent) or completes the full real
-  proof if the key now exists.
+* `claude_code_operator_live_proof.py` — PID §81/§84/§88/§97 (Gate-2
+  closure): real, against the real rebuilt `bagman-api` container and
+  the real `claude` binary — no Anthropic API key exists or is needed;
+  a real headless Claude Code invocation returns a real,
+  context-grounded answer; browser-injected model/cwd/env fields are
+  silently ignored; a prompt-injection/shell/secret-exfiltration
+  attempt is correctly refused (BAGMAN source proven byte-for-byte
+  untouched via a sha256 canary, the real secret value confirmed
+  absent from the response); a real dependency-failure/recovery proof
+  (the `claude` binary temporarily removed inside the running
+  container); canonical evidence unchanged; full provenance recorded;
+  repeated turns reliable.
+* `ai_gui_claude_code_acceptance_proof.py` — PID §97 (Gate-2 closure):
+  real headless Chromium — a real question submitted through the
+  actual Ask BAGMAN drawer, a real answer rendered back synchronously
+  in the page referencing the real document content, a second
+  reliable real turn, and Overview correctly showing the live
+  `claude_code` health signal.
 * `prompt_injection_live_proof.py` — PID §77-80/§85: synthetic evidence
   containing hostile instructions, uploaded through the real intake
   pipeline; a real `POST /internal/ai/tasks` attempt against whichever

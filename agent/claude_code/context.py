@@ -15,7 +15,7 @@ never a list of everything BAGMAN knows.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Optional
 
 from core.api import BagmanCanonicalAPI
 from persistence.objects.store import EvidenceObjectStore

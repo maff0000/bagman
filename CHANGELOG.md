@@ -183,6 +183,49 @@ All notable changes to BAGMAN will be documented in this file.
   standing as every prior CD delivery; the PL does not self-issue the
   final CD delivery verdict).
 
+### 2026-09-16 — CD-5 closure: root causes, architecture correction, final verdict, cleanup
+
+- **Gate 1 (background inference) closed GREEN**: the `bagman-core`
+  reliability gap above was root-caused by HELM to a stale
+  appliance-side `extra_body.format:"json"` override on the dedicated
+  Mac AI appliance clobbering BAGMAN's own correctly-generated
+  schema-constrained `response_format` — not a Gemma/Ollama/LiteLLM/
+  timeout/concurrency defect. Fixed appliance-side; final proof
+  (`bagman-core` 100/100 isolated + 20/20 controlled-load,
+  `bagman-fast` 10/10, `bagman-deep` unaffected) independently
+  confirmed by a fresh Auditor (`GATE1_FINAL_GREEN_CONFIRMED`). No
+  BAGMAN code change was required to reach GREEN.
+- **Gate 2 (Claude operator) architecture corrected**: the architect
+  ruled BAGMAN does not use a direct Anthropic API key. The original
+  WI-3 design above (`ai/providers/claude/`'s direct Anthropic
+  Messages API adapter + `agent/tools/`'s tool-calling loop) is
+  superseded by a new bounded implementation, `agent/claude_code/` —
+  a headless `claude -p` subprocess invocation (list-form
+  `subprocess.Popen`, never `shell=True`; `--tools ""` +
+  `--restricted` + `--strict-mcp-config`; own process group with
+  `SIGKILL` timeout cleanup; a controlled environment built from
+  scratch, never the parent's; OAuth session credential, never an API
+  key), reusing the existing Ask BAGMAN HTML drawer and the same
+  `AIInvocation`/`ASK_BAGMAN` task contract. Proven live end-to-end
+  (HTTP-level and real-browser-level) and independently confirmed by a
+  fresh Auditor (`GATE2_CLAUDE_CODE_OPERATOR_GREEN_CONFIRMED`).
+- **`AI_FOUNDATION_GREEN` formally issued** by the architect at head
+  `6f47901c` — both gates closed GREEN.
+- **Final bounded hygiene delta**: the superseded direct-Anthropic
+  implementation — `ai/providers/claude/`, `agent/tools/`, and
+  `agent/bagman/orchestrator.py` — was removed as one cohesive unit
+  (16 files), along with every test/manifest/import/configuration
+  line that existed solely to support it, so that `agent/claude_code/`
+  is the sole live operator architecture (no dual-authority
+  ambiguity). Removed before merge, once proven to have zero live
+  dependents. Full removal record, required-checks verification, and
+  the cleanup-delta Auditor's independent verdict at
+  `memory/generated/CD5-EVIDENCE-AI-FOUNDATION-CLAUDE-OPERATOR-AND-GUI-INTEGRATION-2026-09-13.md`
+  §6n/§6o; see also `PID.md` §96/§97 for the full preserved
+  architecture-correction history.
+- **Verdict: `AI_FOUNDATION_GREEN`** (architect-issued). Merge
+  authority rests with the architect.
+
 ### 2026-09-16 — Gate-1 real-provider-acceptance closure
 
 - **Architect correction**: the partial-`AI_FOUNDATION_GREEN` framing

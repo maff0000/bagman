@@ -215,13 +215,13 @@ async def ai_health() -> dict:
     per-alias health; this is a real limitation of what is cheaply
     checkable today, not a fabricated per-alias distinction. `checks` is
     a plain, open dict for exactly that reason, not a fixed/closed
-    model — WI-4 additively fills in the `claude` key this docstring
-    previously left as an open extension point (a genuinely SEPARATE
-    signal, not folded into the gateway-wide caveat above:
-    `claude_client.is_available()` probes the Claude operator provider,
-    not the LiteLLM background gateway, and can fail/recover completely
-    independently of it — PID §46-48's own "distinct failure classes"
-    doctrine).
+    model. `claude_code` (CD-5 Gate-2 closure, PID §97) is a genuinely
+    SEPARATE signal, not folded into the gateway-wide caveat above:
+    `ClaudeCodeOperatorRunner.is_available()` probes the bounded
+    headless Claude Code operator path — the sole, authoritative
+    operator-intelligence surface — and can fail/recover completely
+    independently of the LiteLLM background gateway (PID §46-48's own
+    "distinct failure classes" doctrine).
     """
     composition = get_composition()
     gateway_reachable = composition.litellm_client.is_available()
@@ -229,16 +229,6 @@ async def ai_health() -> dict:
     checks: dict[str, str] = {
         alias.replace("-", "_"): status_value for alias in sorted(BACKGROUND_CAPABILITY_ALIASES)
     }
-    # SUPERSEDED (2026-09-16, Gate-2 closure): the direct-Anthropic path
-    # this checks is no longer reachable from the live Ask BAGMAN
-    # surface — kept reporting since removal is a separate, not-yet-
-    # ruled-on decision (see agent/component.yaml's correction note).
-    checks["claude"] = "ok" if composition.claude_client.is_available() else "unreachable"
-    # CD-5 Gate-2 closure (PID §97): the real signal Ask BAGMAN's own
-    # availability now reflects — the bounded headless Claude Code
-    # runner (`claude` executable on PATH; does not itself prove
-    # authentication is valid, see
-    # ClaudeCodeOperatorRunner.is_available's own docstring).
     checks["claude_code"] = (
         "ok" if composition.claude_code_operator_runner.is_available() else "unreachable"
     )
@@ -247,9 +237,8 @@ async def ai_health() -> dict:
         "granularity": (
             "gateway-wide for bagman-*: all three keys reflect one shared LiteLLM-gateway "
             "reachability signal, not independently-measured per-alias health "
-            "(see ai/providers/litellm/client.py::LiteLLMClient.is_available); 'claude' is "
-            "SUPERSEDED (2026-09-16) — the direct-Anthropic path it checks is no longer used "
-            "by the live Ask BAGMAN surface; 'claude_code' is the current, independently-"
-            "measured signal for the Claude operator provider"
+            "(see ai/providers/litellm/client.py::LiteLLMClient.is_available); 'claude_code' is "
+            "a genuinely separate, independently-measured signal for the sole authoritative "
+            "Claude operator provider"
         ),
     }

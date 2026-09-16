@@ -1,10 +1,11 @@
 """CD-5 WI-5 acceptance evidence — LIVE prompt-injection proof against
 the real stack (PID §32/§77-80/§85/§91), distinct from the existing
-pytest-collected STRUCTURAL proofs
-(``tests/integration/test_prompt_injection_structural.py``,
-``tests/security/test_prompt_injection_ask_bagman.py``) which this
-harness's own evaluation suite already reuses
-(``ai/evaluation/injection_reuse.py``).
+pytest-collected STRUCTURAL proofs this harness's own evaluation suite
+already reuses (``ai/evaluation/injection_reuse.py`` — see that
+module's own docstring for the current, live list; it originally
+included ``tests/security/test_prompt_injection_ask_bagman.py``,
+superseded and removed by the CD-5 Gate-2 operator-architecture
+correction, 2026-09-16 — see `PID.md` §97).
 
 Real, directly-runnable script (see ``tests/acceptance/README.md``). No
 mocks in step 1-2 below: synthetic evidence containing hostile

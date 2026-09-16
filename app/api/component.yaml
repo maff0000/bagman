@@ -54,16 +54,28 @@ responsibility: >
   (PID §8), and never a new audit-event-producing responsibility here:
   the AI_INVOCATION_*/AI_OUTPUT_REJECTED events are minted by
   `ai/gateway/background.py` itself (see that component's own
-  `component.yaml`), not by this router. CD-5 WI-3 additionally owns
+  `component.yaml`), not by this router. CD-5 WI-3 originally owned
   the Ask BAGMAN HTTP surface (POST /internal/operator/chat,
   app/api/routers/operator.py — a new file, deliberately never added
   to routers/ai.py, WI-2's own in-parallel file) and composition-root
-  wiring for the Claude operator provider adapter and the fixed
-  agent/tools tool registry (claude_client/tool_registry on
-  RuntimeComposition, reusing the same ai_invocation_repository field
-  WI-2 already added) — the actual Ask BAGMAN orchestration logic and
-  tool registry live in the separate agent/ component (BAGMAN.AGENT),
-  consumed here, never reimplemented in app/api/. CD-5 WI-4 additively
+  wiring for a direct Anthropic-API provider adapter and a fixed
+  Claude-invocable tool registry (`claude_client`/`tool_registry` on
+  RuntimeComposition). **Superseded and removed 2026-09-16** (CD-5
+  Gate-2 closure, final delta before merge — see `PID.md` §97 and the
+  CD-5 evidence file for the full history): the architect ruled that
+  design wrong (BAGMAN never held an Anthropic API key in the first
+  place at runtime, and the design was confirmed to have zero live
+  dependents before removal); `RuntimeComposition` now instead wires
+  `claude_code_operator_runner` (fake in development/test, the real
+  `ClaudeCodeOperatorRunner` in production), and
+  `POST /internal/operator/chat` calls
+  `agent.claude_code.orchestrator.handle_operator_message` — the sole
+  authoritative operator implementation, owned entirely by the
+  separate `agent/claude_code/` component (BAGMAN.AGENT.CLAUDE_CODE),
+  consumed here, never reimplemented in app/api/. `GET
+  /internal/ai/health`'s `claude` key (WI-4's own addition) is
+  likewise superseded and removed — `claude_code` is the current,
+  independently-measured signal. CD-5 WI-4 additively
   extends both AI HTTP surfaces above rather than introducing new ones:
   `GET /internal/ai/invocations` gains an optional
   `primary_input_reference` query parameter (reusing WI-1's own
@@ -109,12 +121,12 @@ owns: []
 # ai.providers.litellm.client.LiteLLMClient(Protocol) (production), and
 # ai.providers.litellm.fake.FakeLiteLLMClient (development/test),
 # plus persistence.postgres.ai_invocation_repository
-# .PostgresAIInvocationRepository (composition.py only). CD-5 WI-3
-# additionally consumes: ai.providers.claude.client
-# .ClaudeClient(Protocol)/ai.providers.claude.fake.FakeClaudeClient,
-# and agent.tools.{registry,handlers,background} (composition.py wires
-# the real ClaudeClient in production, the deterministic
-# FakeClaudeClient in development/test — PID §61) — reusing the same
+# .PostgresAIInvocationRepository (composition.py only).
+# CD-5 WI-3 originally additionally consumed: ai.providers.claude.client
+# .ClaudeClient(Protocol)/ai.providers.claude.fake.FakeClaudeClient, and
+# agent.tools.{registry,handlers,background} -- REMOVED 2026-09-16 (see
+# `responsibility` above). CD-5 Gate-2 closure instead consumes
+# agent.claude_code.{orchestrator,runner,fake} -- reusing the same
 # AIInvocationRepository/PostgresAIInvocationRepository WI-2 already
 # wired in, never a second one.
 consumes:
@@ -126,7 +138,7 @@ consumes:
   - BAGMAN.AI
   - BAGMAN.AI.GATEWAY
   - BAGMAN.AI.PROVIDERS.LITELLM
-  - BAGMAN.AGENT
+  - BAGMAN.AGENT.CLAUDE_CODE
 
 # app/api/ does not itself emit AuditEvents for CD-2's own canonical
 # writes — those go through core.api.BagmanCanonicalAPI, which already
