@@ -170,11 +170,6 @@ def _build_controlled_env(*, home: str) -> dict[str, str]:
         "PATH": os.environ.get("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"),
         "LANG": "C.UTF-8",
         "LC_ALL": "C.UTF-8",
-        # Never let the invoked process think it IS the Trinity/BAGMAN
-        # persona system's own interactive session — it is a bounded,
-        # separately-invoked operator turn (PID §97's own authority-
-        # containment requirement).
-        "CLAUDE_CODE_SIMPLE": "1",
     }
     return env
 
