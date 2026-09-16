@@ -74,11 +74,17 @@ export const Overview = {
       return;
     }
 
-    const claudeOk = body.checks.claude === "ok";
-    claudeLine.appendChild(el("span", { class: `dot ${claudeOk ? "dot--ok" : "dot--bad"}` }));
-    claudeLine.appendChild(el("span", { class: "status-text", text: body.checks.claude || "unknown" }));
+    // CD-5 Gate-2 closure (2026-09-16): `claude_code` (the bounded
+    // headless Claude Code operator runner) is the real, live signal
+    // now — `claude` (the superseded direct-Anthropic path) is kept
+    // reporting for now but is no longer what Ask BAGMAN actually
+    // uses, so it is deliberately NOT shown here any more (see
+    // app/api/routers/ai.py's own correction note on that key).
+    const claudeCodeOk = body.checks.claude_code === "ok";
+    claudeLine.appendChild(el("span", { class: `dot ${claudeCodeOk ? "dot--ok" : "dot--bad"}` }));
+    claudeLine.appendChild(el("span", { class: "status-text", text: body.checks.claude_code || "unknown" }));
 
-    const aliasKeys = Object.keys(body.checks).filter((k) => k !== "claude");
+    const aliasKeys = Object.keys(body.checks).filter((k) => k !== "claude" && k !== "claude_code");
     for (const alias of aliasKeys) {
       const aliasOk = body.checks[alias] === "ok";
       aliasesBody.appendChild(
