@@ -57,6 +57,10 @@ from typing import Optional
 
 from sqlalchemy.engine import Engine
 
+from agent.claude_code.fake import FakeClaudeCodeOperatorRunner
+from agent.claude_code.runner import ClaudeCodeOperatorRunner, ClaudeCodeOperatorRunnerProtocol
+from ai.invocation import AIInvocationRepository
+from ai.providers.litellm.client import LiteLLMClientProtocol
 from core import actor
 from core.api import BagmanCanonicalAPI
 from persistence.objects.store import EvidenceObjectStore
@@ -146,6 +150,104 @@ class _AlwaysCleanDevelopmentScanner(EvidenceSafetyScanner):
         return True
 
 
+def _dev_mode_litellm_default_response(system_instructions: str) -> "LiteLLMCompletionResult":
+    """`FakeLiteLLMClient`'s `default_response` for development/test
+    composition (CD-5 WI-4 gap closure).
+
+    Without this, `BAGMAN_RUNTIME_ENV=development uvicorn app.api.main:app`
+    plus a real click on the GUI's "Run analysis" button would 500
+    immediately: `FakeLiteLLMClient.complete()` raises `AssertionError`
+    when nothing was pre-scripted and no `default_response` exists (see
+    that module's own docstring) — there was previously no interactive/
+    manual way to see a background-task result without pre-scripting one
+    via a test harness, which does not exist in a live dev server.
+
+    Matches `agent/tools/background.py`'s own
+    `DeterministicFakeBackgroundTaskRunner._canned_output_for` in spirit
+    exactly: a small, fixed, structurally-valid-per-task canned output,
+    never phrased to look like a plausible real model answer (PID §61).
+    Since `FakeLiteLLMClient.complete()` hands `default_response` the
+    exact `system_instructions` string it was called with (rather than
+    a bare zero-arg factory), this can determine which of the three
+    CD-5 background tasks is actually running from that text — each
+    task's prompt asset names its own `task_id` verbatim (e.g. "task
+    DOCUMENT_SUMMARY" — see `ai/prompts/*/v1.md`) — and return an
+    output shaped to match THAT task's own `output_schema`, so a
+    genuine `SUCCEEDED` result renders in the GUI rather than an
+    `OUTPUT_SCHEMA_INVALID` failure caused merely by guessing wrong.
+    """
+    import json as _json
+
+    from ai.providers.litellm.client import LiteLLMCompletionResult, LiteLLMOutcomeStatus
+
+    _dev_warning = (
+        "(dev-mode fake response — not a real model result; no live LiteLLM/Mac-mini/"
+        "Trinity call was made)"
+    )
+    if "task DOCUMENT_TYPE_PROPOSAL" in system_instructions:
+        content: dict = {
+            "proposed_type": "UNKNOWN",
+            "confidence": 0.0,
+            "signals": [],
+            "warnings": [_dev_warning],
+        }
+    elif "task DOCUMENT_SUMMARY" in system_instructions:
+        content = {
+            "summary": f"{_dev_warning} — no real document summary was generated.",
+            "confidence": 0.0,
+            "signals": [],
+            "warnings": [_dev_warning],
+        }
+    elif "task ENTITY_PROPOSAL" in system_instructions:
+        content = {
+            "proposed_entity_hint": None,
+            "confidence": 0.0,
+            "signals": [],
+            "warnings": [_dev_warning],
+        }
+    else:
+        # No CD-5 BACKGROUND task registered today falls outside the
+        # three branches above (see ai/tasks.py::TASK_REGISTRY) — this
+        # is a defensive fallback only, for a future task this dev-mode
+        # default has not been taught about yet. It will legitimately
+        # fail that task's own output_schema validation (an honest,
+        # visible FAILED/OUTPUT_SCHEMA_INVALID state, PID §76), not a
+        # crash — never silently fabricated as a false SUCCEEDED.
+        content = {"warnings": [_dev_warning, "unrecognised task — dev-mode default has no shape for it"]}
+
+    return LiteLLMCompletionResult(
+        status=LiteLLMOutcomeStatus.OK,
+        content=_json.dumps(content),
+        provider_model="fake-litellm-dev-default-v1 (composition dev-mode default — not a real model)",
+        usage_metadata={},
+        latency_ms=1,
+    )
+
+
+def _dev_mode_claude_code_default_response(system_prompt: str, user_prompt: str):
+    """CD-5 Gate-2 closure dev-mode usability fix, mirroring
+    `_dev_mode_litellm_default_response` immediately above exactly: a
+    real click on Ask BAGMAN in a live dev server, with nothing
+    pre-scripted on `FakeClaudeCodeOperatorRunner`, should still return
+    a genuine, clearly-labelled `SUCCEEDED` result the GUI can render —
+    never a 500, never a fabricated real answer.
+    """
+    from agent.claude_code.runner import ClaudeCodeInvocationResult, ClaudeCodeOutcomeStatus
+
+    return ClaudeCodeInvocationResult(
+        status=ClaudeCodeOutcomeStatus.OK,
+        text=(
+            "(dev-mode fake response — no real headless Claude Code invocation was made; "
+            "this is composition's own default response for local development)"
+        ),
+        session_id="dev-mode-fake-session",
+        model_usage={"fake-claude-code-dev-default-v1": {}},
+        total_cost_usd=0.0,
+        duration_ms=1,
+        num_turns=1,
+    )
+
+
 @dataclass(frozen=True)
 class RuntimeComposition:
     """Everything ``app/api/`` needs, wired for the current
@@ -168,19 +270,67 @@ class RuntimeComposition:
     engine: Optional[Engine]
     intake_repository: IntakeRepository
     scanner: EvidenceSafetyScanner
+    #: CD-5 WI-2 (PID §26-27/§6/§8) — a single `AIInvocationRepository`
+    #: shared by BOTH the `OPERATOR` role (Ask BAGMAN) and the
+    #: `BACKGROUND` role (WI-2's own gateway) — WI-1 already built both
+    #: the in-memory and PostgreSQL implementations. `litellm_client`
+    #: is `ai.providers.litellm.client.LiteLLMClientProtocol`-shaped
+    #: (fake in development/test, real adapter in production).
+    ai_invocation_repository: AIInvocationRepository
+    litellm_client: LiteLLMClientProtocol
+    #: CD-5 Gate-2 closure (2026-09-16, PID §97) — the ONE, sole
+    #: authoritative operator-intelligence seam
+    #: `agent.claude_code.orchestrator.handle_operator_message` uses.
+    #: Fake in development/test (PID §61 — no real subprocess in
+    #: ordinary tests/dev server), the real `ClaudeCodeOperatorRunner`
+    #: in production. Supersedes the CD-5 WI-3 direct-Anthropic-API
+    #: design (`ai/providers/claude/`, `agent/tools/`,
+    #: `agent/bagman/orchestrator.py`) — that implementation was
+    #: proven to have zero remaining live dependents (CD-5 evidence
+    #: file's own classification finding) and was removed entirely as
+    #: part of this same closure, to prevent dual-authority ambiguity
+    #: (the architect's own explicit instruction); it is not merely
+    #: unwired here. See `PID.md` §97 and the evidence file for the
+    #: full, preserved history of what it was and why it was
+    #: superseded.
+    claude_code_operator_runner: ClaudeCodeOperatorRunnerProtocol
 
 
 def _build_development_or_test(runtime_environment: str) -> RuntimeComposition:
+    from ai.invocation import InMemoryAIInvocationRepository
+    from ai.providers.litellm.fake import FakeLiteLLMClient
     from persistence.objects.memory_store import InMemoryObjectStore
     from services.evidence.intake.intake import InMemoryIntakeRepository
 
+    api = BagmanCanonicalAPI()  # CD-2's own in-memory default construction
+    object_store = InMemoryObjectStore()
+    scanner = _AlwaysCleanDevelopmentScanner()
+    intake_repository = InMemoryIntakeRepository()
+
+    ai_invocation_repository = InMemoryAIInvocationRepository()
+    # `default_response` closes the WI-4 dev-mode gap documented on
+    # `_dev_mode_litellm_default_response` above — without it, a real
+    # click on the GUI's "Run analysis" button in a live dev server
+    # 500s immediately (nothing pre-scripted, no default). Ordinary
+    # tests are unaffected: any test that wants a SPECIFIC scripted
+    # outcome still calls `queue_success()`/`queue_failure()`, which
+    # always takes priority over this default (see
+    # `FakeLiteLLMClient.complete()`).
+    litellm_client = FakeLiteLLMClient(default_response=_dev_mode_litellm_default_response)
+    claude_code_operator_runner = FakeClaudeCodeOperatorRunner(
+        default_response=_dev_mode_claude_code_default_response
+    )
+
     return RuntimeComposition(
         runtime_environment=runtime_environment,
-        api=BagmanCanonicalAPI(),  # CD-2's own in-memory default construction
-        object_store=InMemoryObjectStore(),
+        api=api,
+        object_store=object_store,
         engine=None,
-        intake_repository=InMemoryIntakeRepository(),
-        scanner=_AlwaysCleanDevelopmentScanner(),
+        intake_repository=intake_repository,
+        scanner=scanner,
+        ai_invocation_repository=ai_invocation_repository,
+        litellm_client=litellm_client,
+        claude_code_operator_runner=claude_code_operator_runner,
     )
 
 
@@ -190,6 +340,7 @@ def _build_production() -> RuntimeComposition:
     # run — mirrors how `persistence/objects/minio_store.py` is only
     # ever imported by something that actually needs MinIO.
     from persistence.objects.minio_store import MinIOConfig, MinIOObjectStore
+    from persistence.postgres.ai_invocation_repository import PostgresAIInvocationRepository
     from persistence.postgres.audit_repository import PostgresAuditRepository
     from persistence.postgres.entity_repository import PostgresEntityRepository
     from persistence.postgres.evidence_repository import PostgresEvidenceRepository
@@ -201,6 +352,8 @@ def _build_production() -> RuntimeComposition:
     from persistence.postgres.session import get_engine
     from persistence.postgres.source_repository import PostgresSourceRepository
     from services.evidence.intake.scanner import ClamAVScanner
+
+    from ai.providers.litellm.client import DEFAULT_LITELLM_API_KEY_FILE, DEFAULT_LITELLM_ENDPOINT, LiteLLMClient
 
     # `get_engine()` builds/returns a pooled SQLAlchemy Engine but never
     # itself opens a connection (PID §46 note above) — safe to call even
@@ -254,6 +407,32 @@ def _build_production() -> RuntimeComposition:
         port=int(os.environ.get("BAGMAN_SCANNER_PORT", "3310")),
     )
 
+    # CD-5 WI-2: durable AIInvocation storage, sharing the same engine
+    # as every other Postgres-backed repository above, plus the one
+    # real LiteLLM-speaking adapter — see ai/providers/litellm/client.py
+    # for its endpoint/secret-file/timeout/retry configuration and its
+    # own documented "no eager I/O at construction" contract (mirrors
+    # ClamAVScanner immediately above: reachability is proven live by
+    # GET /internal/ai/health, never here, so a down/misconfigured
+    # LiteLLM gateway does not prevent composition from succeeding —
+    # PID §48's own "evidence/runtime services remain usable even when
+    # AI is unavailable").
+    ai_invocation_repository = PostgresAIInvocationRepository(engine)
+    litellm_client = LiteLLMClient(
+        endpoint=os.environ.get("BAGMAN_LITELLM_ENDPOINT", DEFAULT_LITELLM_ENDPOINT),
+        api_key_file=os.environ.get("BAGMAN_LITELLM_API_KEY_FILE", DEFAULT_LITELLM_API_KEY_FILE),
+    )
+
+    # CD-5 Gate-2 closure (2026-09-16, PID §97): the real bounded
+    # headless Claude Code operator runner — the ONE, sole
+    # authoritative operator-intelligence seam. Constructing this
+    # performs NO I/O itself (same "no eager I/O at construction"
+    # discipline as every other adapter in this function) —
+    # reachability (`shutil.which("claude")`) is proven live by
+    # `is_available()`, never here; a real invocation is only ever
+    # attempted inside a real Ask BAGMAN request.
+    claude_code_operator_runner = ClaudeCodeOperatorRunner()
+
     return RuntimeComposition(
         runtime_environment=_PRODUCTION,
         api=api,
@@ -261,6 +440,9 @@ def _build_production() -> RuntimeComposition:
         engine=engine,
         intake_repository=intake_repository,
         scanner=scanner,
+        ai_invocation_repository=ai_invocation_repository,
+        litellm_client=litellm_client,
+        claude_code_operator_runner=claude_code_operator_runner,
     )
 
 

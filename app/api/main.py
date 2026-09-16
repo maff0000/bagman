@@ -76,6 +76,7 @@ from fastapi.responses import JSONResponse
 from starlette.staticfiles import StaticFiles
 
 from core.errors import (
+    ActiveInvocationConflictError,
     BagmanError,
     ConflictError,
     DuplicateExternalReferenceError,
@@ -89,7 +90,7 @@ from core.errors import (
     ValidationError,
 )
 from app.api.logging_config import configure_logging
-from app.api.routers import health, intake, internal, version
+from app.api.routers import ai, health, intake, internal, operator, version
 
 configure_logging(level=os.environ.get("BAGMAN_LOG_LEVEL", "INFO"))
 logger = logging.getLogger("bagman.runtime.api")
@@ -100,6 +101,12 @@ app.include_router(health.router)
 app.include_router(version.router)
 app.include_router(internal.router)
 app.include_router(intake.router)
+#: CD-5 WI-2 — the background AI gateway HTTP surface (PID §68).
+app.include_router(ai.router)
+#: CD-5 WI-3 — Ask BAGMAN (PID §42-44/§68). New file (app/api/routers/
+#: operator.py), never added to routers/ai.py (WI-2's own in-parallel
+#: file) — see that router's own docstring.
+app.include_router(operator.router)
 
 #: CD-4 WI-4 — the BAGMAN Documents GUI (PID §36-42), served as plain
 #: static assets. Mounted LAST and at "/" so it never shadows any
@@ -127,6 +134,16 @@ _STATUS_BY_ERROR_TYPE: dict[type[BagmanError], int] = {
     # CD-4 WI-3 additions — see module docstring.
     IdempotencyConflictError: 409,
     InvalidStateTransitionError: 500,
+    # CD-5 WI-2/WI-3 addition (both independently needed it): a genuine,
+    # client-actionable conflict — a non-terminal AIInvocation already
+    # exists for this exact (task_id, task_version,
+    # primary_input_reference) subject (PID §73) — exactly the same
+    # class of thing ConflictError/IdempotencyConflictError above
+    # already map to 409 for. A WI-1 mapping gap this closes rather than
+    # works around, since either /internal/ai/tasks (WI-2) or Ask
+    # BAGMAN's own /internal/operator/chat (WI-3) would otherwise
+    # incorrectly 500 on a duplicate rapid double-submit.
+    ActiveInvocationConflictError: 409,
 }
 
 #: 5xx statuses never return the raw exception message to the client

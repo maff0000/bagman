@@ -24,6 +24,12 @@ from persistence.postgres.session import get_database_url
 # `intake_records` at all.
 from persistence.postgres import intake_models  # noqa: F401
 
+# Registers AIInvocationRow on the shared `Base.metadata` (CD-5 WI-1) —
+# same reason as intake_models above: ai_invocation_models.py lives in
+# its own module, so it must be imported here or 'alembic revision
+# --autogenerate' would never see `ai_invocations` at all.
+from persistence.postgres import ai_invocation_models  # noqa: F401
+
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.
 config = context.config

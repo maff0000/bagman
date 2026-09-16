@@ -19,15 +19,17 @@ pytest==8.3.4
 # belongs here, not in requirements.txt.
 httpx2==2.12.0
 #
-# requests - PL correction (CD-3 WI-4 review): tests/acceptance/_lib.py
-# imports `requests` directly to drive HTTP calls against the live
-# bagman-api for the restart/rebuild/restore-into-clean-target proof
-# scripts, but WI-4's own dispatch never declared it in either
-# requirements file — it only "worked" because `requests` happened to
-# already be installed on this host for something unrelated. Declared
-# here explicitly (test/ops tooling, never imported by app/) so a
-# clean environment built strictly from this repo's own pinned files
-# can actually run these scripts. Pinned to the current stable release
-# as of this correction (2026-09-12; verified via `pip index versions
-# requests`).
+# requests - moved BACK here by CD-5 Gate-2 closure's final cleanup
+# delta (2026-09-16): originally declared here (CD-3 WI-4 review)
+# because only tests/acceptance/_lib.py imported it; CD-5 WI-3 moved it
+# to requirements.txt (2026-09-13) because ai/providers/claude/client.py
+# had started importing it directly from application code. That
+# package has now been removed entirely (the architect's operator-
+# architecture correction superseded it with agent/claude_code/, which
+# has no `requests` dependency of its own — it shells out to `claude`,
+# never speaks HTTP directly). No file under app/, agent/, ai/, core/,
+# services/, or persistence/ imports `requests` any more (checked
+# directly, repo-wide) — only tests/acceptance/*.py does, so per this
+# file's own header discipline it belongs here again, not in
+# requirements.txt.
 requests==2.34.2

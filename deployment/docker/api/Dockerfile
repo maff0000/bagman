@@ -32,9 +32,42 @@ COPY persistence/ ./persistence/
 COPY contracts/ ./contracts/
 COPY config/ ./config/
 COPY app/ ./app/
+# CD-5 WI-5 fix (2026-09-13): `ai/` (BAGMAN.AI — task contracts,
+# invocation domain, the LiteLLM/Claude provider adapters, the
+# background gateway, prompts, and this delivery's own evaluation
+# harness) and `agent/` (BAGMAN.AGENT — Ask BAGMAN's orchestration loop
+# and the governed tool registry) were never added here by WI-1/WI-2/
+# WI-3/WI-4 — the whole of CD-5's AI backend was consequently ABSENT
+# from every previously-built `bagman-api` image. `app/api/composition
+# .py`'s production builder imports both packages directly
+# (`ai.providers.litellm.client.LiteLLMClient`,
+# `ai.gateway.background.run_background_task`,
+# `ai.providers.claude.client.ClaudeClient`,
+# `agent.tools.handlers.build_default_tool_registry`, ...), so every
+# real `bagman-api` container built from the prior Dockerfile would
+# have raised `ModuleNotFoundError` the moment `get_composition()`
+# first built a PRODUCTION composition (lazy, on first request) —
+# confirmed directly in this WI by building the prior Dockerfile and
+# inspecting the resulting image's `/app` directory before this fix
+# (neither `ai/` nor `agent/` was present). See the WI-5 delivery
+# report for the full finding.
+COPY ai/ ./ai/
+COPY agent/ ./agent/
 COPY alembic/ ./alembic/
 COPY alembic.ini ./alembic.ini
 COPY VERSION ./VERSION
+
+# CD-5 Gate-2 closure (2026-09-16, PID §97): the real `claude` native
+# binary the bounded headless operator runner
+# (agent/claude_code/runner.py) execs. Staged into
+# deployment/docker/api/bin/claude by
+# deployment/docker/api/prepare-claude-binary.sh BEFORE this build
+# runs (that script's own docstring explains why — never committed to
+# git, see .gitignore) — this COPY fails loudly, not silently, if that
+# preparation step was skipped, which is the correct fail-closed
+# behaviour (no silent fallback to a missing operator surface).
+COPY deployment/docker/api/bin/claude /usr/local/bin/claude
+RUN chmod +x /usr/local/bin/claude
 
 COPY deployment/docker/api/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh

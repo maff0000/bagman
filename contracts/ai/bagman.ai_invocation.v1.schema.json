@@ -1,0 +1,204 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://bagman.internal/contracts/ai/bagman.ai_invocation.v1.schema.json",
+  "title": "BAGMAN AIInvocation",
+  "description": "Canonical `AIInvocation` (CD-5 PID §26-30, WI-1). Durable, auditable record of one attempt to invoke a governed BAGMAN AI task against an authorised provider/capability. An `AIInvocation` is created the moment BAGMAN accepts a task request (status `REQUESTED`) and is durably updated as it moves through the deterministic state machine `ai.invocation.ALLOWED_TRANSITIONS` describes, until it reaches a terminal state (`SUCCEEDED`, `FAILED`, `REJECTED`). It is a provider-NEUTRAL result/provenance model (PID §70): nothing in this contract exposes raw Anthropic/LiteLLM response shapes. This contract never carries hidden chain-of-thought (PID §25) — only `output`/`confidence`/`validation_result`/`error_code`/`usage_metadata` and input/output provenance references. Every field this WI cannot yet populate (e.g. `prompt_contract_version`, `provider_model`, `output` before completion) is modelled as an explicitly-nullable, but always-REQUIRED, key — the same 'state the question, even if unanswered' doctrine `bagman.intake_record.v1` already uses — so a caller/reader can never confuse 'not yet known' with 'field omitted by accident'.",
+  "type": "object",
+  "properties": {
+    "ai_invocation_id": {
+      "$ref": "https://bagman.internal/contracts/common/bagman.identifier.v1.schema.json",
+      "description": "Canonical BAGMAN identifier for this AI invocation (PID §26) — distinct from `evidence_id`, `intake_id`, `audit_event_id`, or any workflow ID."
+    },
+    "task_id": {
+      "type": "string",
+      "pattern": "^[A-Z][A-Z_]*$",
+      "description": "Identifies the typed AI task requested (PID §21-22), e.g. `DOCUMENT_TYPE_PROPOSAL`. Deliberately OPEN (not a closed enum) so new tasks can be added without a contract redesign — the same doctrine `bagman.audit_event.v1`'s own `event_type` already uses. The actual closed set of tasks BAGMAN currently recognises is enforced in code by `ai.tasks.TASK_REGISTRY`, not by this schema."
+    },
+    "task_version": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Task contract version requested (PID §22/§31) — a task's input/output schema, prompt contract, and behaviour are versioned together; this pins which version this invocation was evaluated against."
+    },
+    "role": {
+      "type": "string",
+      "enum": ["OPERATOR", "BACKGROUND"],
+      "description": "Which of BAGMAN's two application-level provider-routing roles this invocation belongs to (PID §8/§20): `OPERATOR` (Claude, interactive) or `BACKGROUND` (routed via the existing Trinity LiteLLM installation using a BAGMAN-specific alias, PID §9). Closed enum — CD-5's locked three-tier topology (PID §2) recognises exactly these two application-level roles; the Mac-mini-vs-Trinity-escalation distinction within `BACKGROUND` lives entirely in `capability_alias`, never as a third value here."
+    },
+    "provider": {
+      "type": "string",
+      "enum": ["LITELLM", "ANTHROPIC"],
+      "description": "The BAGMAN provider ADAPTER that served this invocation (PID §27) — never the physical backend/model. Closed set of exactly the two adapters CD-5 authorises (PID §6/§8): `LITELLM` (the one existing Trinity LiteLLM installation, serving every `BACKGROUND` invocation regardless of whether the alias resolves to the dedicated Mac mini or to Trinity compute) and `ANTHROPIC` (the Claude operator provider). A closed enum here is a deliberate first line of defence against the raw-model-name-lockdown concern PID §5/§10 raises — this field can never become a place a caller injects an arbitrary provider or physical model identity."
+    },
+    "capability_alias": {
+      "oneOf": [
+        { "type": "string", "enum": ["bagman-fast", "bagman-core", "bagman-deep"] },
+        { "type": "null" }
+      ],
+      "description": "For a `BACKGROUND` invocation: the exact BAGMAN-specific LiteLLM alias requested (PID §9) — always one of the closed set `bagman-fast`/`bagman-core`/`bagman-deep`, NEVER a `trinity-*` alias and NEVER a raw/physical model name (PID §5/§10). For an `OPERATOR` invocation: always `null` — Claude is not reached via a LiteLLM alias at all (PID §8), so this field carries no meaning for that role; the Claude model actually used is instead recorded, audit-only, in `provider_model` (per BAGMAN_OPERATOR_MODEL configuration, PID §18). The `role`-conditioned `allOf`/`if`/`then` rules below enforce this cross-field correspondence structurally, not merely by convention."
+    },
+    "provider_model": {
+      "oneOf": [
+        { "type": "string", "minLength": 1 },
+        { "type": "null" }
+      ],
+      "description": "Physical model identity actually observed from the provider response, when available (PID §10/§24/§27) — e.g. a specific Claude checkpoint, or the physical Mac-mini/Trinity model LiteLLM reports having served the request. AUDIT-ONLY: nothing in `ai/` reads this field to make a routing decision — routing is decided entirely by `task_id`/`role`/`capability_alias` before any provider is ever called, so this field structurally cannot influence what gets called next. `null` until the provider responds (or if the provider never discloses this)."
+    },
+    "started_at": {
+      "$ref": "https://bagman.internal/contracts/common/bagman.utc_timestamp.v1.schema.json",
+      "description": "UTC timestamp at which this `AIInvocation` was created (the moment it entered `REQUESTED`) — analogous to `bagman.intake_record.v1`'s `received_at`, not the moment execution actually begins (`RUNNING`). Stamped once, at creation, so every invocation (even one that never leaves `REQUESTED`) has a deterministic value to order and page by (`started_at DESC`, PID §44/§45's own ordering doctrine, reused here)."
+    },
+    "completed_at": {
+      "oneOf": [
+        { "$ref": "https://bagman.internal/contracts/common/bagman.utc_timestamp.v1.schema.json" },
+        { "type": "null" }
+      ],
+      "description": "UTC timestamp at which this invocation reached a terminal state (`SUCCEEDED`, `FAILED`, or `REJECTED`). Required key, explicit `null` while the invocation is still `REQUESTED` or `RUNNING`."
+    },
+    "status": {
+      "type": "string",
+      "enum": ["REQUESTED", "RUNNING", "SUCCEEDED", "FAILED", "REJECTED"],
+      "description": "Invocation lifecycle state (PID §28). Closed enum — `ai.invocation.ALLOWED_TRANSITIONS` is the single source of truth for which transitions between these values are valid; see that module's docstring for the exact state machine and the documented distinction between `REJECTED` (never dispatched to a provider at all — a pre-flight policy/contract refusal) and `RUNNING -> FAILED` (a dispatched call that errored, timed out, or produced output that failed structured validation)."
+    },
+    "correlation_id": {
+      "$ref": "https://bagman.internal/contracts/common/bagman.identifier.v1.schema.json",
+      "description": "Identifier shared with every audit event and canonical write belonging to the same workflow story this invocation is part of (PID §58), e.g. evidence registered -> AI invocation -> AI proposal. The same correlation doctrine `bagman.audit_event.v1.correlation_id` already establishes."
+    },
+    "actor": {
+      "type": "object",
+      "description": "Who/what caused this invocation to be requested (PID §14, reusing `core.actor`'s exact closed `actor_type` vocabulary rather than inventing a parallel one for AI invocations).",
+      "properties": {
+        "actor_type": {
+          "type": "string",
+          "enum": ["SYSTEM", "USER", "AGENT", "SERVICE", "EXTERNAL_SYSTEM"],
+          "description": "Matches `bagman.audit_event.v1.actor_type` exactly — the same closed set `core.actor.ALL` enforces in code."
+        },
+        "actor_id": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Identifies the SPECIFIC actor, e.g. `\"matt\"`, `\"bagman-agent\"`, `\"document-ai-panel\"`. Must not be a generic literal such as `\"system\"` alone (same doctrine as `bagman.audit_event.v1.actor_id`)."
+        }
+      },
+      "required": ["actor_type", "actor_id"],
+      "additionalProperties": false
+    },
+    "input_references": {
+      "type": "object",
+      "description": "Canonical references this invocation's input traces back to (PID §29) — e.g. `{\"evidence_id\": \"...\"}`, `{\"evidence_id\": \"...\", \"intake_id\": \"...\"}`. Open object (genuinely free-form: different tasks reference different canonical objects) but never opaque/disconnected from source evidence — `ai.invocation.derive_primary_input_reference` requires at least one of a fixed, documented set of recognised reference keys (`evidence_id`, `intake_id`, `entity_id`, in that precedence order) to be present, both to satisfy PID §29 and to identify the subject the one-active-invocation concurrency guard (PID §73) applies to.",
+      "additionalProperties": true
+    },
+    "prompt_contract_version": {
+      "oneOf": [
+        { "type": "string", "minLength": 1 },
+        { "type": "null" }
+      ],
+      "description": "Version identifier of the versioned prompt template/contract actually used for this invocation (PID §31), e.g. `\"v1\"` referencing `ai/prompts/document_type/v1.*`. WI-1 defines this field's shape only — no prompt CONTENT is authored by WI-1 (that is WI-2/WI-3 scope) — so every WI-1-created invocation carries `null` here; a later work item's provider adapter populates it once it actually renders and sends a versioned prompt."
+    },
+    "output": {
+      "oneOf": [
+        { "type": "object" },
+        { "type": "null" }
+      ],
+      "description": "The structured proposal the provider returned (PID §24/§30), exactly as validated/rejected by `validation_result` — never a free-text 'I think this appears to be...' string. `null` while `REQUESTED`/`RUNNING`, or when the invocation reached `REJECTED` before ever being dispatched. May be present (and preserved, per PID §76 'do not repair malformed output silently') even when `status` is `FAILED` due to a structured-validation failure — the raw non-conforming output is retained for audit, not discarded."
+    },
+    "confidence": {
+      "oneOf": [
+        { "type": "number", "minimum": 0, "maximum": 1 },
+        { "type": "null" }
+      ],
+      "description": "Task-specific confidence value (PID §55) — its MEANING is defined per-task by that task's own `confidence_policy` (`ai.tasks.TaskContract.confidence_policy`); this contract only pins its numeric shape (0-1), not a universal interpretation or threshold. `null` until produced."
+    },
+    "validation_result": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "valid": { "type": "boolean" },
+            "errors": {
+              "type": "array",
+              "items": { "type": "string" }
+            }
+          },
+          "required": ["valid", "errors"],
+          "additionalProperties": false
+        },
+        { "type": "null" }
+      ],
+      "description": "Result of validating `output` against the requested task's `output_schema` (PID §24/§76), produced by `ai.tasks.validate_task_output`. `null` until an output has actually been validated (or rejected before ever producing one)."
+    },
+    "error_code": {
+      "oneOf": [
+        { "type": "string", "minLength": 1 },
+        { "type": "null" }
+      ],
+      "description": "Short machine-readable reason this invocation reached `FAILED` or `REJECTED` (PID §35), e.g. an `error_code` from `core.errors`, or a provider/task-specific code such as `TIMEOUT`. `null` unless the invocation is `FAILED` or `REJECTED`."
+    },
+    "usage_metadata": {
+      "type": "object",
+      "description": "Safe, non-sensitive usage information where available (PID §71) — e.g. input/output token counts, provider request ID. Never provider billing/cost truth (that remains outside BAGMAN's canonical model). Open object, defaults to `{}` until populated.",
+      "additionalProperties": true,
+      "default": {}
+    },
+    "latency_ms": {
+      "oneOf": [
+        { "type": "integer", "minimum": 0 },
+        { "type": "null" }
+      ],
+      "description": "Observed provider call latency in milliseconds (PID §71), when available. `null` until measured."
+    },
+    "schema_version": {
+      "allOf": [
+        { "$ref": "https://bagman.internal/contracts/common/bagman.schema_version.v1.schema.json" }
+      ],
+      "const": "bagman.ai_invocation.v1",
+      "description": "Contract version identifier for this AIInvocation. Must literally equal `\"bagman.ai_invocation.v1\"` for instances of this schema version."
+    }
+  },
+  "required": [
+    "ai_invocation_id",
+    "task_id",
+    "task_version",
+    "role",
+    "provider",
+    "capability_alias",
+    "provider_model",
+    "started_at",
+    "completed_at",
+    "status",
+    "correlation_id",
+    "actor",
+    "input_references",
+    "prompt_contract_version",
+    "output",
+    "confidence",
+    "validation_result",
+    "error_code",
+    "usage_metadata",
+    "latency_ms",
+    "schema_version"
+  ],
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "if": {
+        "properties": { "role": { "const": "BACKGROUND" } },
+        "required": ["role"]
+      },
+      "then": {
+        "properties": {
+          "capability_alias": { "type": "string", "enum": ["bagman-fast", "bagman-core", "bagman-deep"] }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "role": { "const": "OPERATOR" } },
+        "required": ["role"]
+      },
+      "then": {
+        "properties": {
+          "capability_alias": { "type": "null" }
+        }
+      }
+    }
+  ]
+}

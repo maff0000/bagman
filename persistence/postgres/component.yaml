@@ -7,30 +7,34 @@
 # component.yaml validation/projection for it.
 
 id: BAGMAN.PERSISTENCE.POSTGRES
-version: 1
+version: 2
 
 responsibility: >
-  Own durable, PostgreSQL-backed implementations of every CD-2/CD-4
+  Own durable, PostgreSQL-backed implementations of every CD-2/CD-4/CD-5
   repository interface (GovernedEntity, Source, ExternalReference,
-  EvidenceItem, Provenance, AuditEvent, IntakeRecord) plus the
-  SQLAlchemy engine/session factory and Alembic migration schema —
+  EvidenceItem, Provenance, AuditEvent, IntakeRecord, AIInvocation) plus
+  the SQLAlchemy engine/session factory and Alembic migration schema —
   preserving exactly the same canonical behaviour (immutability,
   idempotent external-reference/evidence-observation/intake replay,
-  append-only audit) as the in-memory reference implementations core/
-  and services/evidence/ ship, durably.
+  append-only audit, one-active-invocation-per-subject concurrency,
+  CD-5 PID §73) as the in-memory reference implementations core/,
+  services/evidence/, and ai/ ship, durably.
 
 owns: []
 
 # Implements the repository ABC interfaces core/, services/evidence/,
-# and services/evidence/intake/ define; does not define any canonical
-# domain type of its own. Depends on core/'s errors, identity,
-# timestamps, and contract_validation; on services/evidence/'s
-# EvidenceItem/EvidenceRepository/ExternalReferenceHint; and (CD-4
-# WI-1) on services/evidence/intake/'s IntakeRecord/IntakeRepository.
+# services/evidence/intake/, and (CD-5 WI-1) ai/ define; does not
+# define any canonical domain type of its own. Depends on core/'s
+# errors, identity, timestamps, and contract_validation; on
+# services/evidence/'s EvidenceItem/EvidenceRepository/
+# ExternalReferenceHint; on services/evidence/intake/'s
+# IntakeRecord/IntakeRepository; and (CD-5 WI-1) on ai/'s
+# AIInvocation/AIInvocationRepository/derive_primary_input_reference.
 consumes:
   - BAGMAN.CORE
   - BAGMAN.SERVICES.EVIDENCE
   - BAGMAN.EVIDENCE.INTAKE
+  - BAGMAN.AI
 
 produces: []
 

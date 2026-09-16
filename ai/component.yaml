@@ -1,0 +1,93 @@
+# BAGMAN component manifest (CD-5 PID §7/§19) for ai/.
+# Validated by scripts/generate_architecture_memory.py against
+# contracts/manifest/bagman.component_manifest.v1.schema.json.
+
+id: BAGMAN.AI
+version: 3
+
+responsibility: >
+  Own the governed, provider-NEUTRAL AI invocation domain model and
+  typed task contract/registry framework: the AIInvocation state
+  machine and its one-active-invocation-per-subject concurrency
+  guarantee (CD-5 PID §26-30/§73-76), and the TaskContract/TASK_REGISTRY
+  framework naming CD-5's tasks' metadata and real, usable input/output
+  JSON Schemas (PID §21-24/§55) — WI-1 delivered the original four;
+  WI-3 additively registered a 5th, ASK_BAGMAN v1 (Ask BAGMAN's general
+  operator chat task — see ai/tasks.py's own docstring for why this is
+  a new task rather than a reuse of OPERATOR_DOCUMENT_REVIEW). WI-1
+  delivered only the domain/contract/persistence slice of BAGMAN.AI's
+  eventual responsibility (PID §7's full statement: "route typed
+  BAGMAN intelligence tasks to an authorised AI provider/capability,
+  enforce task contracts and policy, record invocation provenance,
+  validate structured responses and return proposals without directly
+  mutating canonical business state"). WI-2 lands the BACKGROUND half
+  of that: `ai/providers/litellm/` (the one LiteLLM-speaking adapter,
+  its mechanical alias-only enforcement, and its deterministic fake)
+  and `ai/gateway/` (`run_background_task`'s full REQUESTED -> RUNNING
+  -> terminal orchestration, PID §57 audit emission). WI-3 originally
+  landed the OPERATOR half's provider adapter here too:
+  `ai/providers/claude/` — a direct Anthropic Messages API adapter
+  (ClaudeClient/ClaudeClientProtocol/FakeClaudeClient). **Removed
+  2026-09-16** (CD-5 Gate-2 closure, final delta before merge): the
+  architect ruled BAGMAN's operator intelligence is not a direct
+  Anthropic-API integration at all — the sole authoritative operator
+  path is the bounded headless Claude Code runner owned entirely by
+  `agent/claude_code/` (BAGMAN.AGENT.CLAUDE_CODE), which does not
+  consume this component and speaks no Anthropic wire protocol of any
+  kind. `ai/providers/claude/` was confirmed to have zero remaining
+  live dependents before removal — see `PID.md` §97 and the CD-5
+  evidence file for the full, preserved history. `ai/providers/litellm/`
+  and `ai/gateway/` are UNAFFECTED by this — both remain live, each
+  with its own `component.yaml`, consuming this one. Real prompt
+  CONTENT for the three BACKGROUND tasks lives at `ai/prompts/` (PID
+  §31), loaded by `ai/gateway/background.py`. `ai/policy/`,
+  `ai/evaluation/`, and `ai/provenance/` remain WI-5's job to populate
+  (`ai/evaluation/` is populated; the other two remain placeholders).
+
+owns:
+  - AIInvocation
+  - TaskContract
+
+# ai/invocation.py depends on core/ exactly like every other CD-2/CD-4
+# domain module: identity (id generation), timestamps (UTC handling),
+# actor (closed actor_type vocabulary — reused exactly, no parallel
+# vocabulary invented), errors (ActiveInvocationConflictError,
+# InvalidStateTransitionError, NotFoundError, ValidationError), and
+# contract_validation (validate_against_contract). ai/tasks.py further
+# depends on core.contract_validation.describe_schema_errors (added by
+# this WI alongside validate_against_contract) and imports
+# ai.invocation.BACKGROUND_CAPABILITY_ALIASES as the single source of
+# truth for the closed background-alias set.
+consumes:
+  - BAGMAN.CORE
+
+# This component does not itself emit audit events — AI_INVOCATION_*
+# audit event emission (PID §57) is WI-2/WI-3's orchestration-layer
+# responsibility, mirroring how services/evidence/intake/ does not
+# emit its own audit events either (see that component's own
+# component.yaml).
+produces: []
+
+# No new third-party dependency was introduced by WI-1: schema
+# validation reuses core.contract_validation's existing jsonschema
+# wiring (a new describe_schema_errors function alongside it, not a
+# new dependency). WI-3's (now-removed) ai/providers/claude/ had added
+# `requests` here; with that package gone (2026-09-16, see
+# `responsibility` above), nothing under ai/ imports `requests` any
+# more (checked directly, repo-wide) — moved back to
+# requirements-dev.txt (test/tooling-only again, see that file's own
+# history note) and removed from this list.
+dependencies:
+  - jsonschema
+  - rfc3339-validator
+
+external_access: false
+
+prohibited:
+  - direct_email_access
+  - direct_bank_access
+  - direct_xero_access
+  - direct_chargebee_access
+  - direct_litellm_client_outside_gateway
+  - direct_anthropic_client_outside_gateway
+  - trinity_star_alias_usage

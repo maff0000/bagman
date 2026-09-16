@@ -1,0 +1,54 @@
+# BAGMAN component manifest (CD-5 PID §19) for ai/providers/litellm/.
+# Validated by scripts/generate_architecture_memory.py against
+# contracts/manifest/bagman.component_manifest.v1.schema.json.
+
+id: BAGMAN.AI.PROVIDERS.LITELLM
+version: 1
+
+responsibility: >
+  Own the ONE adapter that speaks to BAGMAN's LiteLLM gateway (CD-5 PID
+  §6/§8/§9/§50, WI-2): LiteLLMClient (the real POST /v1/chat/completions
+  OpenAI-compatible wire call, alias-only, bounded timeout/retry,
+  fail-closed result normalisation into LiteLLMCompletionResult, and —
+  Gate-1 closure, 2026-09-16 — a per-request response_format
+  JSON-schema structured-output constraint built from the caller's
+  output_schema) and FakeLiteLLMClient (the deterministic substitute
+  every ordinary test and dev/test composition uses, PID §61).
+  Mechanically enforces BAGMAN's own alias-only routing boundary
+  (validate_capability_alias) — this is the one place in the whole
+  repository that could ever construct a request naming a physical
+  model or a trinity-* alias, and it refuses to. Does not decide WHICH
+  alias a task prefers (ai.tasks.TaskContract.preferred_capability owns
+  that) and does not orchestrate a task's lifecycle (ai.gateway owns
+  that) — this component's job ends at "send one bounded HTTP request
+  for a validated alias, return a normalised result, never raise for a
+  transport-level failure". Final topology (Gate-1 closure, 2026-09-16,
+  see the CD-5 evidence file for the full preserved history): the real
+  gateway this adapter reaches is HELM's dedicated, BAGMAN-exclusive
+  Mac AI appliance (its own LiteLLM + PostgreSQL), not the shared
+  Trinity LiteLLM installation this component originally targeted at
+  CD-5's initial dispatch — this manifest's own owns/consumes/produces
+  edges are unaffected, since which real process sits behind the
+  gateway is a deployment-level detail, not an architectural one.
+
+owns:
+  - LiteLLMCompletionResult
+
+consumes:
+  - BAGMAN.AI
+
+produces: []
+
+dependencies: []
+
+external_access: true
+
+prohibited:
+  - direct_email_access
+  - direct_bank_access
+  - direct_xero_access
+  - direct_chargebee_access
+  - direct_mac_mini_access
+  - direct_ollama_mlx_llamacpp_access
+  - trinity_star_alias_usage
+  - raw_physical_model_name_usage

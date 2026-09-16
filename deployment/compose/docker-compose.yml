@@ -47,6 +47,27 @@ secrets:
     file: /srv/bagman-secrets/minio_root_user
   minio_root_user_password:
     file: /srv/bagman-secrets/minio_root_user_password
+  # CD-5 WI-2 (PID §13): the BAGMAN-scoped virtual key for the EXISTING
+  # Trinity LiteLLM installation — never a second inference-control-plane
+  # deployment (PID §8). Provisioned externally by Matt directly, same
+  # discipline as the three secrets above. NOTE the real provisioned
+  # filename is `litellm_gateway_key`, not the `trinity_litellm_api_key`
+  # name PID §13's own text originally guessed (confirmed present at this
+  # path immediately before this WI began).
+  litellm_gateway_key:
+    file: /srv/bagman-secrets/litellm_gateway_key
+  # CD-5 WI-3 (PID §13/§17-18) originally reserved an `anthropic_api_key`
+  # Compose secret here for a direct Anthropic-API operator provider.
+  # REMOVED 2026-09-16 (Gate-2 closure, final cleanup delta before
+  # merge): the architect ruled BAGMAN does not use a direct Anthropic
+  # API key at all — the sole authoritative operator path is the
+  # bounded headless Claude Code runner (`agent/claude_code/`), which
+  # authenticates via its own OAuth/session credential (see the
+  # `volumes:` mount on `bagman-api` below,
+  # `/srv/bagman-secrets/claude_code_home`), never an API key. No
+  # `anthropic_api_key` secret is declared here, commented or
+  # otherwise — see `PID.md` §97 and the CD-5 evidence file for the
+  # full, preserved history of this correction.
 
 services:
   bagman-db:
@@ -189,12 +210,98 @@ services:
       BAGMAN_OBJECT_STORE_SECRET_KEY_FILE: /run/secrets/minio_root_user_password
       BAGMAN_SCANNER_HOST: bagman-scan
       BAGMAN_SCANNER_PORT: "3310"
+      # CD-5 Gate-1 real-provider acceptance closure (2026-09-16,
+      # superseding the CD-5 WI-2/WI-5 narrative below): HELM has
+      # returned `BAGMAN_AI_APPLIANCE_GREEN` — BAGMAN's background
+      # inference authority is no longer the shared Trinity LiteLLM
+      # installation (`local-ai-gateway`, host port 4000). It is now a
+      # dedicated, BAGMAN-exclusive AI appliance at
+      # `http://192.168.11.4:4100` — the same dedicated Mac mini
+      # (`mac-prod-01`, see CLAUDE.md's Equipment Access table) the
+      # locked three-tier topology (PID §2/§8/§9) always named as
+      # BAGMAN's primary background tier, now fronted by its own
+      # dedicated LiteLLM installation instead of sharing Trinity's.
+      # This is still alias-only routing
+      # (bagman-fast/bagman-core/bagman-deep — never a raw model name,
+      # never the Mac mini's own Ollama port 11434 directly) — nothing
+      # about `ai/providers/litellm/client.py`'s own contract changes,
+      # only which real gateway process this env var points at.
+      #
+      # Verified live before this change (2026-09-16, PL's own direct
+      # check, not merely relayed): `GET
+      # http://192.168.11.4:4100/health/readiness` -> `{"status":
+      # "healthy","db":"connected"}` (contrast the old shared gateway's
+      # persistent `"db":"Not connected"`); real authenticated
+      # `POST /v1/chat/completions` succeeded for all three aliases; a
+      # raw physical model name (`gemma4:12b`) was independently
+      # rejected by the appliance's OWN key scoping with `HTTP 403
+      # key_model_access_denied` — defense-in-depth alongside BAGMAN's
+      # own `validate_capability_alias` boundary check, neither
+      # relying on the other.
+      #
+      # No `host.docker.internal`/`extra_hosts` trick is needed for
+      # this endpoint (unlike the old `http://localhost:4000` value,
+      # see CD-5 WI-5's fix below) — `192.168.11.4` is a real LAN
+      # address, not host-loopback, and is directly routable from
+      # `bagman-net` the same way any other external host is.
+      #
+      # --- Prior architecture (CD-5 WI-2/WI-5, retained for history) ---
+      # WI-2 originally pointed this at the shared Trinity LiteLLM
+      # installation; WI-5 (2026-09-13) fixed a genuine `bagman-api`
+      # container-networking defect against THAT gateway (`localhost`
+      # inside `bagman-api`'s own container referred to the container
+      # itself, not the host — fixed via `host.docker.internal` +
+      # `extra_hosts: host-gateway`, Docker-Engine-native since 20.10).
+      # That gateway's OWN backing database was then found down
+      # (`400 no_db_connection` on every completion) — Helm/Trinity-
+      # owned infrastructure, outside BAGMAN's authority — which HELM
+      # first attempted to fix via key rotation (partially/
+      # intermittently effective, see CD-5 evidence file §6d) and has
+      # now superseded entirely with the dedicated appliance above.
+      BAGMAN_LITELLM_ENDPOINT: http://192.168.11.4:4100
+      BAGMAN_LITELLM_API_KEY_FILE: /run/secrets/litellm_gateway_key
+      # CD-5 Gate-2 closure (2026-09-16, PID §97): the bounded headless
+      # Claude Code operator runner (agent/claude_code/runner.py) needs
+      # its own HOME so `claude` can find its own OAuth/session
+      # credential — never an Anthropic API key (the original CD-5
+      # WI-3 direct-Anthropic-API design's own secret declaration was
+      # removed entirely as part of this closure — see the `secrets:`
+      # list below and `PID.md` §97 for the full history). Mounted
+      # read-only from the host below (`volumes:`); a bounded,
+      # dedicated working directory is created by the runner itself
+      # inside the container's own writable layer, no host mount
+      # needed for it.
+      BAGMAN_CLAUDE_CODE_HOME: /home/claude-operator
+      BAGMAN_CLAUDE_CODE_CWD: /tmp/claude-code-operator-cwd
       BAGMAN_LOG_LEVEL: INFO
       TZ: UTC
+    # `extra_hosts: host.docker.internal:host-gateway` (CD-5 WI-5,
+    # 2026-09-13) was here to reach the old shared Trinity LiteLLM
+    # gateway at `http://localhost:4000` from inside this container —
+    # see BAGMAN_LITELLM_ENDPOINT's own comment above. Removed
+    # 2026-09-16: the new dedicated AI appliance
+    # (`http://192.168.11.4:4100`) is a real LAN address, directly
+    # routable from `bagman-net` without this mapping.
     secrets:
       - postgres_password
       - minio_root_user
       - minio_root_user_password
+      - litellm_gateway_key
+    # CD-5 Gate-2 closure: a dedicated Claude Code OAuth/session
+    # credential directory — NOT an Anthropic API key, NOT a Compose
+    # `secrets:` entry (those are single-file only; this is a small
+    # directory: `.claude/.credentials.json` and whatever else Claude
+    # Code's own auth mechanism stores). Mounted read-only. First-pass
+    # provisioning mechanism, flagged plainly (see
+    # deployment/docker/api/prepare-claude-binary.sh's own docstring
+    # for the matching caveat on the `claude` binary itself): this
+    # currently reuses a real, already-authenticated Claude Code
+    # session's own credential, copied to this dedicated path — a
+    # more formal, BAGMAN-dedicated credential (e.g. via
+    # `claude setup-token`) is a real future hardening step, not
+    # solved speculatively here.
+    volumes:
+      - /srv/bagman-secrets/claude_code_home:/home/claude-operator:ro
     # The one deliberate host-published entry point (PID §5) — bound to
     # loopback only, not 0.0.0.0.
     ports:
