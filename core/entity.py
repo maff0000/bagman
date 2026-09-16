@@ -81,6 +81,21 @@ class EntityRepository(abc.ABC):
     def list_entities(self) -> list[GovernedEntity]:
         raise NotImplementedError
 
+    @abc.abstractmethod
+    def find_by_canonical_name(self, canonical_name: str) -> Optional[GovernedEntity]:
+        """Read-only lookup for the ``GovernedEntity`` with this exact
+        ``canonical_name``, or ``None`` if none exists (CD-6 Slice 1,
+        PID §98.3). Added so a caller (e.g.
+        ``app/api/composition.py``'s idempotent canonical-entity seed —
+        see that module's own "Stable canonical entity seed lifecycle"
+        section) can resolve-or-create a well-known entity without
+        creating a duplicate — the exact same role
+        ``SourceRepository.find_by_provider`` already plays for the
+        stable ``MANUAL_UPLOAD`` ``Source``. A query, not a fetch-by-ID,
+        so it never raises ``NotFoundError``.
+        """
+        raise NotImplementedError
+
 
 class InMemoryEntityRepository(EntityRepository):
     """Narrow in-memory reference implementation of EntityRepository
@@ -132,3 +147,9 @@ class InMemoryEntityRepository(EntityRepository):
 
     def list_entities(self) -> list[GovernedEntity]:
         return list(self._entities.values())
+
+    def find_by_canonical_name(self, canonical_name: str) -> Optional[GovernedEntity]:
+        for entity in self._entities.values():
+            if entity.canonical_name == canonical_name:
+                return entity
+        return None

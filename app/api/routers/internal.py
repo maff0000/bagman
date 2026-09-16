@@ -64,7 +64,7 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import Response
 from pydantic import BaseModel
 
-from app.api.composition import get_composition
+from app.api.composition import ensure_seed_entities, get_composition
 from app.api.http_headers import safe_content_disposition_header
 
 router = APIRouter(prefix="/internal")
@@ -116,6 +116,26 @@ async def register_entity(payload: RegisterEntityRequest) -> dict:
     composition = get_composition()
     entity = composition.api.register_entity(**payload.model_dump())
     return entity.to_dict()
+
+
+@router.get("/entities")
+async def list_entities() -> dict[str, Any]:
+    """List every canonical ``GovernedEntity`` (CD-6 Slice 1, PID
+    §98.3) — the GUI's Company dropdown resolves through THIS list's
+    real ``entity_id`` values, never a hardcoded label (see
+    ``app/api/composition.py``'s own "Stable canonical entity seed
+    lifecycle" section for the idempotent seed this call also
+    triggers, lazily, the first time it runs in this process). Small,
+    unbounded list deliberately (unlike ``GET /internal/intake``/
+    ``GET /internal/evidence``'s own paginated contract) — the set of
+    governed entities is operator-curated and expected to remain small
+    (PID §98.3 names exactly three today); a future delivery adds
+    pagination here if that assumption ever stops holding.
+    """
+    composition = get_composition()
+    ensure_seed_entities(composition)
+    entities = composition.api.entity_repository.list_entities()
+    return {"items": [e.to_dict() for e in entities], "count": len(entities)}
 
 
 @router.post("/sources", status_code=201)

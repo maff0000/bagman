@@ -1,9 +1,18 @@
-/* BAGMAN Documents GUI — CD-4 WI-4.
+/* BAGMAN application shell — CD-4 WI-4's Documents GUI, extended into
+   a genuine premium application shell by CD-6 Slice 1 (PID §98.2).
    Plain CSS, no framework, no build step. Light theme by default, with a
    dark-mode override for prefers-color-scheme (this is a static asset
    served by bagman-api directly — not a Claude artifact — but the same
    "define tokens, override under dark" discipline keeps it readable in
-   either OS theme). */
+   either OS theme).
+
+   CD-6 Slice 1 EXTENDS this existing token system rather than
+   replacing it (PID §98's own explicit instruction) — every token
+   below :root's original block is additive: a spacing scale (`--sp-*`)
+   and a second-tier accent (`--accent-soft`) the new premium surfaces
+   (Needs You cards, chips, drawers, toasts) build on, so Documents/AI
+   keep rendering with exactly the same colours/shadows/radius they
+   always have. */
 
 :root {
   --bg: #f5f6f8;
@@ -15,6 +24,7 @@
   --brand-contrast: #ffffff;
   --accent: #2f6fed;
   --accent-contrast: #ffffff;
+  --accent-soft: #eaf0fe;
 
   --ok-bg: #e6f4ea;
   --ok-fg: #1e7d34;
@@ -26,7 +36,19 @@
   --neutral-fg: #444c58;
 
   --radius: 6px;
+  --radius-lg: 12px;
   --shadow: 0 1px 2px rgba(20, 24, 30, 0.08), 0 4px 12px rgba(20, 24, 30, 0.06);
+  --shadow-lg: 0 8px 24px rgba(20, 24, 30, 0.14), 0 2px 6px rgba(20, 24, 30, 0.08);
+
+  /* CD-6 Slice 1 spacing scale — "generous spacing" (PID §98.2) applied
+     consistently rather than ad hoc per-component pixel values. */
+  --sp-1: 4px;
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 16px;
+  --sp-5: 24px;
+  --sp-6: 32px;
+  --sp-7: 48px;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -40,6 +62,7 @@
     --brand-contrast: #e7eaee;
     --accent: #5b8ef7;
     --accent-contrast: #0d1117;
+    --accent-soft: #1c2b47;
 
     --ok-bg: #17301f;
     --ok-fg: #6fd98a;
@@ -61,6 +84,7 @@
   --brand-contrast: #e7eaee;
   --accent: #5b8ef7;
   --accent-contrast: #0d1117;
+  --accent-soft: #1c2b47;
 
   --ok-bg: #17301f;
   --ok-fg: #6fd98a;
@@ -725,10 +749,356 @@ h2 { font-size: 15px; margin: 0 0 12px; }
   color: var(--text);
 }
 
-/* ---------------- responsive ---------------- */
+/* ==================================================================
+   CD-6 Slice 1 — GUI Operations Foundation (PID §98.2). Premium shell
+   primitives: the global + Add menu/modal, generic review drawer,
+   status chips, toasts, empty/loading/error states, Needs You
+   cards/queue, Activity stream, and Overview's real greeting. Extends
+   the existing token language exclusively — no new colour outside
+   --accent/--accent-soft/--ok-*/--warn-*/--bad-*/--neutral-*.
+   ================================================================== */
+
+.section-heading { margin-top: var(--sp-6); }
+
+/* ---------------- Overview greeting ---------------- */
+
+.overview-greeting {
+  padding: var(--sp-5) 0 var(--sp-4);
+}
+.overview-greeting h1 {
+  font-size: 26px;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+  margin: 0 0 var(--sp-3);
+}
+.overview-greeting__count {
+  font-size: 17px;
+  font-weight: 600;
+  margin: 0 0 var(--sp-2);
+}
+.overview-greeting__lines {
+  list-style: none;
+  margin: 0 0 var(--sp-4);
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+}
+.overview-greeting__lines li {
+  font-size: 14px;
+  color: var(--text);
+  padding-left: var(--sp-3);
+  position: relative;
+}
+.overview-greeting__lines li::before {
+  content: "\2022";
+  position: absolute;
+  left: 0;
+  color: var(--accent);
+}
+.overview-greeting .btn { margin-top: var(--sp-2); }
+
+/* ---------------- global + Add menu ---------------- */
+
+.add-menu { position: relative; }
+.add-menu__list {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  min-width: 220px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-lg);
+  padding: var(--sp-2);
+  z-index: 70;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.add-menu__list[hidden] { display: none; }
+.add-menu__list button {
+  text-align: left;
+  background: none;
+  border: none;
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+  padding: var(--sp-2) var(--sp-3);
+  border-radius: 5px;
+  cursor: pointer;
+}
+.add-menu__list button:hover { background: var(--neutral-bg); }
+
+/* ---------------- generic modal (upload modal) ---------------- */
+
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(10, 12, 16, 0.45);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 80;
+  padding: var(--sp-4);
+}
+.modal-overlay[hidden] { display: none; }
+.modal {
+  width: min(480px, 100%);
+  max-height: 90vh;
+  overflow-y: auto;
+  background: var(--panel);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-lg);
+}
+.modal__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--sp-4) var(--sp-5);
+  border-bottom: 1px solid var(--border);
+  position: sticky;
+  top: 0;
+  background: var(--panel);
+}
+.modal__header h2 { margin: 0; }
+.modal__body { padding: var(--sp-5); }
+.upload-modal__form { display: flex; flex-direction: column; gap: var(--sp-4); }
+.upload-modal__actions { display: flex; align-items: center; gap: var(--sp-3); }
+
+/* ---------------- generic right-hand review drawer ---------------- */
+
+.review-drawer-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(10, 12, 16, 0.4);
+  display: flex;
+  justify-content: flex-end;
+  z-index: 65;
+}
+.review-drawer-overlay[hidden] { display: none; }
+.review-drawer {
+  width: min(560px, 100%);
+  height: 100%;
+  background: var(--panel);
+  border-left: 1px solid var(--border);
+  overflow-y: auto;
+  box-shadow: var(--shadow-lg);
+}
+.review-drawer__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--sp-4) var(--sp-5);
+  border-bottom: 1px solid var(--border);
+  position: sticky;
+  top: 0;
+  background: var(--panel);
+}
+.review-drawer__header h2 { margin: 0; }
+.review-drawer__body { padding: var(--sp-5); }
+.review-drawer__question {
+  font-size: 16px;
+  font-weight: 600;
+  margin-bottom: var(--sp-4);
+}
+.review-drawer__section { margin-bottom: var(--sp-5); }
+.review-drawer__section h3 {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+  margin: 0 0 var(--sp-3);
+}
+.review-drawer__actions { display: flex; gap: var(--sp-3); margin-top: var(--sp-3); }
+.review-drawer__preview { min-height: 80px; }
+
+/* ---------------- evidence preview (shell/preview.js) ---------------- */
+
+.evidence-preview--pdf iframe {
+  width: 100%;
+  height: 420px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg);
+}
+.evidence-preview--image img {
+  max-width: 100%;
+  max-height: 420px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  display: block;
+}
+.evidence-preview--fallback,
+.evidence-preview--missing {
+  padding: var(--sp-4);
+  background: var(--neutral-bg);
+  border-radius: var(--radius);
+  text-align: center;
+}
+
+/* ---------------- status chips (shared/chips.js) ---------------- */
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  padding: 3px 9px;
+  border-radius: 999px;
+  white-space: nowrap;
+}
+.chip--neutral { background: var(--neutral-bg); color: var(--neutral-fg); }
+.chip--progress { background: var(--accent-soft); color: var(--accent); }
+.chip--ok { background: var(--ok-bg); color: var(--ok-fg); }
+.chip--warn { background: var(--warn-bg); color: var(--warn-fg); }
+.chip--bad { background: var(--bad-bg); color: var(--bad-fg); }
+
+/* ---------------- empty / loading / error states (shared/state.js) ---------------- */
+
+.state {
+  padding: var(--sp-6) var(--sp-4);
+  text-align: center;
+  color: var(--text-muted);
+}
+.state__spinner {
+  display: inline-block;
+  width: 14px;
+  height: 14px;
+  margin-right: var(--sp-2);
+  border: 2px solid var(--border);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  vertical-align: -2px;
+  animation: bagman-spin 0.8s linear infinite;
+}
+@keyframes bagman-spin { to { transform: rotate(360deg); } }
+.state__label { font-weight: 600; color: var(--text); margin-bottom: 4px; }
+.state--error .state__label { color: var(--bad-fg); }
+.state__hint { margin-top: 2px; }
+
+/* ---------------- Needs You queue (features/needs-you/needs-you.js) ---------------- */
+
+.needs-you-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+  margin-top: var(--sp-4);
+}
+.needs-you-card {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  padding: var(--sp-4);
+}
+.needs-you-card--resolved,
+.needs-you-card--dismissed {
+  border-left-color: var(--border);
+  opacity: 0.75;
+}
+.needs-you-card__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-2);
+  margin-bottom: var(--sp-2);
+}
+.needs-you-card__chips { display: flex; gap: var(--sp-2); }
+.needs-you-card__question { font-size: 15px; font-weight: 600; margin-bottom: 4px; }
+.needs-you-card__meta { margin-bottom: var(--sp-2); }
+.needs-you-card__actions { margin-top: var(--sp-3); }
+.needs-you-card__resolution { margin-top: var(--sp-2); }
+
+/* ---------------- Documents tab header ---------------- */
+
+.documents-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-3);
+  flex-wrap: wrap;
+}
+.documents-header h1 { margin: 0; }
+
+/* ---------------- Activity stream (features/activity/activity.js) ---------------- */
+
+.activity-list {
+  display: flex;
+  flex-direction: column;
+  margin-top: var(--sp-4);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--panel);
+  box-shadow: var(--shadow);
+  overflow: hidden;
+}
+.activity-row {
+  border-bottom: 1px solid var(--border);
+}
+.activity-row:last-child { border-bottom: none; }
+.activity-row__summary {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  padding: var(--sp-3) var(--sp-4);
+  cursor: pointer;
+}
+.activity-row__summary:hover { background: var(--neutral-bg); }
+.activity-row__time { min-width: 150px; }
+.activity-row__detail {
+  padding: 0 var(--sp-4) var(--sp-4) calc(150px + var(--sp-3) + var(--sp-4));
+}
+.activity-row__detail[hidden] { display: none; }
+
+/* ---------------- toast / notice stack (shared/notify.js) ---------------- */
+
+.toast-stack {
+  position: fixed;
+  bottom: var(--sp-5);
+  right: var(--sp-5);
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  z-index: 100;
+  max-width: min(360px, calc(100vw - 2 * var(--sp-5)));
+}
+.toast {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-2);
+  padding: var(--sp-3) var(--sp-4);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-lg);
+  font-size: 13px;
+  animation: bagman-toast-in 0.15s ease-out;
+}
+@keyframes bagman-toast-in {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.toast--ok { background: var(--ok-bg); color: var(--ok-fg); }
+.toast--bad { background: var(--bad-bg); color: var(--bad-fg); }
+.toast--info { background: var(--neutral-bg); color: var(--neutral-fg); }
+.toast__close {
+  margin-left: auto;
+  background: none;
+  border: none;
+  color: inherit;
+  cursor: pointer;
+  font-size: 15px;
+  line-height: 1;
+  opacity: 0.7;
+}
+.toast__close:hover { opacity: 1; }
+
+/* ---------------- responsive (CD-6 additions) ---------------- */
 
 @media (max-width: 480px) {
-  .shell-main { padding: 14px 14px 40px; }
-  .detail-panel { width: 100%; }
-  .ask-bagman-drawer { width: 100%; }
+  .review-drawer { width: 100%; }
+  .modal { width: 100%; max-height: 100%; height: 100%; border-radius: 0; }
+  .activity-row__detail { padding-left: var(--sp-4); }
+  .toast-stack { left: var(--sp-3); right: var(--sp-3); max-width: none; }
 }

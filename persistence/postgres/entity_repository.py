@@ -133,3 +133,15 @@ class PostgresEntityRepository(EntityRepository):
                 return [_row_to_entity(row) for row in rows]
         except SQLAlchemyError as exc:
             raise PersistenceError(f"could not list GovernedEntity rows: {exc}") from exc
+
+    def find_by_canonical_name(self, canonical_name: str) -> Optional[GovernedEntity]:
+        try:
+            with session_scope(self._engine) as session:
+                row = (
+                    session.query(GovernedEntityRow)
+                    .filter_by(canonical_name=canonical_name)
+                    .first()
+                )
+                return _row_to_entity(row) if row is not None else None
+        except SQLAlchemyError as exc:
+            raise PersistenceError(f"could not look up GovernedEntity by canonical_name: {exc}") from exc

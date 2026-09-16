@@ -10,19 +10,33 @@
   <header class="shell-header">
     <div class="shell-header__brand">
       <span class="shell-header__mark">BAGMAN</span>
-      <span class="shell-header__sub">Evidence Intake</span>
+      <span class="shell-header__sub">Operations</span>
     </div>
     <nav class="shell-header__nav" aria-label="Primary">
       <button class="tab-btn" data-tab="overview" type="button" aria-current="page">Overview</button>
+      <button class="tab-btn" data-tab="needs-you" type="button">Needs You</button>
       <button class="tab-btn" data-tab="documents" type="button">Documents</button>
+      <button class="tab-btn" data-tab="activity" type="button">Activity</button>
       <button class="tab-btn tab-btn--disabled" type="button" disabled title="Not part of this delivery">
-        Entities <span class="pill pill--muted">unavailable</span>
+        Email <span class="pill pill--muted">unavailable</span>
       </button>
       <button class="tab-btn tab-btn--disabled" type="button" disabled title="Not part of this delivery">
-        Audit <span class="pill pill--muted">unavailable</span>
+        Invoices <span class="pill pill--muted">unavailable</span>
       </button>
     </nav>
     <div class="shell-header__actions">
+      <!-- Global + Add (PID §98.3) — reachable from anywhere, funnels
+           through the one governed intake endpoint (shell/add-menu.js). -->
+      <div class="add-menu">
+        <button class="btn btn--primary" id="add-menu-toggle" type="button" aria-haspopup="true" aria-expanded="false">
+          + Add
+        </button>
+        <div class="add-menu__list" id="add-menu-list" hidden role="menu">
+          <button type="button" role="menuitem" data-add-kind="INVOICE_RECEIPT">Upload invoice / receipt</button>
+          <button type="button" role="menuitem" data-add-kind="OTHER_DOCUMENT">Upload other document</button>
+          <button type="button" role="menuitem" data-add-kind="PHOTO">Add photo</button>
+        </div>
+      </div>
       <label class="operator-identity">
         <span>Acting as</span>
         <input type="text" id="operator-identity-input" autocomplete="off" />
@@ -38,13 +52,11 @@
 
     <!-- ============================= OVERVIEW ============================= -->
     <section id="panel-overview" class="tab-panel">
-      <h1>Runtime Overview</h1>
-      <p class="muted">
-        A minimal liveness/readiness summary. This is not the focus of this delivery —
-        see the <button class="link-btn" data-goto-tab="documents" type="button">Documents</button> tab
-        for the governed evidence intake workflow.
-      </p>
+      <div id="overview-greeting" class="overview-greeting">
+        <h1>Good morning Matt</h1>
+      </div>
 
+      <h2 class="section-heading">Runtime</h2>
       <div class="card-grid" id="overview-cards">
         <div class="card" data-card="health">
           <div class="card__title">Liveness — <code>GET /health</code></div>
@@ -69,7 +81,7 @@
       <button class="btn btn--secondary" id="overview-refresh" type="button">Refresh</button>
 
       <!-- ---------- AI status (CD-5 WI-4, PID §46-48) ---------- -->
-      <h2 class="ai-status__heading">AI Status</h2>
+      <h2 class="ai-status__heading section-heading">AI Status</h2>
       <div class="card-grid" id="ai-status-cards">
         <div class="card" data-card="ai-claude">
           <div class="card__title">Claude operator</div>
@@ -93,9 +105,22 @@
       </div>
     </section>
 
+    <!-- ============================= NEEDS YOU ============================= -->
+    <section id="panel-needs-you" class="tab-panel" hidden>
+      <h1>Needs You</h1>
+      <p class="muted">
+        Every decision, across every BAGMAN module, that only Matt can make — open items first,
+        most pressing on top.
+      </p>
+      <div id="needs-you-list" class="needs-you-list"></div>
+    </section>
+
     <!-- ============================= DOCUMENTS ============================= -->
     <section id="panel-documents" class="tab-panel" hidden>
-      <h1>Documents</h1>
+      <div class="documents-header">
+        <h1>Documents</h1>
+        <button class="btn btn--secondary" id="documents-upload-invoice" type="button">Upload invoice</button>
+      </div>
 
       <!-- ---------- Upload ---------- -->
       <div class="upload-panel">
@@ -226,6 +251,13 @@
       </div>
     </section>
 
+    <!-- ============================= ACTIVITY ============================= -->
+    <section id="panel-activity" class="tab-panel" hidden>
+      <h1>Activity</h1>
+      <p class="muted">Every automatic action and every operator decision, in one place (PID §98.8). Click a row for the full forensic detail.</p>
+      <div id="activity-list" class="activity-list"></div>
+    </section>
+
   </main>
 
   <!-- ---------- Detail panel (slide-over) ---------- -->
@@ -240,6 +272,35 @@
       </div>
     </div>
   </div>
+
+  <!-- ---------- Needs You review drawer (CD-6 Slice 1, shell/drawer.js) ---------- -->
+  <div id="review-drawer" class="review-drawer-overlay" hidden>
+    <div class="review-drawer" role="dialog" aria-modal="true" aria-labelledby="review-drawer-title">
+      <div class="review-drawer__header">
+        <h2 id="review-drawer-title">Review</h2>
+        <button class="btn btn--ghost" id="review-drawer-close" type="button" aria-label="Close">&times;</button>
+      </div>
+      <div class="review-drawer__body" id="review-drawer-body">
+        <!-- populated by features/needs-you/needs-you.js -->
+      </div>
+    </div>
+  </div>
+
+  <!-- ---------- Global upload modal (CD-6 Slice 1, shell/add-menu.js) ---------- -->
+  <div id="upload-modal" class="modal-overlay" hidden>
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="upload-modal-title">
+      <div class="modal__header">
+        <h2 id="upload-modal-title">Upload</h2>
+        <button class="btn btn--ghost" id="upload-modal-close" type="button" aria-label="Close">&times;</button>
+      </div>
+      <div class="modal__body" id="upload-modal-body">
+        <!-- populated by shell/add-menu.js -->
+      </div>
+    </div>
+  </div>
+
+  <!-- ---------- Toast/notice stack (CD-6 Slice 1, shared/notify.js) ---------- -->
+  <div id="toast-stack" class="toast-stack" aria-live="polite"></div>
 
   <!-- ---------- Ask BAGMAN drawer (PID §42-44) ---------- -->
   <div id="ask-bagman-drawer" class="ask-bagman-drawer" hidden>

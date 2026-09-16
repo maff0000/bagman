@@ -8,6 +8,7 @@ import { el, clear, qs } from "../../shared/dom.js";
 import { fmtBytes, fmtDateTime, hashPrefix, statusBadge } from "../../shared/format.js";
 import { API, apiGet, errorMessage } from "../../shared/api.js";
 import { Detail } from "./detail.js";
+import { openUploadModal } from "../../shell/add-menu.js";
 
 export const Documents = {
   _loaded: false,
@@ -26,7 +27,19 @@ export const Documents = {
     this._loaded = true;
     this._wireUpload();
     this._wireFilters();
+    this._wireUploadInvoiceButton();
     this.load();
+    document.addEventListener("bagman:evidence-registered", () => this.load());
+  },
+
+  // CD-6 Slice 1 (PID §98.3) — "Also add Upload invoice within the
+  // Invoices/Documents tab": opens the SAME global upload modal
+  // (shell/add-menu.js) pre-selected to the invoice/receipt kind,
+  // rather than a second, duplicated upload form.
+  _wireUploadInvoiceButton() {
+    const btn = qs("#documents-upload-invoice");
+    if (!btn) return;
+    btn.addEventListener("click", () => openUploadModal("INVOICE_RECEIPT"));
   },
 
   // ---- filters / pagination ----

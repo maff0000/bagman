@@ -99,7 +99,11 @@ def main() -> None:
         section("1. APP LOADS")
         page.goto(BASE_URL + "/", wait_until="load", timeout=30_000)
         page.wait_for_selector("text=BAGMAN", timeout=10_000)
-        page.wait_for_selector(".shell-header__sub:has-text('Evidence Intake')", timeout=10_000)
+        # CD-6 Slice 1 (PID §98) renamed the shell subtitle from "Evidence
+        # Intake" to "Operations" — the GUI is no longer scoped to intake
+        # alone (Needs You/Activity tabs, global + Add). A deliberate text
+        # change, not a regression; updated here to match.
+        page.wait_for_selector(".shell-header__sub:has-text('Operations')", timeout=10_000)
         print("    page loaded; BAGMAN shell header visible.")
 
         section("2. DOCUMENTS SCREEN RENDERS")

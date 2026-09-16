@@ -28,6 +28,7 @@ EXPECTED_TABLES = {
     "audit_events",
     "intake_records",  # CD-4 WI-1
     "ai_invocations",  # CD-5 WI-1
+    "needs_you_items",  # CD-6 Slice 1
 }
 
 

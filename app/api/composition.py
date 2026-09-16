@@ -66,6 +66,7 @@ from core.api import BagmanCanonicalAPI
 from persistence.objects.store import EvidenceObjectStore
 from services.evidence.intake.intake import IntakeRepository
 from services.evidence.intake.scanner import EvidenceSafetyScanner, ScanResult, ScanVerdict
+from services.needs_you.needs_you import NeedsYouRepository
 
 #: Repo root, resolved once from this file's own location
 #: (``app/api/composition.py`` -> ``app/api`` -> ``app`` ->
@@ -294,6 +295,12 @@ class RuntimeComposition:
     #: full, preserved history of what it was and why it was
     #: superseded.
     claude_code_operator_runner: ClaudeCodeOperatorRunnerProtocol
+    #: CD-6 Slice 1 (PID §98.5) — the universal Needs You queue
+    #: repository. In-memory in development/test, a real
+    #: `PostgresNeedsYouRepository` (sharing the same `engine` as every
+    #: other Postgres-backed repository above) in production — never
+    #: mixed across modes, same discipline as `intake_repository`.
+    needs_you_repository: NeedsYouRepository
 
 
 def _build_development_or_test(runtime_environment: str) -> RuntimeComposition:
@@ -301,11 +308,13 @@ def _build_development_or_test(runtime_environment: str) -> RuntimeComposition:
     from ai.providers.litellm.fake import FakeLiteLLMClient
     from persistence.objects.memory_store import InMemoryObjectStore
     from services.evidence.intake.intake import InMemoryIntakeRepository
+    from services.needs_you.needs_you import InMemoryNeedsYouRepository
 
     api = BagmanCanonicalAPI()  # CD-2's own in-memory default construction
     object_store = InMemoryObjectStore()
     scanner = _AlwaysCleanDevelopmentScanner()
     intake_repository = InMemoryIntakeRepository()
+    needs_you_repository = InMemoryNeedsYouRepository()
 
     ai_invocation_repository = InMemoryAIInvocationRepository()
     # `default_response` closes the WI-4 dev-mode gap documented on
@@ -331,6 +340,7 @@ def _build_development_or_test(runtime_environment: str) -> RuntimeComposition:
         ai_invocation_repository=ai_invocation_repository,
         litellm_client=litellm_client,
         claude_code_operator_runner=claude_code_operator_runner,
+        needs_you_repository=needs_you_repository,
     )
 
 
@@ -348,6 +358,7 @@ def _build_production() -> RuntimeComposition:
         PostgresExternalReferenceRepository,
     )
     from persistence.postgres.intake_repository import PostgresIntakeRepository
+    from persistence.postgres.needs_you_repository import PostgresNeedsYouRepository
     from persistence.postgres.provenance_repository import PostgresProvenanceRepository
     from persistence.postgres.session import get_engine
     from persistence.postgres.source_repository import PostgresSourceRepository
@@ -392,6 +403,10 @@ def _build_production() -> RuntimeComposition:
     # CD-4 WI-3: durable intake repository, sharing the same engine as
     # every other Postgres-backed repository above.
     intake_repository = PostgresIntakeRepository(engine)
+
+    # CD-6 Slice 1 (PID §98.5): durable Needs You repository, sharing
+    # the same engine as every other Postgres-backed repository above.
+    needs_you_repository = PostgresNeedsYouRepository(engine)
 
     # CD-4 WI-3: a real ClamAV scanner — configured from
     # BAGMAN_SCANNER_HOST/BAGMAN_SCANNER_PORT (mirroring the existing
@@ -443,6 +458,7 @@ def _build_production() -> RuntimeComposition:
         ai_invocation_repository=ai_invocation_repository,
         litellm_client=litellm_client,
         claude_code_operator_runner=claude_code_operator_runner,
+        needs_you_repository=needs_you_repository,
     )
 
 
@@ -483,14 +499,16 @@ def reset_composition_for_tests() -> None:
     re-read ``BAGMAN_RUNTIME_ENV`` and rebuild from scratch — used by
     ``tests/app_api/`` to exercise both composition modes, and the
     no-fallback proof, within a single test process. Also clears the
-    memoized ``MANUAL_UPLOAD`` source id (CD-4 WI-3) — a source id
-    memoized against one composition (e.g. a prior test's disposable
-    Postgres database) would otherwise be silently stale/invalid
-    against the NEXT composition this process builds."""
-    global _composition, _manual_upload_source_id
+    memoized ``MANUAL_UPLOAD`` source id (CD-4 WI-3) and the memoized
+    canonical-entity seed ids (CD-6 Slice 1) — either, memoized against
+    one composition (e.g. a prior test's disposable Postgres database),
+    would otherwise be silently stale/invalid against the NEXT
+    composition this process builds."""
+    global _composition, _manual_upload_source_id, _seed_entity_ids
     with _lock:
         _composition = None
         _manual_upload_source_id = None
+        _seed_entity_ids = None
 
 
 # ---------------------------------------------------------------------
@@ -571,3 +589,109 @@ def get_manual_upload_source_id(composition: "RuntimeComposition") -> str:
         )
         _manual_upload_source_id = source.source_id
         return _manual_upload_source_id
+
+
+# ---------------------------------------------------------------------
+# Stable canonical entity seed lifecycle (CD-6 Slice 1, PID §98.3)
+# ---------------------------------------------------------------------
+#
+# PID §98.3: "Select from canonical BAGMAN entities. Initial expected
+# entities: Infosecurs Limited, NoustAI Limited, Matthew Scott Personal
+# ... These labels must not be hardcoded as business truth in the UI.
+# They map to canonical entity IDs." CD-6's own dispatch is explicit
+# that the seed mechanism should "follow the exact pattern already used
+# for get_manual_upload_source_id/_MANUAL_UPLOAD_SOURCE_TYPE" above —
+# this section is that same lifecycle, applied to three well-known
+# GovernedEntity rows instead of one well-known Source row:
+#
+#   1. an in-process memoized {canonical_name: entity_id} dict (fast
+#      path, no query at all once warm) — mirrors
+#      _manual_upload_source_id's own cache;
+#   2. for each of the three canonical names, a read-only
+#      find_by_canonical_name() lookup (the entity may already exist —
+#      created by an earlier process, or an earlier request in this
+#      same process before the memoized value was set);
+#   3. only if not found, register_entity() creates it.
+#
+# `entity_type` values: "COMPANY" for the two Limiteds, "PERSON" for
+# the personal entity — both are the contract's own DOCUMENTED (open,
+# non-enum-enforced) "known initial values" for entity_type
+# (contracts/entity/bagman.entity.v1.schema.json's own description:
+# "Known initial values (documentation only, not an enforced closed
+# set): COMPANY, PERSON"), not new ad hoc types invented for this
+# delivery.
+#
+# Trigger point: resolved lazily the first time GET /internal/entities
+# is called (app/api/routers/internal.py) — never inside
+# get_composition() itself, consistent with this module's own
+# documented "no eager PostgreSQL I/O at composition-build time"
+# invariant (see this module's top-of-file docstring: constructing the
+# PostgreSQL-backed repositories never itself contacts the database).
+# A GUI that has not yet loaded the entity dropdown simply has not
+# triggered the seed yet — exactly the same lazy-resolution shape
+# get_manual_upload_source_id has always had for its first caller
+# (POST /internal/intake/evidence).
+#
+# Known limitation, stated plainly rather than silently accepted — same
+# class of gap _MANUAL_UPLOAD_SOURCE_TYPE's own docstring already
+# accepts for CD-4, for the identical reason: no database-level
+# uniqueness constraint on governed_entities.canonical_name backs this
+# (unlike needs_you_items' or intake_records' own real partial unique
+# indexes), so a genuine multi-PROCESS cold-start race could each
+# independently create a duplicate canonical-name row. Acceptable for
+# CD-6 Slice 1 for the same reason it was acceptable for CD-4's
+# MANUAL_UPLOAD source: BAGMAN runs as a single bagman-api process/
+# container (no multi-replica deployment exists yet), so the only race
+# that matters in practice is intra-process, fully closed by the
+# module-level lock below. Flagged here for whoever introduces
+# multi-replica bagman-api, not solved speculatively now.
+_SEED_ENTITY_TYPE_COMPANY = "COMPANY"
+_SEED_ENTITY_TYPE_PERSON = "PERSON"
+
+#: (canonical_name, display_name, entity_type) — PID §98.3's own three
+#: "initial expected entities", in the order the GUI should offer them.
+SEED_ENTITIES: tuple[tuple[str, str, str], ...] = (
+    ("INFOSECURS_LIMITED", "Infosecurs Limited", _SEED_ENTITY_TYPE_COMPANY),
+    ("NOUSTAI_LIMITED", "NoustAI Limited", _SEED_ENTITY_TYPE_COMPANY),
+    ("MATTHEW_SCOTT_PERSONAL", "Matthew Scott Personal", _SEED_ENTITY_TYPE_PERSON),
+)
+
+_seed_entity_ids: Optional[dict[str, str]] = None
+
+
+def ensure_seed_entities(composition: "RuntimeComposition") -> dict[str, str]:
+    """Resolve (or, on first use, create) the three canonical
+    :data:`SEED_ENTITIES` rows (see module section docstring above).
+    Returns ``{canonical_name: entity_id}``, memoized for the life of
+    the process once every entity has been resolved."""
+    global _seed_entity_ids
+    if _seed_entity_ids is not None:
+        return _seed_entity_ids
+
+    with _lock:
+        if _seed_entity_ids is not None:
+            return _seed_entity_ids
+
+        resolved: dict[str, str] = {}
+        for canonical_name, display_name, entity_type in SEED_ENTITIES:
+            existing = composition.api.entity_repository.find_by_canonical_name(canonical_name)
+            if existing is not None:
+                resolved[canonical_name] = existing.entity_id
+                continue
+
+            entity = composition.api.register_entity(
+                entity_type=entity_type,
+                canonical_name=canonical_name,
+                display_name=display_name,
+                status="ACTIVE",
+                actor_type=actor.SYSTEM,
+                actor_id="bagman-entity-seed-bootstrap",
+                metadata={
+                    "note": "canonical entity seed, resolved-or-created once per process "
+                    "(CD-6 Slice 1, PID §98.3) — never re-created on a later call"
+                },
+            )
+            resolved[canonical_name] = entity.entity_id
+
+        _seed_entity_ids = resolved
+        return _seed_entity_ids

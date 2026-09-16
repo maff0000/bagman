@@ -90,7 +90,7 @@ from core.errors import (
     ValidationError,
 )
 from app.api.logging_config import configure_logging
-from app.api.routers import ai, health, intake, internal, operator, version
+from app.api.routers import activity, ai, health, intake, internal, needs_you, operator, version
 
 configure_logging(level=os.environ.get("BAGMAN_LOG_LEVEL", "INFO"))
 logger = logging.getLogger("bagman.runtime.api")
@@ -107,6 +107,10 @@ app.include_router(ai.router)
 #: operator.py), never added to routers/ai.py (WI-2's own in-parallel
 #: file) — see that router's own docstring.
 app.include_router(operator.router)
+#: CD-6 Slice 1 — the universal Needs You queue HTTP surface (PID
+#: §98.2/§98.5) and the cross-BAGMAN activity/audit stream (PID §98.8).
+app.include_router(needs_you.router)
+app.include_router(activity.router)
 
 #: CD-4 WI-4 — the BAGMAN Documents GUI (PID §36-42), served as plain
 #: static assets. Mounted LAST and at "/" so it never shadows any
