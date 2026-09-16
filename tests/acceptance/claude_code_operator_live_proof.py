@@ -11,10 +11,10 @@ OAuth/session credential mounted read-only from
 
 Supersedes ``tests/acceptance/claude_operator_live_proof.py`` (the
 CD-5 WI-5 script for the now-superseded direct-Anthropic-API design,
-which checks for ``/srv/bagman-secrets/anthropic_api_key`` — that file
+which checked for ``/srv/bagman-secrets/anthropic_api_key`` — that file
 is intentionally never provisioned under the corrected architecture;
-that script is NOT deleted, see the CD-5 evidence file's classification
-note, but no longer describes the authoritative path).
+that script was itself removed in the 2026-09-16 final cleanup delta —
+see the CD-5 evidence file §6n for the removal record).
 
 Covers the architect's numbered acceptance list (points 1/3/14 — the
 actual HTML-UI submission — are proven separately by

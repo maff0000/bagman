@@ -15,9 +15,9 @@ needed for this correction (PID §97's own "reuse the existing Ask
 BAGMAN UI, do not create another chat application" instruction). See
 ``PID.md`` §97 and the CD-5 evidence file for the full history; the
 superseded implementation (``agent/bagman/``, ``agent/tools/``,
-``ai/providers/claude/``) is NOT deleted, only no longer called from
-here — see those packages' own manifests for the architect's
-classification note.
+``ai/providers/claude/``) was subsequently removed entirely (2026-09-16
+final cleanup delta, once proven to have zero live dependents) — see
+the CD-5 evidence file §6n for the removal record.
 
 Kept in its own file, deliberately never adding routes to
 ``app/api/routers/ai.py`` (WI-2's own, in-parallel-created file this

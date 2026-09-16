@@ -3,9 +3,9 @@
 ``agent.bagman.orchestrator.handle_operator_message``, the CD-5 WI-3
 direct-Anthropic-API tool-calling-loop implementation; see ``PID.md``
 §97 and the CD-5 evidence file for the full architecture-correction
-history — that module is NOT deleted, see this package's own
-classification note, but is no longer reachable from
-``POST /internal/operator/chat``).
+history — that module was subsequently removed entirely, once proven
+to have zero live dependents (2026-09-16 final cleanup delta; see the
+CD-5 evidence file §6n for the removal record).
 
 ``handle_operator_message`` is the ONE function that turns one operator
 chat message into a governed, audited, bounded

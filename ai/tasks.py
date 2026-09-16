@@ -440,9 +440,12 @@ _ASK_BAGMAN_OUTPUT_SCHEMA: Mapping[str, Any] = {
 #: `evidence_id` review) because Ask BAGMAN may reason about an
 #: intake_id/entity_id instead, may call zero-or-more tools before
 #: answering, and its output is conversational rather than a per-
-#: document review. See `agent/bagman/orchestrator.py`'s module
-#: docstring for the full "general chat has no evidence_id" tension
-#: this task's `input_schema` resolves: `evidence_id`/`intake_id`/
+#: document review. See `agent/claude_code/orchestrator.py`'s module
+#: docstring (the CD-5 Gate-2 corrected implementation;
+#: `agent/bagman/orchestrator.py`, the original WI-3 implementation
+#: this comment once pointed to, was removed 2026-09-16 — see the CD-5
+#: evidence file §6n) for the full "general chat has no evidence_id"
+#: tension this task's `input_schema` resolves: `evidence_id`/`intake_id`/
 #: `entity_id` are each optional (nullable), but
 #: `ai.invocation.derive_primary_input_reference` still requires at
 #: least one non-null — a genuinely subject-less "what needs my
