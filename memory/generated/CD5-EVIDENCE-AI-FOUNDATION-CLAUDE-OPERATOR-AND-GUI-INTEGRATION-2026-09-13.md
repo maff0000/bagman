@@ -384,6 +384,10 @@ What it independently reproduced (not merely read/trusted):
 
 **Verdict: `GATE1_STRUCTURED_OUTPUT_DELTA_GREEN`, no unresolved concerns**, explicitly scoped to this delta only — no opinion offered or implied on the overall CD-5 verdict, which remains the architect's/PL's call per §6b's own correction note above.
 
+### Live CI at this delta's final head
+
+Per the standing lesson carried from CD-3 onward (local/Auditor-green and live-CI-green are different claims — always check the second directly): PR #5 was pushed to head `a2c2a12` (§6d/§6e's five commits: `0aa7f5f`, `e51c615`, `7df321d`, `eff0848`, `a2c2a12`). The GitHub Actions "Security" workflow (run `35081761506`) was watched directly to completion (`gh run watch`) — every step succeeded: gitleaks, architecture-memory drift check, all three test-suite steps (now including this delta's new/changed tests), nothing skipped. `gh pr view 5`: `mergeable: MERGEABLE`, `mergeStateStatus: CLEAN`, `state: OPEN` — **still not merged**, per standing instruction.
+
 ---
 
 ## 7. Exit-gate statement (PID §93) — drafted, not issued
