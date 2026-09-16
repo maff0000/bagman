@@ -1166,3 +1166,534 @@ Ask BAGMAN UI
 `ai/providers/claude/`, `agent/tools/`, and `agent/bagman/orchestrator.py` were, at the point this classification was first written, NOT deleted — see the CD-5 evidence file's own classification finding for the architect's ruling on their disposition before any removal. **This has since changed — see the correction note immediately below.**
 
 **Correction — final removal, 2026-09-16 (CD-5 Gate-1 and Gate-2 both CLOSED GREEN, `AI_FOUNDATION_GREEN` formally issued at head `6f47901c`):** the architect subsequently authorised, as one final bounded hygiene delta before merge, the removal of this same superseded direct-Anthropic operator implementation — `ai/providers/claude/`, `agent/tools/`, and `agent/bagman/orchestrator.py` — as ONE cohesive obsolete unit, plus every test/manifest/import/configuration line that existed solely to support it. This paragraph's own "NOT deleted" statement above is preserved as history, not rewritten: it accurately describes the state at the time it was written (before final closure). The removal itself is recorded as history, not erased: `ai/providers/claude/`, `agent/tools/`, and `agent/bagman/orchestrator.py` were the original CD-5 implementation; the architecture was superseded (by the bounded headless Claude Code operator documented above) before final closure; the classification finding referenced above proved zero live dependents on the superseded code before any file was touched; the removal itself was executed before merge specifically to prevent dual-authority ambiguity (i.e. to guarantee exactly one operator architecture, `agent/claude_code/`, is ever live in this repository — never two supposedly-authoritative implementations at once). See the CD-5 evidence file's own cleanup-delta section for the full removal record, required-checks verification, and the fresh focused Auditor's independent verdict on this delta.
+
+**CD-5 closed. `AI_FOUNDATION_GREEN` formally issued; PR #5 merged to `main` at merge commit `13c2282f052491cf0783597c326de26f25c9b35d` (2026-09-16T19:01:30Z, merged head `f9399acd90abe52ddabeabaa9c9e2df8c23ce36e`). Post-merge `main` CI confirmed green (run `35138032010`).**
+
+---
+
+# 98. CD-6 — GUI Operations Foundation (Architect build authority, 2026-09-16)
+
+CD-1 through CD-5 are CLOSED GREEN.
+
+From this point forward, BAGMAN product delivery becomes **GUI-led vertical slices**.
+
+The governing UX principle is:
+
+> Simple on the surface, extremely capable underneath.
+
+The operator should normally understand what needs attention within seconds of opening BAGMAN.
+
+## 98.1 Runtime requirement
+
+The BAGMAN GUI/application shall run on the dedicated Mac mini:
+
+`192.168.11.4`
+
+and shall be accessible to Matt from:
+
+`192.168.246.0/24`
+
+HELM owns deployment/network/firewall/startup acceptance.
+
+Do not silently move canonical PostgreSQL/MinIO merely to satisfy GUI placement. Application placement and canonical-data placement are separate decisions.
+
+## 98.2 GUI doctrine
+
+Use one coherent premium BAGMAN application shell.
+
+Design requirements:
+
+* clean and spacious;
+* highly readable;
+* restrained use of colour;
+* excellent desktop usability;
+* exceptions first;
+* drill-down instead of clutter;
+* original evidence beside BAGMAN's interpretation;
+* persistent Ask BAGMAN;
+* universal Needs You queue;
+* every automatic action logged;
+* no fake buttons;
+* no business logic in browser JavaScript.
+
+Overview should resemble:
+
+```text
+Good morning Matt
+
+4 things need your attention
+
+2 invoices need a company
+1 email needs classification
+1 rule proposal needs approval
+
+Everything else is running normally.
+```
+
+## 98.3 Global invoice / receipt / photo upload
+
+Add a prominent global:
+
+`+ Add`
+
+with:
+
+* Upload invoice / receipt
+* Upload other document
+* Add photo
+
+Also add `Upload invoice` within the Invoices tab.
+
+Supported evidence should include:
+
+* PDF
+* JPEG/JPG
+* PNG
+* HEIC if safely practical
+* multiple images/pages where practical
+
+All uploads MUST pass through the existing CD-4 governed evidence-intake pipeline.
+
+There is no special image-upload bypass.
+
+For newly uploaded invoices/receipts, BAGMAN should determine what it safely can and ask Matt only for missing information.
+
+The critical operator questions are:
+
+### Company
+
+Select from canonical BAGMAN entities.
+
+Initial expected entities:
+
+* Infosecurs Limited
+* NoustAI Limited
+* Matthew Scott Personal
+
+These labels must not be hardcoded as business truth in the UI. They map to canonical entity IDs.
+
+### What
+
+Accounting/business meaning.
+
+This should ultimately be coded using the selected company's real Xero Chart of Accounts.
+
+### Why
+
+Short business-purpose explanation.
+
+Example:
+
+```text
+Company: NoustAI Limited
+What: <Xero account: Computer Equipment>
+Why: GPU hardware for local inference R&D testing
+```
+
+The `why` field is first-class provenance and may later contribute to R&D/tax evidence.
+
+## 98.4 Xero reference-data doctrine
+
+BAGMAN SHALL NOT maintain a competing generic accounting-category vocabulary where Xero owns the actual accounting coding.
+
+Each BAGMAN company may map to one Xero organisation.
+
+For each connected Xero organisation, synchronise:
+
+`GET /api.xro/2.0/Accounts`
+
+Persist/cache at least:
+
+* Xero tenant / organisation ID
+* AccountID
+* Code
+* Name
+* Type
+* Class if supplied
+* TaxType
+* Status
+* ShowInExpenseClaims
+* ReportingCode
+* ReportingCodeName
+* UpdatedDateUTC
+* BAGMAN last-sync UTC
+
+The invoice/receipt account dropdown must display real Xero accounts for the currently selected company.
+
+Display should normally be:
+
+```text
+[400] Advertising
+[404] Bank Fees
+[420] Cleaning
+[429] General Expenses
+...
+```
+
+or whatever the organisation's actual Xero Chart of Accounts contains.
+
+Do not assume two companies have identical charts.
+
+BAGMAN AI may propose:
+
+> likely account = Software / Subscriptions
+
+but the actual selected value must resolve to the real Xero `AccountID`.
+
+Prefer active purchase/expense-appropriate accounts in the operator UI.
+
+`ShowInExpenseClaims` is useful metadata but is not automatically the only eligibility rule.
+
+When Xero is unavailable/not yet connected:
+
+```text
+Xero chart of accounts not connected
+```
+
+Do not fabricate account categories to make the screen look finished.
+
+Tax-rate/reference-data synchronisation should follow the same model.
+
+Do not build new functionality on Xero Classic Expense Claims / Receipts APIs (deprecated/decommissioning).
+
+## 98.5 Universal Needs You queue
+
+Create one cross-BAGMAN operator queue.
+
+Example:
+
+```text
+NEEDS YOU
+
+Screwfix receipt
+Which company is this for?
+
+AWS invoice
+What was this spend for?
+
+HMRC email
+Is this important?
+
+Adobe rule
+Always classify Adobe invoices as Infosecurs software?
+```
+
+Each item contains:
+
+* ID
+* type
+* source module
+* priority
+* created UTC
+* concise question
+* evidence/context
+* allowed answers/actions
+* resolution
+* resolved UTC
+* operator provenance
+
+Resolving one item should naturally advance to the next.
+
+## 98.6 TAB 1 — Email Inboxes
+
+This is the first operational tab.
+
+### Mailbox list
+
+Show:
+
+* mailbox address
+* provider
+* status
+* enabled/paused
+* last successful sweep
+* last error
+* relevant messages
+* needs-review count
+
+Actions:
+
+* Add
+* Edit
+* Pause / enable
+* Disconnect/delete
+* Test
+* Sweep now
+
+Initial adapters:
+
+1. Microsoft Graph — `matt@infosecurs.com`
+2. IMAP/OAuth-capable — `matt@noust.ai`
+3. Gmail adapters later
+
+Prove ONE real mailbox fully before broadening.
+
+Mailbox is a source, not a company/entity.
+
+### Email triage
+
+For each message show:
+
+* received UTC
+* sender
+* subject
+* mailbox
+* classification proposal
+* company proposal
+* confidence
+* reason
+* attachments
+* resulting evidence
+* operator action
+
+Governed classification vocabulary should cover at least:
+
+* supplier invoice
+* receipt
+* supplier statement
+* HMRC/tax
+* customer billing
+* subscription/renewal
+* payment failure
+* supplier correspondence
+* customer correspondence
+* irrelevant
+* unknown
+
+### Learning
+
+Matt's correction may create an explicit rule.
+
+Example:
+
+```text
+IF:
+sender domain = adobe.com
+AND:
+invoice-like PDF exists
+
+THEN:
+classification = supplier invoice
+company = INFOSECURS_LIMITED
+suggest Xero account = <AccountID>
+
+reason:
+Adobe software subscription
+```
+
+Rules must be:
+
+* visible;
+* editable;
+* disableable;
+* versioned;
+* auditable.
+
+Never hide important learned behaviour only inside AI/model memory.
+
+### Email Activity
+
+Every sweep creates a durable record:
+
+```text
+Mailbox: matt@infosecurs.com
+Messages examined: 47
+Relevant: 3
+Ignored: 42
+Needs review: 2
+Attachments ingested: 4
+Invoice candidates: 2
+Duplicates: 1
+Errors: 0
+```
+
+Drill-down identifies exactly why each message was processed/ignored.
+
+## 98.7 TAB 2 — Invoices
+
+Primary views:
+
+* Needs Review
+* Ready
+* Processed
+* Exceptions
+* Activity
+
+Avoid giant spreadsheet UX.
+
+Primary row/card should expose only essential information:
+
+```text
+Adobe                 £118.80
+Infosecurs            Ready
+Software subscription   99%
+```
+
+Open an invoice into a review surface showing:
+
+LEFT: original image/PDF
+
+RIGHT:
+
+* supplier
+* invoice number
+* date
+* due date
+* net
+* VAT
+* gross
+* currency
+* company
+* real Xero account
+* why
+* confidence
+* provenance
+
+Actions:
+
+* Approve
+* Correct
+* Reject/not invoice
+* Mark duplicate where applicable
+* Create/update supplier rule
+
+No Xero posting in this first slice unless separately authorised.
+
+The boundary should be:
+
+```text
+Evidence
+  ↓
+Invoice recognised
+  ↓
+Reviewed/coded
+  ↓
+Xero-ready
+```
+
+not:
+
+```text
+AI output → Xero
+```
+
+## 98.8 Activity / audit UX
+
+Every tab gets an Activity view.
+
+Simple default:
+
+```text
+10:42  Adobe invoice processed automatically
+10:38  Matt approved Screwfix receipt
+10:21  Mailbox sweep: 47 checked, 3 relevant
+09:56  Supplier rule created
+```
+
+Clicking an event reveals full forensic detail:
+
+* source evidence ID
+* audit event
+* AIInvocation
+* rule/version
+* operator
+* timestamps
+* old/new values
+* reason
+* confidence
+
+This allows:
+
+> What happened?
+
+and
+
+> Prove exactly what happened.
+
+without cluttering the normal GUI.
+
+## 98.9 Domain/persistence expectations
+
+Introduce proper durable concepts, approximately:
+
+* MailboxSource
+* MailSweep
+* EmailMessage
+* EmailDecision
+* ProcessingRule
+* InvoiceRecord / InvoiceCandidate
+* NeedsYouItem
+* ReferenceDataSnapshot
+* XeroAccountProjection
+
+Use existing canonical evidence/provenance/audit infrastructure.
+
+Idempotency is mandatory for:
+
+* mailbox message ingestion;
+* repeated mailbox sweeps;
+* attachment ingestion;
+* invoice creation;
+* rule execution.
+
+## 98.10 AI boundaries
+
+CD-5 remains binding.
+
+* AI output = proposal.
+* No direct canonical writes merely because a model answered.
+* Email/document text is untrusted DATA.
+* Use typed `bagman-fast/core/deep` contracts.
+* Ask BAGMAN remains bounded Claude Code.
+* Consequential AI output requires provenance and validation.
+
+## 98.11 Delivery order
+
+Build in this order:
+
+**Slice 1** — GUI visual refinement + universal Needs You + global receipt/photo upload.
+
+**Slice 2** — Canonical company selector + Xero-reference-data contracts/dropdowns.
+
+**Slice 3** — TAB 1 mailbox management.
+
+**Slice 4** — One real mailbox adapter + sweep engine.
+
+**Slice 5** — Email relevance/classification/operator corrections/rules/activity.
+
+**Slice 6** — TAB 2 invoice workflow consuming uploaded/email evidence.
+
+**Slice 7** — Mac deployment at `192.168.11.4` and live browser proof from `192.168.246.0/24`.
+
+Every slice must remain usable and coherent.
+
+Do not build fake integrations for screenshots.
+
+## 98.12 Acceptance
+
+GREEN requires real proof of:
+
+1. polished GUI running from Mac mini;
+2. reachable from `192.168.246.0/24`;
+3. universal Needs You queue;
+4. PDF/image receipt upload through CD-4 intake;
+5. original evidence beside BAGMAN's interpretation;
+6. company dropdown backed by canonical entities;
+7. Xero dropdown backed by real synced Xero Accounts when connected;
+8. visible failure if Xero reference data is unavailable;
+9. company / what / why review interaction;
+10. correction → explicit reusable rule;
+11. full activity/audit record;
+12. one real mailbox connected and swept;
+13. email attachment → evidence → invoice workflow;
+14. adversarial email/document prompt-injection proof;
+15. no direct AI canonical accounting writes;
+16. fresh independent Auditor;
+17. exact-head live CI GREEN;
+18. no merge without Architect ruling.
+
+Do not reinterpret ambiguity. Escalate it.
+
+## 98.13 Branch record
+
+Branched from `main` at `13c2282f052491cf0783597c326de26f25c9b35d` (CD-5 merge commit) as `cd-6/gui-operations-foundation`, by the PL under this section's own architect authority — the branch/issue creation the architect attempted directly failed with `403 Resource not accessible by integration` on the architect's own GitHub connector (a permission gap on that connector, not a repository restriction); the PL's own git/GitHub access is a separate credential and was unaffected, so the branch is created here rather than by writing directly to `main`.
