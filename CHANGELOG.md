@@ -257,3 +257,52 @@ All notable changes to BAGMAN will be documented in this file.
   `/srv/bagman-secrets/anthropic_api_key` still does not exist as of
   this entry. **CD-5 remains `BLOCKED`, not the final unqualified
   `AI_FOUNDATION_GREEN`, until Gate 2 also closes.**
+
+### 2026-09-16 (same day, later still) — Gate-2 architecture correction and closure
+
+- **Architect correction**: BAGMAN does not use a direct Anthropic API
+  key for its operator intelligence — the "Gate 2 blocked on
+  `/srv/bagman-secrets/anthropic_api_key`" framing above is itself
+  superseded. The PL investigated the architect's "already-proven"
+  framing before implementing anything (a host-wide, read-only search)
+  and found no existing implementation to reuse; the architect
+  authorised a new, bounded implementation instead, built from two
+  separately-proven precedents (synchronous FastAPI AI wrappers,
+  headless `claude -p` invocation).
+- New `agent/claude_code/` package: the ONE place BAGMAN ever execs a
+  `claude` subprocess. Fixed executable/argument contract (never
+  `shell=True`, never shell-string interpolation); `--tools ""` +
+  `--restricted` + `--strict-mcp-config` strip the invoked process of
+  every tool/MCP/ambient-settings capability — its authority is a
+  strict subset of this host's own normal Claude Code development-agent
+  authority, never inherited from it. No live tool-calling loop —
+  BAGMAN assembles governed context before one bounded, synchronous
+  invocation. Same `AskBagmanResult`/`AIInvocation`/`ASK_BAGMAN` v1
+  contract the superseded design used, so the GUI needed zero code
+  changes to its Ask BAGMAN drawer (one real, separate Overview-widget
+  bug — reading the wrong health-check key — was found and fixed
+  while preparing the browser proof).
+- Real Docker packaging: the actual `claude` native binary baked into
+  the `bagman-api` image; a dedicated Claude Code OAuth/session
+  credential (never an API key) mounted read-only.
+- Real live acceptance, against the real rebuilt container: HTTP-level
+  proof (no Anthropic key needed; real transport and response; browser
+  cannot influence process control; no source mutation/shell/SQL
+  access; prompt-injection content stays data; a real dependency-
+  failure/recovery proof; no silent fallback to `bagman-fast/core/deep`;
+  canonical state unchanged; full provenance recorded) — PASS. Real
+  Playwright browser proof (a real question submitted from the actual
+  HTML page, a real answer rendering back synchronously, a reliable
+  second turn) — PASS.
+- `ai/providers/claude/`, `agent/tools/`, and `agent/bagman/
+  orchestrator.py` are NOT deleted — classified as one cohesive
+  obsolete unit (with one nuance: the 8 tool implementations'
+  underlying logic could resurface differently later) and returned for
+  the architect's ruling before any removal.
+- Full evidence at
+  `memory/generated/CD5-EVIDENCE-AI-FOUNDATION-CLAUDE-OPERATOR-AND-GUI-INTEGRATION-2026-09-13.md`
+  §6i-§6m; `PID.md` §97.
+- **Both Gate 1 and Gate 2 are now GREEN. The final, unqualified
+  `AI_FOUNDATION_GREEN` verdict is met in substance**, pending the
+  architect's own formal issuance after a fresh, focused independent
+  Auditor reviews the Gate-2 delta specifically.
