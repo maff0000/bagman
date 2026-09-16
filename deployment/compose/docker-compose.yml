@@ -217,47 +217,55 @@ services:
       BAGMAN_OBJECT_STORE_SECRET_KEY_FILE: /run/secrets/minio_root_user_password
       BAGMAN_SCANNER_HOST: bagman-scan
       BAGMAN_SCANNER_PORT: "3310"
-      # CD-5 WI-2 (PID §8/§15/§50): the existing Trinity LiteLLM
-      # installation's endpoint, alias-only requests
+      # CD-5 Gate-1 real-provider acceptance closure (2026-09-16,
+      # superseding the CD-5 WI-2/WI-5 narrative below): HELM has
+      # returned `BAGMAN_AI_APPLIANCE_GREEN` — BAGMAN's background
+      # inference authority is no longer the shared Trinity LiteLLM
+      # installation (`local-ai-gateway`, host port 4000). It is now a
+      # dedicated, BAGMAN-exclusive AI appliance at
+      # `http://192.168.11.4:4100` — the same dedicated Mac mini
+      # (`mac-prod-01`, see CLAUDE.md's Equipment Access table) the
+      # locked three-tier topology (PID §2/§8/§9) always named as
+      # BAGMAN's primary background tier, now fronted by its own
+      # dedicated LiteLLM installation instead of sharing Trinity's.
+      # This is still alias-only routing
       # (bagman-fast/bagman-core/bagman-deep — never a raw model name,
-      # never the Mac mini directly). The exact production network path
-      # between this Compose project's bagman-net and wherever the
-      # Trinity LiteLLM container actually runs is a deployment-level
-      # integration detail established by whoever wires the two Compose
-      # projects together (PID §15).
+      # never the Mac mini's own Ollama port 11434 directly) — nothing
+      # about `ai/providers/litellm/client.py`'s own contract changes,
+      # only which real gateway process this env var points at.
       #
-      # CD-5 WI-5 fix (2026-09-13): WI-2's own original value here
-      # (`http://localhost:4000`) was verified, in this WI, to be
-      # genuinely broken for `bagman-api` itself — `localhost` inside
-      # `bagman-api`'s own container refers to that container, not the
-      # host machine, so a real Docker-Compose-stack acceptance attempt
-      # could never reach the gateway at all (WI-2's own local
-      # inspection tested this literally from the host's shell, not
-      # from inside the container it wrote this value for). The real
-      # Trinity LiteLLM gateway (a separate, pre-existing Docker
-      # container on this host, `local-ai-gateway`) publishes its port
-      # to the HOST's own network stack (`0.0.0.0:4000`), not to
-      # `bagman-net` — it is not a service of BAGMAN's own Compose
-      # project, and joining it to `bagman-net` (or vice versa) is
-      # infrastructure ownership outside this Compose file's own
-      # authority (PID §15's own "deployment-level integration detail
-      # established by whoever wires the two Compose projects
-      # together"). `host.docker.internal` (below, via `extra_hosts`)
-      # is the correct, safe fix that stays entirely within THIS
-      # service's own definition: it resolves, from inside
-      # `bagman-api`'s container, to the Docker host's own gateway IP —
-      # verified reachable on this host (Docker 29.3.0, Linux) via a
-      # throwaway `docker run --add-host=host.docker.internal:host-gateway
-      # alpine curl http://host.docker.internal:4000/health/readiness`,
-      # which returned the real gateway's own JSON response. This does
-      # NOT fix the SEPARATE, independently-verified LiteLLM-gateway
-      # database outage (`{"status":"healthy","db":"Not connected"}` /
-      # every real `/v1/chat/completions` call failing with
-      # `400 no_db_connection`) — that remains Helm/Trinity-owned
-      # infrastructure, entirely outside BAGMAN's authority, and is
-      # recorded as its own separate, still-open gap in the WI-5
-      # evidence file.
-      BAGMAN_LITELLM_ENDPOINT: http://host.docker.internal:4000
+      # Verified live before this change (2026-09-16, PL's own direct
+      # check, not merely relayed): `GET
+      # http://192.168.11.4:4100/health/readiness` -> `{"status":
+      # "healthy","db":"connected"}` (contrast the old shared gateway's
+      # persistent `"db":"Not connected"`); real authenticated
+      # `POST /v1/chat/completions` succeeded for all three aliases; a
+      # raw physical model name (`gemma4:12b`) was independently
+      # rejected by the appliance's OWN key scoping with `HTTP 403
+      # key_model_access_denied` — defense-in-depth alongside BAGMAN's
+      # own `validate_capability_alias` boundary check, neither
+      # relying on the other.
+      #
+      # No `host.docker.internal`/`extra_hosts` trick is needed for
+      # this endpoint (unlike the old `http://localhost:4000` value,
+      # see CD-5 WI-5's fix below) — `192.168.11.4` is a real LAN
+      # address, not host-loopback, and is directly routable from
+      # `bagman-net` the same way any other external host is.
+      #
+      # --- Prior architecture (CD-5 WI-2/WI-5, retained for history) ---
+      # WI-2 originally pointed this at the shared Trinity LiteLLM
+      # installation; WI-5 (2026-09-13) fixed a genuine `bagman-api`
+      # container-networking defect against THAT gateway (`localhost`
+      # inside `bagman-api`'s own container referred to the container
+      # itself, not the host — fixed via `host.docker.internal` +
+      # `extra_hosts: host-gateway`, Docker-Engine-native since 20.10).
+      # That gateway's OWN backing database was then found down
+      # (`400 no_db_connection` on every completion) — Helm/Trinity-
+      # owned infrastructure, outside BAGMAN's authority — which HELM
+      # first attempted to fix via key rotation (partially/
+      # intermittently effective, see CD-5 evidence file §6d) and has
+      # now superseded entirely with the dedicated appliance above.
+      BAGMAN_LITELLM_ENDPOINT: http://192.168.11.4:4100
       BAGMAN_LITELLM_API_KEY_FILE: /run/secrets/litellm_gateway_key
       # CD-5 WI-3 (PID §13/§17-18): NOT set here yet — deliberately.
       # ai/providers/claude/client.py's own `_DEFAULT_API_KEY_FILE`
@@ -270,14 +278,13 @@ services:
       # ClaudeClient's own default path already matches.
       BAGMAN_LOG_LEVEL: INFO
       TZ: UTC
-    # host-gateway: a Docker-Engine-native (not Docker-Desktop-only)
-    # mechanism, supported since Docker 20.10 — this host runs 29.3.0 —
-    # that maps `host.docker.internal` to the real host gateway IP
-    # without any other infrastructure change. Scoped to this one
-    # service only; does not touch bagman-db/bagman-objects/bagman-scan,
-    # which have no need to reach the host.
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
+    # `extra_hosts: host.docker.internal:host-gateway` (CD-5 WI-5,
+    # 2026-09-13) was here to reach the old shared Trinity LiteLLM
+    # gateway at `http://localhost:4000` from inside this container —
+    # see BAGMAN_LITELLM_ENDPOINT's own comment above. Removed
+    # 2026-09-16: the new dedicated AI appliance
+    # (`http://192.168.11.4:4100`) is a real LAN address, directly
+    # routable from `bagman-net` without this mapping.
     secrets:
       - postgres_password
       - minio_root_user

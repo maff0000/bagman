@@ -33,6 +33,17 @@ trusting (per this WI's own dispatch)
    real running container, as its own first step — independently of
    whether the upstream LiteLLM database is healthy.
 
+CD-5 Gate-1 closure update (2026-09-16): BAGMAN's background-inference
+authority moved from the shared Trinity LiteLLM installation to HELM's
+dedicated BAGMAN AI appliance (`http://192.168.11.4:4100`,
+`BAGMAN_AI_APPLIANCE_GREEN`) — see
+`deployment/compose/docker-compose.yml`'s own comment for the full
+history. `192.168.11.4` is a real LAN address, reachable directly from
+`bagman-net` without the `host.docker.internal` trick, so this
+script's network-path check below now targets that address; the
+`host.docker.internal`/`extra_hosts` fix itself is retained here only
+as history (see the compose file), not because it is still load-bearing.
+
 What this proves, for real, regardless of the database-outage condition
 --------------------------------------------------------------------------
 * `bagman-api`'s own network path to the real LiteLLM gateway now
@@ -92,7 +103,7 @@ def _check_network_path_from_inside_container() -> dict:
     script = (
         "import json, urllib.request\n"
         "try:\n"
-        "    r = urllib.request.urlopen('http://host.docker.internal:4000/health/readiness', timeout=5)\n"
+        "    r = urllib.request.urlopen('http://192.168.11.4:4100/health/readiness', timeout=5)\n"
         "    print(json.dumps({'reachable': True, 'status': r.status, 'body': r.read().decode()}))\n"
         "except Exception as e:\n"
         "    print(json.dumps({'reachable': False, 'error': f'{type(e).__name__}: {e}'}))\n"
@@ -132,14 +143,14 @@ def main() -> None:
     network_check = _check_network_path_from_inside_container()
     print(f"    from inside bagman-api's own container: {network_check}")
     assert network_check["reachable"] is True, (
-        "bagman-api still cannot reach the real LiteLLM gateway at all — the "
-        "host.docker.internal/extra_hosts fix did not hold: " + json.dumps(network_check)
+        "bagman-api still cannot reach the dedicated BAGMAN AI appliance at all (192.168.11.4:4100): "
+        + json.dumps(network_check)
     )
-    print("    CONFIRMED: bagman-api's container-network path to the real LiteLLM gateway now genuinely works.")
+    print("    CONFIRMED: bagman-api's container-network path to the dedicated BAGMAN AI appliance now genuinely works.")
 
-    section("2. LIVE INFRASTRUCTURE CHECK — is the LiteLLM gateway's backing database still down? (re-checked live, not assumed)")
-    readiness = requests.get("http://localhost:4000/health/readiness", timeout=5).json()
-    print(f"    GET http://localhost:4000/health/readiness -> {readiness}")
+    section("2. LIVE INFRASTRUCTURE CHECK — is the BAGMAN AI appliance's backing database up? (re-checked live, not assumed)")
+    readiness = requests.get("http://192.168.11.4:4100/health/readiness", timeout=5).json()
+    print(f"    GET http://192.168.11.4:4100/health/readiness -> {readiness}")
     db_connected = readiness.get("db") not in (None, "Not connected")
     print(f"    gateway backing database connected: {db_connected}")
 
@@ -217,8 +228,8 @@ def main() -> None:
     print(f"    retry created a new, distinct invocation: {retry_invocation['ai_invocation_id']}")
 
     section("SUMMARY")
-    print(f"    network-path fix (host.docker.internal)         : PROVEN — bagman-api genuinely reaches the real gateway")
-    print(f"    LiteLLM gateway backing database                : {'CONNECTED' if db_connected else 'STILL DOWN (re-checked live)'}")
+    print(f"    network-path to dedicated appliance (192.168.11.4:4100) : PROVEN — bagman-api genuinely reaches it")
+    print(f"    BAGMAN AI appliance backing database             : {'CONNECTED' if db_connected else 'STILL DOWN (re-checked live)'}")
     print(f"    bagman-fast (Mac-mini tier) real call            : {fast_tier_status}")
     print(f"    bagman-core (Mac-mini tier) real call            : {core_tier_status}")
     print(f"    canonical evidence unaffected                    : PROVEN")

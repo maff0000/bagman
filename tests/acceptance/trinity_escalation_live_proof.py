@@ -38,6 +38,16 @@ exactly what it finds either way — genuinely completing the full proof
 if the database has recovered, or reporting the exact real error if
 not.
 
+CD-5 Gate-1 closure update (2026-09-16): the endpoint this script
+re-checks, and `BAGMAN_LITELLM_ENDPOINT` itself, now point at HELM's
+dedicated BAGMAN AI appliance (`http://192.168.11.4:4100`,
+`BAGMAN_AI_APPLIANCE_GREEN`) rather than the old shared Trinity
+gateway (`local-ai-gateway`, host port 4000) — see
+`deployment/compose/docker-compose.yml`'s own comment for the full
+history. The script's own logic, assertions, and honesty discipline
+are unchanged; only the URL this section's live re-check hits was
+updated to match.
+
 Run standalone (brings the stack up itself first):
 
     python3 tests/acceptance/trinity_escalation_live_proof.py
@@ -109,9 +119,9 @@ def main() -> None:
 
     tag = run_id()
 
-    section("LIVE INFRASTRUCTURE CHECK — is the LiteLLM gateway's backing database still down? (re-checked live)")
-    readiness = requests.get("http://localhost:4000/health/readiness", timeout=5).json()
-    print(f"    GET http://localhost:4000/health/readiness -> {readiness}")
+    section("LIVE INFRASTRUCTURE CHECK — is the BAGMAN AI appliance's backing database up? (re-checked live)")
+    readiness = requests.get("http://192.168.11.4:4100/health/readiness", timeout=5).json()
+    print(f"    GET http://192.168.11.4:4100/health/readiness -> {readiness}")
     db_connected = readiness.get("db") not in (None, "Not connected")
     print(f"    gateway backing database connected: {db_connected}")
 
@@ -130,7 +140,8 @@ def main() -> None:
     assert result["status"] not in ("TRANSPORT_ERROR", "TIMEOUT"), (
         f"the real network path to the LiteLLM gateway appears to have regressed (status={result['status']}, "
         f"detail={result['error_detail']!r}) — this is NOT the expected 'reached the gateway, got a real "
-        "error response' condition; investigate the host.docker.internal/extra_hosts fix"
+        "error response' condition; investigate connectivity to the dedicated BAGMAN AI appliance at "
+        "192.168.11.4:4100 (BAGMAN_LITELLM_ENDPOINT)"
     )
 
     if result["status"] == "OK":
