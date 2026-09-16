@@ -255,12 +255,19 @@ def handle_operator_message(
         "num_turns": result.num_turns,
         "permission_denials": list(result.permission_denials),
     }
-    # provider_model (PID §10/§24 — audit-only provenance): the first
-    # model name Claude Code's own `modelUsage` breakdown reports, if
-    # any (it may list more than one — e.g. an internal routing/
-    # classification model alongside the main response model; this is
-    # a best-effort audit label, never read anywhere for a decision).
-    provider_model = next(iter(result.model_usage), None)
+    # provider_model (PID §10/§24 — audit-only provenance): Claude
+    # Code's own `modelUsage` breakdown may list more than one model
+    # (e.g. a small internal routing/classification call alongside the
+    # main response) — the one with the most output_tokens is the best
+    # available proxy for "the model that actually generated the
+    # visible response text", never read anywhere for a routing
+    # decision, purely an audit label.
+    provider_model = None
+    if result.model_usage:
+        provider_model = max(
+            result.model_usage,
+            key=lambda name: (result.model_usage[name] or {}).get("outputTokens", 0),
+        )
 
     if result.status != ClaudeCodeOutcomeStatus.OK:
         logger.warning(

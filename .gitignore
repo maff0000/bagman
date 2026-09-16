@@ -13,6 +13,14 @@ secrets/
 credentials.json
 token.json
 
+# --- CD-5 Gate-2: the real `claude` native binary, staged into the
+# Docker build context by deployment/docker/api/prepare-claude-binary.sh
+# immediately before `docker compose build` — never committed (it is a
+# large, host-specific binary artifact, not source; see that script's
+# own docstring for why it is prepared this way rather than downloaded
+# inside the Dockerfile). ---
+deployment/docker/api/bin/
+
 # --- Runtime / generated / production data ---
 runtime/
 data/

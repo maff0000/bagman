@@ -1129,4 +1129,38 @@ Mac-owned LiteLLM + PostgreSQL
   └── bagman-deep → Trinity escalation backend
 ```
 
-Claude remains a wholly separate, independent Anthropic operator path (§8/§13/§17 unaffected). The existing/shared Trinity LiteLLM gateway is **no longer BAGMAN's primary AI control plane** — BAGMAN's own three aliases (`bagman-fast`/`bagman-core`/`bagman-deep`), its alias-only routing boundary, its per-request structured-output schema contract, and its unconditional post-response validation are all unaffected by which real gateway process sits behind them; this is a deployment-level topology change, not an architectural/contract one. Full closure history — the credential-rotation attempt, the appliance provisioning, the `bagman-fast`/`bagman-core` reliability investigation (root-caused to a stale appliance-side `extra_body.format:"json"` override clobbering BAGMAN's correctly-generated schema constraint, fixed by HELM), and the full acceptance evidence — is preserved in `memory/generated/CD5-EVIDENCE-AI-FOUNDATION-CLAUDE-OPERATOR-AND-GUI-INTEGRATION-2026-09-13.md`.
+Claude remains a wholly separate operator path (§8/§13/§17 unaffected in SPIRIT — Claude is still BAGMAN's operator intelligence, still governed by BAGMAN tools/APIs, still never touches canonical state directly). **Correction (2026-09-16, later the same day — see §97 below): the specific claim that this is "an independent Anthropic operator path" reached via a direct Anthropic API key is itself superseded — read §97 before relying on this sentence.** The existing/shared Trinity LiteLLM gateway is **no longer BAGMAN's primary background-inference control plane** — BAGMAN's own three aliases (`bagman-fast`/`bagman-core`/`bagman-deep`), its alias-only routing boundary, its per-request structured-output schema contract, and its unconditional post-response validation are all unaffected by which real gateway process sits behind them; this is a deployment-level topology change, not an architectural/contract one. Full closure history — the credential-rotation attempt, the appliance provisioning, the `bagman-fast`/`bagman-core` reliability investigation (root-caused to a stale appliance-side `extra_body.format:"json"` override clobbering BAGMAN's correctly-generated schema constraint, fixed by HELM), and the full acceptance evidence — is preserved in `memory/generated/CD5-EVIDENCE-AI-FOUNDATION-CLAUDE-OPERATOR-AND-GUI-INTEGRATION-2026-09-13.md`.
+
+---
+
+# 97. Operator Architecture Correction (Architect ruling, 2026-09-16, same day as §96)
+
+This addendum corrects §13's "second, separate secret governs the Claude operator provider" text and §17-18's implicit assumption of a direct Anthropic Messages API integration. **Preserve history: §13/§17/§18 above are NOT deleted or rewritten — they record what the original CD-5 design assumed. This section records what is actually authoritative now.**
+
+**Original design (§13/§17/§18, as first written):** BAGMAN holds a BAGMAN-scoped Anthropic API key at `/srv/bagman-secrets/anthropic_api_key`, mounted at `/run/secrets/anthropic_api_key`, and a direct Anthropic Messages API adapter (`ai/providers/claude/`) calls Claude directly, with a BAGMAN-owned tool-calling loop (`agent/tools/`, `agent/bagman/orchestrator.py`) exposing 8 governed read-only/analyse-only tools Claude may invoke live, mid-conversation.
+
+**Corrected, authoritative design (2026-09-16):** BAGMAN does **not** use a direct Anthropic API key for its operator intelligence. The proven operator architecture is:
+
+```text
+Matt
+  ↓
+BAGMAN Ask BAGMAN HTML UI
+  ↓
+bagman-api
+  ↓
+bounded Claude Code operator runner
+  ↓
+claude -p
+  ↓
+governed BAGMAN read/analyse context
+  ↓
+response
+  ↓
+Ask BAGMAN UI
+```
+
+`agent/claude_code/` (new package) owns this: `runner.py` is the one place in the whole repository that ever execs a `claude` subprocess — fixed executable/argument contract, `--tools ""` + `--restricted` + `--strict-mcp-config` strip the invoked process of every tool/MCP/ambient-settings capability, so its authority is a strict SUBSET of, never inherited from, this host's own normal Claude Code development-agent authority. There is no live tool-calling loop in this design — BAGMAN's own application layer (`context.py`) assembles all governed context (evidence/intake/entity, fetched directly from BAGMAN's canonical services) BEFORE the one bounded, synchronous invocation (`orchestrator.py`), per this same section's own "keep it bounded... simple synchronous request/response... do not build a general autonomous multi-agent platform" instruction.
+
+**Claude Code owns its own authentication/session mechanism entirely** — BAGMAN's own code never reads, writes, transmits, or even knows the shape of any Anthropic credential for this path. `/srv/bagman-secrets/anthropic_api_key` is explicitly **not** a CD-5 blocker and is never provisioned under this corrected architecture — §13's text above describing it is historical, not a live requirement. The operator boundary remains governed exactly as §17 always required: Claude may inspect governed BAGMAN information, explain, summarise, analyse, review AI proposals, identify exceptions, and recommend next actions to Matt — it may not edit BAGMAN source, run shell commands, execute SQL, manipulate Docker, read arbitrary host files, access unrelated secrets, move money, write accounting/tax truth, send email, or alter canonical state; under the corrected design this is enforced structurally (zero tools exist to even attempt any of it), a stronger guarantee than §17's original tool-registry-based enforcement, not a weaker one.
+
+`ai/providers/claude/`, `agent/tools/`, and `agent/bagman/orchestrator.py` are NOT deleted — see the CD-5 evidence file's own classification finding for the architect's ruling on their disposition before any removal.

@@ -276,6 +276,17 @@ services:
       # until Matt provisions the real credential, at which point
       # uncommenting the secret block above is sufficient on its own —
       # ClaudeClient's own default path already matches.
+      # CD-5 Gate-2 closure (2026-09-16, PID §97): the bounded headless
+      # Claude Code operator runner (agent/claude_code/runner.py) needs
+      # its own HOME so `claude` can find its own OAuth/session
+      # credential — never an Anthropic API key (see the now-superseded
+      # `anthropic_api_key` block below, kept commented out/unused).
+      # Mounted read-only from the host below (`volumes:`); a bounded,
+      # dedicated working directory is created by the runner itself
+      # inside the container's own writable layer, no host mount
+      # needed for it.
+      BAGMAN_CLAUDE_CODE_HOME: /home/claude-operator
+      BAGMAN_CLAUDE_CODE_CWD: /tmp/claude-code-operator-cwd
       BAGMAN_LOG_LEVEL: INFO
       TZ: UTC
     # `extra_hosts: host.docker.internal:host-gateway` (CD-5 WI-5,
@@ -290,7 +301,22 @@ services:
       - minio_root_user
       - minio_root_user_password
       - litellm_gateway_key
-      # - anthropic_api_key   # uncomment once /srv/bagman-secrets/anthropic_api_key exists (see above)
+      # - anthropic_api_key   # SUPERSEDED (2026-09-16, Gate-2 closure) — no longer needed; BAGMAN does not hold an Anthropic API key (see PID.md §97)
+    # CD-5 Gate-2 closure: a dedicated Claude Code OAuth/session
+    # credential directory — NOT an Anthropic API key, NOT a Compose
+    # `secrets:` entry (those are single-file only; this is a small
+    # directory: `.claude/.credentials.json` and whatever else Claude
+    # Code's own auth mechanism stores). Mounted read-only. First-pass
+    # provisioning mechanism, flagged plainly (see
+    # deployment/docker/api/prepare-claude-binary.sh's own docstring
+    # for the matching caveat on the `claude` binary itself): this
+    # currently reuses a real, already-authenticated Claude Code
+    # session's own credential, copied to this dedicated path — a
+    # more formal, BAGMAN-dedicated credential (e.g. via
+    # `claude setup-token`) is a real future hardening step, not
+    # solved speculatively here.
+    volumes:
+      - /srv/bagman-secrets/claude_code_home:/home/claude-operator:ro
     # The one deliberate host-published entry point (PID §5) — bound to
     # loopback only, not 0.0.0.0.
     ports:

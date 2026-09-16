@@ -57,6 +57,18 @@ COPY alembic/ ./alembic/
 COPY alembic.ini ./alembic.ini
 COPY VERSION ./VERSION
 
+# CD-5 Gate-2 closure (2026-09-16, PID §97): the real `claude` native
+# binary the bounded headless operator runner
+# (agent/claude_code/runner.py) execs. Staged into
+# deployment/docker/api/bin/claude by
+# deployment/docker/api/prepare-claude-binary.sh BEFORE this build
+# runs (that script's own docstring explains why — never committed to
+# git, see .gitignore) — this COPY fails loudly, not silently, if that
+# preparation step was skipped, which is the correct fail-closed
+# behaviour (no silent fallback to a missing operator surface).
+COPY deployment/docker/api/bin/claude /usr/local/bin/claude
+RUN chmod +x /usr/local/bin/claude
+
 COPY deployment/docker/api/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
