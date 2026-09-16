@@ -223,3 +223,37 @@ All notable changes to BAGMAN will be documented in this file.
   `memory/generated/CD5-EVIDENCE-AI-FOUNDATION-CLAUDE-OPERATOR-AND-GUI-INTEGRATION-2026-09-13.md`
   §6b (correction note), §6d, §6e. **CD-5 remains `BLOCKED`, not
   `GREEN`, until Gate 2 also closes.**
+
+### 2026-09-16 (same day, later) — Gate-1 isolation experiment and architect GREEN ruling
+
+- A controlled 50-call isolated (zero concurrent load) `ENTITY_PROPOSAL`/
+  `bagman-core` experiment reached **49/50** — a real, low-rate schema-
+  compliance gap, safety net proven robust throughout (every failure
+  correctly rejected, never a false success). Per the architect's own
+  stop-rule, this halted Gate-1 closure and was handed to HELM rather
+  than worked around in BAGMAN code.
+- **Final root cause**: not a Gemma/Ollama/LiteLLM/BAGMAN-timeout/
+  concurrency-only defect — a stale appliance-side
+  `extra_body.format:"json"` override, left from before this Gate-1
+  delta existed, was clobbering BAGMAN's correctly-generated
+  schema-constrained request on some calls. HELM removed the stale
+  override, retaining only `think:false`.
+- **Final authoritative acceptance**: `bagman-core` 100/100 isolated +
+  20/20 under controlled load; `bagman-fast` 10/10; `bagman-deep`
+  unaffected. Alias-only enforcement and BAGMAN's own unconditional
+  post-response validation reconfirmed unaffected. No BAGMAN code
+  changed to reach this result.
+- **Architect ruling: `BAGMAN_CORE_STRUCTURED_GREEN` — Gate 1 (all
+  three background tiers) is GREEN.** Final architecture: BAGMAN → a
+  dedicated, BAGMAN-exclusive Mac AI appliance (its own LiteLLM +
+  PostgreSQL) → `bagman-fast`/`bagman-core` (local Mac model) and
+  `bagman-deep` (Trinity escalation) — the shared Trinity LiteLLM
+  gateway is no longer BAGMAN's primary AI control plane. Claude
+  remains a wholly independent Anthropic operator path. Full addendum
+  at `PID.md` §96; full evidence at
+  `memory/generated/CD5-EVIDENCE-AI-FOUNDATION-CLAUDE-OPERATOR-AND-GUI-INTEGRATION-2026-09-13.md`
+  §6g/§6h.
+- **Gate 2 (Claude) is the sole remaining CD-5 blocker** —
+  `/srv/bagman-secrets/anthropic_api_key` still does not exist as of
+  this entry. **CD-5 remains `BLOCKED`, not the final unqualified
+  `AI_FOUNDATION_GREEN`, until Gate 2 also closes.**

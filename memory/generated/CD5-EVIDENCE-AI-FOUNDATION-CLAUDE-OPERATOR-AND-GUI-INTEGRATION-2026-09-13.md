@@ -411,7 +411,53 @@ Matt ruled a controlled isolation experiment before any HELM escalation, with an
 
 ### Live CI at this delta's final head
 
-Per the standing lesson carried from CD-3 onward (local/Auditor-green and live-CI-green are different claims — always check the second directly): PR #5 was pushed to head `a2c2a12` (§6d/§6e's five commits: `0aa7f5f`, `e51c615`, `7df321d`, `eff0848`, `a2c2a12`). The GitHub Actions "Security" workflow (run `35081761506`) was watched directly to completion (`gh run watch`) — every step succeeded: gitleaks, architecture-memory drift check, all three test-suite steps (now including this delta's new/changed tests), nothing skipped. `gh pr view 5`: `mergeable: MERGEABLE`, `mergeStateStatus: CLEAN`, `state: OPEN` — **still not merged**, per standing instruction.
+Per the standing lesson carried from CD-3 onward (local/Auditor-green and live-CI-green are different claims — always check the second directly): PR #5 was pushed to head `a2c2a12` (§6d/§6e's five commits: `0aa7f5f`, `e51c615`, `7df321d`, `eff0848`, `a2c2a12`). The GitHub Actions "Security" workflow (run `35081761506`) was watched directly to completion (`gh run watch`) — every step succeeded: gitleaks, architecture-memory drift check, all three test-suite steps (now including this delta's new/changed tests), nothing skipped. `gh pr view 5`: `mergeable: MERGEABLE`, `mergeStateStatus: CLEAN`, `state: OPEN` — **still not merged**, per standing instruction. (Superseded — see §6g: subsequent commits `02971d6` (Phase A) then the architect's GREEN ruling and this section's own final evidence-alignment commit moved the head again; §6g/§6h record the final state.)
+
+---
+
+## 6g. Architect ruling: `BAGMAN_CORE_STRUCTURED_GREEN` — Gate 1 CLOSED GREEN (2026-09-16)
+
+Following §6e/§6f's Phase A finding (49/50, real but low-rate `bagman-core` schema-compliance gap, handed to HELM), HELM identified and fixed the actual root cause, and the architect issued a final ruling accepting Gate 1 as GREEN. This section records that ruling and its evidence verbatim; §6e/§6f above are **not deleted or reinterpreted** — they are exactly what happened, in order, and remain the accurate record of how this conclusion was reached.
+
+### Final root cause (architect ruling, verbatim substance)
+
+The structured-output instability was **not**: a Gemma capability failure; an Ollama grammar failure; a LiteLLM schema-translation defect; a BAGMAN timeout problem; or a concurrency-only problem (§6f's own Phase A result — a real failure under zero concurrent load — already ruled out "concurrency-only" as the sole explanation, which pointed toward this correct root cause rather than away from it).
+
+The proven root cause was an **appliance configuration conflict**: BAGMAN correctly supplied the task-specific `response_format`; LiteLLM 1.99.0 correctly translated it into Ollama's native schema grammar; but the appliance also carried a stale static `extra_body.format: "json"` override, left over from the earlier period (before this Gate-1 delta existed) when BAGMAN did not yet send a schema at all. That stale static setting clobbered the correctly-generated native schema constraint on some requests, degrading them to generic (syntax-only) JSON mode — exactly the intermittent, low-rate pattern both the independent Auditor's ad hoc batch and the PL's own Phase A experiment observed. HELM removed the stale `extra_body.format: "json"` override and retained only `think: false`.
+
+### Final acceptance (HELM's authoritative live proof, all against the real production BAGMAN path)
+
+| Tier / test | Result |
+|---|---|
+| `bagman-core` — sequential isolated | **100/100** transport success, **100/100** exact-schema validity; latency p50 9.77s, p95 12.16s, max 13.06s (SLA unchanged at 30s) |
+| `bagman-core` — controlled load | **20/20** transport success, **20/20** exact-schema validity; p95 11.92s |
+| `bagman-fast` | **10/10** transport success, **10/10** exact-schema validity; p95 9.72s (SLA unchanged at 20s) |
+| `bagman-deep` | real HTTP 200, unaffected by this fix |
+
+Enforcement reconfirmed unaffected: a forbidden/raw physical model name is still rejected (`403`); no silent cross-tier fallback; BAGMAN's own post-response `validate_task_output` remains active and unconditional (this fix is entirely appliance-side — it did not touch, weaken, or bypass BAGMAN's own safety boundary in any way).
+
+The PL independently spot-checked this before recording it here (not a blind relay): `GET http://192.168.11.4:4100/health/readiness` → `{"status":"healthy","db":"connected"}`; a fresh 10-call `ENTITY_PROPOSAL`/`bagman-core` sample through the real production path → **10/10 SUCCEEDED**, consistent with HELM's own reported fix.
+
+**Gate 1 (background inference — `bagman-fast`/`bagman-core`/`bagman-deep`) is `GREEN`.** No BAGMAN code was changed to reach this result: the per-request `output_schema`/`response_format` delta (§6d/§6e) remains exactly as implemented; timeouts, task schemas, and validation strictness are all unchanged. Per the architect's explicit instruction, fast/core/deep are not to be reopened unless the final Auditor (§6h) finds a concrete defect.
+
+### Final architecture (superseding §2/§8/§9's originally-amended shared-Trinity-gateway topology — see `PID.md` §96 for the full addendum; history preserved there and throughout this file's own §6d narrative, not deleted)
+
+```text
+BAGMAN
+  ↓
+Dedicated BAGMAN Mac AI appliance
+  ↓
+Mac-owned LiteLLM + PostgreSQL
+  ├── bagman-fast → local Mac model
+  ├── bagman-core → local Mac model
+  └── bagman-deep → Trinity escalation backend
+```
+
+Claude remains a wholly independent Anthropic operator path. The existing/shared Trinity LiteLLM gateway (`local-ai-gateway`, host port 4000) is **not** BAGMAN's primary AI control plane — it was the ORIGINAL target (WI-2's initial dispatch, §1's own delivery-summary table), superseded first by the credential-rotation attempt (§6d Step 1), then by the dedicated appliance (§6d Step 2 onward), which is where the topology now finally stands.
+
+## 6h. Focused independent Auditor — final Gate-1 verification, against the exact post-GREEN-ruling head
+
+*(to be completed once dispatched and returned — see this file's own commit history for the exact head SHA it was run against)*
 
 ---
 
@@ -419,6 +465,6 @@ Per the standing lesson carried from CD-3 onward (local/Auditor-green and live-C
 
 Per PID §93, no live mailbox integration may begin until **AI_FOUNDATION_GREEN**. §6b's original engineer-drafted framing (below, superseded) argued for an explicitly-scoped partial-GREEN; **the architect has since corrected that framing as broader than PID §91 permits (§6b's correction note, 2026-09-16)** — the honest state of a delivery with any tier's genuine-completion criterion unproven is `BLOCKED`, not any form of `GREEN`.
 
-**Status as of the Phase A isolation experiment (2026-09-16): Gate 1 remains `BLOCKED`. `bagman-fast` and `bagman-deep` are solidly proven (clean across every independent sample taken — `bagman-fast`: 35/35 combined fresh calls plus 25/25 across the two official-script runs; `bagman-deep`: every reconfirmation GREEN). `bagman-core`/`ENTITY_PROPOSAL` is proven WORKING and its safety net proven ROBUST (every non-conforming response correctly caught, never a false success across every sample taken this day) but a controlled, strictly-isolated 50-invocation experiment (see "Phase A" above) reached 49/50, not the required 50/50 — a real, reproducible, low-but-nonzero rate at which the underlying `bagman-core` model violates its own `additionalProperties: false` structured-output constraint, present even with zero concurrent load. Per the architect's own explicit stop-rule, this is now HELM's investigation, not BAGMAN's to route around. Gate 2 (Claude) remains separately OPEN — `/srv/bagman-secrets/anthropic_api_key` still does not exist. CD-5 remains `BLOCKED`, not `GREEN`, pending both HELM's `bagman-core` investigation AND Gate 2's own real-provider acceptance proof.**
+**Status as of §6g (2026-09-16): Gate 1 (all three background tiers — `bagman-fast`/`bagman-core`/`bagman-deep`) is `GREEN`.** HELM root-caused §6f's Phase A finding to a stale appliance-side `extra_body.format:"json"` override clobbering BAGMAN's correctly-generated schema constraint (not a Gemma/Ollama/LiteLLM/BAGMAN-timeout/concurrency-only defect) and fixed it; final authoritative proof (§6g) — `bagman-core` 100/100 isolated + 20/20 under controlled load, `bagman-fast` 10/10, `bagman-deep` unaffected — independently spot-checked by the PL before being recorded here. No BAGMAN code changed to reach GREEN; the architect's explicit instruction is not to reopen fast/core/deep unless the final Auditor (§6h) finds a concrete defect. **Gate 2 (Claude) is the sole remaining CD-5 blocker** — re-confirmed live immediately before writing this: `/srv/bagman-secrets/anthropic_api_key` still does not exist. CD-5 therefore remains `BLOCKED`, not the final unqualified `AI_FOUNDATION_GREEN`, pending Gate 2's own real-provider acceptance proof — per the PID's own §88 requirement, honestly unmet as of this evidence.
 
 Original (superseded) framing, retained for history: "every PID §91 criterion reachable without a live model completion was independently exercised against the real stack (not merely read about); two genuine, previously-undiscovered infrastructure defects were found and root-cause-fixed (§2.4/§2.5), each independently re-verified after the fix; the mandatory evaluation harness was genuinely built and is genuinely green; and every external blocker (LiteLLM-gateway database, Anthropic credential) was re-checked live at acceptance time, not assumed from the pre-dispatch briefing, with the exact real error captured each time." **The actual verdict — `AI_FOUNDATION_GREEN` (unqualified — see architect correction), `AI_FOUNDATION_RED`, or `BLOCKED` — is the PL's/architect's to issue, after PL reconciliation and independent Auditor dispatch (PID §92), not this Engineer's.**

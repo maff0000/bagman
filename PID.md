@@ -1107,3 +1107,26 @@ Matt is interrupted only when necessary.
 ```
 
 That is the BAGMAN architecture.
+
+---
+
+# 96. Topology Finalization Addendum (Architect ruling, 2026-09-16)
+
+This addendum records the final, deployed shape of the "Dedicated local AI processes routinely" tier named throughout this PID (§2/§8/§9 and elsewhere) — it does not replace or delete anything above; §2/§8/§9's original text stands as the historical record of the locked-topology amendment as first issued. Preserve history: describe the prior architecture as superseded, never as though it never existed.
+
+**As originally amended (§2/§8/§9):** `bagman-fast`/`bagman-core`/`bagman-deep` all routed through the SAME, pre-existing, shared Trinity LiteLLM installation — explicitly never a second inference-control-plane.
+
+**As finally deployed, CD-5 Gate-1 closure (2026-09-16):** HELM has since stood up a dedicated, BAGMAN-exclusive Mac AI appliance — its own LiteLLM + PostgreSQL, not the shared Trinity installation — fronting the same dedicated Mac mini for `bagman-fast`/`bagman-core` and escalating to Trinity compute for `bagman-deep`:
+
+```text
+BAGMAN
+  ↓
+Dedicated BAGMAN Mac AI appliance
+  ↓
+Mac-owned LiteLLM + PostgreSQL
+  ├── bagman-fast → local Mac model
+  ├── bagman-core → local Mac model
+  └── bagman-deep → Trinity escalation backend
+```
+
+Claude remains a wholly separate, independent Anthropic operator path (§8/§13/§17 unaffected). The existing/shared Trinity LiteLLM gateway is **no longer BAGMAN's primary AI control plane** — BAGMAN's own three aliases (`bagman-fast`/`bagman-core`/`bagman-deep`), its alias-only routing boundary, its per-request structured-output schema contract, and its unconditional post-response validation are all unaffected by which real gateway process sits behind them; this is a deployment-level topology change, not an architectural/contract one. Full closure history — the credential-rotation attempt, the appliance provisioning, the `bagman-fast`/`bagman-core` reliability investigation (root-caused to a stale appliance-side `extra_body.format:"json"` override clobbering BAGMAN's correctly-generated schema constraint, fixed by HELM), and the full acceptance evidence — is preserved in `memory/generated/CD5-EVIDENCE-AI-FOUNDATION-CLAUDE-OPERATOR-AND-GUI-INTEGRATION-2026-09-13.md`.

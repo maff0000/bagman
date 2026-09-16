@@ -124,17 +124,20 @@ python3 tests/acceptance/trinity_escalation_live_proof.py
 python3 tests/acceptance/claude_operator_live_proof.py
 python3 tests/acceptance/prompt_injection_live_proof.py
 python3 tests/acceptance/ai_gui_browser_acceptance_proof.py   # requires: pip install playwright && python3 -m playwright install chromium
+python3 tests/acceptance/structured_output_20x_proof.py       # Gate-1 closure — 20x/5x/20x/1 real structured-output acceptance
+python3 tests/acceptance/entity_proposal_isolation_experiment.py  # Gate-1 controlled isolation experiment (Phase A)
 ```
+
+**Final topology note (CD-5 Gate-1 closure, 2026-09-16):** the scripts below originally targeted the shared Trinity LiteLLM installation (CD-5 WI-2's initial dispatch); BAGMAN's background inference now goes through HELM's dedicated, BAGMAN-exclusive Mac AI appliance instead (its own LiteLLM + PostgreSQL, `http://192.168.11.4:4100`) — see the CD-5 evidence file for the full, preserved history of how the topology arrived here. Descriptions below are updated to match; nothing about the scripts' own methodology/rigor changed.
 
 * `mac_mini_background_tier_live_proof.py` — PID §14/§83/§87: real
   `bagman-fast`/`bagman-core` calls via the real HTTP surface against
-  the real, existing Trinity LiteLLM installation. Proves this WI's own
-  `host.docker.internal`/`extra_hosts` container-network fix holds for
-  real, re-checks the (previously found down) LiteLLM-gateway backing
-  database live, and honestly reports either a genuine live completion
-  or the exact real blocked outcome. Also proves canonical-evidence
-  non-interference, no silent cross-tier fallback, restart survival,
-  and retry semantics.
+  the real, dedicated BAGMAN AI appliance. Proves this WI's own
+  container-network path holds for real, re-checks the appliance's
+  backing database live, and honestly reports either a genuine live
+  completion or the exact real blocked outcome. Also proves
+  canonical-evidence non-interference, no silent cross-tier fallback,
+  restart survival, and retry semantics.
 * `trinity_escalation_live_proof.py` — PID §81/§82/§87: the real
   `bagman-deep` alias, exercised via the real `LiteLLMClient` directly
   inside the real running `bagman-api` container (no CD-5 task

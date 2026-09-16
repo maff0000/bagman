@@ -1,17 +1,22 @@
-"""``LiteLLMClient`` — the ONE adapter that speaks to the existing
-Trinity LiteLLM installation (CD-5 PID §6/§8/§9/§50, WI-2).
+"""``LiteLLMClient`` — the ONE adapter that speaks to BAGMAN's LiteLLM
+gateway (CD-5 PID §6/§8/§9/§50, WI-2).
 
-Locked topology (PID §2/§8/§9 — see ``PID.md`` in full before changing
-anything here): BAGMAN never calls the Mac mini, Ollama/MLX/llama.cpp,
-or Trinity compute directly. It calls the existing, already-governed
-Trinity LiteLLM gateway with one of exactly three BAGMAN-owned logical
-aliases (``bagman-fast``/``bagman-core``/``bagman-deep``) and lets that
-gateway decide the physical backend. This module's own mechanical
-enforcement of that boundary is :func:`validate_capability_alias`,
-called before ANY HTTP request is ever constructed (PID §5's
-raw-model-name-lockdown mitigation: the shared gateway itself is known
-to still accept a raw physical model name, so BAGMAN's own boundary
-must refuse to ever send one, regardless of what the gateway tolerates).
+Final topology (CD-5 Gate-1 closure, 2026-09-16 — see ``PID.md`` and
+the CD-5 evidence file for the full, preserved history; see ``PID.md``
+in full before changing anything here): BAGMAN never calls the Mac
+mini, Ollama/MLX/llama.cpp, or Trinity compute directly. It calls
+HELM's dedicated, BAGMAN-exclusive Mac AI appliance — its own LiteLLM
++ PostgreSQL, not the shared Trinity LiteLLM installation this module
+originally targeted at CD-5's initial dispatch — with one of exactly
+three BAGMAN-owned logical aliases (``bagman-fast``/``bagman-core``/
+``bagman-deep``) and lets that gateway decide the physical backend
+(the dedicated Mac model for `fast`/`core`, escalating to Trinity
+compute for `deep`). This module's own mechanical enforcement of that
+boundary is :func:`validate_capability_alias`, called before ANY HTTP
+request is ever constructed (PID §5's raw-model-name-lockdown
+mitigation — independently reconfirmed against the final appliance,
+which rejects a raw physical model name with its own `403
+key_model_access_denied` in addition to this boundary check).
 
 Wire protocol (PID §50, independently re-verified during this WI)
 --------------------------------------------------------------------
@@ -126,13 +131,20 @@ from typing import Any, Mapping, Optional, Protocol
 from ai.invocation import BACKGROUND_CAPABILITY_ALIASES
 from core.errors import ValidationError
 
-#: Default endpoint — a sensible, configurable default only. The exact
-#: production network path between the `bagman-api` container/compose
-#: project and the existing Trinity LiteLLM installation's container is
-#: a deployment-level integration detail established by whoever wires
-#: the two Compose projects together (PID §15) — not invented here. In
-#: this WI's own local inspection, the Trinity LiteLLM gateway was
-#: reachable at this address from the host running BAGMAN.
+#: Default endpoint — a sensible, configurable default only, never
+#: actually used in production (`deployment/compose/docker-compose.yml`
+#: always sets `BAGMAN_LITELLM_ENDPOINT` explicitly — see
+#: `app/api/composition.py`'s production builder). Kept as a harmless
+#: bare fallback (the same historical value CD-5 WI-2 originally
+#: inspected, back when the shared Trinity LiteLLM installation was
+#: BAGMAN's target) rather than pointed at the final dedicated
+#: appliance's own address, since hard-coding a real host/port as a
+#: bare-constructor default would invite exactly the silent-wrong-
+#: fallback bug CD-5 WI-5 found and fixed once already (see
+#: `tests/acceptance/trinity_escalation_live_proof.py`'s own module
+#: docstring for that history) — every real call site must read
+#: `BAGMAN_LITELLM_ENDPOINT` from the environment explicitly, never
+#: rely on this default.
 DEFAULT_LITELLM_ENDPOINT = "http://localhost:4000"
 
 #: Default secret-file path — see this WI's dispatch: the PID §13 text
