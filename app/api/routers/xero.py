@@ -40,9 +40,18 @@ Endpoints
   for one entity; returns the Xero authorize URL for the browser to
   navigate to.
 * ``GET /internal/xero/oauth/callback`` — the exact path registered in
-  the (not-yet-provisioned) real Xero Developer App, per PID §102.1's
-  own topology decision — do not rename without updating that PID
-  section too.
+  the real Xero Developer App, per PID §102.1's own topology decision —
+  do not rename without updating that PID section too. Performs all
+  real processing (state consumption, token exchange, tenant
+  resolution, persistence) then ALWAYS 303-redirects to
+  ``/oauth/result`` — never renders HTML at this URL itself (architect
+  hardening finding, PID §102.4: OAuth credential material must not
+  remain in the browser URL/address bar at rest).
+* ``GET /internal/xero/oauth/result`` — the clean, code/state-free
+  landing page every ``/oauth/callback`` outcome redirects to. Inert:
+  no domain mutation, no state consumption, reachable directly and
+  unauthenticated, but only ever displays one of a closed set of
+  fixed, hand-written strings (see ``_RESULT_REASONS``).
 * ``POST /internal/xero/{entity_id}/disconnect``
 * ``POST /internal/xero/{entity_id}/sync`` — "Sync now" (architect spec
   §16).
@@ -57,10 +66,11 @@ Endpoints
 from __future__ import annotations
 
 import os
+import urllib.parse
 from typing import Any, Optional
 
 from fastapi import APIRouter, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel
 
 from app.api.composition import get_composition
@@ -187,16 +197,51 @@ async def connect(payload: ConnectRequest) -> dict[str, Any]:
     }
 
 
-def _callback_page(*, ok: bool, message: str) -> HTMLResponse:
-    """A minimal, honest landing page for the browser Xero redirects to
-    (architect spec §3 does not require a styled page — this exists so
-    a human completing the SSH-tunnel OAuth consent step, PID §102.1's
-    own documented procedure, sees a plain, real confirmation rather
-    than a bare JSON blob or a blank tab). Never renders anything
-    caller-controlled via unescaped HTML — `message` is always one of
-    this module's own fixed, hand-written strings, never `code`/`state`
-    or any other request-supplied value."""
+#: Closed set of landing-page reason keys (architect hardening finding —
+#: "the OAuth callback endpoint itself should not return a normal HTML
+#: page while OAuth credential material remains in the browser URL").
+#: `GET /oauth/callback` now redirects (303) to `GET /oauth/result`
+#: instead of rendering HTML directly, so the outcome text has to
+#: travel as a query parameter on that redirect — but `/oauth/result`
+#: is itself a public, unauthenticated GET endpoint an attacker can hit
+#: DIRECTLY, bypassing `/oauth/callback` entirely. A free-text
+#: `message` query parameter would therefore reopen exactly the
+#: "never render anything caller-controlled via unescaped HTML"
+#: invariant this module always documented (see the prior
+#: `_callback_page` docstring this replaces) — an attacker could inject
+#: arbitrary HTML/JS via `?message=<script>...`. This closed KEY set
+#: closes that: only a recognised key selects a fixed, hand-written
+#: string below; an unrecognised key (or none) falls back to a generic
+#: message, never anything request-supplied. Any dynamic detail (a real
+#: provider error string, a specific tenant name, a conflicting
+#: entity_id) stays server-side only — in the audit event payload and
+#: the `XeroConnection.error_detail` field, both reachable only through
+#: authenticated internal endpoints, never through this public landing
+#: page.
+_RESULT_REASONS: dict[str, str] = {
+    "missing_state": "Xero did not return a state value — rejected.",
+    "invalid_state": "This connection link is invalid, expired, or already used.",
+    "no_pending_connection": "No pending connection was found for this flow.",
+    "missing_code": "Xero did not return an authorization code.",
+    "token_exchange_failed": "Could not complete the Xero token exchange. Please try connecting again.",
+    "tenant_lookup_failed": "Could not resolve your Xero organisation. Please try connecting again.",
+    "no_organisation_authorised": "No Xero organisation was authorised during consent. Please try connecting again.",
+    "tenant_conflict": "This Xero organisation is already connected to a different BAGMAN company.",
+    "superseded": "This connection was already completed by another request.",
+    "connected": "BAGMAN is now connected to Xero.",
+}
+_UNKNOWN_REASON_MESSAGE = "Something went wrong with this connection attempt."
+
+
+def _result_page(*, ok: bool, reason: str) -> HTMLResponse:
+    """The plain, honest landing page a human completing the SSH-tunnel
+    OAuth consent step (PID §102.1) actually sees — served at
+    `GET /oauth/result`, never at `/oauth/callback` itself (see that
+    endpoint's own docstring for why). `reason` is looked up against
+    the closed :data:`_RESULT_REASONS` set above; never rendered as
+    raw request-supplied text."""
     colour = "#1a7f37" if ok else "#b42318"
+    message = _RESULT_REASONS.get(reason, _UNKNOWN_REASON_MESSAGE)
     return HTMLResponse(
         f"<!doctype html><html><body style='font-family: system-ui; padding: 2rem;'>"
         f"<h1 style='color:{colour}'>{'Connected' if ok else 'Connection failed'}</h1>"
@@ -205,8 +250,47 @@ def _callback_page(*, ok: bool, message: str) -> HTMLResponse:
     )
 
 
+def _redirect_to_result(*, ok: bool, reason: str) -> RedirectResponse:
+    """Every outcome of `GET /oauth/callback` — success or failure —
+    ends here instead of rendering HTML directly at the callback URL
+    itself (architect hardening finding, Slice 2 live acceptance
+    review: 'the OAuth callback endpoint itself should not return a
+    normal HTML page while OAuth credential material remains in the
+    browser URL'). A 303 redirect means the address bar Matt actually
+    SEES at rest — after the redirect completes, on refresh, if
+    bookmarked — is the clean `/oauth/result?...` URL, which never
+    contains Xero's `code`/`state` (those were only ever query
+    parameters on the ORIGINAL `/oauth/callback` request, consumed
+    entirely server-side before this redirect is issued; no HTML is
+    ever rendered at that URL for a Referer header or a rendered-page
+    bookmark to later leak them from). `reason` is one of the closed
+    :data:`_RESULT_REASONS` keys — never raw text — so this redirect
+    target carries no caller-controlled content either (see
+    `_result_page`'s own docstring for why that matters: `/oauth/result`
+    is a public GET endpoint an attacker could hit directly)."""
+    query = urllib.parse.urlencode({"ok": "true" if ok else "false", "reason": reason})
+    return RedirectResponse(url=f"/internal/xero/oauth/result?{query}", status_code=303)
+
+
+@router.get("/oauth/result")
+async def oauth_result(ok: bool = False, reason: str = "") -> HTMLResponse:
+    """The clean, code/state-free landing page every `GET
+    /oauth/callback` outcome redirects to (see
+    :func:`_redirect_to_result`). Reads ONLY `ok`/`reason` from ITS OWN
+    query string — never `code`/`state` — and performs NO domain
+    mutation, no state consumption, no token exchange at all; this
+    endpoint is purely a static, inert rendering step. A direct,
+    unauthenticated GET here (bypassing `/oauth/callback` entirely) can
+    therefore only ever display one of this module's own fixed,
+    hand-written strings — never inject content or change any real
+    connection state — which is exactly why `reason` is validated
+    against the closed :data:`_RESULT_REASONS` set rather than trusted
+    as free text."""
+    return _result_page(ok=ok, reason=reason)
+
+
 @router.get("/oauth/callback")
-async def oauth_callback(code: Optional[str] = None, state: Optional[str] = None) -> HTMLResponse:
+async def oauth_callback(code: Optional[str] = None, state: Optional[str] = None) -> RedirectResponse:
     """The exact path registered in the real Xero Developer App (PID
     §102.1) — receives `code`/`state` from Xero's own redirect.
 
@@ -216,11 +300,21 @@ async def oauth_callback(code: Optional[str] = None, state: Optional[str] = None
     and `tenant_id` is resolved entirely server-side via
     `GET /connections` after a successful token exchange (architect
     spec §3).
+
+    Always ends in a 303 redirect to `GET /oauth/result` — never
+    renders HTML at this URL itself (architect hardening finding: "the
+    OAuth callback endpoint itself should not return a normal HTML page
+    while OAuth credential material remains in the browser URL"; see
+    :func:`_redirect_to_result`'s own docstring for the full reasoning).
+    All processing — state consumption, token exchange, tenant
+    resolution, persisting the governed connection/tokens — happens
+    here, entirely server-side, BEFORE that redirect is issued; the
+    landing page itself performs none of it.
     """
     composition = get_composition()
 
     if not state:
-        return _callback_page(ok=False, message="Xero did not return a state value — rejected.")
+        return _redirect_to_result(ok=False, reason="missing_state")
 
     try:
         consumed_state = consume_state(composition.oauth_state_repository, state)
@@ -248,15 +342,15 @@ async def oauth_callback(code: Optional[str] = None, state: Optional[str] = None
             causation_id=None,
             payload={"reason": str(exc), "rejected_state_value": state},
         )
-        return _callback_page(ok=False, message="This connection link is invalid, expired, or already used.")
+        return _redirect_to_result(ok=False, reason="invalid_state")
 
     entity_id = consumed_state.entity_id
     connection = composition.xero_connection_repository.get_by_entity(entity_id)
     if connection is None:
-        return _callback_page(ok=False, message="No pending connection was found for this flow.")
+        return _redirect_to_result(ok=False, reason="no_pending_connection")
 
-    def _fail(reason: str) -> HTMLResponse:
-        composition.xero_connection_repository.fail_connect(connection.xero_connection_id, error_detail=reason)
+    def _fail(reason_key: str, detail: str) -> RedirectResponse:
+        composition.xero_connection_repository.fail_connect(connection.xero_connection_id, error_detail=detail)
         composition.api.record_audit_event(
             event_type="XERO_CONNECTION_CONNECT_FAILED",
             actor_type="EXTERNAL_SYSTEM",
@@ -265,24 +359,30 @@ async def oauth_callback(code: Optional[str] = None, state: Optional[str] = None
             subject_id=connection.xero_connection_id,
             correlation_id=connection.xero_connection_id,
             causation_id=None,
-            payload={"entity_id": entity_id, "reason": reason},
+            payload={"entity_id": entity_id, "reason": detail},
         )
-        return _callback_page(ok=False, message=reason)
+        return _redirect_to_result(ok=False, reason=reason_key)
 
     if not code:
-        return _fail("Xero did not return an authorization code.")
+        return _fail("missing_code", "Xero did not return an authorization code.")
 
     token_result = composition.xero_oauth_client.exchange_code(code=code, redirect_uri=_redirect_uri())
     if token_result.status != XeroOutcomeStatus.OK or token_result.tokens is None:
-        return _fail(f"token exchange failed: {token_result.error_detail or token_result.status.value}")
+        return _fail(
+            "token_exchange_failed",
+            f"token exchange failed: {token_result.error_detail or token_result.status.value}",
+        )
 
     connections_result = composition.xero_oauth_client.list_connections(
         access_token=token_result.tokens.access_token
     )
     if connections_result.status != XeroOutcomeStatus.OK:
-        return _fail(f"could not resolve your Xero organisation: {connections_result.error_detail}")
+        return _fail(
+            "tenant_lookup_failed",
+            f"could not resolve your Xero organisation: {connections_result.error_detail}",
+        )
     if not connections_result.connections:
-        return _fail("no Xero organisation was authorised during consent.")
+        return _fail("no_organisation_authorised", "no Xero organisation was authorised during consent.")
 
     # Architect spec §3/§17: exactly one BAGMAN entity <-> one Xero
     # tenant. If more than one organisation was authorised in one
@@ -303,7 +403,7 @@ async def oauth_callback(code: Optional[str] = None, state: Optional[str] = None
             token_expires_at=token_result.tokens.expires_at,
         )
     except ConflictError as exc:
-        return _fail(str(exc))
+        return _fail("tenant_conflict", str(exc))
     except InvalidStateTransitionError:
         # A genuinely valid, honestly-consumed `state` (never a replay
         # of an already-consumed value -- `consume_state` above already
@@ -340,10 +440,7 @@ async def oauth_callback(code: Optional[str] = None, state: Optional[str] = None
             causation_id=None,
             payload={"entity_id": entity_id, "connection_status_at_callback": connection.status},
         )
-        return _callback_page(
-            ok=False,
-            message="This connection was already completed by another request.",
-        )
+        return _redirect_to_result(ok=False, reason="superseded")
 
     composition.xero_token_store.write(
         entity_id,
@@ -363,7 +460,7 @@ async def oauth_callback(code: Optional[str] = None, state: Optional[str] = None
         payload={"entity_id": entity_id, "tenant_id": tenant.tenant_id, "tenant_name": tenant.tenant_name},
     )
 
-    return _callback_page(ok=True, message=f"BAGMAN is now connected to '{tenant.tenant_name or tenant.tenant_id}'.")
+    return _redirect_to_result(ok=True, reason="connected")
 
 
 @router.post("/{entity_id}/disconnect")

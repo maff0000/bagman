@@ -453,3 +453,129 @@ def test_default_redirect_uri_matches_the_actually_registered_xero_value():
     from app.api.routers.xero import _DEFAULT_REDIRECT_URI
 
     assert _DEFAULT_REDIRECT_URI == "https://localhost:8543/internal/xero/oauth/callback"
+
+
+def test_redirect_uri_override_env_var_takes_effect(monkeypatch):
+    """`BAGMAN_XERO_REDIRECT_URI` exists purely for a disposable test/
+    dev instance on a different port (the module's own docstring) --
+    proves it genuinely overrides the default, live, not just by
+    reading the source. Architect finding, live OAuth attempt: verify
+    whether an override is active on the real deployment is exactly
+    the kind of question that must be answerable by a real check, not
+    an assumption -- this is that check, permanently, as a test."""
+    from app.api.routers.xero import _redirect_uri, _DEFAULT_REDIRECT_URI
+
+    monkeypatch.delenv("BAGMAN_XERO_REDIRECT_URI", raising=False)
+    assert _redirect_uri() == _DEFAULT_REDIRECT_URI
+
+    monkeypatch.setenv("BAGMAN_XERO_REDIRECT_URI", "https://localhost:9999/some/other/callback")
+    assert _redirect_uri() == "https://localhost:9999/some/other/callback"
+
+
+def test_oauth_callback_returns_a_redirect_not_html_with_no_code_or_state_in_the_location(dev_client):
+    """Architect hardening finding: 'the OAuth callback endpoint itself
+    should not return a normal HTML page while OAuth credential
+    material remains in the browser URL.' Proves the actual HTTP
+    contract, with redirects NOT auto-followed (unlike every other test
+    in this file, which relies on TestClient's default
+    follow_redirects=True and only ever sees the FINAL page): a
+    successful callback is a 303 to a clean `/oauth/result` URL that
+    contains neither `code` nor `state` anywhere in it."""
+    import urllib.parse
+
+    comp = get_composition()
+    entity_id = _first_entity_id(dev_client)
+    connect = dev_client.post("/internal/xero/connect", json={"entity_id": entity_id, "actor_type": "USER", "actor_id": ACTOR_ID})
+    state = urllib.parse.parse_qs(urllib.parse.urlparse(connect.json()["authorize_url"]).query)["state"][0]
+
+    comp.xero_oauth_client.queue_exchange_result(XeroTokenResult(status=XeroOutcomeStatus.OK, tokens=fake_token_bundle()))
+    comp.xero_oauth_client.queue_connections_result(
+        XeroConnectionsResult(status=XeroOutcomeStatus.OK, connections=(XeroConnectionInfo("c1", "tenant-xyz", "Acme Ltd", "ORGANISATION"),))
+    )
+    r = dev_client.get(
+        "/internal/xero/oauth/callback",
+        params={"code": "a-real-looking-authorization-code", "state": state},
+        follow_redirects=False,
+    )
+    assert r.status_code == 303
+    location = r.headers["location"]
+    assert location.startswith("/internal/xero/oauth/result?")
+    assert "code=" not in location
+    assert "a-real-looking-authorization-code" not in location
+    assert "state=" not in location
+    assert state not in location
+    assert "reason=connected" in location
+    assert "ok=true" in location
+
+    # And the redirect target itself renders the honest confirmation,
+    # entirely from its OWN query string -- never re-deriving anything
+    # from the original code/state.
+    landing = dev_client.get(location)
+    assert landing.status_code == 200
+    assert "Connected" in landing.text
+
+
+def test_oauth_callback_failure_redirect_also_carries_no_code_or_state(dev_client):
+    """Same proof, the failure path: a rejected/replayed state must
+    redirect just as cleanly as a success -- never leak `code`/`state`
+    into the Location header regardless of outcome."""
+    resp = dev_client.get(
+        "/internal/xero/oauth/callback",
+        params={"code": "whatever-code-value", "state": "a-value-nobody-ever-minted"},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+    location = resp.headers["location"]
+    assert location.startswith("/internal/xero/oauth/result?")
+    assert "whatever-code-value" not in location
+    assert "a-value-nobody-ever-minted" not in location
+    assert "reason=invalid_state" in location
+    assert "ok=false" in location
+
+    landing = dev_client.get(location)
+    assert landing.status_code == 200
+    assert "failed" in landing.text.lower()
+
+
+def test_oauth_result_page_ignores_an_unrecognised_reason_key(dev_client):
+    """`/oauth/result` is public and unauthenticated (see its own
+    docstring) -- a direct GET with an unrecognised `reason` value
+    (never producible by BAGMAN's own redirect, but not something an
+    attacker is prevented from typing) must fall back to the generic
+    message, never echo the raw value back into the page."""
+    r = dev_client.get("/internal/xero/oauth/result", params={"ok": "false", "reason": "<script>alert(1)</script>"})
+    assert r.status_code == 200
+    assert "<script>" not in r.text
+    assert "Something went wrong" in r.text
+
+
+def test_replayed_state_redirect_cannot_establish_a_connection(dev_client):
+    """The exact architect ask: 'ensure replayed/expired superseded
+    callbacks fail honestly' -- now proven against the redirect
+    contract specifically (the existing
+    test_oauth_state_replay_is_rejected_at_http_level proves the
+    follow-redirects-and-read-the-final-page version of this; this
+    proves the connection itself never becomes CONNECTED from the
+    replay, checked via the authoritative status endpoint, not just
+    the rendered text)."""
+    import urllib.parse
+
+    comp = get_composition()
+    entity_id = _first_entity_id(dev_client)
+    connect = dev_client.post("/internal/xero/connect", json={"entity_id": entity_id, "actor_type": "USER", "actor_id": ACTOR_ID})
+    state = urllib.parse.parse_qs(urllib.parse.urlparse(connect.json()["authorize_url"]).query)["state"][0]
+
+    comp.xero_oauth_client.queue_exchange_result(XeroTokenResult(status=XeroOutcomeStatus.OK, tokens=fake_token_bundle()))
+    comp.xero_oauth_client.queue_connections_result(
+        XeroConnectionsResult(status=XeroOutcomeStatus.OK, connections=(XeroConnectionInfo("c1", "tenant-xyz", "Acme Ltd", "ORGANISATION"),))
+    )
+    first = dev_client.get("/internal/xero/oauth/callback", params={"code": "abc", "state": state}, follow_redirects=False)
+    assert first.status_code == 303
+    assert "reason=connected" in first.headers["location"]
+
+    replay = dev_client.get("/internal/xero/oauth/callback", params={"code": "abc", "state": state}, follow_redirects=False)
+    assert replay.status_code == 303
+    assert "reason=invalid_state" in replay.headers["location"]
+
+    status = dev_client.get(f"/internal/xero/{entity_id}").json()
+    assert status["connection"]["tenant_id"] == "tenant-xyz"  # the real, FIRST completion -- untouched by the replay
