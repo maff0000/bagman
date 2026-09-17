@@ -106,6 +106,106 @@ def test_connect_when_xero_not_configured_returns_honest_422(dev_client):
     assert "not configured" in r.json()["message"]
 
 
+def test_a_pending_connection_can_be_restarted_via_connect_and_mints_a_fresh_state(dev_client):
+    """Architect finding, Slice 2 acceptance review: a PENDING
+    connection was a real GUI dead end (no action offered) even though
+    `begin_connect`/`connect()` have always supported safely restarting
+    an in-flight flow. Proves the BACKEND half of that fix still holds
+    (the GUI half is `connections.js`'s own new `PENDING` action
+    button, verified live on the Mac, not by an automated JS test --
+    this repo has no JS test harness): calling `/connect` again on an
+    already-PENDING connection succeeds, mints a genuinely fresh
+    `state` (not the same value reused), and reuses the SAME
+    `xero_connection_id` rather than creating a second row for the
+    entity."""
+    import urllib.parse
+
+    entity_id = _first_entity_id(dev_client)
+    first = dev_client.post("/internal/xero/connect", json={"entity_id": entity_id, "actor_type": "USER", "actor_id": ACTOR_ID})
+    assert first.status_code == 201
+    first_state = urllib.parse.parse_qs(urllib.parse.urlparse(first.json()["authorize_url"]).query)["state"][0]
+
+    second = dev_client.post("/internal/xero/connect", json={"entity_id": entity_id, "actor_type": "USER", "actor_id": ACTOR_ID})
+    assert second.status_code == 201
+    second_state = urllib.parse.parse_qs(urllib.parse.urlparse(second.json()["authorize_url"]).query)["state"][0]
+
+    assert second_state != first_state
+    assert second.json()["xero_connection_id"] == first.json()["xero_connection_id"]
+
+
+def test_a_restarted_pending_flow_completes_successfully_with_its_fresh_state(dev_client):
+    """The practical case the GUI fix exists for: an operator abandons
+    the first attempt, restarts, and completes the SECOND (fresh)
+    flow -- this must reach CONNECTED exactly like a first-attempt
+    completion always has."""
+    entity_id = _first_entity_id(dev_client)
+    dev_client.post("/internal/xero/connect", json={"entity_id": entity_id, "actor_type": "USER", "actor_id": ACTOR_ID})
+    _connect_and_complete(dev_client, entity_id, tenant_name="Restarted Org")
+
+    r = dev_client.get(f"/internal/xero/{entity_id}")
+    assert r.json()["connected"] is True
+    assert r.json()["connection"]["tenant_name"] == "Restarted Org"
+
+
+def test_a_superseded_callback_after_restart_fails_honestly_without_corrupting_the_connection(dev_client):
+    """The exact race the architect asked to have verified: restarting
+    a PENDING flow mints a SECOND, independently valid `state` while
+    the FIRST one (from the abandoned attempt) is still live and
+    unconsumed. If the operator completes the second flow (the normal
+    case) and then a stale browser tab from the FIRST, abandoned
+    attempt is also completed -- a lingering tab, browser back/forward,
+    or Xero's own still-authenticated session auto-completing -- that
+    second completion must fail honestly (never a raw 500) and must
+    NEVER corrupt the already-successful CONNECTED row (never flip it
+    to ERROR just because a duplicate/stale browser tab also
+    finished). `consume_state` itself correctly, independently
+    single-use-consumes EACH state value; this proves the layer above
+    it (the connection-status guard) closes the remaining gap."""
+    import urllib.parse
+
+    comp = get_composition()
+    entity_id = _first_entity_id(dev_client)
+
+    # First attempt (state A) -- abandoned, never completed.
+    first = dev_client.post("/internal/xero/connect", json={"entity_id": entity_id, "actor_type": "USER", "actor_id": ACTOR_ID})
+    state_a = urllib.parse.parse_qs(urllib.parse.urlparse(first.json()["authorize_url"]).query)["state"][0]
+
+    # Restart (state B) -- this is the one the operator actually completes.
+    second = dev_client.post("/internal/xero/connect", json={"entity_id": entity_id, "actor_type": "USER", "actor_id": ACTOR_ID})
+    state_b = urllib.parse.parse_qs(urllib.parse.urlparse(second.json()["authorize_url"]).query)["state"][0]
+    assert state_b != state_a
+
+    comp.xero_oauth_client.queue_exchange_result(XeroTokenResult(status=XeroOutcomeStatus.OK, tokens=fake_token_bundle()))
+    comp.xero_oauth_client.queue_connections_result(
+        XeroConnectionsResult(status=XeroOutcomeStatus.OK, connections=(XeroConnectionInfo("c1", "tenant-real", "Real Org", "ORGANISATION"),))
+    )
+    completed = dev_client.get("/internal/xero/oauth/callback", params={"code": "code-b", "state": state_b})
+    assert "Connected" in completed.text
+
+    # Now the STALE, abandoned first tab finally gets completed too --
+    # state A itself is still perfectly valid and unconsumed (never
+    # replayed), so `consume_state` honestly accepts it; the connection
+    # is no longer PENDING, though, so this must fail cleanly.
+    comp.xero_oauth_client.queue_exchange_result(XeroTokenResult(status=XeroOutcomeStatus.OK, tokens=fake_token_bundle()))
+    comp.xero_oauth_client.queue_connections_result(
+        XeroConnectionsResult(status=XeroOutcomeStatus.OK, connections=(XeroConnectionInfo("c1", "tenant-wrong", "Wrong Org", "ORGANISATION"),))
+    )
+    superseded = dev_client.get("/internal/xero/oauth/callback", params={"code": "code-a", "state": state_a})
+    assert superseded.status_code == 200  # honest landing page, never a raw 500
+    assert "already completed" in superseded.text.lower()
+
+    # The real, successful connection from state B must be completely
+    # untouched -- still CONNECTED, still the real tenant, never
+    # flipped to ERROR and never rebound to the second (wrong) tenant.
+    r = dev_client.get(f"/internal/xero/{entity_id}")
+    assert r.json()["connected"] is True
+    assert r.json()["connection"]["status"] == "CONNECTED"
+    assert r.json()["connection"]["tenant_id"] == "tenant-real"
+
+    events = comp.api.audit_repository.list_recent(limit=50, event_type_prefix="XERO_CONNECTION_CALLBACK_SUPERSEDED")
+    assert len(events) == 1
+
+
 def test_full_connect_callback_flow_reaches_connected(dev_client):
     entity_id = _first_entity_id(dev_client)
     _connect_and_complete(dev_client, entity_id)

@@ -100,10 +100,36 @@ export const Connections = {
 
     const actions = el("div", { class: "card__actions" });
     const isConnected = connection && connection.status === "CONNECTED";
-    const canConnect = !connection || ["DISCONNECTED", "REVOKED", "ERROR"].includes(connection.status);
+    const isPending = connection && connection.status === "PENDING";
+    // Every non-CONNECTED state must offer a real operator recovery
+    // path (architect finding, Slice 2 acceptance review — "do not
+    // leave any non-terminal state without an operator recovery
+    // path"). `PENDING` was the one real dead end: `POST
+    // /internal/xero/connect` has always supported re-beginning a
+    // flow already in `PENDING` (see `begin_connect`'s own docstring —
+    // "re-clicking 'Connect' while a flow is already in flight" is an
+    // explicitly designed, safe case, and the router mints a genuinely
+    // fresh `state` on every call regardless of the connection's
+    // current status), but the GUI never exposed a button for it,
+    // silently stranding an operator whose browser tab from the first
+    // attempt was closed, lost, or never completed.
+    const canConnect = !connection || ["DISCONNECTED", "REVOKED", "ERROR", "PENDING"].includes(connection.status);
+    // Wording is deliberately state-specific and truthful about what
+    // the click does (spec: "use wording that truthfully reflects the
+    // behaviour") rather than one generic "Connect" label for every
+    // non-connected state.
+    const connectLabel = !connection
+      ? "Connect Xero"
+      : isPending
+        ? "Restart Xero connection"
+        : connection.status === "ERROR"
+          ? "Reconnect"
+          : connection.status === "REVOKED" || connection.status === "DISCONNECTED"
+            ? "Reconnect"
+            : "Connect Xero";
 
     if (canConnect) {
-      const connectBtn = el("button", { class: "btn btn--primary btn--sm", text: "Connect", attrs: { type: "button" } });
+      const connectBtn = el("button", { class: "btn btn--primary btn--sm", text: connectLabel, attrs: { type: "button" } });
       connectBtn.addEventListener("click", () => this._connect(entity));
       actions.appendChild(connectBtn);
     }

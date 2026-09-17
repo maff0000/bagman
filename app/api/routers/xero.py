@@ -65,7 +65,7 @@ from pydantic import BaseModel
 
 from app.api.composition import get_composition
 from core import identity
-from core.errors import ConflictError, NotFoundError, OAuthStateError, ValidationError
+from core.errors import ConflictError, InvalidStateTransitionError, NotFoundError, OAuthStateError, ValidationError
 from services.xero.ai_suggestion import UNRESOLVED, resolve_ai_suggested_account
 from services.xero.client import XeroOutcomeStatus
 from services.xero.eligibility import list_eligible_accounts
@@ -304,6 +304,46 @@ async def oauth_callback(code: Optional[str] = None, state: Optional[str] = None
         )
     except ConflictError as exc:
         return _fail(str(exc))
+    except InvalidStateTransitionError:
+        # A genuinely valid, honestly-consumed `state` (never a replay
+        # of an already-consumed value -- `consume_state` above already
+        # proved that) whose CONNECTION is no longer in a status
+        # `complete_connect` can act on. The real, live-findable shape
+        # of this (architect finding, Slice 2 acceptance review, "a
+        # PENDING connection can become an operator dead-end... verify
+        # the existing OAuth-state race/replay protections... ensure
+        # replayed/expired superseded callbacks fail honestly"): an
+        # operator restarts a PENDING flow (a second, independently
+        # valid `state` is minted -- see `connect()` above, which now
+        # supports this from the GUI), and a STALE browser tab from the
+        # FIRST, abandoned attempt is also later completed (a lingering
+        # tab, browser back/forward, or Xero's own still-authenticated
+        # session auto-completing). Both `state` values are correctly,
+        # independently single-use-consumed by `consume_state` -- but
+        # only the FIRST callback to actually reach this point may
+        # transition the connection; a second, superseded completion
+        # must fail honestly WITHOUT corrupting an already-successful
+        # connection. Deliberately NOT `_fail(...)`: that call flips the
+        # connection to `ERROR`, which would be actively wrong here --
+        # the connection this second callback names is, in the case
+        # that actually matters, already genuinely `CONNECTED`, and a
+        # duplicate/stale browser tab is not evidence anything is
+        # broken with it. No connection mutation occurs on this path at
+        # all.
+        composition.api.record_audit_event(
+            event_type="XERO_CONNECTION_CALLBACK_SUPERSEDED",
+            actor_type="EXTERNAL_SYSTEM",
+            actor_id="xero-oauth-callback",
+            subject_type="XeroConnection",
+            subject_id=connection.xero_connection_id,
+            correlation_id=connection.xero_connection_id,
+            causation_id=None,
+            payload={"entity_id": entity_id, "connection_status_at_callback": connection.status},
+        )
+        return _callback_page(
+            ok=False,
+            message="This connection was already completed by another request.",
+        )
 
     composition.xero_token_store.write(
         entity_id,
