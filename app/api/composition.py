@@ -67,6 +67,12 @@ from persistence.objects.store import EvidenceObjectStore
 from services.evidence.intake.intake import IntakeRepository
 from services.evidence.intake.scanner import EvidenceSafetyScanner, ScanResult, ScanVerdict
 from services.needs_you.needs_you import NeedsYouRepository
+from services.xero.account import XeroAccountRepository
+from services.xero.client import XeroAccountingClientProtocol, XeroOAuthClientProtocol
+from services.xero.connection import XeroConnectionRepository
+from services.xero.oauth_state import OAuthStateRepository
+from services.xero.secrets import TokenStoreProtocol
+from services.xero.sync import XeroSyncRunRepository
 
 #: Repo root, resolved once from this file's own location
 #: (``app/api/composition.py`` -> ``app/api`` -> ``app`` ->
@@ -301,6 +307,26 @@ class RuntimeComposition:
     #: other Postgres-backed repository above) in production — never
     #: mixed across modes, same discipline as `intake_repository`.
     needs_you_repository: NeedsYouRepository
+    #: CD-6 Slice 2 (PID §98.4, architect spec §1-24) — the Xero
+    #: reference-data domain. In-memory in development/test, real
+    #: `Postgres*` implementations (sharing `engine`) in production —
+    #: same never-mixed-across-modes discipline as every repository
+    #: above. `xero_oauth_client`/`xero_accounting_client` are the real
+    #: `services.xero.client` adapters in production and
+    #: `services.xero.fake_client`'s deterministic substitutes in
+    #: development/test (this codebase's established `Fake*` pattern —
+    #: see `ai_invocation_repository`/`litellm_client` above for the
+    #: identical split). `xero_token_store` is `InMemoryTokenStore` in
+    #: development/test (a real dev machine has no
+    #: `/opt/bagman/secrets/xero/` directory at all) and `FileTokenStore`
+    #: in production.
+    xero_connection_repository: XeroConnectionRepository
+    xero_account_repository: XeroAccountRepository
+    xero_sync_run_repository: XeroSyncRunRepository
+    oauth_state_repository: OAuthStateRepository
+    xero_oauth_client: XeroOAuthClientProtocol
+    xero_accounting_client: XeroAccountingClientProtocol
+    xero_token_store: TokenStoreProtocol
 
 
 def _build_development_or_test(runtime_environment: str) -> RuntimeComposition:
@@ -309,12 +335,29 @@ def _build_development_or_test(runtime_environment: str) -> RuntimeComposition:
     from persistence.objects.memory_store import InMemoryObjectStore
     from services.evidence.intake.intake import InMemoryIntakeRepository
     from services.needs_you.needs_you import InMemoryNeedsYouRepository
+    from services.xero.account import InMemoryXeroAccountRepository
+    from services.xero.connection import InMemoryXeroConnectionRepository
+    from services.xero.fake_client import FakeXeroAccountingClient, FakeXeroOAuthClient
+    from services.xero.oauth_state import InMemoryOAuthStateRepository
+    from services.xero.secrets import InMemoryTokenStore
+    from services.xero.sync import InMemoryXeroSyncRunRepository
 
     api = BagmanCanonicalAPI()  # CD-2's own in-memory default construction
     object_store = InMemoryObjectStore()
     scanner = _AlwaysCleanDevelopmentScanner()
     intake_repository = InMemoryIntakeRepository()
     needs_you_repository = InMemoryNeedsYouRepository()
+    xero_connection_repository = InMemoryXeroConnectionRepository()
+    xero_account_repository = InMemoryXeroAccountRepository()
+    xero_sync_run_repository = InMemoryXeroSyncRunRepository()
+    oauth_state_repository = InMemoryOAuthStateRepository()
+    # CD-6 Slice 2: no real Xero Developer App exists yet (PID §102.1's
+    # own stated constraint) — development/test composition ALWAYS uses
+    # the deterministic fakes, never the real network-speaking adapters,
+    # exactly like `litellm_client`/`claude_code_operator_runner` above.
+    xero_oauth_client = FakeXeroOAuthClient()
+    xero_accounting_client = FakeXeroAccountingClient()
+    xero_token_store = InMemoryTokenStore()
 
     # CD-6 reliability delta: shares `api.audit_repository` so the
     # bounded stale-RUNNING recovery backstop's own audit events land in
@@ -347,6 +390,13 @@ def _build_development_or_test(runtime_environment: str) -> RuntimeComposition:
         litellm_client=litellm_client,
         claude_code_operator_runner=claude_code_operator_runner,
         needs_you_repository=needs_you_repository,
+        xero_connection_repository=xero_connection_repository,
+        xero_account_repository=xero_account_repository,
+        xero_sync_run_repository=xero_sync_run_repository,
+        oauth_state_repository=oauth_state_repository,
+        xero_oauth_client=xero_oauth_client,
+        xero_accounting_client=xero_accounting_client,
+        xero_token_store=xero_token_store,
     )
 
 
@@ -368,7 +418,15 @@ def _build_production() -> RuntimeComposition:
     from persistence.postgres.provenance_repository import PostgresProvenanceRepository
     from persistence.postgres.session import get_engine
     from persistence.postgres.source_repository import PostgresSourceRepository
+    from persistence.postgres.xero_repository import (
+        PostgresOAuthStateRepository,
+        PostgresXeroAccountRepository,
+        PostgresXeroConnectionRepository,
+        PostgresXeroSyncRunRepository,
+    )
     from services.evidence.intake.scanner import ClamAVScanner
+    from services.xero.client import XeroAccountingClient, XeroOAuthClient
+    from services.xero.secrets import FileTokenStore
 
     from ai.providers.litellm.client import DEFAULT_LITELLM_API_KEY_FILE, DEFAULT_LITELLM_ENDPOINT, LiteLLMClient
 
@@ -461,6 +519,25 @@ def _build_production() -> RuntimeComposition:
     # attempted inside a real Ask BAGMAN request.
     claude_code_operator_runner = ClaudeCodeOperatorRunner()
 
+    # CD-6 Slice 2 (PID §98.4, architect spec §1-24): durable Xero
+    # repositories, sharing the same engine as every other Postgres-
+    # backed repository above, plus the two real adapters
+    # (`XeroOAuthClient`/`XeroAccountingClient`) and the real
+    # file-backed per-connection token store. Constructing any of these
+    # performs NO I/O itself (same "no eager I/O at construction"
+    # discipline as every other adapter in this function) — a missing
+    # Xero Developer App credential (no real one is provisioned yet,
+    # PID §102.1's own stated constraint) surfaces as a live, per-call
+    # `CONFIG_ERROR`/`XeroAppCredentials is None` outcome the first time
+    # a real OAuth call is attempted, never at composition/startup time.
+    xero_connection_repository = PostgresXeroConnectionRepository(engine)
+    xero_account_repository = PostgresXeroAccountRepository(engine)
+    xero_sync_run_repository = PostgresXeroSyncRunRepository(engine)
+    oauth_state_repository = PostgresOAuthStateRepository(engine)
+    xero_oauth_client = XeroOAuthClient()
+    xero_accounting_client = XeroAccountingClient()
+    xero_token_store = FileTokenStore()
+
     return RuntimeComposition(
         runtime_environment=_PRODUCTION,
         api=api,
@@ -472,6 +549,13 @@ def _build_production() -> RuntimeComposition:
         litellm_client=litellm_client,
         claude_code_operator_runner=claude_code_operator_runner,
         needs_you_repository=needs_you_repository,
+        xero_connection_repository=xero_connection_repository,
+        xero_account_repository=xero_account_repository,
+        xero_sync_run_repository=xero_sync_run_repository,
+        oauth_state_repository=oauth_state_repository,
+        xero_oauth_client=xero_oauth_client,
+        xero_accounting_client=xero_accounting_client,
+        xero_token_store=xero_token_store,
     )
 
 

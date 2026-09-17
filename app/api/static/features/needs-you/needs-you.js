@@ -15,6 +15,7 @@ import * as drawer from "../../shell/drawer.js";
 import { listEntities } from "../../shell/entities.js";
 import { renderEvidencePreview } from "../../shell/preview.js";
 import { listNeedsYou, resolveNeedsYouItem } from "./needs-you-api.js";
+import { getXeroAccounts } from "../xero/xero-api.js";
 
 //: item_type -> human phrase template for both the queue card heading
 //: and Overview's own greeting breakdown (PID §98.2's worked example —
@@ -206,7 +207,10 @@ export const NeedsYou = {
     step1.appendChild(el("label", { class: "field", text: "Company" }, [entitySelect]));
     wrap.appendChild(step1);
 
-    // ---- step 2: What ----
+    // ---- step 2: What (free-text business-purpose, unchanged) PLUS a
+    // genuinely separate "Accounting category" control backed by real
+    // synced Xero accounts for the selected company (CD-6 Slice 2, PID
+    // §98.4, architect spec §8/§9/§10) ----
     const step2 = el("div", { class: "review-step", attrs: { hidden: "true" } });
     step2.appendChild(el("div", { class: "review-step__label", text: "Step 2 of 3" }));
     step2.appendChild(el("div", { class: "review-step__prompt", text: "What was this for?" }));
@@ -214,12 +218,45 @@ export const NeedsYou = {
       attrs: { type: "text", id: "review-what-input", placeholder: "e.g. Software subscription", autocomplete: "off" },
     });
     step2.appendChild(el("label", { class: "field", text: "What" }, [whatInput]));
+
+    // Accounting category — a SEPARATE control from "What" (architect
+    // spec §8: "keep 'What' as the free-text business-purpose
+    // description unchanged, and add a genuinely separate 'Accounting
+    // category' control"). The <select>'s VALUE is always the real
+    // Xero `AccountID` — the visible option TEXT (`Code — Name`) is
+    // display only and is never itself trusted as identity (architect
+    // spec §9/§10). `xeroAccountFilter` is a plain client-side filter
+    // over an ALREADY server-filtered eligible set fetched once per
+    // company change — never a fetch-everything-then-filter-in-browser
+    // "source of truth" (that policy decision stays server-side, PID
+    // §98.4/architect spec §5 — see services/xero/eligibility.py).
+    let xeroAccountsForEntity = [];
+    const xeroAccountFilter = el("input", {
+      attrs: { type: "text", id: "review-xero-account-filter", placeholder: "Filter accounts…", autocomplete: "off" },
+      class: "field-inline",
+    });
+    xeroAccountFilter.hidden = true;
+    const xeroAccountSelect = el("select", { attrs: { id: "review-xero-account-select", disabled: "true" } }, [
+      el("option", { attrs: { value: "" }, text: "No Xero account" }),
+    ]);
+    const xeroStatusNote = el("p", { class: "muted small", text: "Select a company to see its Xero accounts." });
     step2.appendChild(
-      el("p", {
-        class: "muted small",
-        text: "Xero chart of accounts not yet connected — temporary free-text, will be replaced with real Xero account coding.",
-      })
+      el("label", { class: "field", text: "Accounting category (Xero)" }, [xeroAccountSelect, xeroAccountFilter])
     );
+    step2.appendChild(xeroStatusNote);
+
+    function renderXeroOptions(filterText) {
+      clear(xeroAccountSelect);
+      xeroAccountSelect.appendChild(el("option", { attrs: { value: "" }, text: "No Xero account" }));
+      const needle = (filterText || "").trim().toLowerCase();
+      for (const account of xeroAccountsForEntity) {
+        const label = `${account.code ? `[${account.code}] ` : ""}${account.name}`;
+        if (needle && !label.toLowerCase().includes(needle)) continue;
+        xeroAccountSelect.appendChild(el("option", { attrs: { value: account.account_id }, text: label }));
+      }
+    }
+    xeroAccountFilter.addEventListener("input", () => renderXeroOptions(xeroAccountFilter.value));
+
     wrap.appendChild(step2);
 
     // ---- step 3: Why ----
@@ -251,8 +288,42 @@ export const NeedsYou = {
         step1.classList.remove("review-step--active");
         step2.hidden = false;
         step2.classList.add("review-step--active");
+        loadXeroAccountsForSelectedCompany();
       }
     });
+
+    /** Fetches this company's real synced, eligible Xero accounts (CD-6
+     * Slice 2) the moment a company is chosen — never a fake/fallback
+     * list, and never a client-side-filtered "every account" fetch
+     * (see the field's own construction comment above). Shows "Xero not
+     * connected" honestly (architect spec §9) and still leaves Company/
+     * What/Why fully answerable when there is no connection. */
+    async function loadXeroAccountsForSelectedCompany() {
+      xeroAccountsForEntity = [];
+      xeroAccountFilter.hidden = true;
+      xeroAccountFilter.value = "";
+      renderXeroOptions("");
+      xeroAccountSelect.disabled = true;
+      xeroStatusNote.textContent = "Loading Xero accounts…";
+
+      const { ok, body } = await getXeroAccounts(entitySelect.value, true);
+      if (!ok || !body) {
+        xeroStatusNote.textContent = "Could not load Xero accounts for this company.";
+        return;
+      }
+      if (!body.connected) {
+        xeroStatusNote.textContent = "Xero chart of accounts not connected for this company.";
+        return;
+      }
+      xeroAccountsForEntity = body.items;
+      xeroAccountSelect.disabled = false;
+      xeroAccountFilter.hidden = xeroAccountsForEntity.length < 8; // small lists don't need a filter box
+      xeroStatusNote.textContent =
+        xeroAccountsForEntity.length > 0
+          ? `${xeroAccountsForEntity.length} account(s) from ${body.tenant_name || "Xero"}.`
+          : "This company's Xero organisation has no eligible accounts synced yet.";
+      renderXeroOptions("");
+    }
     whatInput.addEventListener("input", () => {
       if (whatInput.value.trim()) {
         step2.classList.add("review-step--done");
@@ -279,7 +350,16 @@ export const NeedsYou = {
 
       const { ok, status, body: result } = await resolveNeedsYouItem(item.item_id, {
         newStatus: "RESOLVED",
-        resolution: { entity_id: entitySelect.value, what: whatInput.value.trim(), why: whyInput.value.trim() },
+        resolution: {
+          entity_id: entitySelect.value,
+          what: whatInput.value.trim(),
+          why: whyInput.value.trim(),
+          // The real Xero AccountID (never the displayed "[Code] Name"
+          // label) — `null` when the operator left "No Xero account"
+          // selected, e.g. this company has no Xero connection yet
+          // (architect spec §9/§10).
+          xero_account_id: xeroAccountSelect.value || null,
+        },
         actorId: getActorId(),
       });
 

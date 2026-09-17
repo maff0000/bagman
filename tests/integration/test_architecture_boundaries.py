@@ -642,3 +642,65 @@ def test_requirements_files_do_not_mention_forbidden_mailbox_or_provider_sdks():
         assert violations == [], f"{req_file} must not depend on: {violations}"
 
     assert not violations, "\n".join(violations)
+
+
+# ---------------------------------------------------------------------
+# CD-6 Slice 2 (PID §98.4, architect spec §1) — "No hardcoded company
+# strings anywhere in app/api/static/... the existing seed entities
+# remain the canonical source; do not duplicate or shadow them."
+# ---------------------------------------------------------------------
+
+#: The exact literal tokens PID §98.3/§98.4 name as this delivery's
+#: real, canonical BAGMAN companies (`app/api/composition.py
+#: ::SEED_ENTITIES` — the single source of truth these tokens are
+#: copied from, not re-typed independently). Every one of these is
+#: "business truth" the GUI must resolve through a live `GET
+#: /internal/entities` call, never bake in as a literal — both the
+#: `canonical_name` form (`INFOSECURS_LIMITED`) an `<option value=...>`
+#: could hardcode, and the `display_name` form (`Infosecurs Limited`) a
+#: label could hardcode.
+_HARDCODED_COMPANY_TOKENS: tuple[str, ...] = (
+    "INFOSECURS_LIMITED",
+    "NOUSTAI_LIMITED",
+    "MATTHEW_SCOTT_PERSONAL",
+    "Infosecurs Limited",
+    "NoustAI Limited",
+    "Matthew Scott Personal",
+)
+
+
+def test_no_hardcoded_company_truth_anywhere_in_static_ui():
+    """A real, repo-wide grep proof — mirrors
+    ``test_no_trinity_star_alias_literal_anywhere_in_application_source``'s
+    own "scan every file, not just .py" technique, scoped to
+    ``app/api/static/`` and CD-6's own closed set of real company
+    tokens (see :data:`_HARDCODED_COMPANY_TOKENS`).
+
+    This is not merely aspirational: CD-6 Slice 2's own delivery
+    removed a real violation this test caught during development — CD-4
+    WI-4's Documents "Upload evidence" panel (``index.html``) hardcoded
+    all three companies directly as ``<option>`` literals. It now
+    resolves them at runtime via ``shell/entities.js``'s existing
+    ``listEntities()`` cache (see
+    ``features/documents/documents.js::_wireUpload``), exactly like
+    every other company-aware surface in this GUI already does.
+    """
+    static_dir = REPO_ROOT / "app" / "api" / "static"
+    violations: list[str] = []
+    for path in sorted(static_dir.rglob("*")):
+        if not path.is_file():
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (UnicodeDecodeError, OSError):
+            continue
+        for token in _HARDCODED_COMPANY_TOKENS:
+            if token in text:
+                violations.append(f"{path.relative_to(REPO_ROOT)} contains hardcoded company token {token!r}")
+
+    assert violations == [], (
+        "app/api/static/ must never hardcode a real company name/canonical_name — every "
+        "company-aware surface must resolve companies through GET /internal/entities "
+        "(shell/entities.js::listEntities()), the one canonical source (PID §98.3/§98.4):\n"
+        + "\n".join(violations)
+    )

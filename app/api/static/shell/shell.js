@@ -13,6 +13,7 @@ import { Documents } from "../features/documents/documents.js";
 import { Detail } from "../features/documents/detail.js";
 import { NeedsYou } from "../features/needs-you/needs-you.js";
 import { Activity } from "../features/activity/activity.js";
+import { Connections } from "../features/xero/connections.js";
 import * as AskBagman from "../features/ai/ask-bagman.js";
 import * as AddMenu from "./add-menu.js";
 import * as ReviewDrawer from "./drawer.js";
@@ -26,6 +27,8 @@ const TABS = {
   "needs-you": { panel: "#panel-needs-you", onActivate: () => NeedsYou.ensureLoaded() },
   documents: { panel: "#panel-documents", onActivate: () => Documents.ensureLoaded() },
   activity: { panel: "#panel-activity", onActivate: () => Activity.ensureLoaded() },
+  //: CD-6 Slice 2 (architect spec §16) — the Settings/Connections tab.
+  connections: { panel: "#panel-connections", onActivate: () => Connections.ensureLoaded() },
 };
 
 function initTabs() {

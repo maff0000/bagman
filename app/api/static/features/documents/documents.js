@@ -10,6 +10,7 @@ import { API, apiGet, errorMessage } from "../../shared/api.js";
 import { generateRequestId } from "../../shared/uuid.js";
 import { Detail } from "./detail.js";
 import { openUploadModal } from "../../shell/add-menu.js";
+import { listEntities } from "../../shell/entities.js";
 
 export const Documents = {
   _loaded: false,
@@ -214,6 +215,23 @@ export const Documents = {
     const submitBtn = qs("#upload-submit");
     const entitySelect = qs("#entity-select");
     const entityCustom = qs("#entity-custom");
+
+    // CD-6 Slice 2 (architect spec §1): populated from the real
+    // canonical entity list, never hardcoded company labels in
+    // index.html's own markup — the static markup keeps only the two
+    // app-semantic, non-business options ("UNRESOLVED"/"Other…").
+    // `entity.canonical_name` is used as this <option>'s value (the
+    // SAME shape this free-text `entity_hint` field already expected —
+    // see `_submitUpload()` below), never `entity_id`, so this remains
+    // a pure "swap the source of the labels" fix with no change to
+    // what CD-4's intake endpoint actually receives.
+    listEntities().then((entities) => {
+      const customOption = entitySelect.querySelector('option[value="__custom__"]');
+      for (const entity of entities) {
+        const option = el("option", { attrs: { value: entity.canonical_name }, text: entity.display_name });
+        entitySelect.insertBefore(option, customOption);
+      }
+    });
 
     entitySelect.addEventListener("change", () => {
       entityCustom.hidden = entitySelect.value !== "__custom__";

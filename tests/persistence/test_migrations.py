@@ -29,6 +29,10 @@ EXPECTED_TABLES = {
     "intake_records",  # CD-4 WI-1
     "ai_invocations",  # CD-5 WI-1
     "needs_you_items",  # CD-6 Slice 1
+    "xero_connections",  # CD-6 Slice 2
+    "xero_accounts",  # CD-6 Slice 2
+    "xero_sync_runs",  # CD-6 Slice 2
+    "xero_oauth_states",  # CD-6 Slice 2
 }
 
 
@@ -61,6 +65,36 @@ def test_re_running_upgrade_head_is_a_safe_no_op(postgres_container):
     inspector = sa.inspect(get_engine())
     assert after == before
     assert set(inspector.get_table_names()) == EXPECTED_TABLES | {"alembic_version"}
+
+
+def test_xero_migration_downgrade_genuinely_undoes_the_upgrade(postgres_container):
+    """CD-6 Slice 2 migration safety proof: `5e8c1f42b9a7`'s own
+    `downgrade()` genuinely removes exactly the four `xero_*` tables it
+    added (and nothing else), and `upgrade("head")` genuinely restores
+    them — a real round trip against a real database, not merely
+    reading the migration file's source and trusting it by inspection.
+    Restores the database to `head` again at the end (via the `finally`)
+    so later tests in this module/session are unaffected.
+    """
+    cfg = _alembic_config()
+    try:
+        command.downgrade(cfg, "712c5a2aab92")
+        inspector = sa.inspect(get_engine())
+        tables_after_downgrade = set(inspector.get_table_names())
+        assert "xero_connections" not in tables_after_downgrade
+        assert "xero_accounts" not in tables_after_downgrade
+        assert "xero_sync_runs" not in tables_after_downgrade
+        assert "xero_oauth_states" not in tables_after_downgrade
+        # Every OTHER canonical table must still be present — downgrade
+        # must remove ONLY what this one migration added.
+        assert (EXPECTED_TABLES - {"xero_connections", "xero_accounts", "xero_sync_runs", "xero_oauth_states"}) <= tables_after_downgrade
+
+        command.upgrade(cfg, "head")
+        inspector = sa.inspect(get_engine())
+        tables_after_reupgrade = set(inspector.get_table_names())
+        assert EXPECTED_TABLES <= tables_after_reupgrade
+    finally:
+        command.upgrade(cfg, "head")
 
 
 def test_external_references_unique_constraint_exists_at_the_database_level(postgres_container):

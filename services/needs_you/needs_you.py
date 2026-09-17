@@ -130,6 +130,28 @@ ITEM_TYPE_CLASSIFICATION_REVIEW = "CLASSIFICATION_REVIEW"
 ITEM_TYPE_RULE_APPROVAL = "RULE_APPROVAL"
 ITEM_TYPE_GENERIC_QUESTION = "GENERIC_QUESTION"
 
+#: CD-6 Slice 2 additions (PID §98.4, architect spec §7) — the open
+#: vocabulary's own extensibility exercised for real: an AI-proposed
+#: Xero account that fails `services.xero.ai_suggestion
+#: .resolve_ai_suggested_account`'s candidate-set check, and a mapped
+#: company whose reference data has gone stale (`services.xero.sync
+#: .is_reference_data_stale`). Declared here now, WITHOUT a live
+#: producer wired in this slice — a documented judgment call (see the
+#: CD-6 Slice 2 delivery report): `XERO_ACCOUNT_REQUIRED`'s only
+#: plausible trigger is an AI account-suggestion call this slice
+#: deliberately does not build (see `services.xero.ai_suggestion`'s own
+#: module docstring — no AI task/prompt proposes a Xero account yet);
+#: `XERO_REFERENCE_DATA_STALE` has no natural "raise a question now"
+#: moment in this slice either (no scheduled/cron job exists yet to
+#: notice staleness between operator visits — `GET
+#: /internal/xero/{entity_id}` already surfaces `reference_data_stale`
+#: honestly for the GUI to display inline, which is a real, live signal,
+#: just not one funnelled through this queue today). Both constants
+#: exist now so the FIRST future producer for either one needs no
+#: contract/vocabulary change — only a real trigger call site.
+ITEM_TYPE_XERO_ACCOUNT_REQUIRED = "XERO_ACCOUNT_REQUIRED"
+ITEM_TYPE_XERO_REFERENCE_DATA_STALE = "XERO_REFERENCE_DATA_STALE"
+
 #: Slice 1's own single real allowed_action_type (see module docstring
 #: "Slice 1's one real trigger"). Also open (not contract-enforced).
 ALLOWED_ACTION_COMPANY_WHAT_WHY = "COMPANY_WHAT_WHY"

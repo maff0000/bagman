@@ -103,6 +103,10 @@ CANONICAL_TABLES = (
     "intake_records",
     "ai_invocations",
     "needs_you_items",
+    "xero_connections",  # CD-6 Slice 2
+    "xero_accounts",  # CD-6 Slice 2
+    "xero_sync_runs",  # CD-6 Slice 2
+    "xero_oauth_states",  # CD-6 Slice 2
 )
 
 

@@ -66,9 +66,9 @@
     </button>
     <div class="shell-nav__divider"></div>
     <button class="tab-btn" data-tab="activity" type="button">Activity</button>
-    <button class="tab-btn tab-btn--disabled" type="button" disabled title="Not part of this delivery">
-      Settings <span class="pill pill--muted">unavailable</span>
-    </button>
+    <!-- CD-6 Slice 2 (architect spec §16) — was a disabled placeholder
+         in Slice 1; now a real, live Connections tab. -->
+    <button class="tab-btn" data-tab="connections" type="button">Connections</button>
   </nav>
 
   <main class="shell-main">
@@ -166,11 +166,12 @@
           <div class="form-grid">
             <label class="field">
               <span>Entity</span>
+              <!-- Real canonical companies are populated at runtime by
+                   features/documents/documents.js's own listEntities()
+                   call (CD-6 Slice 2, architect spec §1) — no company
+                   name is hardcoded in this markup. -->
               <select id="entity-select">
                 <option value="">UNRESOLVED (no entity yet)</option>
-                <option value="NOUSTAI_LIMITED">NoustAI Limited</option>
-                <option value="INFOSECURS_LIMITED">Infosecurs Limited</option>
-                <option value="MATTHEW_SCOTT_PERSONAL">Matthew Scott (personal)</option>
                 <option value="__custom__">Other (type below)…</option>
               </select>
               <input type="text" id="entity-custom" class="field-inline" placeholder="free-text entity hint" hidden />
@@ -233,7 +234,7 @@
             </label>
             <label>
               Entity hint
-              <input type="text" id="filter-entity" placeholder="e.g. NOUSTAI_LIMITED" />
+              <input type="text" id="filter-entity" placeholder="a company's canonical_name" />
             </label>
             <label>
               From
@@ -288,6 +289,17 @@
         </div>
       </div>
       <div id="activity-list" class="activity-list"></div>
+    </section>
+
+    <!-- ============================= CONNECTIONS ============================= -->
+    <section id="panel-connections" class="tab-panel" hidden>
+      <div class="page-head">
+        <div>
+          <h1>Connections</h1>
+          <p class="muted">Each BAGMAN company's Xero accounting connection — state, last sync, account count. No token details are ever shown here (PID §98.4).</p>
+        </div>
+      </div>
+      <div id="connections-list" class="card-grid"></div>
     </section>
 
   </main>

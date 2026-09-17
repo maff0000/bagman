@@ -159,6 +159,17 @@ Own canonical EvidenceItem identity and its immutability and idempotent-observat
 - **External access:** `false`
 - **Prohibited:** `direct_email_access`, `direct_bank_access`, `direct_xero_access`, `direct_chargebee_access`
 
+### `BAGMAN.XERO` (v1)
+
+Own the durable Company<->Xero-organisation mapping (XeroConnection, its closed connect/disconnect/error/revoke state machine, and the server-side OAuth anti-CSRF/replay `state` token that protects the Authorization Code callback), the synced read-only Chart-of-Accounts reference-data projection (XeroAccount, idempotent on (tenant_id, account_id), history-preserving — never deleted, only re-synced), and the sync-attempt ledger (XeroSyncRun) that makes a failed/partial sync provably unable to ever replace last-known-good projection data (PID §98.4, architect spec §4/§5/§20). Also owns the documented, extensible account-eligibility-filtering policy (which synced accounts a coding dropdown shows by default) and the AI-suggestion candidate-set validation (an AI-proposed AccountID/Code/Name/TaxType must resolve to a real synced eligible account or be treated as UNRESOLVED — never invented). This is a READ/REFERENCE-ONLY integration: the only "write" direction to Xero is the OAuth token lifecycle itself (authorize/refresh/revoke) — no Xero write endpoint (invoice/bill/journal/payment/contact creation, bank reconciliation, tax filing) is implemented anywhere in this component.
+
+- **Owns:** `XeroConnection`, `XeroAccount`, `XeroSyncRun`
+- **Consumes:** `BAGMAN.CORE`
+- **Produces:** _(none)_
+- **Dependencies:** `jsonschema`, `rfc3339-validator`
+- **External access:** `true`
+- **Prohibited:** `direct_email_access`, `direct_bank_access`, `direct_chargebee_access`, `xero_write_endpoints`
+
 ## Contracts
 
 | `$id` | Title | Path |
@@ -176,6 +187,9 @@ Own canonical EvidenceItem identity and its immutability and idempotent-observat
 | `https://bagman.internal/contracts/provenance/bagman.provenance.v1.schema.json` | BAGMAN Provenance | `contracts/provenance/bagman.provenance.v1.schema.json` |
 | `https://bagman.internal/contracts/source/bagman.external_reference.v1.schema.json` | BAGMAN ExternalReference | `contracts/source/bagman.external_reference.v1.schema.json` |
 | `https://bagman.internal/contracts/source/bagman.source.v1.schema.json` | BAGMAN Source | `contracts/source/bagman.source.v1.schema.json` |
+| `https://bagman.internal/contracts/xero/bagman.xero_account.v1.schema.json` | BAGMAN XeroAccount | `contracts/xero/bagman.xero_account.v1.schema.json` |
+| `https://bagman.internal/contracts/xero/bagman.xero_connection.v1.schema.json` | BAGMAN XeroConnection | `contracts/xero/bagman.xero_connection.v1.schema.json` |
+| `https://bagman.internal/contracts/xero/bagman.xero_sync_run.v1.schema.json` | BAGMAN XeroSyncRun | `contracts/xero/bagman.xero_sync_run.v1.schema.json` |
 
 ## Canonical Entities
 

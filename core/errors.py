@@ -244,3 +244,20 @@ class PersistenceError(BagmanError):
     """
 
     error_code = "PERSISTENCE_ERROR"
+
+
+class OAuthStateError(BagmanError):
+    """A server-side OAuth anti-CSRF/replay `state` token failed
+    validation on an OAuth callback (CD-6 Slice 2, PID §98.4, architect
+    spec §3) — the `state` value is missing/unknown, already expired, or
+    already consumed by an earlier callback (a replay). Deliberately its
+    own error type rather than reusing `ValidationError`/`ConflictError`:
+    this is a genuine SECURITY rejection (mapped to HTTP 403 by
+    `app/api/main.py`, not 422/409), always audited
+    (`services.xero.oauth_state`'s own callers), and never silently
+    accepted under any condition — see
+    ``services.xero.oauth_state.consume_state``'s own docstring for the
+    exact checks this covers.
+    """
+
+    error_code = "OAUTH_STATE_INVALID"
