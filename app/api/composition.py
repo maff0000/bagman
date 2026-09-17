@@ -316,7 +316,13 @@ def _build_development_or_test(runtime_environment: str) -> RuntimeComposition:
     intake_repository = InMemoryIntakeRepository()
     needs_you_repository = InMemoryNeedsYouRepository()
 
-    ai_invocation_repository = InMemoryAIInvocationRepository()
+    # CD-6 reliability delta: shares `api.audit_repository` so the
+    # bounded stale-RUNNING recovery backstop's own audit events land in
+    # the SAME in-memory audit trail every test/dev-mode caller already
+    # reads via `api.audit_repository` — see `ai.invocation`'s module
+    # docstring ("Stale-RUNNING recovery") and
+    # `AIInvocationRepository`'s own class docstring.
+    ai_invocation_repository = InMemoryAIInvocationRepository(audit_repository=api.audit_repository)
     # `default_response` closes the WI-4 dev-mode gap documented on
     # `_dev_mode_litellm_default_response` above — without it, a real
     # click on the GUI's "Run analysis" button in a live dev server
@@ -432,7 +438,14 @@ def _build_production() -> RuntimeComposition:
     # LiteLLM gateway does not prevent composition from succeeding —
     # PID §48's own "evidence/runtime services remain usable even when
     # AI is unavailable").
-    ai_invocation_repository = PostgresAIInvocationRepository(engine)
+    # CD-6 reliability delta: shares `api.audit_repository`
+    # (`PostgresAuditRepository(engine)`, built above) so the bounded
+    # stale-RUNNING recovery backstop's own audit events land in the
+    # SAME `audit_events` table every other production audit event
+    # already writes to — see `ai.invocation`'s module docstring
+    # ("Stale-RUNNING recovery") and `AIInvocationRepository`'s own
+    # class docstring.
+    ai_invocation_repository = PostgresAIInvocationRepository(engine, audit_repository=api.audit_repository)
     litellm_client = LiteLLMClient(
         endpoint=os.environ.get("BAGMAN_LITELLM_ENDPOINT", DEFAULT_LITELLM_ENDPOINT),
         api_key_file=os.environ.get("BAGMAN_LITELLM_API_KEY_FILE", DEFAULT_LITELLM_API_KEY_FILE),

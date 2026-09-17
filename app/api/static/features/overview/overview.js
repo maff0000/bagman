@@ -196,7 +196,10 @@ export const Overview = {
       list.appendChild(
         el("li", {}, [
           el("span", { class: "ai-recent-list__task", text: `${invocation.task_id}` }),
-          el("span", { class: `pill pill--${invocation.status === "SUCCEEDED" ? "ok" : invocation.status === "FAILED" || invocation.status === "REJECTED" ? "bad" : "muted"}`, text: invocation.status }),
+          // TIMED_OUT/CANCELLED (CD-6 reliability delta, PID §100) join
+          // FAILED/REJECTED's terminal-outcome pill styling rather than
+          // falling through to the still-in-flight "muted" default.
+          el("span", { class: `pill pill--${invocation.status === "SUCCEEDED" ? "ok" : ["FAILED", "REJECTED", "TIMED_OUT", "CANCELLED"].includes(invocation.status) ? "bad" : "muted"}`, text: invocation.status }),
           el("span", { class: "muted small", text: fmtDateTime(invocation.started_at) }),
         ])
       );

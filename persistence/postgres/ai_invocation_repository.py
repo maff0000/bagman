@@ -25,6 +25,26 @@ constraint-violation path below is what actually proves correctness
 under a genuine race (proven against a real disposable PostgreSQL
 container in `tests/persistence/test_ai_invocation_repository.py`),
 never the stale pre-check alone.
+
+Stale-`RUNNING` recovery (CD-6 reliability delta, PID §100.14/§100.16)
+------------------------------------------------------------------------
+See `ai.invocation`'s own module docstring ("Stale-`RUNNING` recovery")
+for the full architecture/reasoning — this is the real, durable half of
+that bounded backstop. `_recover_if_stale` locks the candidate row with
+`SELECT ... FOR UPDATE` (the same discipline `transition_status` below
+already uses) before re-checking staleness and transitioning it, so a
+genuine concurrent race between two callers both discovering the same
+stale row cannot double-recover/double-audit it — the loser's lock wait
+resolves against an already-terminal row, and its own re-check inside
+the lock (never trusting the pre-lock read alone) reports "nothing to
+recover" rather than attempting a second, now-invalid transition. The
+stale-recovery audit event is emitted via a separate, freshly-scoped
+`AuditRepository` call AFTER the row-transitioning transaction commits
+— never inside the same transaction/session — mirroring exactly how
+every other `AIInvocation` audit event in this codebase is emitted
+(`agent.claude_code.orchestrator`/`ai.gateway.background`'s own
+"repository call, then a separate `record_audit_event` call" pattern),
+not a new cross-cutting transactional coupling.
 """
 from __future__ import annotations
 
@@ -36,11 +56,17 @@ from sqlalchemy.exc import DataError, IntegrityError, SQLAlchemyError
 from ai.invocation import (
     AIInvocation,
     AIInvocationRepository,
+    STALE_RECOVERY_AUDIT_EVENT_TYPE,
+    STALE_RECOVERY_ERROR_CODE,
+    STALE_RUNNING_THRESHOLD_SECONDS,
     derive_primary_input_reference,
+    is_stale_running,
+    recover_stale_invocation,
     transition,
     validate_role_provider_capability_pairing,
 )
 from core import actor, identity
+from core.audit import AuditRepository
 from core.contract_validation import validate_against_contract
 from core.errors import (
     ActiveInvocationConflictError,
@@ -116,8 +142,79 @@ class PostgresAIInvocationRepository(AIInvocationRepository):
     method reads/writes the database directly via a fresh `Session`.
     """
 
-    def __init__(self, engine: Optional[Engine] = None) -> None:
+    def __init__(self, engine: Optional[Engine] = None, *, audit_repository: Optional[AuditRepository] = None) -> None:
         self._engine = engine or get_engine()
+        # Lazy import mirrors `app/api/composition.py`'s own production
+        # composition style. A fresh `PostgresAuditRepository` per call
+        # is fine (unlike the in-memory repository, this one is
+        # stateless — every method opens its own session against the
+        # SAME database) — see module docstring's "Stale-RUNNING
+        # recovery" section for why this exists at all.
+        if audit_repository is None:
+            from persistence.postgres.audit_repository import PostgresAuditRepository
+
+            audit_repository = PostgresAuditRepository(self._engine)
+        self._audit_repository: AuditRepository = audit_repository
+
+    def _recover_if_stale(
+        self, *, task_id: str, task_version: int, primary_input_reference: str
+    ) -> Optional[AIInvocation]:
+        """Lock, re-check, and (if genuinely stale) recover the active
+        row for this subject, if any. Returns the recovered `AIInvocation`
+        (already `TIMED_OUT`) if a recovery happened, else `None` — see
+        module docstring's "Stale-RUNNING recovery" section for the
+        locking discipline this relies on to stay race-safe.
+        """
+        try:
+            with session_scope(self._engine) as session:
+                row = (
+                    session.query(AIInvocationRow)
+                    .filter(
+                        AIInvocationRow.task_id == task_id,
+                        AIInvocationRow.task_version == task_version,
+                        AIInvocationRow.primary_input_reference == primary_input_reference,
+                        AIInvocationRow.status.in_(("REQUESTED", "RUNNING")),
+                    )
+                    .with_for_update()
+                    .one_or_none()
+                )
+                if row is None:
+                    return None
+
+                current = _row_to_invocation(row)
+                # Re-check UNDER THE LOCK — never trust a pre-lock read
+                # alone (a concurrent recoverer, or the row's own
+                # legitimate owner, could have already resolved it).
+                if not is_stale_running(current):
+                    return None
+
+                recovered = recover_stale_invocation(current)
+                row.status = recovered.status
+                row.completed_at = recovered.completed_at
+                row.error_code = recovered.error_code
+                row.usage_metadata = dict(recovered.usage_metadata)
+                session.flush()
+        except SQLAlchemyError as exc:
+            raise PersistenceError(f"could not recover stale AIInvocation: {exc}") from exc
+
+        return recovered
+
+    def _record_stale_recovery_audit_event(self, recovered: AIInvocation) -> None:
+        self._audit_repository.record_audit_event(
+            event_type=STALE_RECOVERY_AUDIT_EVENT_TYPE,
+            actor_type=actor.SYSTEM,
+            actor_id="ai-invocation-stale-recovery",
+            subject_type="AIInvocation",
+            subject_id=recovered.ai_invocation_id,
+            correlation_id=recovered.correlation_id,
+            causation_id=None,
+            payload={
+                "task_id": recovered.task_id,
+                "task_version": recovered.task_version,
+                "error_code": STALE_RECOVERY_ERROR_CODE,
+                "stale_threshold_seconds": STALE_RUNNING_THRESHOLD_SECONDS,
+            },
+        )
 
     def create_invocation(
         self,
@@ -143,6 +240,18 @@ class PostgresAIInvocationRepository(AIInvocationRepository):
             )
 
         primary_ref = derive_primary_input_reference(input_references)
+
+        # Bounded stale-RUNNING recovery backstop (CD-6 reliability
+        # delta) — BEFORE the ordinary pre-check below, exactly per
+        # `ai.invocation`'s module docstring: an abandoned row must
+        # never permanently block this subject. Emitting the audit
+        # event happens OUTSIDE `_recover_if_stale`'s own transaction —
+        # see module docstring.
+        recovered = self._recover_if_stale(
+            task_id=task_id, task_version=task_version, primary_input_reference=primary_ref
+        )
+        if recovered is not None:
+            self._record_stale_recovery_audit_event(recovered)
 
         existing = self.find_active_invocation(
             task_id=task_id, task_version=task_version, primary_input_reference=primary_ref
@@ -272,9 +381,27 @@ class PostgresAIInvocationRepository(AIInvocationRepository):
                     )
                     .one_or_none()
                 )
-                return _row_to_invocation(row) if row is not None else None
+                found = _row_to_invocation(row) if row is not None else None
         except SQLAlchemyError as exc:
             raise PersistenceError(f"could not look up active AIInvocation: {exc}") from exc
+
+        if found is None:
+            return None
+
+        # Bounded stale-RUNNING recovery backstop (CD-6 reliability
+        # delta) — see `ai.invocation.AIInvocationRepository
+        # .find_active_invocation`'s own docstring: an abandoned row is
+        # never reported as active to a caller (a GUI "grey out the
+        # button" check, or `create_invocation`'s own pre-check above).
+        if not is_stale_running(found):
+            return found
+
+        recovered = self._recover_if_stale(
+            task_id=task_id, task_version=task_version, primary_input_reference=primary_input_reference
+        )
+        if recovered is not None:
+            self._record_stale_recovery_audit_event(recovered)
+        return None
 
     def list_invocations(
         self,

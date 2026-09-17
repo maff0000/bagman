@@ -209,6 +209,29 @@ def test_unstartable_executable_becomes_process_error_not_a_raised_exception(mon
     assert result.status == ClaudeCodeOutcomeStatus.PROCESS_ERROR
 
 
+def test_embedded_null_byte_in_prompt_becomes_process_error_not_a_raised_exception(monkeypatch, tmp_path):
+    """CD-6 reliability delta (PID §100.14/§100.16) — a real, live
+    failure mode found during this delivery's own live acceptance
+    testing against the real Mac mini appliance: binary evidence
+    content (e.g. a PNG) decoded with `errors="replace"` still contains
+    real NUL bytes (0x00 is valid UTF-8), which reach `user_prompt` and
+    make the real `subprocess.Popen` raise `ValueError` ("embedded null
+    byte"), NOT `OSError`. Before this fix, that exception was never
+    caught here — it violated this module's own "never raises out of
+    run()" contract and left the calling `AIInvocation` permanently
+    stuck in `RUNNING` (the exact symptom this whole delivery exists to
+    close), proven live before this fix landed."""
+
+    def _raise(argv, **kwargs):  # noqa: ARG001
+        raise ValueError("embedded null byte")
+
+    monkeypatch.setattr(subprocess, "Popen", _raise)
+    runner = ClaudeCodeOperatorRunner(home=str(tmp_path / "h"), cwd=str(tmp_path / "c"))
+    result = runner.run(system_prompt="sys", user_prompt="hi\x00there", timeout_seconds=5.0)  # must not raise
+
+    assert result.status == ClaudeCodeOutcomeStatus.PROCESS_ERROR
+
+
 def test_timeout_kills_the_process_group_and_returns_timeout_status(monkeypatch, tmp_path):
     killed = {}
 

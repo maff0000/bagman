@@ -242,7 +242,35 @@ class ClaudeCodeOperatorRunner:
                 start_new_session=True,  # own process group -> clean group kill on timeout
                 text=True,
             )
-        except OSError as exc:
+        except (OSError, ValueError) as exc:
+            # CD-6 reliability delta (PID §100.14/§100.16) — a real,
+            # live failure mode found during this delivery's own live
+            # acceptance testing: `subprocess.Popen` raises `ValueError`
+            # ("embedded null byte"), NOT `OSError`, when any argv
+            # element (here, `user_prompt` — see module docstring, the
+            # only caller-influenced values) contains a NUL byte. This
+            # is a real, reachable case: `agent.claude_code.context
+            # .assemble_operator_context` decodes an evidence item's
+            # raw bytes with `errors="replace"`, which does NOT strip
+            # NUL bytes (0x00 is valid UTF-8), so any binary evidence
+            # (e.g. a PNG/JPEG image) embeds real NUL bytes into the
+            # prompt text. Before this fix, that `ValueError` was never
+            # caught here at all — it propagated straight out of `run()`
+            # (violating this module's own "never raises out of run()"
+            # contract) and out of `handle_operator_message`, past the
+            # point the invocation had already been transitioned to
+            # `RUNNING`, leaving it stuck exactly like the original
+            # stuck-`RUNNING` incident this delivery's PID §100.14
+            # investigates — proven live, reproducibly, against the
+            # real Mac mini appliance. `ValueError` is treated exactly
+            # like `OSError` here — "the process could not be started
+            # with the given arguments" either way — never a new
+            # outcome status. The deeper root cause (binary evidence
+            # content reaching a prompt as raw decoded bytes at all) is
+            # `agent.claude_code.context`'s own concern, out of this
+            # module's scope and out of this delta's two assigned
+            # defects — honestly flagged, not silently worked around,
+            # for a future delivery.
             return ClaudeCodeInvocationResult(
                 status=ClaudeCodeOutcomeStatus.PROCESS_ERROR,
                 error_detail=f"could not start {_CLAUDE_EXECUTABLE!r}: {exc}"[:500],

@@ -388,8 +388,30 @@ _ASK_BAGMAN_INPUT_SCHEMA: Mapping[str, Any] = {
             "oneOf": [{"type": "string", "minLength": 1}, {"type": "null"}],
             "description": "Canonical entity_id in context, if the operator is asking about a specific GovernedEntity.",
         },
+        "conversation_id": {
+            "oneOf": [{"type": "string", "minLength": 1}, {"type": "null"}],
+            "description": (
+                "CD-6 reliability delta (PID §98/§100): a GUI-generated identifier for ONE open "
+                "Ask BAGMAN drawer session (see `app/api/static/features/ai/ask-bagman.js`) — the "
+                "conversation-scoped subject `ai.invocation.derive_primary_input_reference` falls "
+                "back to (last in precedence) when none of `evidence_id`/`intake_id`/`entity_id` is "
+                "present, so a genuinely contextless 'hi bagman' turn is still traceable to a real "
+                "canonical subject instead of being rejected outright."
+            ),
+        },
+        "source": {
+            "type": "string",
+            "minLength": 1,
+            "description": (
+                "CD-6 reliability delta (PID §98/§100): a simple, honest literal recording which UI "
+                "surface originated this call, e.g. `\"ask_bagman_drawer\"` — part of the full "
+                "provenance list the architect specified for every Ask BAGMAN turn. Not a closed "
+                "taxonomy (deliberately open, like `task_id`/`event_type` elsewhere) — `\"unknown\"` "
+                "is used when a caller does not supply one."
+            ),
+        },
     },
-    "required": ["message", "evidence_id", "intake_id", "entity_id"],
+    "required": ["message", "evidence_id", "intake_id", "entity_id", "conversation_id", "source"],
     "additionalProperties": False,
 }
 
@@ -446,11 +468,19 @@ _ASK_BAGMAN_OUTPUT_SCHEMA: Mapping[str, Any] = {
 #: this comment once pointed to, was removed 2026-09-16 — see the CD-5
 #: evidence file §6n) for the full "general chat has no evidence_id"
 #: tension this task's `input_schema` resolves: `evidence_id`/`intake_id`/
-#: `entity_id` are each optional (nullable), but
+#: `entity_id`/`conversation_id` are each optional (nullable), but
 #: `ai.invocation.derive_primary_input_reference` still requires at
-#: least one non-null — a genuinely subject-less "what needs my
-#: attention?" query is explicitly out of WI-3's scope (documented,
-#: not silently papered over).
+#: least one non-null. CD-6 reliability delta (PID §98/§100) added
+#: `conversation_id` (last in precedence) and `source` specifically so
+#: a genuinely subject-less "hi bagman"/"what needs my attention?"
+#: query — the architect's own explicit ruling that "an
+#: operator-originated conversational message is itself a valid
+#: traceable input" — is no longer out of scope; a truly bare call with
+#: not even a `conversation_id` still correctly raises `ValidationError`
+#: (there is no recognised subject at all to key the concurrency guard
+#: on), but the GUI's own Ask BAGMAN drawer always supplies one now
+#: (see `app/api/static/features/ai/ask-bagman.js`), so this is no
+#: longer reachable from ordinary GUI use.
 ASK_BAGMAN_V1 = TaskContract(
     task_id="ASK_BAGMAN",
     task_version=1,

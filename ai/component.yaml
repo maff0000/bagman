@@ -3,7 +3,7 @@
 # contracts/manifest/bagman.component_manifest.v1.schema.json.
 
 id: BAGMAN.AI
-version: 3
+version: 4
 
 responsibility: >
   Own the governed, provider-NEUTRAL AI invocation domain model and
@@ -44,6 +44,21 @@ responsibility: >
   `ai/evaluation/`, and `ai/provenance/` remain WI-5's job to populate
   (`ai/evaluation/` is populated; the other two remain placeholders).
 
+  **CD-6 reliability delta (2026-09-17, PID §98/§100.14/§100.16):**
+  `ai.invocation` grew two new terminal states (`TIMED_OUT`,
+  `CANCELLED`), a `conversation_id` primary-reference fallback (PID
+  §29/§73), and a bounded, deterministic stale-`RUNNING` recovery
+  backstop — see that module's own docstring for the full mechanism.
+  The backstop is the one narrow exception to this component's own
+  "does not itself emit audit events" rule below: both concrete
+  `AIInvocationRepository` implementations now accept an
+  `AuditRepository` and emit exactly one new event type,
+  `AI_INVOCATION_STALE_RECOVERED`, when they silently discover and
+  recover an abandoned row — no other caller is ever positioned to
+  observe that transition happening, so it could not be left to the
+  orchestration layer the way every other `AIInvocation` audit event
+  still is.
+
 owns:
   - AIInvocation
   - TaskContract
@@ -61,12 +76,17 @@ owns:
 consumes:
   - BAGMAN.CORE
 
-# This component does not itself emit audit events — AI_INVOCATION_*
-# audit event emission (PID §57) is WI-2/WI-3's orchestration-layer
-# responsibility, mirroring how services/evidence/intake/ does not
-# emit its own audit events either (see that component's own
-# component.yaml).
-produces: []
+# This component does not itself emit the ORDINARY AI_INVOCATION_*
+# lifecycle events (REQUESTED/RUNNING/SUCCEEDED/FAILED/...) —
+# WI-2/WI-3's orchestration-layer responsibility, mirroring how
+# services/evidence/intake/ does not emit its own audit events either
+# (see that component's own component.yaml). CD-6 reliability delta
+# (see `responsibility` above): both concrete `AIInvocationRepository`
+# implementations DO now emit exactly one event type themselves,
+# `AI_INVOCATION_STALE_RECOVERED`, for the one transition no external
+# orchestration-layer caller is ever positioned to observe.
+produces:
+  - AI_INVOCATION_STALE_RECOVERED
 
 # No new third-party dependency was introduced by WI-1: schema
 # validation reuses core.contract_validation's existing jsonschema

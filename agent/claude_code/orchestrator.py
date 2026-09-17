@@ -12,12 +12,61 @@ chat message into a governed, audited, bounded
 :class:`AskBagmanResult` — same public return shape the superseded
 implementation used (so ``app/api/routers/operator.py`` needed no
 response-contract change), same `AIInvocation` lifecycle
-(`REQUESTED -> RUNNING -> SUCCEEDED/FAILED`), same `ASK_BAGMAN` v1 task
+(`REQUESTED -> RUNNING -> SUCCEEDED/FAILED/TIMED_OUT`, the last added
+by the CD-6 reliability delta below), same `ASK_BAGMAN` v1 task
 contract (WI-1/WI-3's output schema already fits: `tool_calls` is
 simply always empty now, since this design makes no live tool call at
 all — PID §97's own "keep the implementation bounded... simple
 synchronous request/response... do not build a general autonomous
 multi-agent platform" instruction).
+
+CD-6 reliability delta (PID §98/§100.14/§100.16) — two real, live
+defects fixed here
+---------------------------------------------------------------------
+1. **A genuine Claude Code runner timeout now reaches `TIMED_OUT`, not
+   `FAILED`.** `_fail` below takes a `target_status` parameter (default
+   `"FAILED"`, unchanged for every other non-OK outcome) so a
+   `ClaudeCodeOutcomeStatus.TIMEOUT` result specifically targets
+   `TIMED_OUT` — `ai.invocation.ALLOWED_TRANSITIONS` permits
+   `RUNNING -> TIMED_OUT` precisely for this. This alone does NOT fully
+   explain the stuck-`RUNNING` incident PID §100.14 recorded live (a
+   controlled reproduction against the real Mac mini appliance — a
+   client that disconnected well before the server-side timeout —
+   proved the server-side call still runs to completion and reaches a
+   terminal state regardless of the client's own fate; Python cannot be
+   pre-empted mid-synchronous-call by a remote socket event with no
+   cooperative yield point in the call path). The actual mechanism this
+   delivery's root-cause investigation found: `app/api/routers
+   /operator.py`'s `async def operator_chat` called this fully
+   SYNCHRONOUS function directly, with no thread offload, meaning the
+   entire single-worker `bagman-api` process is unresponsive to
+   EVERYTHING (new requests, health checks, and its own graceful-
+   shutdown signal handling) for up to the full `ASK_BAGMAN_V1` bound
+   (90s) on every call — so ANY process-level event landing in that
+   window (a deliberate restart, an OOM kill, a crash, a host reboot)
+   abandons the in-flight row forever, with no code left running
+   anywhere to ever revisit it. `operator.py` now offloads this call via
+   `starlette.concurrency.run_in_threadpool` (see that router's own
+   docstring) — necessary, but per the architect's own explicit
+   instruction, not sufficient on its own (a background thread finishing
+   normally still needs the process to survive it), hence point 2.
+2. **A bounded, deterministic stale-`RUNNING` recovery backstop** now
+   exists at the persistence layer regardless of root cause — see
+   `ai.invocation`'s own module docstring ("Stale-`RUNNING` recovery")
+   for the full mechanism. This module does not call it directly; it is
+   `AIInvocationRepository.create_invocation`/`find_active_invocation`'s
+   own concern, transparent to every caller here.
+
+Defect 2 (Ask BAGMAN traceability, same PID §98/§100 delta) — a
+contextless "hi bagman" call (no `evidence_id`/`intake_id`/`entity_id`)
+now succeeds via a new `conversation_id`/`source` pair threaded through
+from `app/api/routers/operator.py` into `input_references` — see
+`ai.invocation.derive_primary_input_reference`'s own module docstring
+for the full precedence reasoning. This module's own prompt-
+construction/system-prompt logic (the untrusted-content boundary) is
+UNTOUCHED by this delta — the only changes here are the `_fail`
+`target_status` parametrisation and the two new, purely-provenance
+parameters threaded into `input_references`.
 
 What is DIFFERENT from the superseded design
 ------------------------------------------------
@@ -144,6 +193,8 @@ def handle_operator_message(
     evidence_id: Optional[str] = None,
     intake_id: Optional[str] = None,
     entity_id: Optional[str] = None,
+    conversation_id: Optional[str] = None,
+    source: Optional[str] = None,
     repository: AIInvocationRepository,
     runner: ClaudeCodeOperatorRunnerProtocol,
     api: BagmanCanonicalAPI,
@@ -154,11 +205,27 @@ def handle_operator_message(
     """Handle one Ask BAGMAN operator chat turn end-to-end via the
     bounded headless Claude Code runner.
 
+    `conversation_id`/`source` (CD-6 reliability delta, PID §98/§100):
+    `conversation_id` is the GUI-generated "this open Ask BAGMAN drawer
+    session" identifier (see `app/api/static/features/ai/ask-bagman.js`)
+    — `ai.invocation.derive_primary_input_reference`'s LAST-precedence
+    fallback subject, used only when none of `evidence_id`/`intake_id`/
+    `entity_id` is present. `source` is a simple, honest literal
+    recording which UI surface originated this call (e.g.
+    `"ask_bagman_drawer"`) — defaults to `"unknown"` if not supplied, so
+    every invocation always carries SOME value here (module docstring's
+    "state the question, even if unanswered" doctrine, applied to
+    provenance rather than a domain fact).
+
     Raises:
-        core.errors.ValidationError: if `message` is empty, or if none
-            of `evidence_id`/`intake_id`/`entity_id` was supplied (same
-            "general chat has no evidence_id" contract the superseded
-            orchestrator established — unchanged by this delta).
+        core.errors.ValidationError: if `message` is empty, or if NONE
+            of `evidence_id`/`intake_id`/`entity_id`/`conversation_id`
+            was supplied — a stricter-than-before condition (CD-6: a
+            genuinely contextless call now succeeds AS LONG AS a
+            `conversation_id` is present, which the GUI's Ask BAGMAN
+            drawer always supplies; only a caller that omits ALL FOUR
+            still hits this, e.g. a direct API call bypassing the GUI
+            entirely).
         core.errors.ActiveInvocationConflictError: a non-terminal
             ASK_BAGMAN invocation already exists for the exact same
             subject (PID §73) — unchanged.
@@ -173,6 +240,8 @@ def handle_operator_message(
         "evidence_id": evidence_id,
         "intake_id": intake_id,
         "entity_id": entity_id,
+        "conversation_id": conversation_id,
+        "source": source or "unknown",
     }
 
     invocation = repository.create_invocation(
@@ -203,11 +272,24 @@ def handle_operator_message(
 
     referenced_evidence_ids: set[str] = {evidence_id} if evidence_id else set()
 
-    def _fail(error_code: str, *, provenance: Optional[Mapping[str, Any]] = None) -> AskBagmanResult:
+    def _fail(
+        error_code: str, *, target_status: str = "FAILED", provenance: Optional[Mapping[str, Any]] = None
+    ) -> AskBagmanResult:
+        """`target_status` (CD-6 reliability delta) lets a genuine
+        runner timeout reach `TIMED_OUT` specifically while every other
+        provider-level error still reaches `FAILED` — see module
+        docstring point 1. The audit `event_type` stays
+        `AI_INVOCATION_FAILED` regardless of `target_status`: it
+        describes WHAT HAPPENED (this attempt did not produce a usable
+        result), not which of the two closely-related terminal states it
+        landed in — `payload["error_code"]` and the invocation's own
+        `status` field already distinguish `TIMED_OUT` from `FAILED` for
+        any reader who needs to.
+        """
         nonlocal invocation
         invocation = repository.transition_status(
             invocation.ai_invocation_id,
-            "FAILED",
+            target_status,
             error_code=error_code,
             usage_metadata=dict(provenance) if provenance else {},
         )
@@ -219,7 +301,7 @@ def handle_operator_message(
             subject_id=invocation.ai_invocation_id,
             correlation_id=invocation.correlation_id,
             causation_id=last_event_id,
-            payload={"error_code": error_code},
+            payload={"error_code": error_code, "status": target_status},
         )
         return AskBagmanResult(
             invocation=invocation,
@@ -270,6 +352,11 @@ def handle_operator_message(
         )
 
     if result.status != ClaudeCodeOutcomeStatus.OK:
+        # CD-6 reliability delta: a genuine runner timeout targets
+        # TIMED_OUT specifically — see module docstring point 1 and
+        # `ai.invocation.ALLOWED_TRANSITIONS`'s `RUNNING -> TIMED_OUT`
+        # edge. Every other non-OK status is unchanged: FAILED.
+        target_status = "TIMED_OUT" if result.status == ClaudeCodeOutcomeStatus.TIMEOUT else "FAILED"
         logger.warning(
             "ask_bagman_claude_code_provider_error",
             extra={
@@ -277,9 +364,14 @@ def handle_operator_message(
                 "event_type": "AI_INVOCATION_FAILED",
                 "ai_invocation_id": invocation.ai_invocation_id,
                 "status": result.status.value,
+                "target_status": target_status,
             },
         )
-        return _fail(_ERROR_CODE_BY_STATUS.get(result.status, "CLAUDE_CODE_PROVIDER_ERROR"), provenance=provenance)
+        return _fail(
+            _ERROR_CODE_BY_STATUS.get(result.status, "CLAUDE_CODE_PROVIDER_ERROR"),
+            target_status=target_status,
+            provenance=provenance,
+        )
 
     final_text = (result.text or "").strip()
     output = {

@@ -155,8 +155,14 @@ def test_operator_chat_request_has_no_field_naming_process_or_environment_contro
         f"influence process execution: {suspicious} — the browser must never control the "
         "executable/flags/cwd/environment (Matt's explicit Gate-2 instruction)"
     )
+    # conversation_id/source (CD-6 reliability delta, PID §98/§100) are
+    # pure provenance strings — a GUI-session identifier and a UI-surface
+    # label — never anything that could influence the fixed subprocess
+    # argv/env the runner builds; already covered by the
+    # forbidden-substrings check above.
     assert field_names == {
         "message", "actor_type", "actor_id", "correlation_id", "evidence_id", "intake_id", "entity_id",
+        "conversation_id", "source",
     }
 
 

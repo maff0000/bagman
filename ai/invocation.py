@@ -15,17 +15,20 @@ answer "what AI work did BAGMAN ask for, what happened, and can it
 prove it" — the actual provider call is WI-2 (background tasks) / WI-3
 (Claude operator) scope.
 
-State machine (PID §28)
-------------------------
+State machine (PID §28; CD-6 PID §98/§100.14/§100.16 reliability delta
+adds ``TIMED_OUT``/``CANCELLED``, see below)
+------------------------------------------------------------------------
 ``ALLOWED_TRANSITIONS`` is the single source of truth::
 
-    REQUESTED -> {RUNNING, FAILED, REJECTED}
-    RUNNING   -> {SUCCEEDED, FAILED}
+    REQUESTED -> {RUNNING, FAILED, REJECTED, CANCELLED}
+    RUNNING   -> {SUCCEEDED, FAILED, TIMED_OUT, CANCELLED}
     SUCCEEDED -> {}   (terminal)
     FAILED    -> {}   (terminal)
     REJECTED  -> {}   (terminal)
+    TIMED_OUT -> {}   (terminal)
+    CANCELLED -> {}   (terminal)
 
-Two design decisions worth reading before changing this table:
+Three design decisions worth reading before changing this table:
 
 * **`REQUESTED -> FAILED` is a real, direct edge.** A request can fail
   before it is ever dispatched to a provider — e.g. an infrastructure
@@ -46,6 +49,97 @@ Two design decisions worth reading before changing this table:
   This keeps the two terminal-failure states meaningfully distinct
   rather than overlapping: `REJECTED` = "we said no before asking";
   `FAILED` = "we asked and it did not work".
+* **`TIMED_OUT` and `CANCELLED` (CD-6 reliability delta, PID §100.14's
+  honestly-flagged finding — a stuck-`RUNNING` `AIInvocation` from a
+  real live Ask BAGMAN incident) are new, narrowly-scoped terminal
+  states, not a redefinition of the three above.**
+
+  - `TIMED_OUT` means "BAGMAN's own bounded timeout fired — we gave up
+    waiting" — distinct from `FAILED`'s "the provider actively
+    errored". Two producers: (1)
+    `agent.claude_code.orchestrator.handle_operator_message` maps a
+    `ClaudeCodeOutcomeStatus.TIMEOUT` runner outcome here instead of to
+    `FAILED` (see that module and `agent.claude_code.runner` for the
+    real subprocess-timeout mechanism this reports); (2) this module's
+    own stale-`RUNNING`-recovery backstop (see "Stale-`RUNNING`
+    recovery" below) uses `TIMED_OUT` with
+    `error_code=STALE_RECOVERY_ERROR_CODE` for a row that was
+    definitely never going to complete because whatever process was
+    running it is gone. Reachable only from `RUNNING` (never
+    `REQUESTED`): a request cannot time out before it was ever
+    dispatched — that is `REJECTED`/`FAILED`'s territory, not a new
+    third pre-dispatch outcome.
+  - `CANCELLED` means "an invocation was explicitly cancelled — by an
+    operator action or a deliberate application-level decision —
+    rather than having failed or timed out on its own". PID §100's
+    "required behaviour explicitly includes task cancellation as its
+    own case" is honoured here as a real, transition-tested terminal
+    state; there is deliberately no live UI trigger for it in this
+    delivery (Ask BAGMAN has no "cancel" button today, and inventing
+    one merely to exercise this edge would be exactly the kind of
+    fabricated affordance PID §98.2's "no fake buttons" doctrine
+    forbids) — see `tests/integration/test_ai_invocation_domain.py`
+    and `tests/persistence/test_ai_invocation_repository.py` for the
+    direct, repository-level transition tests that exercise it
+    instead. Reachable from BOTH `REQUESTED` (cancelled before a
+    provider call was ever attempted — e.g. a future "cancel this
+    pending request" action) and `RUNNING` (cancelled mid-flight — the
+    same shape of decision as `TIMED_OUT`'s "we stopped waiting", just
+    operator-initiated rather than a bound expiring). Never reachable
+    from `SUCCEEDED`/`FAILED`/`REJECTED`/`TIMED_OUT` — every terminal
+    state stays terminal; cancellation is not a way to retroactively
+    un-fail or un-succeed something.
+
+Stale-`RUNNING` recovery (CD-6 reliability delta, PID §100.14/§100.16)
+------------------------------------------------------------------------
+The live incident this delta fixes (see this delivery's own evidence/
+report, and the root-cause finding recorded there) proved that a
+process-level event (a deliberate `bagman-api` restart, an OOM kill, a
+crash, a host reboot — ANY cause, not merely the specific client-
+disconnect scenario first observed) can terminate the process that was
+mid-flight inside `RUNNING`, abandoning the row forever with no code
+left running anywhere to ever revisit it. `ALLOWED_TRANSITIONS` alone
+cannot fix this — a state machine only enforces which transitions are
+valid, not that SOME transition eventually happens.
+
+The architect's explicit requirement is a **bounded, deterministic**
+backstop — "do not introduce an unrestricted background worker
+architecture merely to solve this" — so this is deliberately NOT a
+polling daemon/cron/background thread. It is a check performed lazily,
+at the exact two points where staleness matters:
+:meth:`AIInvocationRepository.create_invocation` (when it finds an
+existing "active" row for the subject) and
+:meth:`AIInvocationRepository.find_active_invocation`. Both concrete
+repositories (:class:`InMemoryAIInvocationRepository` and
+`persistence.postgres.ai_invocation_repository.PostgresAIInvocationRepository`)
+implement this identically, sharing the exact same threshold/predicate
+(:func:`is_stale_running`) and the exact same recovery transition
+(:func:`recover_stale_invocation`) — see each repository's own
+docstring for its concurrency-specific details (Postgres: row-locked
+under `SELECT ... FOR UPDATE`, the same discipline its own
+`transition_status` already uses; in-memory: single-process, no
+locking needed).
+
+:data:`STALE_RUNNING_THRESHOLD_SECONDS` is a **fixed constant**, not
+derived live from `ai.tasks.TASK_REGISTRY`'s own `timeout_seconds`
+values, for a concrete, structural reason: `ai.tasks` already imports
+FROM this module (`TaskRole`, `BACKGROUND_CAPABILITY_ALIASES`) — a
+live import back from here would be circular. The chosen value (10
+minutes) is documented, not arbitrary: at the time this delta was
+written, `ASK_BAGMAN_V1` (`ai/tasks.py`) carries this system's longest
+registered `timeout_seconds`, 90 — the only task whose provider call
+can plausibly run for minutes rather than seconds (a bounded headless
+Claude Code subprocess, not a bounded LiteLLM HTTP call). 600 seconds
+is roughly 6-7x that bound: comfortable headroom over the subprocess
+timeout itself (90s) + the runner's own best-effort post-timeout
+cleanup (`agent.claude_code.runner`'s `communicate(timeout=5.0)`) +
+realistic database/network latency + ordinary clock skew, while still
+being tight enough that an operator who hits a genuinely stuck subject
+is never blocked for more than ~10 minutes even in the worst case.
+Whoever registers a future task with a `timeout_seconds` approaching
+this bound must revisit this constant explicitly — it is not
+recalculated automatically, exactly because it cannot be, by
+construction.
 
 Concurrency guard — "one active invocation per subject" (PID §73)
 -------------------------------------------------------------------
@@ -57,16 +151,45 @@ This module generalises "evidence_id" to a **primary input reference**
 specifically (e.g. a hypothetical future task keyed off `entity_id`
 alone) — but every task's input MUST carry at least one of a small,
 fixed, documented set of recognised reference keys, in this precedence
-order: ``evidence_id``, ``intake_id``, ``entity_id``. The first of
-these present with a non-empty string value is the "subject" the
-concurrency guard applies to. If `input_references` contains none of
-them, `create_invocation` refuses to create the record at all
-(`core.errors.ValidationError`) — this is a deliberate, stricter
-reading of PID §29 ("do not create opaque AI analysis disconnected
-from source evidence") than `IntakeRecord` needs, because unlike an
-intake attempt (which legitimately starts with no evidence yet), an AI
-invocation's whole point is to reason ABOUT something that must already
-be canonically identifiable.
+order: ``evidence_id``, ``intake_id``, ``entity_id``, ``conversation_id``.
+The first of these present with a non-empty string value is the
+"subject" the concurrency guard applies to. If `input_references`
+contains none of them, `create_invocation` refuses to create the
+record at all (`core.errors.ValidationError`) — this is a deliberate,
+stricter reading of PID §29 ("do not create opaque AI analysis
+disconnected from source evidence") than `IntakeRecord` needs, because
+unlike an intake attempt (which legitimately starts with no evidence
+yet), an AI invocation's whole point is to reason ABOUT something that
+must already be canonically identifiable.
+
+``conversation_id`` (CD-6 PID §98/§100 reliability delta) is
+deliberately LAST in precedence, not first or alongside the other
+three: it exists to satisfy the architect's traceability ruling that
+"an operator-originated conversational message is itself a valid
+traceable input" for Ask BAGMAN's persistent header affordance — which
+today has no multi-turn server-side conversation state (each call is
+one bounded, independent Claude Code invocation, see
+`agent.claude_code.orchestrator`'s own module docstring) but DOES have
+a real, GUI-generated identifier for "this open drawer session" (see
+`app/api/static/features/ai/ask-bagman.js`). When an operator asks
+Ask BAGMAN a question WHILE a specific document/intake/entity is
+attached (the more common, more specific case — "Ask BAGMAN about
+this"), the invocation should stay keyed on THAT canonical subject, not
+be diluted onto the surrounding conversation — a second, unrelated
+question typed moments later in the same open drawer but about the
+SAME document should still correctly conflict with an in-flight first
+one about that document (unchanged, pre-existing doctrine). Only when
+none of `evidence_id`/`intake_id`/`entity_id` is present — the
+genuinely contextless "hi bagman" case PID §100 identifies as a real,
+previously-broken path (see `derive_primary_input_reference`'s own
+docstring for the exact production incident this fixes) — does
+`conversation_id` become the subject, so that two turns typed in quick
+succession in the SAME open conversation still correctly conflict with
+each other (the existing, unchanged "wait for the prior one to reach a
+terminal state" doctrine, now applying to a conversation subject
+instead of only a document subject), while two DIFFERENT conversations
+(two browser tabs, or the drawer closed and reopened) never conflict
+with each other at all.
 
 Given that subject tuple `(task_id, task_version, primary_input_reference)`,
 `create_invocation` raises `core.errors.ActiveInvocationConflictError`
@@ -96,6 +219,7 @@ from datetime import datetime
 from typing import Any, Literal, Mapping, Optional
 
 from core import actor, identity
+from core.audit import AuditRepository, InMemoryAuditRepository
 from core.contract_validation import validate_against_contract
 from core.errors import (
     ActiveInvocationConflictError,
@@ -112,23 +236,33 @@ _SCHEMA = "ai/bagman.ai_invocation.v1.schema.json"
 #: JSON Schema `const`, so it is never a caller-supplied parameter.
 SCHEMA_VERSION = "bagman.ai_invocation.v1"
 
-#: The five invocation states (PID §28). Matches the contract's closed
+#: The seven invocation states (PID §28; `TIMED_OUT`/`CANCELLED` added
+#: by the CD-6 reliability delta, PID §100.14/§100.16 — see module
+#: docstring's "State machine" section). Matches the contract's closed
 #: `status` enum exactly.
-STATUSES = frozenset({"REQUESTED", "RUNNING", "SUCCEEDED", "FAILED", "REJECTED"})
+STATUSES = frozenset(
+    {"REQUESTED", "RUNNING", "SUCCEEDED", "FAILED", "REJECTED", "TIMED_OUT", "CANCELLED"}
+)
 
-#: States from which no further transition is possible (PID §28).
-TERMINAL_STATUSES = frozenset({"SUCCEEDED", "FAILED", "REJECTED"})
+#: States from which no further transition is possible (PID §28;
+#: `TIMED_OUT`/`CANCELLED` added by the CD-6 reliability delta).
+TERMINAL_STATUSES = frozenset({"SUCCEEDED", "FAILED", "REJECTED", "TIMED_OUT", "CANCELLED"})
 
 #: The single source of truth for valid invocation state transitions
-#: (PID §28). See the module docstring for the rationale behind the
-#: `REQUESTED -> FAILED` edge and the `REJECTED`-only-from-`REQUESTED`
-#: restriction.
+#: (PID §28). See the module docstring's "State machine" section for
+#: the rationale behind the `REQUESTED -> FAILED` edge, the
+#: `REJECTED`-only-from-`REQUESTED` restriction, and the CD-6 reliability
+#: delta's `TIMED_OUT`/`CANCELLED` additions (in particular why
+#: `TIMED_OUT` is reachable only from `RUNNING` while `CANCELLED` is
+#: reachable from both `REQUESTED` and `RUNNING`).
 ALLOWED_TRANSITIONS: dict[str, frozenset[str]] = {
-    "REQUESTED": frozenset({"RUNNING", "FAILED", "REJECTED"}),
-    "RUNNING": frozenset({"SUCCEEDED", "FAILED"}),
+    "REQUESTED": frozenset({"RUNNING", "FAILED", "REJECTED", "CANCELLED"}),
+    "RUNNING": frozenset({"SUCCEEDED", "FAILED", "TIMED_OUT", "CANCELLED"}),
     "SUCCEEDED": frozenset(),
     "FAILED": frozenset(),
     "REJECTED": frozenset(),
+    "TIMED_OUT": frozenset(),
+    "CANCELLED": frozenset(),
 }
 
 #: The two application-level provider-routing roles (PID §8/§20's
@@ -157,9 +291,90 @@ PROVIDERS = frozenset({"LITELLM", "ANTHROPIC"})
 BACKGROUND_CAPABILITY_ALIASES: frozenset[str] = frozenset({"bagman-fast", "bagman-core", "bagman-deep"})
 
 #: Recognised `input_references` keys, in the precedence order
-#: :func:`derive_primary_input_reference` checks them. See the module
-#: docstring's "Concurrency guard" section.
-PRIMARY_INPUT_REFERENCE_KEYS: tuple[str, ...] = ("evidence_id", "intake_id", "entity_id")
+#: :func:`derive_primary_input_reference` checks them. `conversation_id`
+#: is deliberately LAST (CD-6 reliability delta) — see the module
+#: docstring's "Concurrency guard" section for the full precedence
+#: reasoning.
+PRIMARY_INPUT_REFERENCE_KEYS: tuple[str, ...] = ("evidence_id", "intake_id", "entity_id", "conversation_id")
+
+#: Bounded, deterministic stale-`RUNNING` recovery threshold (CD-6
+#: reliability delta) — see the module docstring's "Stale-`RUNNING`
+#: recovery" section for the full reasoning behind both the fixed
+#: (non-derived) nature of this constant and its exact value.
+STALE_RUNNING_THRESHOLD_SECONDS: float = 600.0
+
+#: `error_code` stamped on an `AIInvocation` the stale-`RUNNING`
+#: recovery backstop transitions to `TIMED_OUT` — distinguishes "we
+#: gave up waiting because the recovery backstop found an abandoned row"
+#: from `agent.claude_code.orchestrator`'s own, more specific
+#: `CLAUDE_CODE_TIMEOUT` (a live runner call that itself hit its
+#: subprocess timeout while something was still there to observe it).
+STALE_RECOVERY_ERROR_CODE = "STALE_RECOVERY_TIMEOUT"
+
+#: `AuditEvent.event_type` recorded (same discipline every other status
+#: transition already gets, per the architect's explicit instruction)
+#: the moment the stale-`RUNNING` recovery backstop transitions an
+#: abandoned row — emitted by the repository itself (not by an external
+#: caller, since no external caller is positioned to observe this: it
+#: happens transparently as a side effect of some UNRELATED caller's own
+#: `create_invocation`/`find_active_invocation` call for a *different*,
+#: brand-new invocation attempt against the same subject).
+STALE_RECOVERY_AUDIT_EVENT_TYPE = "AI_INVOCATION_STALE_RECOVERED"
+
+
+def is_stale_running(invocation: "AIInvocation", *, now: Optional[datetime] = None) -> bool:
+    """True if ``invocation`` is non-terminal (`REQUESTED`/`RUNNING`)
+    and has been sitting there longer than
+    :data:`STALE_RUNNING_THRESHOLD_SECONDS` — the single shared
+    predicate both :class:`InMemoryAIInvocationRepository` and
+    `persistence.postgres.ai_invocation_repository.PostgresAIInvocationRepository`
+    use, so the threshold/semantics can never drift between them (PID
+    §100's explicit "implemented identically... in BOTH repositories"
+    requirement).
+
+    ``now`` is injectable purely for deterministic testing (construct a
+    row with an artificially old `started_at` and call this directly,
+    or freeze `now` instead of sleeping for real) — defaults to
+    :func:`core.timestamps.utc_now`.
+    """
+    if invocation.status not in ("REQUESTED", "RUNNING"):
+        return False
+    now = now if now is not None else utc_now()
+    return (now - invocation.started_at).total_seconds() > STALE_RUNNING_THRESHOLD_SECONDS
+
+
+def recover_stale_invocation(invocation: "AIInvocation") -> "AIInvocation":
+    """Return the terminal `AIInvocation` a stale, abandoned ``invocation``
+    (see :func:`is_stale_running`) is recovered into — always `TIMED_OUT`
+    with :data:`STALE_RECOVERY_ERROR_CODE`, never a silent delete/ignore
+    (PID §100: "a stale invocation must be transitioned explicitly and
+    audibly to an appropriate terminal/recovered state"). The single
+    shared recovery transition both repositories apply, via the same
+    :func:`transition` state-machine enforcement every other status
+    change goes through — this is not a bespoke bypass of
+    `ALLOWED_TRANSITIONS`.
+
+    Does not itself persist anything or emit an audit event — callers
+    (the two concrete repositories) are responsible for both, using
+    :data:`STALE_RECOVERY_AUDIT_EVENT_TYPE`.
+    """
+    return transition(
+        invocation,
+        "TIMED_OUT",
+        error_code=STALE_RECOVERY_ERROR_CODE,
+        usage_metadata={
+            **dict(invocation.usage_metadata),
+            "stale_recovery": {
+                "reason": (
+                    f"started_at was older than STALE_RUNNING_THRESHOLD_SECONDS "
+                    f"({STALE_RUNNING_THRESHOLD_SECONDS}s) with no terminal transition ever "
+                    "recorded — recovered by the bounded stale-RUNNING backstop, not a live "
+                    "runner outcome"
+                ),
+                "recovered_at": to_contract_string(utc_now()),
+            },
+        },
+    )
 
 
 def derive_primary_input_reference(input_references: Mapping[str, Any]) -> str:
@@ -167,6 +382,20 @@ def derive_primary_input_reference(input_references: Mapping[str, Any]) -> str:
     this invocation's subject (PID §29/§73) — the first of
     :data:`PRIMARY_INPUT_REFERENCE_KEYS`, in that precedence order,
     present with a non-empty string value.
+
+    `conversation_id` (CD-6 reliability delta, last in precedence) is
+    what fixes the real, live, production-confirmed defect PID §98/§100
+    record: before this delta, a genuinely contextless Ask BAGMAN
+    message (no `evidence_id`/`intake_id`/`entity_id` — e.g. a plain
+    "hi bagman" typed into the GUI's persistent header affordance with
+    no document/intake/entity attached) had no recognised primary
+    reference at all and this function raised `ValidationError`
+    unconditionally, which `agent.claude_code.orchestrator
+    .handle_operator_message` let propagate as an HTTP 422 — the
+    architect's own ruling is that this was always wrong: "an
+    operator-originated conversational message is itself a valid
+    traceable input... Ask BAGMAN MUST NOT require an external
+    EvidenceItem for ordinary conversation."
 
     Raises:
         core.errors.ValidationError: if `input_references` contains
@@ -358,7 +587,24 @@ def transition(invocation: AIInvocation, new_status: str, **field_updates: Any) 
 
 
 class AIInvocationRepository(abc.ABC):
-    """Repository abstraction for AIInvocation (PID §27)."""
+    """Repository abstraction for AIInvocation (PID §27).
+
+    Concrete implementations (:class:`InMemoryAIInvocationRepository`,
+    `persistence.postgres.ai_invocation_repository.PostgresAIInvocationRepository`)
+    each accept an `audit_repository` at construction — used ONLY to
+    emit :data:`STALE_RECOVERY_AUDIT_EVENT_TYPE` when
+    `create_invocation`/`find_active_invocation` silently discover and
+    recover an abandoned stale-`RUNNING` row (see module docstring's
+    "Stale-`RUNNING` recovery" section). This is deliberately different
+    from every OTHER `AIInvocation` audit event (`AI_INVOCATION_REQUESTED`/
+    `_SUCCEEDED`/`_FAILED`/...), which the CALLER emits explicitly
+    alongside its own repository calls (see
+    `agent.claude_code.orchestrator.handle_operator_message` and
+    `ai.gateway.background.run_background_task`) — stale recovery is the
+    one transition that happens transparently, as a side effect of some
+    UNRELATED caller's own `create_invocation`/`find_active_invocation`
+    call, so no external caller is ever positioned to audit it itself.
+    """
 
     @abc.abstractmethod
     def create_invocation(
@@ -380,11 +626,15 @@ class AIInvocationRepository(abc.ABC):
         Enforces, in order: the role/provider/capability_alias pairing
         (see :func:`validate_role_provider_capability_pairing`), that
         `input_references` yields a `derive_primary_input_reference`,
-        and the one-active-invocation concurrency guard (PID §73) —
-        raising `core.errors.ActiveInvocationConflictError` if a
-        NON-terminal invocation already exists for the exact same
-        `(task_id, task_version, primary_input_reference)` subject (see
-        module docstring).
+        a bounded stale-`RUNNING` recovery pass (CD-6 reliability delta
+        — see module docstring: if the subject's existing "active" row
+        is actually abandoned per :func:`is_stale_running`, it is
+        transitioned to `TIMED_OUT` first, audibly, before this method
+        proceeds), and the one-active-invocation concurrency guard (PID
+        §73) — raising `core.errors.ActiveInvocationConflictError` if a
+        genuinely NON-terminal (and non-stale) invocation still exists
+        for the exact same `(task_id, task_version,
+        primary_input_reference)` subject (see module docstring).
 
         `correlation_id` is generated fresh if not supplied — an AI
         invocation is normally either the start of a new workflow
@@ -408,13 +658,23 @@ class AIInvocationRepository(abc.ABC):
     def find_active_invocation(
         self, *, task_id: str, task_version: int, primary_input_reference: str
     ) -> Optional[AIInvocation]:
-        """Read-only lookup: the invocation currently in a NON-terminal
-        status (`REQUESTED` or `RUNNING`) for this exact subject, if any
-        — the same check `create_invocation` performs internally,
-        exposed for callers that want to know without attempting a
-        create (e.g. a GUI deciding whether to grey out a 'run
-        analysis' button). Returns `None` if none exists — a query, not
-        a fetch-by-ID, so it never raises `NotFoundError`.
+        """Read-only(-ish) lookup: the invocation currently in a
+        NON-terminal status (`REQUESTED` or `RUNNING`) for this exact
+        subject, if any — the same check `create_invocation` performs
+        internally, exposed for callers that want to know without
+        attempting a create (e.g. a GUI deciding whether to grey out a
+        'run analysis' button). Returns `None` if none exists — a
+        query, not a fetch-by-ID, so it never raises `NotFoundError`.
+
+        CD-6 reliability delta: if the row found IS non-terminal but is
+        stale per :func:`is_stale_running`, this method recovers it
+        (transitions it to `TIMED_OUT`, audibly — see module docstring's
+        "Stale-`RUNNING` recovery" section and the `AIInvocationRepository`
+        class docstring) and returns `None` — a genuinely abandoned row
+        must never be reported as "active" to a caller deciding whether
+        to grey out a button, or Ask BAGMAN's own `create_invocation`
+        pre-check above would keep believing a dead subject is still in
+        flight forever.
         """
         raise NotImplementedError
 
@@ -467,11 +727,61 @@ class AIInvocationRepository(abc.ABC):
 class InMemoryAIInvocationRepository(AIInvocationRepository):
     """Narrow in-memory reference implementation (PID §21 Option A)."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, audit_repository: Optional[AuditRepository] = None) -> None:
         self._by_id: dict[str, AIInvocation] = {}
         #: subject tuple -> ai_invocation_id of the currently-active
         #: (non-terminal) invocation for that subject, if any.
         self._active_by_subject: dict[tuple[str, int, str], str] = {}
+        # Single-process, GIL-serialised — no real concurrency to defend
+        # against here, unlike the Postgres implementation's row locking
+        # (module docstring's "Stale-RUNNING recovery" section). Defaults
+        # to a fresh, private `InMemoryAuditRepository` (never `None`)
+        # so stale-recovery audit emission never has to special-case a
+        # missing sink; a caller that wants stale-recovery events to
+        # land in the SAME audit trail the rest of the app reads
+        # (e.g. `core.api.BagmanCanonicalAPI.audit_repository`) passes
+        # it explicitly — `app/api/composition.py` does exactly this.
+        self._audit_repository: AuditRepository = audit_repository or InMemoryAuditRepository()
+
+    def _recover_if_stale(self, invocation: AIInvocation) -> Optional[AIInvocation]:
+        """If ``invocation`` (a row this instance currently believes is
+        active for its subject) is stale per :func:`is_stale_running`,
+        transition it to `TIMED_OUT`, persist, clear it from
+        `_active_by_subject`, emit :data:`STALE_RECOVERY_AUDIT_EVENT_TYPE`,
+        and return the recovered record. Returns `None` if ``invocation``
+        is not actually stale (the ordinary, common case) — callers
+        distinguish "nothing to recover" from "recovered" by this
+        return value, never by a side effect alone.
+        """
+        if not is_stale_running(invocation):
+            return None
+
+        recovered = recover_stale_invocation(invocation)
+        self._by_id[recovered.ai_invocation_id] = recovered
+        subject = (
+            recovered.task_id,
+            recovered.task_version,
+            derive_primary_input_reference(recovered.input_references),
+        )
+        if self._active_by_subject.get(subject) == recovered.ai_invocation_id:
+            del self._active_by_subject[subject]
+
+        self._audit_repository.record_audit_event(
+            event_type=STALE_RECOVERY_AUDIT_EVENT_TYPE,
+            actor_type=actor.SYSTEM,
+            actor_id="ai-invocation-stale-recovery",
+            subject_type="AIInvocation",
+            subject_id=recovered.ai_invocation_id,
+            correlation_id=recovered.correlation_id,
+            causation_id=None,
+            payload={
+                "task_id": recovered.task_id,
+                "task_version": recovered.task_version,
+                "error_code": STALE_RECOVERY_ERROR_CODE,
+                "stale_threshold_seconds": STALE_RUNNING_THRESHOLD_SECONDS,
+            },
+        )
+        return recovered
 
     def create_invocation(
         self,
@@ -498,6 +808,14 @@ class InMemoryAIInvocationRepository(AIInvocationRepository):
         subject = (task_id, task_version, primary_ref)
 
         existing_id = self._active_by_subject.get(subject)
+        if existing_id is not None:
+            # Bounded stale-RUNNING recovery backstop (CD-6 reliability
+            # delta) — BEFORE the conflict check below, exactly per the
+            # module docstring: an abandoned row must never permanently
+            # block this subject.
+            self._recover_if_stale(self._by_id[existing_id])
+            existing_id = self._active_by_subject.get(subject)
+
         if existing_id is not None:
             raise ActiveInvocationConflictError(
                 f"an active (non-terminal) AIInvocation '{existing_id}' already exists for "
@@ -563,7 +881,17 @@ class InMemoryAIInvocationRepository(AIInvocationRepository):
         self, *, task_id: str, task_version: int, primary_input_reference: str
     ) -> Optional[AIInvocation]:
         existing_id = self._active_by_subject.get((task_id, task_version, primary_input_reference))
-        return self._by_id[existing_id] if existing_id is not None else None
+        if existing_id is None:
+            return None
+        existing = self._by_id[existing_id]
+        # Bounded stale-RUNNING recovery backstop (CD-6 reliability
+        # delta) — see module docstring and `AIInvocationRepository
+        # .find_active_invocation`'s own docstring: an abandoned row is
+        # never reported as active.
+        recovered = self._recover_if_stale(existing)
+        if recovered is not None:
+            return None
+        return existing
 
     def list_invocations(
         self,

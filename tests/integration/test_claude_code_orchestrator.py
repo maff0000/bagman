@@ -138,13 +138,12 @@ def test_runner_receives_the_exact_bounded_timeout_from_the_task_contract(
 @pytest.mark.parametrize(
     "status",
     [
-        ClaudeCodeOutcomeStatus.TIMEOUT,
         ClaudeCodeOutcomeStatus.PROCESS_ERROR,
         ClaudeCodeOutcomeStatus.OUTPUT_PARSE_ERROR,
         ClaudeCodeOutcomeStatus.PROVIDER_ERROR,
     ],
 )
-def test_every_non_ok_status_fails_closed_with_a_distinct_error_code(
+def test_every_non_timeout_non_ok_status_fails_closed_with_a_distinct_error_code(
     api, repository, runner, object_store, intake_repository, status
 ):
     evidence_id = _register_evidence(api)
@@ -157,6 +156,30 @@ def test_every_non_ok_status_fails_closed_with_a_distinct_error_code(
 
     assert result.invocation.status == "FAILED"
     assert result.invocation.error_code.startswith("CLAUDE_CODE_")
+    assert result.response_text is None
+
+    events = api.audit_repository.list_by_subject("AIInvocation", result.invocation.ai_invocation_id)
+    assert [e.event_type for e in events] == ["AI_INVOCATION_REQUESTED", "AI_INVOCATION_FAILED"]
+
+
+def test_a_genuine_runner_timeout_reaches_timed_out_not_failed(
+    api, repository, runner, object_store, intake_repository
+):
+    """CD-6 reliability delta (PID §100.14/§100.16): a genuine,
+    non-abandoned Claude Code runner timeout is distinguishable from an
+    ordinary provider FAILED — the architect's own explicit acceptance
+    criterion ("a controlled timeout reaches TIMED_OUT... separate from
+    ...FAILED")."""
+    evidence_id = _register_evidence(api)
+    runner.queue_failure(status=ClaudeCodeOutcomeStatus.TIMEOUT, error_detail="simulated timeout")
+
+    result = _run(
+        api=api, repository=repository, runner=runner, object_store=object_store,
+        intake_repository=intake_repository, evidence_id=evidence_id,
+    )
+
+    assert result.invocation.status == "TIMED_OUT"
+    assert result.invocation.error_code == "CLAUDE_CODE_TIMEOUT"
     assert result.response_text is None
 
     events = api.audit_repository.list_by_subject("AIInvocation", result.invocation.ai_invocation_id)
@@ -193,9 +216,90 @@ def test_empty_message_is_rejected(api, repository, runner, object_store, intake
 
 
 def test_no_canonical_subject_reference_is_rejected(api, repository, runner, object_store, intake_repository):
+    """Still rejected when NOT EVEN a `conversation_id` is supplied —
+    the CD-6 reliability delta narrows this case, it does not remove
+    it (see `handle_operator_message`'s own docstring)."""
     with pytest.raises(ValidationError):
         _run(api=api, repository=repository, runner=runner, object_store=object_store, intake_repository=intake_repository)
     assert repository.list_invocations() == []
+
+
+# ---------------------------------------------------------------------
+# CD-6 reliability delta — contextless "hi bagman" via conversation_id
+# (PID §98/§100)
+# ---------------------------------------------------------------------
+
+
+def test_contextless_hi_bagman_succeeds_via_conversation_id(api, repository, runner, object_store, intake_repository):
+    runner.queue_success(text="Hi Matt — how can I help?")
+
+    result = _run(
+        api=api, repository=repository, runner=runner, object_store=object_store,
+        intake_repository=intake_repository, message="hi bagman", conversation_id="conv-hi",
+    )
+
+    assert result.invocation.status == "SUCCEEDED"
+    assert result.response_text == "Hi Matt — how can I help?"
+    assert result.invocation.input_references["conversation_id"] == "conv-hi"
+    # Traceable via its conversation_id: the invocation's own
+    # ai_invocation_id already serves as the "turn id" PID §100's
+    # provenance list asks for (see orchestrator module docstring).
+    assert result.invocation.ai_invocation_id is not None
+
+
+def test_contextless_call_defaults_source_to_unknown_when_not_supplied(
+    api, repository, runner, object_store, intake_repository
+):
+    runner.queue_success(text="hi")
+    result = _run(
+        api=api, repository=repository, runner=runner, object_store=object_store,
+        intake_repository=intake_repository, message="hi", conversation_id="conv-src",
+    )
+    assert result.invocation.input_references["source"] == "unknown"
+
+
+def test_source_is_recorded_verbatim_when_supplied(api, repository, runner, object_store, intake_repository):
+    runner.queue_success(text="hi")
+    result = _run(
+        api=api, repository=repository, runner=runner, object_store=object_store,
+        intake_repository=intake_repository, message="hi", conversation_id="conv-src2",
+        source="ask_bagman_drawer",
+    )
+    assert result.invocation.input_references["source"] == "ask_bagman_drawer"
+
+
+def test_two_contextless_turns_in_the_same_conversation_conflict(
+    api, repository, runner, object_store, intake_repository
+):
+    repository.create_invocation(
+        task_id="ASK_BAGMAN", task_version=1, role="OPERATOR", provider="ANTHROPIC",
+        capability_alias=None,
+        input_references={"message": "first", "conversation_id": "conv-same"},
+        actor_type=ACTOR_TYPE, actor_id=ACTOR_ID,
+    )
+    with pytest.raises(ActiveInvocationConflictError):
+        _run(
+            api=api, repository=repository, runner=runner, object_store=object_store,
+            intake_repository=intake_repository, message="second", conversation_id="conv-same",
+        )
+    assert runner.calls == []
+
+
+def test_two_contextless_turns_in_different_conversations_do_not_conflict(
+    api, repository, runner, object_store, intake_repository
+):
+    repository.create_invocation(
+        task_id="ASK_BAGMAN", task_version=1, role="OPERATOR", provider="ANTHROPIC",
+        capability_alias=None,
+        input_references={"message": "first", "conversation_id": "conv-a"},
+        actor_type=ACTOR_TYPE, actor_id=ACTOR_ID,
+    )
+    runner.queue_success(text="ok")
+    result = _run(
+        api=api, repository=repository, runner=runner, object_store=object_store,
+        intake_repository=intake_repository, message="second", conversation_id="conv-b",
+    )
+    assert result.invocation.status == "SUCCEEDED"
 
 
 def test_unknown_evidence_id_raises_not_found_not_a_fabricated_context(

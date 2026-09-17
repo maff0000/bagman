@@ -43,6 +43,7 @@ wall-clock overlap of each thread's own call window below.
 """
 from __future__ import annotations
 
+import datetime
 import threading
 import time
 from unittest import mock
@@ -50,13 +51,16 @@ from unittest import mock
 import pytest
 import sqlalchemy as sa
 
+from ai.invocation import STALE_RECOVERY_ERROR_CODE, STALE_RUNNING_THRESHOLD_SECONDS
 from core import identity
+from core.audit import InMemoryAuditRepository
 from core.errors import (
     ActiveInvocationConflictError,
     InvalidStateTransitionError,
     NotFoundError,
     ValidationError,
 )
+from core.timestamps import utc_now
 from persistence.postgres.ai_invocation_models import AIInvocationRow
 from persistence.postgres.ai_invocation_repository import PostgresAIInvocationRepository
 from persistence.postgres.session import get_engine
@@ -192,6 +196,137 @@ def test_transition_invalid_edge_raises_and_leaves_state_unchanged():
 def test_transition_status_not_found_raises():
     with pytest.raises(NotFoundError):
         PostgresAIInvocationRepository().transition_status(identity.generate_id(), "RUNNING")
+
+
+# ---------------------------------------------------------------------
+# CD-6 reliability delta — TIMED_OUT / CANCELLED durably persist
+# (PID §100.14/§100.16)
+# ---------------------------------------------------------------------
+
+
+def test_running_can_time_out_and_persists_durably():
+    created = _create_operator()
+    PostgresAIInvocationRepository().transition_status(created.ai_invocation_id, "RUNNING")
+    timed_out = PostgresAIInvocationRepository().transition_status(
+        created.ai_invocation_id, "TIMED_OUT", error_code="CLAUDE_CODE_TIMEOUT"
+    )
+    assert timed_out.status == "TIMED_OUT"
+    assert timed_out.completed_at is not None
+
+    reread = PostgresAIInvocationRepository().get_invocation(created.ai_invocation_id)
+    assert reread.status == "TIMED_OUT"
+    assert reread.error_code == "CLAUDE_CODE_TIMEOUT"
+
+
+def test_requested_cannot_time_out_directly():
+    created = _create_operator()
+    with pytest.raises(InvalidStateTransitionError):
+        PostgresAIInvocationRepository().transition_status(created.ai_invocation_id, "TIMED_OUT")
+
+
+def test_requested_can_be_cancelled_and_persists_durably():
+    created = _create_operator()
+    cancelled = PostgresAIInvocationRepository().transition_status(created.ai_invocation_id, "CANCELLED")
+    assert cancelled.status == "CANCELLED"
+
+    reread = PostgresAIInvocationRepository().get_invocation(created.ai_invocation_id)
+    assert reread.status == "CANCELLED"
+
+
+def test_running_can_be_cancelled_and_persists_durably():
+    created = _create_operator()
+    PostgresAIInvocationRepository().transition_status(created.ai_invocation_id, "RUNNING")
+    cancelled = PostgresAIInvocationRepository().transition_status(created.ai_invocation_id, "CANCELLED")
+    assert cancelled.status == "CANCELLED"
+
+
+@pytest.mark.parametrize("terminal_status", ["SUCCEEDED", "FAILED", "REJECTED", "TIMED_OUT"])
+def test_no_other_terminal_state_can_be_cancelled(terminal_status):
+    created = _create_operator()
+    if terminal_status == "SUCCEEDED":
+        PostgresAIInvocationRepository().transition_status(created.ai_invocation_id, "RUNNING")
+        PostgresAIInvocationRepository().transition_status(created.ai_invocation_id, "SUCCEEDED")
+    elif terminal_status == "TIMED_OUT":
+        PostgresAIInvocationRepository().transition_status(created.ai_invocation_id, "RUNNING")
+        PostgresAIInvocationRepository().transition_status(created.ai_invocation_id, "TIMED_OUT")
+    else:
+        PostgresAIInvocationRepository().transition_status(created.ai_invocation_id, terminal_status)
+    with pytest.raises(InvalidStateTransitionError):
+        PostgresAIInvocationRepository().transition_status(created.ai_invocation_id, "CANCELLED")
+
+
+# ---------------------------------------------------------------------
+# CD-6 reliability delta — conversation_id primary reference precedence
+# (PID §98/§100), at the database level (the REAL generated column)
+# ---------------------------------------------------------------------
+
+
+def test_generated_column_derives_conversation_id_when_nothing_else_present():
+    conversation_id = identity.generate_id()
+    created = PostgresAIInvocationRepository().create_invocation(
+        task_id="ASK_BAGMAN", task_version=1, role="OPERATOR", provider="ANTHROPIC",
+        capability_alias=None,
+        input_references={"message": "hi", "conversation_id": conversation_id},
+        actor_type="USER", actor_id="matt",
+    )
+    with get_engine().connect() as conn:
+        value = conn.execute(
+            sa.select(AIInvocationRow.primary_input_reference).where(
+                AIInvocationRow.ai_invocation_id == created.ai_invocation_id
+            )
+        ).scalar_one()
+    assert value == conversation_id
+
+
+def test_generated_column_prefers_evidence_id_over_conversation_id():
+    evidence_id = identity.generate_id()
+    conversation_id = identity.generate_id()
+    created = PostgresAIInvocationRepository().create_invocation(
+        task_id="ASK_BAGMAN", task_version=1, role="OPERATOR", provider="ANTHROPIC",
+        capability_alias=None,
+        input_references={"message": "hi", "evidence_id": evidence_id, "conversation_id": conversation_id},
+        actor_type="USER", actor_id="matt",
+    )
+    with get_engine().connect() as conn:
+        value = conn.execute(
+            sa.select(AIInvocationRow.primary_input_reference).where(
+                AIInvocationRow.ai_invocation_id == created.ai_invocation_id
+            )
+        ).scalar_one()
+    assert value == evidence_id
+
+
+def test_two_contextless_turns_in_the_same_conversation_conflict_via_the_real_constraint():
+    conversation_id = identity.generate_id()
+    PostgresAIInvocationRepository().create_invocation(
+        task_id="ASK_BAGMAN", task_version=1, role="OPERATOR", provider="ANTHROPIC",
+        capability_alias=None,
+        input_references={"message": "first", "conversation_id": conversation_id},
+        actor_type="USER", actor_id="matt",
+    )
+    with pytest.raises(ActiveInvocationConflictError):
+        PostgresAIInvocationRepository().create_invocation(
+            task_id="ASK_BAGMAN", task_version=1, role="OPERATOR", provider="ANTHROPIC",
+            capability_alias=None,
+            input_references={"message": "second", "conversation_id": conversation_id},
+            actor_type="USER", actor_id="matt",
+        )
+
+
+def test_two_contextless_turns_in_different_conversations_do_not_conflict():
+    first = PostgresAIInvocationRepository().create_invocation(
+        task_id="ASK_BAGMAN", task_version=1, role="OPERATOR", provider="ANTHROPIC",
+        capability_alias=None,
+        input_references={"message": "first", "conversation_id": identity.generate_id()},
+        actor_type="USER", actor_id="matt",
+    )
+    second = PostgresAIInvocationRepository().create_invocation(
+        task_id="ASK_BAGMAN", task_version=1, role="OPERATOR", provider="ANTHROPIC",
+        capability_alias=None,
+        input_references={"message": "second", "conversation_id": identity.generate_id()},
+        actor_type="USER", actor_id="matt",
+    )
+    assert first.ai_invocation_id != second.ai_invocation_id
 
 
 # ---------------------------------------------------------------------
@@ -441,3 +576,160 @@ def test_genuinely_concurrent_threads_racing_the_same_subject_resolve_to_exactly
 
     winner = PostgresAIInvocationRepository().get_invocation(created[0]["ai_invocation_id"])
     assert winner.status == "REQUESTED"
+
+
+# ---------------------------------------------------------------------
+# CD-6 reliability delta — bounded, deterministic stale-RUNNING
+# recovery backstop (PID §100.14/§100.16), against the REAL database.
+# ---------------------------------------------------------------------
+
+
+def _force_started_at(ai_invocation_id: str, started_at: datetime.datetime) -> None:
+    """Test-only: directly overwrite a row's `started_at` via a real,
+    safe, targeted UPDATE — the deterministic way this suite proves
+    staleness without ever actually waiting `STALE_RUNNING_THRESHOLD_SECONDS`
+    for real (per the PID's own "artificially old started_at, not by
+    actually waiting" instruction)."""
+    with get_engine().begin() as conn:
+        conn.execute(
+            sa.update(AIInvocationRow)
+            .where(AIInvocationRow.ai_invocation_id == ai_invocation_id)
+            .values(started_at=started_at)
+        )
+
+
+def test_create_invocation_recovers_a_stale_running_row_then_succeeds():
+    audit = InMemoryAuditRepository()
+    repo = PostgresAIInvocationRepository(audit_repository=audit)
+    conversation_id = identity.generate_id()
+
+    stuck = repo.create_invocation(
+        task_id="ASK_BAGMAN", task_version=1, role="OPERATOR", provider="ANTHROPIC",
+        capability_alias=None,
+        input_references={"message": "first", "conversation_id": conversation_id},
+        actor_type="USER", actor_id="matt",
+    )
+    repo.transition_status(stuck.ai_invocation_id, "RUNNING")
+    _force_started_at(
+        stuck.ai_invocation_id, utc_now() - datetime.timedelta(seconds=STALE_RUNNING_THRESHOLD_SECONDS + 5)
+    )
+
+    # A brand-new invocation for the SAME subject succeeds instead of
+    # raising ActiveInvocationConflictError — the real partial unique
+    # index would otherwise refuse this insert outright, proving the
+    # stale row was genuinely transitioned to a terminal state FIRST
+    # (not merely ignored) before this insert was even attempted.
+    new = repo.create_invocation(
+        task_id="ASK_BAGMAN", task_version=1, role="OPERATOR", provider="ANTHROPIC",
+        capability_alias=None,
+        input_references={"message": "second", "conversation_id": conversation_id},
+        actor_type="USER", actor_id="matt",
+    )
+    assert new.ai_invocation_id != stuck.ai_invocation_id
+    assert new.status == "REQUESTED"
+
+    recovered = PostgresAIInvocationRepository().get_invocation(stuck.ai_invocation_id)
+    assert recovered.status == "TIMED_OUT"
+    assert recovered.error_code == STALE_RECOVERY_ERROR_CODE
+    assert recovered.completed_at is not None
+
+    events = audit.list_by_subject("AIInvocation", stuck.ai_invocation_id)
+    assert [e.event_type for e in events] == ["AI_INVOCATION_STALE_RECOVERED"]
+
+    # Exactly two rows for this subject now — the recovered original
+    # plus the new one — never a silent delete of the old row.
+    assert _invocation_count_for_subject("ASK_BAGMAN", 1, conversation_id) == 2
+
+
+def test_find_active_invocation_recovers_a_stale_row_and_reports_none():
+    audit = InMemoryAuditRepository()
+    repo = PostgresAIInvocationRepository(audit_repository=audit)
+    conversation_id = identity.generate_id()
+
+    stuck = repo.create_invocation(
+        task_id="ASK_BAGMAN", task_version=1, role="OPERATOR", provider="ANTHROPIC",
+        capability_alias=None,
+        input_references={"message": "first", "conversation_id": conversation_id},
+        actor_type="USER", actor_id="matt",
+    )
+    repo.transition_status(stuck.ai_invocation_id, "RUNNING")
+    _force_started_at(
+        stuck.ai_invocation_id, utc_now() - datetime.timedelta(seconds=STALE_RUNNING_THRESHOLD_SECONDS + 5)
+    )
+
+    found = repo.find_active_invocation(
+        task_id="ASK_BAGMAN", task_version=1, primary_input_reference=conversation_id
+    )
+    assert found is None
+
+    recovered = PostgresAIInvocationRepository().get_invocation(stuck.ai_invocation_id)
+    assert recovered.status == "TIMED_OUT"
+    assert recovered.error_code == STALE_RECOVERY_ERROR_CODE
+
+    events = audit.list_by_subject("AIInvocation", stuck.ai_invocation_id)
+    assert [e.event_type for e in events] == ["AI_INVOCATION_STALE_RECOVERED"]
+
+
+def test_a_genuinely_recent_running_row_is_not_recovered_and_still_blocks():
+    repo = PostgresAIInvocationRepository()
+    conversation_id = identity.generate_id()
+
+    stuck = repo.create_invocation(
+        task_id="ASK_BAGMAN", task_version=1, role="OPERATOR", provider="ANTHROPIC",
+        capability_alias=None,
+        input_references={"message": "first", "conversation_id": conversation_id},
+        actor_type="USER", actor_id="matt",
+    )
+    repo.transition_status(stuck.ai_invocation_id, "RUNNING")
+
+    # No time manipulation — this row is genuinely fresh.
+    found = repo.find_active_invocation(
+        task_id="ASK_BAGMAN", task_version=1, primary_input_reference=conversation_id
+    )
+    assert found is not None
+    assert found.status == "RUNNING"
+
+    with pytest.raises(ActiveInvocationConflictError):
+        repo.create_invocation(
+            task_id="ASK_BAGMAN", task_version=1, role="OPERATOR", provider="ANTHROPIC",
+            capability_alias=None,
+            input_references={"message": "second", "conversation_id": conversation_id},
+            actor_type="USER", actor_id="matt",
+        )
+
+    still_running = PostgresAIInvocationRepository().get_invocation(stuck.ai_invocation_id)
+    assert still_running.status == "RUNNING"
+    assert _invocation_count_for_subject("ASK_BAGMAN", 1, conversation_id) == 1
+
+
+def test_stale_recovery_default_audit_repository_shares_the_same_database():
+    """No `audit_repository` explicitly supplied — the default
+    (`PostgresAuditRepository(engine)`, see the repository's own
+    `__init__`) still durably records the stale-recovery event, in the
+    SAME `audit_events` table every other production audit event
+    writes to."""
+    repo = PostgresAIInvocationRepository()
+    conversation_id = identity.generate_id()
+
+    stuck = repo.create_invocation(
+        task_id="ASK_BAGMAN", task_version=1, role="OPERATOR", provider="ANTHROPIC",
+        capability_alias=None,
+        input_references={"message": "first", "conversation_id": conversation_id},
+        actor_type="USER", actor_id="matt",
+    )
+    repo.transition_status(stuck.ai_invocation_id, "RUNNING")
+    _force_started_at(
+        stuck.ai_invocation_id, utc_now() - datetime.timedelta(seconds=STALE_RUNNING_THRESHOLD_SECONDS + 5)
+    )
+
+    repo.create_invocation(
+        task_id="ASK_BAGMAN", task_version=1, role="OPERATOR", provider="ANTHROPIC",
+        capability_alias=None,
+        input_references={"message": "second", "conversation_id": conversation_id},
+        actor_type="USER", actor_id="matt",
+    )
+
+    from persistence.postgres.audit_repository import PostgresAuditRepository
+
+    events = PostgresAuditRepository(get_engine()).list_by_subject("AIInvocation", stuck.ai_invocation_id)
+    assert [e.event_type for e in events] == ["AI_INVOCATION_STALE_RECOVERED"]

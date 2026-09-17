@@ -57,8 +57,9 @@ export function statusBadge(status) {
   return badge(status, INTAKE_STATUS_GROUP[status] || "progress");
 }
 
-// AIInvocation.status vocabulary (PID §28) — a DIFFERENT closed set
-// from IntakeRecord.status above (REQUESTED/RUNNING/SUCCEEDED/FAILED/
+// AIInvocation.status vocabulary (PID §28; TIMED_OUT/CANCELLED added by
+// the CD-6 reliability delta, PID §100) — a DIFFERENT closed set from
+// IntakeRecord.status above (REQUESTED/RUNNING/SUCCEEDED/FAILED/
 // REJECTED), so deliberately its own map rather than folded into
 // INTAKE_STATUS_GROUP, even though a couple of colour buckets coincide.
 const INVOCATION_STATUS_GROUP = {
@@ -67,6 +68,13 @@ const INVOCATION_STATUS_GROUP = {
   SUCCEEDED: "ok",
   FAILED: "bad",
   REJECTED: "warn",
+  // TIMED_OUT is a failure-shaped outcome from the operator's
+  // perspective (no answer arrived) even though it is domain-distinct
+  // from a provider FAILED — same colour bucket, different label text.
+  TIMED_OUT: "bad",
+  // CANCELLED is a deliberate, non-alarming outcome — closer to
+  // REJECTED's "we said no"/"we stopped" shade than to a red failure.
+  CANCELLED: "warn",
 };
 
 export function invocationStatusBadge(status) {

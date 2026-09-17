@@ -77,6 +77,62 @@ def test_chat_without_a_canonical_subject_reference_returns_422(dev_client):
     assert resp.json()["error_code"] == "VALIDATION_ERROR"
 
 
+def test_chat_with_only_a_conversation_id_succeeds(dev_client):
+    """CD-6 reliability delta (PID §98/§100) — the real, previously-live
+    defect this delivery fixes: a genuinely contextless "hi bagman"
+    message (no evidence/intake/entity_id) now succeeds via
+    `conversation_id`, the architect's own ruling that "an
+    operator-originated conversational message is itself a valid
+    traceable input"."""
+    from app.api.composition import get_composition
+
+    composition = get_composition()
+    composition.claude_code_operator_runner.queue_success(text="Hi Matt — how can I help?")
+
+    resp = dev_client.post(
+        "/internal/operator/chat",
+        json={
+            "message": "hi bagman",
+            "actor_type": "USER",
+            "actor_id": "matt",
+            "conversation_id": "conv-http-1",
+            "source": "ask_bagman_drawer",
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "SUCCEEDED"
+    assert body["response_text"] == "Hi Matt — how can I help?"
+    assert body["input_references"]["conversation_id"] == "conv-http-1"
+    assert body["input_references"]["source"] == "ask_bagman_drawer"
+
+
+def test_two_turns_same_conversation_id_conflict_via_http(dev_client):
+    from app.api.composition import get_composition
+
+    composition = get_composition()
+    from core import actor as actor_module
+
+    composition.ai_invocation_repository.create_invocation(
+        task_id="ASK_BAGMAN", task_version=1, role="OPERATOR", provider="ANTHROPIC",
+        capability_alias=None,
+        input_references={"message": "first", "conversation_id": "conv-http-2"},
+        actor_type=actor_module.USER, actor_id="matt",
+    )
+
+    resp = dev_client.post(
+        "/internal/operator/chat",
+        json={
+            "message": "second, concurrent",
+            "actor_type": "USER",
+            "actor_id": "matt",
+            "conversation_id": "conv-http-2",
+        },
+    )
+    assert resp.status_code == 409
+    assert resp.json()["error_code"] == "ACTIVE_INVOCATION_CONFLICT"
+
+
 def test_chat_with_an_empty_message_returns_422(dev_client):
     resp = dev_client.post(
         "/internal/operator/chat",
@@ -172,7 +228,9 @@ def test_a_duplicate_concurrent_chat_about_the_same_subject_returns_409(dev_clie
     assert resp.json()["error_code"] == "ACTIVE_INVOCATION_CONFLICT"
 
 
-def test_claude_code_timeout_surfaces_as_a_failed_invocation_not_a_500(dev_client):
+def test_claude_code_timeout_surfaces_as_a_timed_out_invocation_not_a_500(dev_client):
+    """CD-6 reliability delta (PID §100.14/§100.16): a genuine runner
+    timeout now reaches TIMED_OUT specifically, not FAILED."""
     composition, evidence = _register_evidence(dev_client)
     from agent.claude_code.runner import ClaudeCodeOutcomeStatus
 
@@ -189,9 +247,9 @@ def test_claude_code_timeout_surfaces_as_a_failed_invocation_not_a_500(dev_clien
             "evidence_id": evidence.evidence_id,
         },
     )
-    assert resp.status_code == 200  # the HTTP call itself succeeded — it returns a FAILED AIInvocation
+    assert resp.status_code == 200  # the HTTP call itself succeeded — it returns a TIMED_OUT AIInvocation
     body = resp.json()
-    assert body["status"] == "FAILED"
+    assert body["status"] == "TIMED_OUT"
     assert body["error_code"] == "CLAUDE_CODE_TIMEOUT"
     assert body["response_text"] is None
 
