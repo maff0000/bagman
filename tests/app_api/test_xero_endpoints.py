@@ -334,3 +334,22 @@ def test_needs_you_resolution_stores_the_real_account_id_not_a_display_string(de
     # And it survives a re-read (not just the immediate response).
     refetched = dev_client.get(f"/internal/needs-you/{item.item_id}").json()
     assert refetched["resolution"]["xero_account_id"] == "REAL-ACCOUNT-ID-XYZ"
+
+
+def test_default_redirect_uri_matches_the_actually_registered_xero_value():
+    """PL-review regression guard: PID §102.1's original topology plan
+    (`http://localhost:8200/...`) was corrected in §102.2 after Xero's
+    own live app-registration UI rejected it ("must use https") -- the
+    `http://localhost` exception only applies to Xero's PKCE-only
+    "Mobile or desktop app" client type, never to BAGMAN's server-side
+    confidential "Web app" registration. `_DEFAULT_REDIRECT_URI` was
+    found, during PL review, to still hold the OLD superseded value
+    even though PID.md's prose had already been corrected -- a real,
+    live-blocking defect (a genuine OAuth attempt would have failed
+    with a redirect_uri mismatch against Xero's actually-registered
+    URI). This pins the constant to the real, currently-registered
+    value so this exact class of "prose corrected, code not" drift can
+    never silently recur."""
+    from app.api.routers.xero import _DEFAULT_REDIRECT_URI
+
+    assert _DEFAULT_REDIRECT_URI == "https://localhost:8543/internal/xero/oauth/callback"

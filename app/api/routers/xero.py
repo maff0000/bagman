@@ -74,15 +74,25 @@ from services.xero.sync import is_reference_data_stale, run_sync
 
 router = APIRouter(prefix="/internal/xero")
 
-#: The EXACT path Xero's own OAuth redirect targets (PID §102.1's own
-#: researched topology decision: `http://localhost:8200/internal/xero/
-#: oauth/callback`, reached via an SSH local port-forward from Matt's
-#: machine — see that section for the full reasoning). Overridable via
-#: `BAGMAN_XERO_REDIRECT_URI` purely so a disposable test/dev instance
-#: on a different port never has to fight this literal; production
-#: never sets the override — the registered Xero Developer App redirect
-#: URI must match this exact default.
-_DEFAULT_REDIRECT_URI = "http://localhost:8200/internal/xero/oauth/callback"
+#: The EXACT path Xero's own OAuth redirect targets — PID §102.2's
+#: CORRECTED topology (superseding §102.1's original `http://
+#: localhost:8200/...` plan): Xero's `http://localhost` redirect-URI
+#: testing exception applies only to its PKCE-only "Mobile or desktop
+#: app" client type, never to BAGMAN's server-side confidential "Web
+#: app" registration — confirmed live when Matt's own attempt to
+#: register the `http://localhost:8200/...` value was rejected by
+#: Xero's own app-registration UI ("must use https"). The real,
+#: registered redirect URI is therefore HTTPS, on the dedicated
+#: loopback-only TLS terminator (`bagman-xero-oauth-tls`, Caddy, port
+#: 8543 — see the Mac's own `bagman.docker-compose.yml`), reached via
+#: an SSH local port-forward from Matt's machine
+#: (`ssh -L 8543:localhost:8543 matt@<mac-host>`), NOT the plain-HTTP
+#: LAN-facing GUI port 8200. Overridable via `BAGMAN_XERO_REDIRECT_URI`
+#: purely so a disposable test/dev instance on a different port never
+#: has to fight this literal; production never sets the override — the
+#: registered Xero Developer App redirect URI must match this exact
+#: default.
+_DEFAULT_REDIRECT_URI = "https://localhost:8543/internal/xero/oauth/callback"
 
 
 def _redirect_uri() -> str:
