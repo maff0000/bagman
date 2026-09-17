@@ -93,7 +93,6 @@ from core.errors import (
     TenantSelectionError,
     ValidationError,
 )
-from core.timestamps import utc_now
 from services.xero.ai_suggestion import UNRESOLVED, resolve_ai_suggested_account
 from services.xero.client import XeroConnectionInfo, XeroOutcomeStatus
 from services.xero.connection import XeroConnection
@@ -693,11 +692,11 @@ async def get_pending_tenant_selection(selection_id: str) -> dict:
     composition = get_composition()
     selection = composition.xero_pending_tenant_selection_store.get(selection_id)
     if selection is None:
+        # Unknown, already consumed, or expired -- indistinguishable
+        # by design (see `services.xero.tenant_selection`'s own module
+        # docstring: a consumed selection is fully removed, not merely
+        # flagged, and an expired one is purged on every access).
         raise TenantSelectionError(f"no pending Xero tenant selection '{selection_id}'")
-    if selection.is_resolved:
-        raise TenantSelectionError("this Xero tenant selection was already resolved")
-    if utc_now() > selection.expires_at:
-        raise TenantSelectionError("this Xero tenant selection has expired")
     return {
         "selection_id": selection.selection_id,
         "candidates": [{"tenant_id": c.tenant_id, "tenant_name": c.tenant_name} for c in selection.candidates],
@@ -713,48 +712,48 @@ async def resolve_pending_tenant_selection(selection_id: str, payload: ResolveTe
     candidate set returned by Xero for this OAuth flow; the browser
     must not be able to substitute an arbitrary tenant ID."
 
-    Two independent guards, neither trusting the other alone:
-
-    1. `payload.tenant_id` is checked against the selection's own
-       frozen (immutable since creation) candidate set BEFORE any
-       locking work — a fast, specific rejection for an out-of-set
-       value.
-    2. :meth:`PendingTenantSelectionStore.mark_resolved` is the real,
-       lock-guarded, one-time-consumption gate — mirrors
-       `services.xero.oauth_state.consume_state`/`mark_consumed`'s own
-       "re-check under the lock, never trust a pre-lock read alone"
-       discipline exactly, for the identical concurrency hazard (two
-       near-simultaneous resolution attempts for the same
-       `selection_id`).
+    :meth:`PendingTenantSelectionStore.consume` is the ONE authoritative
+    operation here — under a single lock it finds the record, rejects
+    unknown/expired, validates `payload.tenant_id` against the exact
+    frozen candidate set, and ATOMICALLY removes the record from the
+    store before returning it (architect correction, PID §102.4: an
+    earlier version of this module kept a token-bearing record around
+    after resolution — real process-lifetime raw-token retention,
+    fixed by making resolution consume-and-remove, never mark-and-
+    retain; see `services.xero.tenant_selection`'s own module
+    docstring for the full reasoning). After this call returns
+    successfully, the store holds no raw token for this selection
+    anywhere — a replay of the same `selection_id` fails simply because
+    the record no longer exists.
 
     On success, completes the connection via the SAME
     :func:`_complete_with_tenant` logic the single-eligible-candidate
-    auto-path uses — the access/refresh tokens written are the ones
-    THIS server captured at the original callback, from THIS
-    selection's own record, never anything the browser supplies.
+    auto-path uses — the access/refresh tokens used are the ones THIS
+    server captured at the original callback, from THIS now-removed
+    selection's own local copy, never anything the browser supplies. If
+    that completion unexpectedly fails (a tenant conflict, a superseded
+    connection), the tokens simply fall out of scope with this request
+    and are never retained for a retry — the operator restarts the
+    OAuth flow from the GUI's own already-supported "PENDING → Restart
+    Xero connection" action (correctness/security over retry
+    convenience, a deliberate trade-off, not an oversight).
     """
     composition = get_composition()
     store = composition.xero_pending_tenant_selection_store
 
-    pre_check = store.get(selection_id)
-    if pre_check is None:
-        raise TenantSelectionError(f"no pending Xero tenant selection '{selection_id}'")
-    if payload.tenant_id not in pre_check.candidate_tenant_ids():
-        raise TenantSelectionError("the selected Xero organisation was not part of this authorisation")
+    consumed_selection = store.consume(selection_id, payload.tenant_id)
 
-    resolved_selection = store.mark_resolved(selection_id)
-
-    connection = composition.xero_connection_repository.get_connection(resolved_selection.xero_connection_id)
-    chosen = next(c for c in resolved_selection.candidates if c.tenant_id == payload.tenant_id)
+    connection = composition.xero_connection_repository.get_connection(consumed_selection.xero_connection_id)
+    chosen = next(c for c in consumed_selection.candidates if c.tenant_id == payload.tenant_id)
 
     ok, reason_key = _complete_with_tenant(
         composition,
         connection,
-        resolved_selection.entity_id,
+        consumed_selection.entity_id,
         chosen,
-        access_token=resolved_selection.access_token,
-        refresh_token=resolved_selection.refresh_token,
-        token_expires_at=resolved_selection.token_expires_at,
+        access_token=consumed_selection.access_token,
+        refresh_token=consumed_selection.refresh_token,
+        token_expires_at=consumed_selection.token_expires_at,
     )
     if not ok:
         message = _RESULT_REASONS.get(reason_key, _UNKNOWN_REASON_MESSAGE)
@@ -762,7 +761,7 @@ async def resolve_pending_tenant_selection(selection_id: str, payload: ResolveTe
 
     return {
         "ok": True,
-        "entity_id": resolved_selection.entity_id,
+        "entity_id": consumed_selection.entity_id,
         "tenant_id": chosen.tenant_id,
         "tenant_name": chosen.tenant_name,
     }

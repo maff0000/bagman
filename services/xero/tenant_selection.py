@@ -63,16 +63,52 @@ Postgres, and never a file either:
   the GUI's own already-supported "PENDING → Restart Xero connection"
   action.
 
-One-time consumption, mirrored from ``services.xero.oauth_state``
+Consume-and-remove, not mark-and-retain (architect correction, PID
+§102.4)
 ------------------------------------------------------------------------
-:meth:`PendingTenantSelectionStore.mark_resolved` is the SAME
-"authoritative, lock-guarded gate — re-validate under the lock, never
-trust a pre-lock read alone" discipline
-``services.xero.oauth_state.OAuthStateRepository.mark_consumed`` and
-``ai.invocation._recover_if_stale`` both already establish elsewhere in
-this codebase, applied here to the identical concurrency hazard: two
-near-simultaneous resolution attempts for the same ``selection_id``
-must not both succeed.
+A first version of this module kept holding raw tokens on the record
+even after resolution — it replaced the entry with an otherwise
+identical ``resolved_at``-stamped copy, still sitting in the store, and
+never purged unresolved-but-expired entries at all. That is a REAL
+defect: it silently turned a "documented short-lived secret bridge"
+into process-lifetime raw-token retention, which directly contradicts
+this module's own reason for existing (see "Where the freshly-
+exchanged tokens live" above — the whole premise is that this state is
+short-lived).
+
+:meth:`PendingTenantSelectionStore.consume` fixes this: it is an
+ATOMIC consume-and-remove — under ONE lock it finds the record, rejects
+it if unknown/expired, validates the operator's chosen tenant_id
+against the exact frozen candidate set, and — ONLY on success — pops
+the record out of the store entirely before returning it to the
+caller for that one request's own local use. After `consume()`
+returns, the store holds NO raw access/refresh token for that
+selection, full stop — there is no separate "mark resolved" step that
+would leave a token-bearing tombstone behind. A replay of the same
+`selection_id` therefore fails not because some `resolved_at` flag was
+checked, but because the record genuinely no longer exists — the
+SIMPLEST possible one-time-use guarantee, and the audit event
+(`XERO_CONNECTION_CONNECTED`/`XERO_CONNECTION_CONNECT_FAILED`/
+`XERO_CONNECTION_CALLBACK_SUPERSEDED`, all already recorded by
+`app/api/routers/xero.py::_complete_with_tenant`) is the durable
+evidence of what happened — this module itself keeps none.
+
+If completing the connection AFTER a successful `consume()` fails
+unexpectedly (a tenant conflict, a superseded connection — see
+`_complete_with_tenant`'s own docstring), the tokens simply fall out of
+scope with the request and are never retained for a retry: the
+operator restarts the OAuth flow from the GUI's own already-supported
+"PENDING → Restart Xero connection" action. Correctness/security is
+more important than retry convenience here — an explicit, deliberate
+trade-off, not an oversight.
+
+Every store method also opportunistically purges any entry whose
+`expires_at` has passed (architect requirement: "purge expired records
+opportunistically on create/get/consume, or otherwise ensure expired
+selections cannot accumulate indefinitely") — so an abandoned,
+never-resolved selection is never retained past its own TTL either,
+closing the second half of the same "process-lifetime retention"
+concern.
 """
 from __future__ import annotations
 
@@ -100,6 +136,12 @@ class TenantCandidate:
 
 @dataclass(frozen=True)
 class PendingTenantSelection:
+    """No `resolved_at`/`is_resolved` field, deliberately: "resolved"
+    now means "no longer present in the store at all" (see module
+    docstring's "Consume-and-remove, not mark-and-retain" section) —
+    there is no in-between state where a resolved-but-still-token-
+    bearing record exists for anything to check."""
+
     selection_id: str
     entity_id: str
     xero_connection_id: str
@@ -109,11 +151,6 @@ class PendingTenantSelection:
     token_expires_at: datetime
     created_at: datetime
     expires_at: datetime
-    resolved_at: Optional[datetime] = None
-
-    @property
-    def is_resolved(self) -> bool:
-        return self.resolved_at is not None
 
     def candidate_tenant_ids(self) -> frozenset[str]:
         return frozenset(c.tenant_id for c in self.candidates)
@@ -152,25 +189,46 @@ class PendingTenantSelectionStore(abc.ABC):
 
     @abc.abstractmethod
     def get(self, selection_id: str) -> Optional[PendingTenantSelection]:
-        """Read-only lookup — `None` if unknown/never created. Does NOT
-        itself check expiry/resolution (callers needing the
-        authoritative check use :meth:`mark_resolved`; a GET-only
-        candidate-listing caller checks `is_resolved`/`expires_at`
-        itself for an honest, non-mutating display)."""
+        """Read-only lookup for the picker's own candidate-listing
+        call — never mutates, never removes anything itself (beyond
+        the same opportunistic expired-entry purge every method
+        performs). Returns `None` for BOTH an unknown selection_id and
+        an expired one — indistinguishable to a read-only caller, and
+        deliberately so (see :meth:`consume` for why "unknown" and
+        "expired" are not distinguished anywhere in this module)."""
         raise NotImplementedError
 
     @abc.abstractmethod
-    def mark_resolved(self, selection_id: str, *, now: Optional[datetime] = None) -> PendingTenantSelection:
-        """Atomically stamp `resolved_at` — the AUTHORITATIVE, race-safe
-        consumption gate (mirrors
-        `services.xero.oauth_state.OAuthStateRepository.mark_consumed`
-        exactly, including WHY: a caller's own prior unlocked read is
-        never trusted as the sole guarantee against two near-
-        simultaneous resolution attempts).
+    def consume(
+        self, selection_id: str, selected_tenant_id: str, *, now: Optional[datetime] = None
+    ) -> PendingTenantSelection:
+        """The ONE authoritative operation across this selection's
+        entire lifecycle — atomic consume-and-remove, under a single
+        lock:
+
+        1. find the record;
+        2. reject unknown (never existed, already consumed by an
+           earlier call, or purged for having expired — all
+           indistinguishable, deliberately: see module docstring);
+        3. reject expired (purged before the lookup, so an expired
+           record is simply absent by this point — folded into the
+           same "unknown" rejection above, not a separate check);
+        4. validate `selected_tenant_id` against the record's own
+           frozen (immutable since :meth:`create`) candidate set;
+        5. remove the record from the store;
+        6. return the removed record to the caller for THIS request's
+           own local, one-time use.
+
+        After this returns successfully, the store contains NO raw
+        access/refresh token for `selection_id` — there is no
+        intermediate "resolved but still retained" state. A second
+        call with the same `selection_id` (a genuine replay) fails at
+        step 2, identically to a `selection_id` that never existed.
 
         Raises:
-            core.errors.TenantSelectionError: unknown, already
-                resolved, or expired, as re-checked under the lock.
+            core.errors.TenantSelectionError: unknown/expired/already-
+                consumed `selection_id`, or `selected_tenant_id` not in
+                the authorised candidate set.
         """
         raise NotImplementedError
 
@@ -184,6 +242,18 @@ class InMemoryPendingTenantSelectionStore(PendingTenantSelectionStore):
     def __init__(self) -> None:
         self._by_id: dict[str, PendingTenantSelection] = {}
         self._lock = _threading.Lock()
+
+    def _purge_expired_locked(self, now: datetime) -> None:
+        """Must be called only while holding `self._lock`. Removes
+        every entry whose TTL has passed — architect requirement:
+        "ensure expired selections cannot accumulate indefinitely." An
+        abandoned, never-resolved selection is therefore never retained
+        past its own TTL, closing the same "process-lifetime
+        retention" concern :meth:`consume`'s own removal closes for the
+        resolved case."""
+        expired_ids = [sid for sid, record in self._by_id.items() if now > record.expires_at]
+        for sid in expired_ids:
+            del self._by_id[sid]
 
     def create(
         self,
@@ -206,44 +276,40 @@ class InMemoryPendingTenantSelectionStore(PendingTenantSelectionStore):
             token_expires_at=token_expires_at,
             created_at=now,
             expires_at=now + timedelta(seconds=PENDING_SELECTION_TTL_SECONDS),
-            resolved_at=None,
         )
         with self._lock:
+            self._purge_expired_locked(now)
             self._by_id[candidate.selection_id] = candidate
         return candidate
 
     def get(self, selection_id: str) -> Optional[PendingTenantSelection]:
+        now = utc_now()
         with self._lock:
+            self._purge_expired_locked(now)
             return self._by_id.get(selection_id)
 
-    def mark_resolved(self, selection_id: str, *, now: Optional[datetime] = None) -> PendingTenantSelection:
+    def consume(
+        self, selection_id: str, selected_tenant_id: str, *, now: Optional[datetime] = None
+    ) -> PendingTenantSelection:
         resolved_now = now if now is not None else utc_now()
         with self._lock:
+            # Purging BEFORE the lookup, with the SAME `resolved_now`
+            # this call uses throughout, means: if `current` is found
+            # below at all, it is provably unexpired relative to
+            # `resolved_now` — no separate expiry re-check is needed
+            # (and none is performed) after this point.
+            self._purge_expired_locked(resolved_now)
             current = self._by_id.get(selection_id)
             if current is None:
-                raise TenantSelectionError(f"no pending Xero tenant selection '{selection_id}'")
-            # Re-validated INSIDE the lock — see this method's own
-            # abstract docstring.
-            if current.is_resolved:
                 raise TenantSelectionError(
-                    f"this Xero tenant selection was already resolved at {current.resolved_at.isoformat()}"
+                    f"no pending Xero tenant selection '{selection_id}' "
+                    "(unknown, already consumed, or expired)"
                 )
-            if resolved_now > current.expires_at:
-                raise TenantSelectionError(
-                    f"this Xero tenant selection expired at {current.expires_at.isoformat()} "
-                    f"(now {resolved_now.isoformat()})"
-                )
-            updated = PendingTenantSelection(
-                selection_id=current.selection_id,
-                entity_id=current.entity_id,
-                xero_connection_id=current.xero_connection_id,
-                candidates=current.candidates,
-                access_token=current.access_token,
-                refresh_token=current.refresh_token,
-                token_expires_at=current.token_expires_at,
-                created_at=current.created_at,
-                expires_at=current.expires_at,
-                resolved_at=resolved_now,
-            )
-            self._by_id[selection_id] = updated
-            return updated
+            if selected_tenant_id not in current.candidate_tenant_ids():
+                raise TenantSelectionError("the selected Xero organisation was not part of this authorisation")
+            # Atomic consume-and-remove — see this method's own
+            # abstract docstring and the module docstring's
+            # "Consume-and-remove, not mark-and-retain" section for why
+            # this is a `del`, never a "mark resolved and retain".
+            del self._by_id[selection_id]
+            return current
