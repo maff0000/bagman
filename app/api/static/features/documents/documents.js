@@ -141,10 +141,22 @@ export const Documents = {
     });
 
     tr.appendChild(el("td", {}, [statusBadge(record.status)]));
-    tr.appendChild(el("td", { text: record.evidence_id || "—" }));
+    tr.appendChild(
+      el("td", {
+        class: "mono",
+        text: record.evidence_id || "—",
+        attrs: record.evidence_id ? { title: record.evidence_id } : {},
+      })
+    );
     tr.appendChild(el("td", { text: entity }));
     tr.appendChild(el("td", { text: evidenceTypeHint }));
-    tr.appendChild(el("td", { class: "wrap", text: record.original_filename || "—" }));
+    tr.appendChild(
+      el("td", {
+        class: "wrap",
+        text: record.original_filename || "—",
+        attrs: record.original_filename ? { title: record.original_filename } : {},
+      })
+    );
     tr.appendChild(el("td", { text: fmtDateTime(record.received_at) }));
     tr.appendChild(el("td", { text: fmtBytes(record.size_bytes) }));
     tr.appendChild(

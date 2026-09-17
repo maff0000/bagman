@@ -85,6 +85,10 @@ function initOperatorIdentity() {
 
 function initAskBagman(activateTab) {
   AskBagman.init();
+  // #ask-bagman-toggle is the header's search-styled affordance (PID
+  // §42's "reachable from anywhere") — one element, one listener;
+  // "Ask BAGMAN about this" (Documents detail panel) is the separate
+  // contextual entry point into the same drawer.
   qs("#ask-bagman-toggle").addEventListener("click", () => AskBagman.toggle());
   // Wires "referenced evidence" links inside an Ask BAGMAN answer (PID
   // §44) back to the Documents detail view — switching tabs first so

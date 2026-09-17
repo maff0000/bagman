@@ -182,12 +182,36 @@ def main() -> None:
         card.locator("button", has_text="Review").click()
         page.wait_for_selector("#review-drawer:not([hidden])", timeout=10_000)
         # Original evidence beside the interpretation (PID §98.2's hard
-        # requirement) — a real <iframe> pointing at the real governed
-        # content endpoint, not a description of the file.
+        # requirement) — a real <iframe> showing the real bytes fetched
+        # from the governed content endpoint, not a description of the
+        # file.
+        #
+        # Design-review finding (GUI rebuild, see shell/preview.js's own
+        # docstring): `GET /internal/evidence/{id}/content` sends
+        # `Content-Disposition: attachment`, which makes a browser
+        # treat a DIRECT `src="/internal/evidence/.../content"` as a
+        # download rather than inline content — the preview iframe
+        # rendered EMPTY under the previous implementation (proven
+        # directly while building the redesign: `page.goto()` on that
+        # same URL raises "Download is starting"). Fixed on the
+        # frontend only (no wire-contract change — still exactly one
+        # call to this same endpoint): shell/preview.js now `fetch()`s
+        # the bytes itself and hands the iframe a `blob:` object URL,
+        # which always renders inline regardless of Content-Disposition.
+        # That means `src` is now a browser-generated `blob:` URL rather
+        # than a URL containing the evidence_id — so this proof checks
+        # the iframe's own `data-evidence-id` attribute (added for
+        # exactly this purpose) instead of parsing `src`, and separately
+        # proves the iframe is genuinely showing fetched bytes (a real
+        # `blob:` src), not just present-but-empty.
         page.wait_for_selector(".evidence-preview--pdf iframe", timeout=15_000)
+        preview_evidence_id = page.get_attribute(".evidence-preview--pdf iframe", "data-evidence-id")
         preview_src = page.get_attribute(".evidence-preview--pdf iframe", "src")
-        print(f"    original-evidence preview src: {preview_src!r}")
-        assert evidence_id in preview_src, "expected the preview iframe to point at THIS evidence's real content endpoint"
+        print(f"    original-evidence preview data-evidence-id: {preview_evidence_id!r}, src: {preview_src!r}")
+        assert preview_evidence_id == evidence_id, "expected the preview iframe to be showing THIS evidence's real content"
+        assert preview_src and preview_src.startswith("blob:"), (
+            f"expected a real fetched blob: URL (proving the bytes were actually loaded), got {preview_src!r}"
+        )
 
         page.select_option("#review-entity-select", label="Infosecurs Limited")
         page.fill("#review-what-input", "Software subscription")

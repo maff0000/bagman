@@ -12,18 +12,21 @@
       <span class="shell-header__mark">BAGMAN</span>
       <span class="shell-header__sub">Operations</span>
     </div>
-    <nav class="shell-header__nav" aria-label="Primary">
-      <button class="tab-btn" data-tab="overview" type="button" aria-current="page">Overview</button>
-      <button class="tab-btn" data-tab="needs-you" type="button">Needs You</button>
-      <button class="tab-btn" data-tab="documents" type="button">Documents</button>
-      <button class="tab-btn" data-tab="activity" type="button">Activity</button>
-      <button class="tab-btn tab-btn--disabled" type="button" disabled title="Not part of this delivery">
-        Email <span class="pill pill--muted">unavailable</span>
-      </button>
-      <button class="tab-btn tab-btn--disabled" type="button" disabled title="Not part of this delivery">
-        Invoices <span class="pill pill--muted">unavailable</span>
-      </button>
-    </nav>
+
+    <!-- Ask BAGMAN (PID §42) — reachable from anywhere in the shell, not
+         buried inside one tab; styled as the header's search affordance.
+         Opens features/ai/ask-bagman.js's drawer (markup just before
+         </body>) with no context attached — "Ask BAGMAN about this"
+         (Documents detail panel) is the separate, contextual entry
+         point into the same drawer. -->
+    <button class="shell-header__ask" id="ask-bagman-toggle" type="button">
+      <svg width="15" height="15" viewBox="0 0 15 15" fill="none" aria-hidden="true">
+        <circle cx="6.5" cy="6.5" r="5" stroke="currentColor" stroke-width="1.4" />
+        <path d="M10.2 10.2L13.5 13.5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" />
+      </svg>
+      <span>Ask BAGMAN anything…</span>
+    </button>
+
     <div class="shell-header__actions">
       <!-- Global + Add (PID §98.3) — reachable from anywhere, funnels
            through the one governed intake endpoint (shell/add-menu.js). -->
@@ -41,47 +44,47 @@
         <span>Acting as</span>
         <input type="text" id="operator-identity-input" autocomplete="off" />
       </label>
-      <!-- Ask BAGMAN (PID §42) — reachable from anywhere in the shell,
-           not buried inside one tab; opens features/ai/ask-bagman.js's
-           drawer (markup below, just before </body>). -->
-      <button class="btn btn--primary" id="ask-bagman-toggle" type="button">Ask BAGMAN</button>
     </div>
   </header>
+
+  <nav class="shell-nav" aria-label="Primary">
+    <button class="tab-btn" data-tab="overview" type="button" aria-current="page">Overview</button>
+    <button class="tab-btn" data-tab="needs-you" type="button">Needs You</button>
+    <div class="shell-nav__group-label">Records</div>
+    <button class="tab-btn" data-tab="documents" type="button">Documents</button>
+    <button class="tab-btn tab-btn--disabled" type="button" disabled title="Not part of this delivery">
+      Email <span class="pill pill--muted">unavailable</span>
+    </button>
+    <button class="tab-btn tab-btn--disabled" type="button" disabled title="Not part of this delivery">
+      Invoices <span class="pill pill--muted">unavailable</span>
+    </button>
+    <button class="tab-btn tab-btn--disabled" type="button" disabled title="Not part of this delivery">
+      Banking <span class="pill pill--muted">unavailable</span>
+    </button>
+    <button class="tab-btn tab-btn--disabled" type="button" disabled title="Not part of this delivery">
+      Tax <span class="pill pill--muted">unavailable</span>
+    </button>
+    <div class="shell-nav__divider"></div>
+    <button class="tab-btn" data-tab="activity" type="button">Activity</button>
+    <button class="tab-btn tab-btn--disabled" type="button" disabled title="Not part of this delivery">
+      Settings <span class="pill pill--muted">unavailable</span>
+    </button>
+  </nav>
 
   <main class="shell-main">
 
     <!-- ============================= OVERVIEW ============================= -->
     <section id="panel-overview" class="tab-panel">
-      <div id="overview-greeting" class="overview-greeting">
-        <h1>Good morning Matt</h1>
-      </div>
-
-      <h2 class="section-heading">Runtime</h2>
-      <div class="card-grid" id="overview-cards">
-        <div class="card" data-card="health">
-          <div class="card__title">Liveness — <code>GET /health</code></div>
-          <div class="card__body">
-            <div class="status-line"><span class="dot dot--pending"></span><span class="status-text">checking…</span></div>
-          </div>
-        </div>
-        <div class="card" data-card="ready">
-          <div class="card__title">Readiness — <code>GET /ready</code></div>
-          <div class="card__body">
-            <div class="status-line"><span class="dot dot--pending"></span><span class="status-text">checking…</span></div>
-          </div>
-        </div>
-        <div class="card" data-card="version">
-          <div class="card__title">Build — <code>GET /version</code></div>
-          <div class="card__body">
-            <dl class="kv" id="version-kv"><dt>loading…</dt></dl>
-          </div>
+      <div class="overview-hero">
+        <div id="overview-greeting" class="overview-greeting">
+          <h1>Good morning Matt</h1>
         </div>
       </div>
 
-      <button class="btn btn--secondary" id="overview-refresh" type="button">Refresh</button>
-
-      <!-- ---------- AI status (CD-5 WI-4, PID §46-48) ---------- -->
-      <h2 class="ai-status__heading section-heading">AI Status</h2>
+      <!-- ---------- AI status (CD-5 WI-4, PID §46-48) — deliberately
+           BELOW the greeting and visually quiet: Overview's primary job
+           is "what needs Matt", not an infrastructure dashboard. ---------- -->
+      <h2 class="ai-status__heading section-heading">AI status</h2>
       <div class="card-grid" id="ai-status-cards">
         <div class="card" data-card="ai-claude">
           <div class="card__title">Claude operator</div>
@@ -103,15 +106,40 @@
           </div>
         </div>
       </div>
+
+      <h2 class="section-heading">System</h2>
+      <div class="card-grid" id="overview-cards">
+        <div class="card" data-card="health">
+          <div class="card__title">Liveness — <code>GET /health</code></div>
+          <div class="card__body">
+            <div class="status-line"><span class="dot dot--pending"></span><span class="status-text">checking…</span></div>
+          </div>
+        </div>
+        <div class="card" data-card="ready">
+          <div class="card__title">Readiness — <code>GET /ready</code></div>
+          <div class="card__body">
+            <div class="status-line"><span class="dot dot--pending"></span><span class="status-text">checking…</span></div>
+          </div>
+        </div>
+        <div class="card" data-card="version">
+          <div class="card__title">Build — <code>GET /version</code></div>
+          <div class="card__body">
+            <dl class="kv" id="version-kv"><dt>loading…</dt></dl>
+          </div>
+        </div>
+      </div>
+
+      <button class="btn btn--ghost btn--sm" id="overview-refresh" type="button">Refresh</button>
     </section>
 
     <!-- ============================= NEEDS YOU ============================= -->
     <section id="panel-needs-you" class="tab-panel" hidden>
-      <h1>Needs You</h1>
-      <p class="muted">
-        Every decision, across every BAGMAN module, that only Matt can make — open items first,
-        most pressing on top.
-      </p>
+      <div class="page-head">
+        <div>
+          <h1>Needs You</h1>
+          <p class="muted">Every decision, across every BAGMAN module, that only Matt can make — open items first, most pressing on top.</p>
+        </div>
+      </div>
       <div id="needs-you-list" class="needs-you-list"></div>
     </section>
 
@@ -253,8 +281,12 @@
 
     <!-- ============================= ACTIVITY ============================= -->
     <section id="panel-activity" class="tab-panel" hidden>
-      <h1>Activity</h1>
-      <p class="muted">Every automatic action and every operator decision, in one place (PID §98.8). Click a row for the full forensic detail.</p>
+      <div class="page-head">
+        <div>
+          <h1>Activity</h1>
+          <p class="muted">Every automatic action and every operator decision, in one place (PID §98.8). Click a row for the full forensic detail.</p>
+        </div>
+      </div>
       <div id="activity-list" class="activity-list"></div>
     </section>
 

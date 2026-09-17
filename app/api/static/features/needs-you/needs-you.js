@@ -138,7 +138,12 @@ export const NeedsYou = {
 
     const evidenceId = item.metadata && item.metadata.evidence_id;
     const previewHost = el("div", { class: "review-drawer__preview" }, [loadingState("Loading original evidence…")]);
-    body.appendChild(el("div", { class: "review-drawer__section" }, [el("h3", { text: "Original evidence" }), previewHost]));
+    body.appendChild(
+      el("div", { class: "review-drawer__section review-drawer__section--preview" }, [
+        el("h3", { text: "Original evidence" }),
+        previewHost,
+      ])
+    );
 
     if (evidenceId) {
       const { ok, body: evidence } = await apiGet(API.evidenceOne(evidenceId));
@@ -168,9 +173,28 @@ export const NeedsYou = {
     await this._renderCompanyWhatWhyForm(body, item);
   },
 
+  /** The Company/What/Why form, presented as three questions that flow
+   * one into the next (PID §98.2's "feels like a workflow, not a
+   * database table") rather than one dense simultaneous form — each
+   * step reveals once the one before it is answered. Still submits
+   * all three together in the ONE existing `resolve` call once the
+   * operator reaches "Save answer" (`needs-you-api.js`'s
+   * `resolveNeedsYouItem` — unchanged wire contract, PID §98.3): this
+   * is a front-end sequencing/presentation choice only, never a
+   * second backend interaction. Element ids (`#review-entity-select`/
+   * `#review-what-input`/`#review-why-input`) and the "Save answer"
+   * button text are kept stable on purpose — this is the same tested
+   * contract `gui_operations_foundation_browser_acceptance_proof.py`
+   * already drives, just revealed progressively instead of all at
+   * once. */
   async _renderCompanyWhatWhyForm(body, item) {
-    const section = el("div", { class: "review-drawer__section" }, [el("h3", { text: "Company / What / Why" })]);
-    body.appendChild(section);
+    const wrap = el("div", { class: "review-drawer__section review-steps" });
+    body.appendChild(wrap);
+
+    // ---- step 1: Company ----
+    const step1 = el("div", { class: "review-step review-step--active" });
+    step1.appendChild(el("div", { class: "review-step__label", text: "Step 1 of 3" }));
+    step1.appendChild(el("div", { class: "review-step__prompt", text: "Which company is this for?" }));
 
     const entitySelect = el("select", { attrs: { id: "review-entity-select" } }, [
       el("option", { attrs: { value: "" }, text: "Select a company…" }),
@@ -179,18 +203,63 @@ export const NeedsYou = {
     for (const entity of entities) {
       entitySelect.appendChild(el("option", { attrs: { value: entity.entity_id }, text: entity.display_name }));
     }
+    step1.appendChild(el("label", { class: "field", text: "Company" }, [entitySelect]));
+    wrap.appendChild(step1);
 
+    // ---- step 2: What ----
+    const step2 = el("div", { class: "review-step", attrs: { hidden: "true" } });
+    step2.appendChild(el("div", { class: "review-step__label", text: "Step 2 of 3" }));
+    step2.appendChild(el("div", { class: "review-step__prompt", text: "What was this for?" }));
     const whatInput = el("input", {
       attrs: { type: "text", id: "review-what-input", placeholder: "e.g. Software subscription", autocomplete: "off" },
     });
+    step2.appendChild(el("label", { class: "field", text: "What" }, [whatInput]));
+    step2.appendChild(
+      el("p", {
+        class: "muted small",
+        text: "Xero chart of accounts not yet connected — temporary free-text, will be replaced with real Xero account coding.",
+      })
+    );
+    wrap.appendChild(step2);
+
+    // ---- step 3: Why ----
+    const step3 = el("div", { class: "review-step", attrs: { hidden: "true" } });
+    step3.appendChild(el("div", { class: "review-step__label", text: "Step 3 of 3" }));
+    step3.appendChild(el("div", { class: "review-step__prompt", text: "Why was it purchased?" }));
     const whyInput = el("input", {
       attrs: { type: "text", id: "review-why-input", placeholder: "Short business-purpose explanation", autocomplete: "off" },
     });
+    step3.appendChild(el("label", { class: "field", text: "Why" }, [whyInput]));
+    wrap.appendChild(step3);
 
+    // ---- actions (revealed once all three are answered) ----
     const statusEl = el("div", { class: "upload-status", attrs: { "aria-live": "polite" } });
-
     const resolveBtn = el("button", { class: "btn btn--primary", text: "Save answer", attrs: { type: "button" } });
     const dismissBtn = el("button", { class: "btn btn--ghost", text: "Dismiss (not applicable)", attrs: { type: "button" } });
+    const actionsRow = el("div", { class: "review-drawer__actions" }, [resolveBtn, dismissBtn]);
+    wrap.appendChild(actionsRow);
+    wrap.appendChild(statusEl);
+
+    // Reveal step 2 the moment a company is chosen; step 3 the moment
+    // "what" has real text — a real DOM `change`/`input` listener
+    // driving real reveals, not a scripted/fake multi-step animation
+    // (PID §98.2's own "no fake buttons" spirit: every reveal here
+    // responds to genuine operator input).
+    entitySelect.addEventListener("change", () => {
+      if (entitySelect.value) {
+        step1.classList.add("review-step--done");
+        step1.classList.remove("review-step--active");
+        step2.hidden = false;
+        step2.classList.add("review-step--active");
+      }
+    });
+    whatInput.addEventListener("input", () => {
+      if (whatInput.value.trim()) {
+        step2.classList.add("review-step--done");
+        step3.hidden = false;
+        step3.classList.add("review-step--active");
+      }
+    });
 
     resolveBtn.addEventListener("click", async () => {
       if (!entitySelect.value) {
@@ -247,18 +316,6 @@ export const NeedsYou = {
         dismissBtn.disabled = false;
       }
     });
-
-    section.appendChild(el("label", { class: "field", text: "Company" }, [entitySelect]));
-    section.appendChild(el("label", { class: "field", text: "What" }, [whatInput]));
-    section.appendChild(
-      el("p", {
-        class: "muted small",
-        text: "Xero chart of accounts not yet connected — temporary free-text, will be replaced with real Xero account coding.",
-      })
-    );
-    section.appendChild(el("label", { class: "field", text: "Why" }, [whyInput]));
-    section.appendChild(el("div", { class: "review-drawer__actions" }, [resolveBtn, dismissBtn]));
-    section.appendChild(statusEl);
   },
 
   /** Rendered content for the compact greeting summary lines (PID
