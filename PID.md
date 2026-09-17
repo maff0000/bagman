@@ -1697,3 +1697,109 @@ Do not reinterpret ambiguity. Escalate it.
 ## 98.13 Branch record
 
 Branched from `main` at `13c2282f052491cf0783597c326de26f25c9b35d` (CD-5 merge commit) as `cd-6/gui-operations-foundation`, by the PL under this section's own architect authority — the branch/issue creation the architect attempted directly failed with `403 Resource not accessible by integration` on the architect's own GitHub connector (a permission gap on that connector, not a repository restriction); the PL's own git/GitHub access is a separate credential and was unaffected, so the branch is created here rather than by writing directly to `main`.
+
+## 98.14 Slice 1 delivered and independently confirmed
+
+CD-6 Slice 1 (premium GUI shell, universal Needs You queue, global governed upload) landed at commit `28ee010` (branch `cd-6/gui-operations-foundation`, PR #6 draft). PL reconciliation independently re-ran the full test suite fresh (751 passed, 24 skipped), re-ran gitleaks (clean), and caught+fixed one real gap the Engineer's own commit had missed (a stale `architecture-index.md` — regenerated before commit). A fresh, independent Auditor with no inherited conclusions then adversarially re-verified all of it live against an isolated Docker Compose stack — governed-intake bypass resistance, Needs You idempotency under a real replayed request, double-submit and restart-survival of a resolution, entity/Xero honesty, activity log, no regression, architecture-memory freshness — verdict `CD6_SLICE1_GREEN_CONFIRMED` at the application/code level. One real but unrelated issue surfaced: the Claude Code OAuth credential mounted for Ask BAGMAN is revoked (`401 OAuth access token has been revoked`) — pre-existing on the shared credential, not introduced by this slice, flagged for rotation; the GUI surfaced the failure honestly rather than masking it. Also flagged: `agent/claude_code/runner.py`'s `is_available()` is a binary-on-PATH check only, so it cannot detect this class of failure — the AI-health tile is not currently a reliable signal for Ask BAGMAN's real working state.
+
+Slice 1's product acceptance (PID §98.12) was proven at the application level; the GUI's live Mac-mini reachability point (§98.12.15/§98.1) was explicitly deferred pending the appliance-topology ruling below, since it surfaced a genuine architectural fork (see §99) that was not the PL's to resolve unilaterally.
+
+## 99. Appliance Topology Ruling — Full Mac Mini BAGMAN Appliance (Architect ruling, 2026-09-17, supersedes the deployment-topology question raised against §98.1)
+
+**This section supersedes any earlier "expose Trinity's canonical Postgres/MinIO to the Mac's IP" or "private tunnel to live Trinity storage" proposal** (raised by the PL as an open question after discovering Trinity's `bagman-db`/`bagman-objects`/`bagman-scan` had zero network exposure even to localhost beyond the Docker Compose network, and therefore could not be reached by a Mac-hosted `bagman-api` under §98.1's literal "do not move canonical data" reading without a new network decision). The architect's ruling below resolves that fork explicitly: BAGMAN does not remain split across two hosts. The Mac mini becomes the full BAGMAN appliance — application, canonical database, evidence/object storage, scanner, AI gateway, AI database, and native Ollama, all under one root, with Trinity's canonical Postgres/MinIO retired to backup/archive status once migration is proven complete, never a second live writable copy.
+
+**Design goal (verbatim):** "one dedicated Mac mini, one clearly organised BAGMAN root, one coherent Docker/Colima application stack, one trivial backup surface."
+
+### 99.1 Authoritative topology
+
+```text
+Matt / 192.168.246.0/24
+        |
+        v
+Mac mini / 192.168.11.4
++-----------------------------------------------+
+| BAGMAN APPLIANCE                               |
+|                                                 |
+| bagman-api / GUI                               |
+| bagman-db            PostgreSQL                |
+| bagman-objects       MinIO                     |
+| bagman-scan          ClamAV                    |
+|                                                 |
+| bagman-ai-gateway    LiteLLM                   |
+| bagman-ai-db         PostgreSQL                |
+| native Ollama        Apple Metal                |
++-----------------------------------------------+
+                     |
+                     | deep inference only
+                     v
+                  Trinity
+
+Mac BAGMAN canonical state
+        |
+        v
+   encrypted backup
+        |
+        v
+Trinity / governed backup target
+```
+
+Trinity is no longer a live dependency for ordinary BAGMAN canonical storage. It remains: deep-inference escalation (`bagman-deep`); backup/recovery target; infrastructure support if needed.
+
+**Reconciliation with the already-live AI appliance:** HELM's Gate-1 build (`/opt/bagman-ai/` — Colima, `bagman-ai-gateway`/`bagman-ai-db`, pf-anchored to Trinity-only access, its own backup already taken 2026-09-16) is the direct precursor of this section's `bagman-ai-gateway`/`bagman-ai-db` boxes — it is folded into the new unified root (§99.2), not rebuilt from scratch, and its own working configuration/backup discipline is the template this section's canonical-side build follows.
+
+### 99.2 Filesystem doctrine — ONE root
+
+`/opt/bagman` is the one top-level root for everything BAGMAN-owned on the Mac:
+
+```text
+/opt/bagman/
+├── app/            (compose, config, scripts, runbooks)
+├── data/           (postgres, minio, clamav, ai-postgres — host-backed, named paths, not opaque anonymous volumes)
+├── secrets/        (app, xero, mail, ai, infrastructure — 0700 dirs / 0600 files, never in Git, never in argv, never printed)
+├── backups/        (postgres, minio, ai-postgres, manifests, restore)
+├── logs/           (app, backup, maintenance)
+├── runtime/generated/
+└── README.md
+```
+
+No scattered state outside this root except native Ollama's own macOS-native model storage, which must be documented (exact path + inclusion in the backup/rebuild manifest) rather than silently left undocumented. `/srv/bagman-secrets/` (Trinity) is superseded for the Mac deployment by `/opt/bagman/secrets/` — no two authoritative secret roots except during a documented, temporary migration window.
+
+### 99.3 Canonical PostgreSQL / AI PostgreSQL / MinIO / ClamAV
+
+`bagman-db` (canonical BAGMAN state — entities, evidence metadata, intake, audit, provenance, invoice state, mailbox state, Needs You, workflow state, Xero reference projections, rule definitions, later domains) persists under `/opt/bagman/data/postgres/`, kept strictly separate from `bagman-ai-db` (LiteLLM/auth/inference state only) under `/opt/bagman/data/ai-postgres/` — never merged merely because both are PostgreSQL. `bagman-objects` (MinIO, the authoritative evidence store — PDFs, photographs, invoices, receipts, later email attachments/tax evidence, all through the existing governed intake path, no bypass) persists under `/opt/bagman/data/minio/`. `bagman-scan` (ClamAV) persists only genuinely-necessary scanner state under `/opt/bagman/data/clamav/` — never treated as canonical data.
+
+### 99.4 Application definitions, secrets, native Ollama exception
+
+All deployment material (compose files, service definitions, non-secret runtime config, health/backup/restore/bootstrap scripts, README, recovery runbooks) lives under `/opt/bagman/app/` — the Git repository remains the development source, but the deployed runtime definition on the Mac is its own clear, reproducible copy under this root. Secrets live under `/opt/bagman/secrets/` (0700/0600, never in Git/argv/logs/Compose YAML, mounted read-only where possible). Native Ollama stays outside Docker (Apple Metal acceleration requires native execution — an accepted, already-proven exception per `/opt/bagman-ai/README.md`'s own documented finding that a true pre-login system daemon cannot access VZ/Metal); its configuration/manifests/model metadata must still be represented under `/opt/bagman/app/` and/or `/opt/bagman/backups/manifests/`, with its physical model-file location explicitly documented and included in the backup/rebuild plan even though the files themselves stay in Ollama's native location.
+
+### 99.5 Migration from Trinity — mandatory, controlled, no split-brain
+
+Trinity's current canonical Postgres/MinIO hold authoritative BAGMAN state from CD-1 through CD-6. Initialising empty replacements on the Mac and calling that "migrated" is explicitly forbidden. Required sequence: (1) quiesce canonical BAGMAN writes; (2) record source DB/object state; (3) take a verified source backup; (4) restore canonical PostgreSQL to Mac `bagman-db`; (5) transfer/restore MinIO evidence objects; (6) verify object counts/checksums where practical; (7) verify database row counts/invariants; (8) start the Mac BAGMAN stack against restored canonical state; (9) run application acceptance; (10) prove old and new state match; (11) designate Mac state authoritative; (12) prevent accidental split-brain writes to Trinity; (13) retain the Trinity copy only as backup/archive per documented policy. There must never be two simultaneously writable canonical BAGMAN databases.
+
+### 99.6 Backup doctrine
+
+The conceptual backup surface is `/opt/bagman/` plus any unavoidable native-Ollama artifacts documented in one manifest — but a blind filesystem copy of a running PostgreSQL data directory is explicitly NOT an acceptable "backup"; proper application-consistent mechanisms are required. PostgreSQL backups (scheduled, logical and/or physical-consistent) go under `/opt/bagman/backups/postgres/`; MinIO backup manifests/checksums/state under `/opt/bagman/backups/minio/` with actual copies replicated to the remote governed target; AI PostgreSQL backed up separately under `/opt/bagman/backups/ai-postgres/`; recovery-relevant manifests (image tags/digests, model identity/revision/quantisation, container names, ports, filesystem paths, config version, schema/migration version, backup timestamps, restore instructions) under `/opt/bagman/backups/manifests/`. Trinity is the preferred remote/off-box backup target — encrypted where appropriate, scheduled, auditable, not dependent on source Git, restorable onto a fresh Mac; replication is explicitly not the same thing as backup, and enough version history must be kept to recover from accidental deletion, corruption, a bad migration, an operator mistake, or a failed upgrade.
+
+### 99.7 Restore acceptance — mandatory real proof
+
+Not "backup created successfully" — a real restore proof: backup -> destroy/disconnect a disposable restored target -> restore PostgreSQL -> restore MinIO -> start BAGMAN -> verify canonical evidence and state. A disposable isolated restore target is acceptable in place of destructive testing against the live Mac. The result must establish that a replacement Mac can be rebuilt without forensic archaeology.
+
+### 99.8 GUI runtime, network/firewall
+
+Only the GUI/API is normally user-facing, reachable from `192.168.246.0/24`, restricted appropriately; PostgreSQL/MinIO/ClamAV/LiteLLM-DB and other internal services must not be exposed to Matt's LAN unless technically required (none are expected to be). Internal containers communicate over Docker/Colima networking. Any administration endpoint that must exist binds locally or is tightly restricted. The final report to the architect must include the Mac IP, protocol, TCP port, exact browser URL (never assumed — e.g. `http://192.168.11.4:<actual-port>` is illustrative only), bind address, service/container name, health endpoint, autostart/reboot status, firewall restriction, and proof a client on `192.168.246.0/24` can reach it.
+
+### 99.9 Boot behaviour, monitoring
+
+After a real Mac reboot (not merely a service restart): native Ollama, Colima, `bagman-db`, `bagman-objects`, `bagman-scan`, `bagman-ai-db`, `bagman-ai-gateway`, `bagman-api` all return, the GUI becomes reachable, canonical DB/object state remains intact, and no manual command is required — using the already-proven autologin/LaunchAgent reality `/opt/bagman-ai/README.md` documents (a true pre-login system-daemon path was tested and proven incompatible with Apple's VZ framework), not a claim of unsupported true-prelogin behaviour. Basic health/operational monitoring is required for PostgreSQL, MinIO, ClamAV, the BAGMAN API, the AI gateway, free disk capacity, latest backup age, and latest backup success/failure — a low-disk condition must become visible before it threatens canonical evidence.
+
+### 99.10 Scope discipline
+
+This topology change does not alter Slice 1's product acceptance (§98.12) — GUI, Needs You, global Add, upload, evidence-beside-interpretation, company/what/why, activity/audit, and unchanged Ask BAGMAN all remain required. Not yet in scope, this delivery or the appliance migration: Xero posting, mailbox automation, banking, tax filing, unrelated financial automation.
+
+### 99.11 Auditor scope
+
+A fresh, independent Auditor (no inherited conclusions) covers both: **Product** (GUI/Needs You/upload, evidence path, provenance, Ask BAGMAN regression) and **Appliance migration** (no split-brain, canonical state preserved, DB/object-store not exposed unnecessarily, secret hygiene, one-root filesystem discipline, backup correctness, restore proof, reboot/autostart proof, browser reachability).
+
+### 99.12 Required final report
+
+Exact CD-6 head SHA; Mac directory tree beneath `/opt/bagman`; container/service list; canonical Postgres location; canonical MinIO location; AI DB location; backup locations; remote backup target; migration evidence; restore proof; reboot proof; Auditor verdict; live CI run ID/result; exact GUI browser URL; health endpoint; network reachability proof; known limitations; PR #6 state. PR #6 stays DRAFT. No merge. No Slice 2 without architect review.
