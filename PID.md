@@ -1827,3 +1827,65 @@ Both gates committed and pushed (`28ee010`/`278135d` PID record → `5ebf8ac` cl
 **Final, fresh Auditor re-verification of the P0 fix, commit `658968b`**: a THIRD fresh Auditor (no inherited conclusions), pinned exactly to this head, re-tested everything live against the real URL (never localhost/a tunnel) and independently confirmed: the deployed Mac image is byte-identical to the fix (`shared/uuid.js` md5-matched against the worktree); `typeof crypto.randomUUID`/`window.isSecureContext` reproduce the real insecure-context condition; both upload paths succeed with real `201`s and real evidence ids, zero console/page errors; the full downstream Needs You flow now works end-to-end (a real item created, the evidence preview genuinely renders via the Gate-B `blob:`-URL fix, Company/What/Why answered and independently re-confirmed persisted via a fresh `GET`); no regression (EICAR still genuinely quarantined by real ClamAV, oversized upload still cleanly rejected, both visible, neither hangs); fresh-venv suite 751 passed/24 skipped (exact match); gitleaks clean; architecture-memory zero-diff; Gate A/security spot-check clean (6/6 containers healthy, swap flat and non-alarming per the prior Auditor's own documented normal-behaviour finding, one fresh Ask BAGMAN turn succeeded with full provenance). **Verdict: `CD6_P0_FIX_CONFIRMED_GATES_AB_SECURITY_GREEN`.** No issues found. CI green at `658968b`.
 
 **Both Gate A and Gate B are now CLOSED GREEN**, independently confirmed by three separate fresh Auditors across this sequence (Gate A/B/security → the P0 finding → the fix's own re-verification). The Mac appliance's Ask BAGMAN credential is Matt's own independently-authorised OAuth login, not a shared/bootstrap copy. PR #6 remains DRAFT. Phase B canonical-data migration remains paused pending the architect's own review of this full package.
+
+**Also flagged, live, by Matt's own use**: the persistent "Ask BAGMAN" affordance in the shell header (PID §98.2's own requirement) can be opened with no document/entity in view, in which case `ask-bagman.js`'s own `hasContext()`/`contextLabel()` correctly detect the absence but do not block submission — a generic message ("hi bagman") reaches the backend with `evidence_id`/`intake_id`/`entity_id` all null and is honestly rejected by PID §29/§73's traceability requirement, but the raw technical `VALIDATION_ERROR` is what renders as the "response," not a helpful prompt to pick a document/company first. This is a real, pre-existing (CD-5-era) tension between "traceable AI input" and "persistent, reachable-from-anywhere Ask BAGMAN," not a CD-6 regression — recorded here for the architect's own decision, not silently resolved.
+
+## 100. Phase B — Canonical Data Migration (2026-09-17)
+
+Architect ruling formally closed Gate A, Gate B, and the security remediation GREEN and approved Phase B resumption: migrate BAGMAN canonical PostgreSQL/MinIO from Trinity to the Mac mini appliance, with the Mac becoming the sole writable canonical authority. Executed directly by the PL (not delegated — the highest-stakes step in this delivery, matching this session's own established discipline of handling secret/data-integrity-critical work personally rather than via a subagent).
+
+### 100.1 Pre-migration inventory (2026-09-17T12:11Z)
+
+Trinity source: PostgreSQL 17.11 (x86_64), Alembic version `9c2f4b1e7a05`. Authoritative `COUNT(*)` per table (captured post-quiesce, not the earlier approximate `pg_stat_user_tables.n_live_tup` reading, which was found to be a stale-statistics artifact off by 1 on two tables — investigated and resolved as a measurement artifact, not a data change, before proceeding, per the architect's own "if source inconsistencies are discovered, STOP and report them" instruction): `ai_invocations=260, audit_events=2486, evidence_items=271, external_references=0, governed_entities=3, intake_records=280, needs_you_items=24, provenance=0, sources=1`. MinIO: bucket `bagman-evidence`, 549 objects, 66KiB, 100% content-hash-verified (BAGMAN's own evidence objects are content-addressed — object key = sha256 of content — a strong, free integrity check exploited throughout this migration).
+
+Mac target (pre-restore): PostgreSQL 17.11 (aarch64), same Alembic version `9c2f4b1e7a05` (no schema drift), but NOT empty — held 18 MinIO objects and a handful of Postgres rows accumulated from Gate A/B/security acceptance testing conducted directly against the live appliance. Treated as disposable test residue (not real canonical data) and cleanly replaced, not merged, matching the architect's own "no split-brain / no ambiguous merge" spirit.
+
+### 100.2 Quiesce (2026-09-17T12:11:30Z Trinity; T12:15:49Z Mac)
+
+Trinity: `docker stop bagman-api` (the ONLY container capable of writing to `bagman-db`/`bagman-objects` — both already had zero host-published ports, confirmed via `docker port`). Mac: `docker stop bagman-api` immediately before restore. Verified no writer remained on either side before proceeding.
+
+### 100.3/100.4 Backup (Trinity source)
+
+`pg_dump --format=custom` (`sha256:e1137ddf...`) + a plain-SQL companion, taken post-quiesce. MinIO: `mc mirror --preserve` of the full bucket, verified 549/549 objects with zero content-hash mismatches before transfer. Both transferred to the Mac via `scp`/piped `docker cp`, checksums reconfirmed identical on arrival.
+
+### 100.5/100.6 Restore (Mac target)
+
+Postgres: `DROP DATABASE`/`CREATE DATABASE` (clean replace, not merge) + `pg_restore --no-owner --no-privileges`. Verified: **exact `COUNT(*)` match on every one of the 9 tables** against Trinity's post-quiesce authoritative counts. MinIO: bucket emptied (`mc rm --recursive --force`) then `mc mirror --preserve` of the 549-object source — verified 549 objects/66KiB (exact match), 100% content-hash integrity re-verified on the Mac's own host filesystem (`shasum -a 256`, 549/549, 0 mismatches), and sample `evidence_items.storage_reference` values confirmed to resolve to real objects via `mc stat`.
+
+### 100.7 Application cutover
+
+Mac `bagman-api`'s configuration already had zero Trinity dependency (confirmed via `docker inspect` env dump — built local-only from Phase A). Restarted; all 6 containers healthy; `GET /health`→`alive`, `GET /ready`→all three checks `ok`; real migrated data confirmed visible via `GET /internal/evidence`.
+
+### 100.8 Split-brain prevention
+
+Trinity's `bagman-api` container **removed** (`docker rm`, not merely stopped — its `restart: unless-stopped` policy would not have auto-restarted it after an explicit stop, but removal is unambiguous and durable against any future accidental `docker start`). `bagman-db`/`bagman-objects` on Trinity remain running (retained as controlled fallback, per instruction, not deleted) but are structurally non-writable: no host-published ports, and the one container on their shared Docker network that could reach them is gone.
+
+### 100.9 Canonical-authority marker
+
+Written to `/opt/bagman/README-CANONICAL-AUTHORITY.md` on the Mac (verbatim marker per the architect's own template) and recorded here: **canonical BAGMAN runtime is the Mac mini (192.168.11.4)**; canonical Postgres is `bagman-db` at `/opt/bagman/data/postgres/`; canonical object store is `bagman-objects` at `/opt/bagman/data/minio/`; Trinity's copy is retired/read-only migration archive + backup source only.
+
+### 100.10 Off-box backup
+
+A **fresh** dump/mirror of the Mac's now-canonical state (not the earlier migration-source copy) pulled back to Trinity: `/srv/bagman-backups/phase-b-canonical/20260917T121549Z/{postgres,minio,manifests}/`, each artifact checksummed, with a full recovery manifest (`manifests/manifest.md`) recording image identities, row/object counts, and restore instructions — genuinely off-box (a separate host from the Mac), not merely a second copy on the same machine, and distinct from the retained pre-migration Trinity source (never conflated with it).
+
+### 100.11 Restore proof — real, isolated, disposable
+
+Restored the off-box backup into throwaway `bagman-restore-proof-pg`/`bagman-restore-proof-minio` containers on Trinity (never touching production Mac or the retained Trinity source): Postgres restore matched the canonical Mac state exactly on every table checked (`ai_invocations=260, audit_events=2486, evidence_items=271, governed_entities=3, intake_records=280, needs_you_items=24, sources=1`); MinIO restore matched exactly (549 objects/66KiB), 100% content-hash-verified again (549/549, 0 mismatches), and a sample `evidence_items.storage_reference` confirmed to resolve to a real restored object. Disposable environment fully torn down afterward.
+
+### 100.12 Reboot proof
+
+Real `sudo reboot` triggered at `2026-09-17T12:17:15Z`. SSH back within ~30s; **all 6 containers reported healthy by `2026-09-17T12:18:29Z`** (~74 seconds total), fully automatic, zero manual intervention. `GET /health`/`GET /ready` both healthy afterward; native Ollama confirmed serving `bagman:gemma`; migrated canonical data confirmed intact post-reboot (271 evidence_items, 549/66KiB objects — unchanged).
+
+### 100.13 Resource check, post-migration
+
+`vm.swapusage` held at **0.00M** throughout — immediately post-reboot, after real repeated `/health`/`/ready`/`/internal/evidence` traffic, and after real Ask BAGMAN completions (2 successive real turns, both `SUCCEEDED`). No regression from Gate A's own resolved swap result. DB size 10198 kB; MinIO 66KiB/549 objects; free disk 125GiB. Native Ollama's resident model remains the dominant fixed memory cost, unchanged, per the architect's own standing "that decision is the architect's, not to be silently worked around" instruction.
+
+### 100.14 Real end-to-end proof
+
+A genuinely new synthetic invoice uploaded through the real GUI (`+ Add` → Invoice/Receipt): (1-2) governed intake accepted it, real `evidence_id` returned; (3) metadata confirmed present in canonical Mac PostgreSQL; (4) content confirmed present in canonical Mac MinIO; (5) retrieved via the real API, **byte-identical** to the uploaded file; (6) the resulting Needs You item resolved (Company/What/Why) via the real API; (7) the full causal audit chain confirmed present end-to-end (`INTAKE_RECEIVED → ... → EVIDENCE_REGISTERED → NEEDS_YOU_ITEM_CREATED → NEEDS_YOU_ITEM_RESOLVED`); (8) a real Ask BAGMAN query succeeded; (9) `bagman-api` restarted, and the evidence + its resolution were both confirmed unchanged afterward.
+
+**One real, honestly-flagged finding during this step, not fixed (out of Phase B's explicit scope, unrelated to data migration mechanics)**: an Ask BAGMAN call whose HTTP client disconnected after its own 60s timeout left the corresponding `AIInvocation` row stuck in `RUNNING` well past that window, which then correctly (per PID §73's own concurrency guard) blocked a second call scoped to the same `evidence_id` subject — worked around here by using a different (entity-scoped) subject for the required proof, not by forcing the stuck one through. This suggests the runner's own subprocess-timeout enforcement may not reliably record a terminal status when the HTTP client itself disconnects mid-request, independent of the subprocess's own fate — flagged for a future delivery to investigate, not resolved here.
+
+### 100.15 Verdict
+
+All 14 of the architect's numbered Phase B steps executed and verified as above. Head at completion: see the commit this section is recorded in. Fresh, independent Auditor dispatched next (§100.16, once landed) — no self-issued GREEN.
