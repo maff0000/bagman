@@ -17,6 +17,7 @@ import pytest
 from ai.invocation import (
     ALLOWED_TRANSITIONS,
     STALE_RECOVERY_ERROR_CODE,
+    STALE_RECOVERY_NEVER_DISPATCHED_ERROR_CODE,
     STALE_RUNNING_THRESHOLD_SECONDS,
     STATUSES,
     TERMINAL_STATUSES,
@@ -518,6 +519,82 @@ def test_find_active_invocation_recovers_a_stale_row_and_reports_none():
     assert recovered.status == "TIMED_OUT"
     events = audit.list_by_subject("AIInvocation", stuck.ai_invocation_id)
     assert [e.event_type for e in events] == ["AI_INVOCATION_STALE_RECOVERED"]
+
+
+def test_create_invocation_recovers_a_stale_requested_row_to_failed_then_succeeds():
+    """The exact gap a fresh Auditor found and reproduced live against
+    the real Postgres-backed repository: a row abandoned while still
+    `REQUESTED` (the process died in the real, reachable window between
+    `create_invocation` returning `REQUESTED` and a caller's own
+    subsequent `transition_status(..., "RUNNING")` a few lines later —
+    exactly `agent.claude_code.orchestrator.handle_operator_message`'s
+    own call shape) must NOT be targeted at `TIMED_OUT`
+    (`ALLOWED_TRANSITIONS["REQUESTED"]` does not include it — see
+    `ai.invocation.recover_stale_invocation`'s own docstring) — doing so
+    made the subject permanently, unrecoverably stuck: every recovery
+    attempt raised `InvalidStateTransitionError`, a real HTTP 500, worse
+    than the original bug. Deliberately never calls
+    `transition_status(..., "RUNNING")` — that is exactly what every
+    OTHER stale-recovery test in this suite does, which is why none of
+    them caught this."""
+    audit = InMemoryAuditRepository()
+    repo = InMemoryAIInvocationRepository(audit_repository=audit)
+
+    stuck = repo.create_invocation(
+        task_id="ASK_BAGMAN", task_version=1, role="OPERATOR", provider="ANTHROPIC",
+        capability_alias=None, input_references={"conversation_id": "conv-never-dispatched"},
+        actor_type="USER", actor_id="matt",
+    )
+    assert stuck.status == "REQUESTED"  # never transitioned to RUNNING — the exact gap
+    _force_started_at(
+        repo, stuck.ai_invocation_id, utc_now() - datetime.timedelta(seconds=STALE_RUNNING_THRESHOLD_SECONDS + 5)
+    )
+
+    # Must NOT raise InvalidStateTransitionError — this is the live-
+    # reproduced defect: recovery previously crashed here instead of
+    # succeeding.
+    new = repo.create_invocation(
+        task_id="ASK_BAGMAN", task_version=1, role="OPERATOR", provider="ANTHROPIC",
+        capability_alias=None, input_references={"conversation_id": "conv-never-dispatched"},
+        actor_type="USER", actor_id="matt",
+    )
+    assert new.ai_invocation_id != stuck.ai_invocation_id
+    assert new.status == "REQUESTED"
+
+    recovered = repo.get_invocation(stuck.ai_invocation_id)
+    assert recovered.status == "FAILED"  # NOT TIMED_OUT — REQUESTED can never reach it
+    assert recovered.error_code == STALE_RECOVERY_NEVER_DISPATCHED_ERROR_CODE
+    assert recovered.completed_at is not None
+
+    events = audit.list_by_subject("AIInvocation", stuck.ai_invocation_id)
+    assert [e.event_type for e in events] == ["AI_INVOCATION_STALE_RECOVERED"]
+
+
+def test_find_active_invocation_recovers_a_stale_requested_row_to_failed():
+    """Same gap as the `create_invocation` test above, exercised via
+    `find_active_invocation` instead (the other real call site
+    `_recover_if_stale` backs)."""
+    audit = InMemoryAuditRepository()
+    repo = InMemoryAIInvocationRepository(audit_repository=audit)
+
+    stuck = repo.create_invocation(
+        task_id="ASK_BAGMAN", task_version=1, role="OPERATOR", provider="ANTHROPIC",
+        capability_alias=None, input_references={"conversation_id": "conv-never-dispatched-2"},
+        actor_type="USER", actor_id="matt",
+    )
+    assert stuck.status == "REQUESTED"
+    _force_started_at(
+        repo, stuck.ai_invocation_id, utc_now() - datetime.timedelta(seconds=STALE_RUNNING_THRESHOLD_SECONDS + 5)
+    )
+
+    found = repo.find_active_invocation(
+        task_id="ASK_BAGMAN", task_version=1, primary_input_reference="conv-never-dispatched-2"
+    )
+    assert found is None
+
+    recovered = repo.get_invocation(stuck.ai_invocation_id)
+    assert recovered.status == "FAILED"
+    assert recovered.error_code == STALE_RECOVERY_NEVER_DISPATCHED_ERROR_CODE
 
 
 def test_a_genuinely_recent_running_row_is_not_touched_and_still_blocks(repo):

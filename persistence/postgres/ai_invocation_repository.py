@@ -57,7 +57,6 @@ from ai.invocation import (
     AIInvocation,
     AIInvocationRepository,
     STALE_RECOVERY_AUDIT_EVENT_TYPE,
-    STALE_RECOVERY_ERROR_CODE,
     STALE_RUNNING_THRESHOLD_SECONDS,
     derive_primary_input_reference,
     is_stale_running,
@@ -200,6 +199,14 @@ class PostgresAIInvocationRepository(AIInvocationRepository):
         return recovered
 
     def _record_stale_recovery_audit_event(self, recovered: AIInvocation) -> None:
+        # `error_code`/`status` read from `recovered` itself, never a
+        # hardcoded constant — `recover_stale_invocation` targets
+        # different terminal states depending on the row's pre-recovery
+        # status (`TIMED_OUT` for a genuinely-dispatched `RUNNING` row,
+        # `FAILED` for a `REQUESTED` row that never reached a provider
+        # at all; see that function's own docstring) — hardcoding
+        # `STALE_RECOVERY_ERROR_CODE` here would make this audit event
+        # lie about `REQUESTED`-row recoveries.
         self._audit_repository.record_audit_event(
             event_type=STALE_RECOVERY_AUDIT_EVENT_TYPE,
             actor_type=actor.SYSTEM,
@@ -211,7 +218,8 @@ class PostgresAIInvocationRepository(AIInvocationRepository):
             payload={
                 "task_id": recovered.task_id,
                 "task_version": recovered.task_version,
-                "error_code": STALE_RECOVERY_ERROR_CODE,
+                "recovered_status": recovered.status,
+                "error_code": recovered.error_code,
                 "stale_threshold_seconds": STALE_RUNNING_THRESHOLD_SECONDS,
             },
         )

@@ -311,6 +311,27 @@ STALE_RUNNING_THRESHOLD_SECONDS: float = 600.0
 #: subprocess timeout while something was still there to observe it).
 STALE_RECOVERY_ERROR_CODE = "STALE_RECOVERY_TIMEOUT"
 
+#: `error_code` stamped on a stale `REQUESTED` row the recovery
+#: backstop finds — see :func:`recover_stale_invocation`'s own
+#: docstring for why this is a DIFFERENT terminal state/code than
+#: :data:`STALE_RECOVERY_ERROR_CODE` (a real, live-reproduced defect a
+#: fresh Auditor found and this constant fixes, CD-6 reliability delta
+#: follow-up): a row abandoned while still `REQUESTED` was never
+#: dispatched to a provider at all — the module's own pre-existing
+#: `REQUESTED -> FAILED` doctrine ("a request can fail before it is
+#: ever dispatched") already covers exactly this shape of outcome;
+#: `TIMED_OUT` is documented, elsewhere in this same module, as
+#: reachable ONLY from `RUNNING` ("a request cannot time out before it
+#: was ever dispatched — that is REJECTED/FAILED's territory"), so
+#: unconditionally targeting `TIMED_OUT` for every stale row regardless
+#: of its actual current status violated the module's own state
+#: machine and made a stale `REQUESTED` row permanently unrecoverable
+#: (every recovery attempt raised `InvalidStateTransitionError`,
+#: crashing the caller with an HTTP 500 instead of freeing the
+#: subject — worse than the original stuck-row symptom this whole
+#: backstop exists to fix).
+STALE_RECOVERY_NEVER_DISPATCHED_ERROR_CODE = "STALE_RECOVERY_NEVER_DISPATCHED"
+
 #: `AuditEvent.event_type` recorded (same discipline every other status
 #: transition already gets, per the architect's explicit instruction)
 #: the moment the stale-`RUNNING` recovery backstop transitions an
@@ -345,32 +366,71 @@ def is_stale_running(invocation: "AIInvocation", *, now: Optional[datetime] = No
 
 def recover_stale_invocation(invocation: "AIInvocation") -> "AIInvocation":
     """Return the terminal `AIInvocation` a stale, abandoned ``invocation``
-    (see :func:`is_stale_running`) is recovered into — always `TIMED_OUT`
-    with :data:`STALE_RECOVERY_ERROR_CODE`, never a silent delete/ignore
-    (PID §100: "a stale invocation must be transitioned explicitly and
-    audibly to an appropriate terminal/recovered state"). The single
-    shared recovery transition both repositories apply, via the same
-    :func:`transition` state-machine enforcement every other status
-    change goes through — this is not a bespoke bypass of
-    `ALLOWED_TRANSITIONS`.
+    (see :func:`is_stale_running`) is recovered into — never a silent
+    delete/ignore (PID §100: "a stale invocation must be transitioned
+    explicitly and audibly to an appropriate terminal/recovered
+    state"). The single shared recovery transition both repositories
+    apply, via the same :func:`transition` state-machine enforcement
+    every other status change goes through — this is not a bespoke
+    bypass of `ALLOWED_TRANSITIONS`.
+
+    **Target status depends on ``invocation.status`` at the moment it
+    went stale** (a fresh Auditor found and this fixes a real,
+    live-reproduced defect in an earlier version of this function that
+    ignored this distinction): a `RUNNING` row was genuinely dispatched
+    to a provider and abandoned mid-flight — `TIMED_OUT` (with
+    :data:`STALE_RECOVERY_ERROR_CODE`), matching the module's own
+    documented "we dispatched and gave up waiting" meaning for that
+    state. A `REQUESTED` row was abandoned BEFORE ever being dispatched
+    (e.g. the process died in the real, reachable window between
+    `create_invocation` returning `REQUESTED` and a caller's own
+    subsequent `transition_status(..., "RUNNING")` a few lines later,
+    exactly the caller pattern `agent.claude_code.orchestrator
+    .handle_operator_message` uses) — `FAILED` (with
+    :data:`STALE_RECOVERY_NEVER_DISPATCHED_ERROR_CODE`), matching this
+    module's own pre-existing `REQUESTED -> FAILED` doctrine, since
+    `ALLOWED_TRANSITIONS["REQUESTED"]` deliberately does not include
+    `TIMED_OUT` at all (see that table's own docstring: "a request
+    cannot time out before it was ever dispatched"). Unconditionally
+    targeting `TIMED_OUT` regardless of the row's actual status (the
+    original version of this function) made a stale `REQUESTED` row
+    permanently unrecoverable — every attempt raised
+    `InvalidStateTransitionError`, crashing the caller with an HTTP 500
+    instead of freeing the subject.
 
     Does not itself persist anything or emit an audit event — callers
     (the two concrete repositories) are responsible for both, using
     :data:`STALE_RECOVERY_AUDIT_EVENT_TYPE`.
     """
+    if invocation.status == "RUNNING":
+        target_status = "TIMED_OUT"
+        error_code = STALE_RECOVERY_ERROR_CODE
+        reason = (
+            f"started_at was older than STALE_RUNNING_THRESHOLD_SECONDS "
+            f"({STALE_RUNNING_THRESHOLD_SECONDS}s) with no terminal transition ever "
+            "recorded while RUNNING — recovered by the bounded stale-RUNNING backstop, "
+            "not a live runner outcome"
+        )
+    else:
+        target_status = "FAILED"
+        error_code = STALE_RECOVERY_NEVER_DISPATCHED_ERROR_CODE
+        reason = (
+            f"started_at was older than STALE_RUNNING_THRESHOLD_SECONDS "
+            f"({STALE_RUNNING_THRESHOLD_SECONDS}s) while still REQUESTED — the process that "
+            "would have dispatched this invocation to a provider is gone; recovered by the "
+            "bounded stale-RUNNING backstop as FAILED (REQUESTED cannot reach TIMED_OUT, "
+            "PID §28's own doctrine — a request that never dispatched did not time out, it "
+            "simply never happened)"
+        )
+
     return transition(
         invocation,
-        "TIMED_OUT",
-        error_code=STALE_RECOVERY_ERROR_CODE,
+        target_status,
+        error_code=error_code,
         usage_metadata={
             **dict(invocation.usage_metadata),
             "stale_recovery": {
-                "reason": (
-                    f"started_at was older than STALE_RUNNING_THRESHOLD_SECONDS "
-                    f"({STALE_RUNNING_THRESHOLD_SECONDS}s) with no terminal transition ever "
-                    "recorded — recovered by the bounded stale-RUNNING backstop, not a live "
-                    "runner outcome"
-                ),
+                "reason": reason,
                 "recovered_at": to_contract_string(utc_now()),
             },
         },
@@ -746,10 +806,13 @@ class InMemoryAIInvocationRepository(AIInvocationRepository):
     def _recover_if_stale(self, invocation: AIInvocation) -> Optional[AIInvocation]:
         """If ``invocation`` (a row this instance currently believes is
         active for its subject) is stale per :func:`is_stale_running`,
-        transition it to `TIMED_OUT`, persist, clear it from
-        `_active_by_subject`, emit :data:`STALE_RECOVERY_AUDIT_EVENT_TYPE`,
-        and return the recovered record. Returns `None` if ``invocation``
-        is not actually stale (the ordinary, common case) — callers
+        transition it to the appropriate terminal state (see
+        :func:`recover_stale_invocation`'s own docstring — `TIMED_OUT`
+        for a `RUNNING` row, `FAILED` for a `REQUESTED` one), persist,
+        clear it from `_active_by_subject`, emit
+        :data:`STALE_RECOVERY_AUDIT_EVENT_TYPE`, and return the
+        recovered record. Returns `None` if ``invocation`` is not
+        actually stale (the ordinary, common case) — callers
         distinguish "nothing to recover" from "recovered" by this
         return value, never by a side effect alone.
         """
@@ -766,6 +829,11 @@ class InMemoryAIInvocationRepository(AIInvocationRepository):
         if self._active_by_subject.get(subject) == recovered.ai_invocation_id:
             del self._active_by_subject[subject]
 
+        # `error_code`/`status` read from `recovered` itself, never a
+        # hardcoded constant — see `recover_stale_invocation`'s own
+        # docstring for why the target terminal state (and therefore
+        # the correct error_code) depends on the row's pre-recovery
+        # status.
         self._audit_repository.record_audit_event(
             event_type=STALE_RECOVERY_AUDIT_EVENT_TYPE,
             actor_type=actor.SYSTEM,
@@ -777,7 +845,8 @@ class InMemoryAIInvocationRepository(AIInvocationRepository):
             payload={
                 "task_id": recovered.task_id,
                 "task_version": recovered.task_version,
-                "error_code": STALE_RECOVERY_ERROR_CODE,
+                "recovered_status": recovered.status,
+                "error_code": recovered.error_code,
                 "stale_threshold_seconds": STALE_RUNNING_THRESHOLD_SECONDS,
             },
         )
