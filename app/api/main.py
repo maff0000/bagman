@@ -88,6 +88,7 @@ from core.errors import (
     OAuthStateError,
     PersistenceError,
     StorageError,
+    TenantSelectionError,
     ValidationError,
 )
 from app.api.logging_config import configure_logging
@@ -161,6 +162,13 @@ _STATUS_BY_ERROR_TYPE: dict[type[BagmanError], int] = {
     # different content", it is "this request must not be honoured at
     # all").
     OAuthStateError: 403,
+    # Architect finding, real live acceptance run (Infosecurs+NoustAI):
+    # the governed Xero tenant-selection broker (a rejected/expired/
+    # already-resolved selection, or a browser-submitted tenant_id
+    # outside the exact authorised candidate set) is the same class of
+    # genuine SECURITY rejection OAuthStateError already gets 403 for —
+    # see services.xero.tenant_selection's own module docstring.
+    TenantSelectionError: 403,
 }
 
 #: 403 is client-actionable in the same sense 404/409/422 are (see

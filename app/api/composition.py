@@ -73,6 +73,7 @@ from services.xero.connection import XeroConnectionRepository
 from services.xero.oauth_state import OAuthStateRepository
 from services.xero.secrets import TokenStoreProtocol
 from services.xero.sync import XeroSyncRunRepository
+from services.xero.tenant_selection import PendingTenantSelectionStore
 
 #: Repo root, resolved once from this file's own location
 #: (``app/api/composition.py`` -> ``app/api`` -> ``app`` ->
@@ -327,6 +328,12 @@ class RuntimeComposition:
     xero_oauth_client: XeroOAuthClientProtocol
     xero_accounting_client: XeroAccountingClientProtocol
     xero_token_store: TokenStoreProtocol
+    #: Architect finding, real live acceptance run (Infosecurs +
+    #: NoustAI) — the governed multi-tenant-candidate selection broker
+    #: (see `services.xero.tenant_selection`'s own module docstring for
+    #: why this is the SAME implementation, never in-memory-vs-Postgres
+    #: split, in both development and production).
+    xero_pending_tenant_selection_store: PendingTenantSelectionStore
 
 
 def _build_development_or_test(runtime_environment: str) -> RuntimeComposition:
@@ -341,6 +348,7 @@ def _build_development_or_test(runtime_environment: str) -> RuntimeComposition:
     from services.xero.oauth_state import InMemoryOAuthStateRepository
     from services.xero.secrets import InMemoryTokenStore
     from services.xero.sync import InMemoryXeroSyncRunRepository
+    from services.xero.tenant_selection import InMemoryPendingTenantSelectionStore
 
     api = BagmanCanonicalAPI()  # CD-2's own in-memory default construction
     object_store = InMemoryObjectStore()
@@ -358,6 +366,7 @@ def _build_development_or_test(runtime_environment: str) -> RuntimeComposition:
     xero_oauth_client = FakeXeroOAuthClient()
     xero_accounting_client = FakeXeroAccountingClient()
     xero_token_store = InMemoryTokenStore()
+    xero_pending_tenant_selection_store = InMemoryPendingTenantSelectionStore()
 
     # CD-6 reliability delta: shares `api.audit_repository` so the
     # bounded stale-RUNNING recovery backstop's own audit events land in
@@ -397,6 +406,7 @@ def _build_development_or_test(runtime_environment: str) -> RuntimeComposition:
         xero_oauth_client=xero_oauth_client,
         xero_accounting_client=xero_accounting_client,
         xero_token_store=xero_token_store,
+        xero_pending_tenant_selection_store=xero_pending_tenant_selection_store,
     )
 
 
@@ -427,6 +437,7 @@ def _build_production() -> RuntimeComposition:
     from services.evidence.intake.scanner import ClamAVScanner
     from services.xero.client import XeroAccountingClient, XeroOAuthClient
     from services.xero.secrets import FileTokenStore
+    from services.xero.tenant_selection import InMemoryPendingTenantSelectionStore
 
     from ai.providers.litellm.client import DEFAULT_LITELLM_API_KEY_FILE, DEFAULT_LITELLM_ENDPOINT, LiteLLMClient
 
@@ -537,6 +548,11 @@ def _build_production() -> RuntimeComposition:
     xero_oauth_client = XeroOAuthClient()
     xero_accounting_client = XeroAccountingClient()
     xero_token_store = FileTokenStore()
+    # Deliberately the SAME in-memory implementation as development/test
+    # — see `services.xero.tenant_selection`'s own module docstring for
+    # why this bridge state is never Postgres- or file-backed in either
+    # mode.
+    xero_pending_tenant_selection_store = InMemoryPendingTenantSelectionStore()
 
     return RuntimeComposition(
         runtime_environment=_PRODUCTION,
@@ -556,6 +572,7 @@ def _build_production() -> RuntimeComposition:
         xero_oauth_client=xero_oauth_client,
         xero_accounting_client=xero_accounting_client,
         xero_token_store=xero_token_store,
+        xero_pending_tenant_selection_store=xero_pending_tenant_selection_store,
     )
 
 

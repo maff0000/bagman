@@ -11,6 +11,7 @@ exists yet, PID §102.1's own stated constraint). Mirrors
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
@@ -41,6 +42,20 @@ def dev_client(monkeypatch):
 
 def _first_entity_id(client) -> str:
     return client.get("/internal/entities").json()["items"][0]["entity_id"]
+
+
+def _entity_id_by_name(client, canonical_name: str) -> str:
+    items = client.get("/internal/entities").json()["items"]
+    return next(e["entity_id"] for e in items if e["canonical_name"] == canonical_name)
+
+
+def _begin_connect(client, entity_id: str) -> str:
+    """Returns the fresh `state` value for a new connect flow."""
+    import urllib.parse
+
+    r = client.post("/internal/xero/connect", json={"entity_id": entity_id, "actor_type": "USER", "actor_id": ACTOR_ID})
+    assert r.status_code == 201, r.text
+    return urllib.parse.parse_qs(urllib.parse.urlparse(r.json()["authorize_url"]).query)["state"][0]
 
 
 def _connect_and_complete(client, entity_id, *, tenant_id="tenant-xyz", tenant_name="Acme Ltd") -> None:
@@ -579,3 +594,314 @@ def test_replayed_state_redirect_cannot_establish_a_connection(dev_client):
 
     status = dev_client.get(f"/internal/xero/{entity_id}").json()
     assert status["connection"]["tenant_id"] == "tenant-xyz"  # the real, FIRST completion -- untouched by the replay
+
+
+# ---------------------------------------------------------------------
+# Governed tenant selection — architect finding, real live acceptance
+# run (Infosecurs + NoustAI): GET /connections can return more than one
+# authorised Xero organisation in a single consent grant; array order
+# is never identity. See services/xero/tenant_selection.py's own
+# module docstring for the full three-way resolution these cases prove
+# (architect spec cases A-H, verbatim).
+# ---------------------------------------------------------------------
+
+
+def test_case_a_second_entity_selects_the_unmapped_tenant_irrespective_of_order(dev_client):
+    """Case A: returned connections [Infosecurs, NoustAI], Infosecurs
+    already bound, connecting NoustAI -> NoustAI selected, irrespective
+    of array order."""
+    comp = get_composition()
+    infosecurs_id = _entity_id_by_name(dev_client, "INFOSECURS_LIMITED")
+    noustai_id = _entity_id_by_name(dev_client, "NOUSTAI_LIMITED")
+
+    _connect_and_complete(dev_client, infosecurs_id, tenant_id="tenant-infosecurs", tenant_name="Infosecurs Limited")
+
+    state = _begin_connect(dev_client, noustai_id)
+    comp.xero_oauth_client.queue_exchange_result(XeroTokenResult(status=XeroOutcomeStatus.OK, tokens=fake_token_bundle()))
+    comp.xero_oauth_client.queue_connections_result(
+        XeroConnectionsResult(
+            status=XeroOutcomeStatus.OK,
+            connections=(
+                XeroConnectionInfo("c1", "tenant-infosecurs", "Infosecurs Limited", "ORGANISATION"),
+                XeroConnectionInfo("c2", "tenant-noustai", "NoustAI Limited", "ORGANISATION"),
+            ),
+        )
+    )
+    r = dev_client.get("/internal/xero/oauth/callback", params={"code": "code-a", "state": state}, follow_redirects=False)
+    assert r.status_code == 303
+    assert "reason=connected" in r.headers["location"]
+
+    status = dev_client.get(f"/internal/xero/{noustai_id}").json()
+    assert status["connected"] is True
+    assert status["connection"]["tenant_id"] == "tenant-noustai"
+    assert status["connection"]["tenant_name"] == "NoustAI Limited"
+
+
+def test_case_b_same_result_with_reversed_array_order(dev_client):
+    """Case B: returned connections [NoustAI, Infosecurs] (reversed) ->
+    same result as case A."""
+    comp = get_composition()
+    infosecurs_id = _entity_id_by_name(dev_client, "INFOSECURS_LIMITED")
+    noustai_id = _entity_id_by_name(dev_client, "NOUSTAI_LIMITED")
+
+    _connect_and_complete(dev_client, infosecurs_id, tenant_id="tenant-infosecurs", tenant_name="Infosecurs Limited")
+
+    state = _begin_connect(dev_client, noustai_id)
+    comp.xero_oauth_client.queue_exchange_result(XeroTokenResult(status=XeroOutcomeStatus.OK, tokens=fake_token_bundle()))
+    comp.xero_oauth_client.queue_connections_result(
+        XeroConnectionsResult(
+            status=XeroOutcomeStatus.OK,
+            connections=(
+                XeroConnectionInfo("c2", "tenant-noustai", "NoustAI Limited", "ORGANISATION"),
+                XeroConnectionInfo("c1", "tenant-infosecurs", "Infosecurs Limited", "ORGANISATION"),
+            ),
+        )
+    )
+    r = dev_client.get("/internal/xero/oauth/callback", params={"code": "code-b", "state": state}, follow_redirects=False)
+    assert r.status_code == 303
+    assert "reason=connected" in r.headers["location"]
+
+    status = dev_client.get(f"/internal/xero/{noustai_id}").json()
+    assert status["connected"] is True
+    assert status["connection"]["tenant_id"] == "tenant-noustai"
+
+
+def test_case_c_only_already_bound_tenant_returned_fails_honestly_no_cross_mapping(dev_client):
+    """Case C: only Infosecurs returned, Infosecurs already bound,
+    connecting NoustAI -> honest failure, no cross-company mapping."""
+    comp = get_composition()
+    infosecurs_id = _entity_id_by_name(dev_client, "INFOSECURS_LIMITED")
+    noustai_id = _entity_id_by_name(dev_client, "NOUSTAI_LIMITED")
+
+    _connect_and_complete(dev_client, infosecurs_id, tenant_id="tenant-infosecurs", tenant_name="Infosecurs Limited")
+
+    state = _begin_connect(dev_client, noustai_id)
+    comp.xero_oauth_client.queue_exchange_result(XeroTokenResult(status=XeroOutcomeStatus.OK, tokens=fake_token_bundle()))
+    comp.xero_oauth_client.queue_connections_result(
+        XeroConnectionsResult(
+            status=XeroOutcomeStatus.OK,
+            connections=(XeroConnectionInfo("c1", "tenant-infosecurs", "Infosecurs Limited", "ORGANISATION"),),
+        )
+    )
+    r = dev_client.get("/internal/xero/oauth/callback", params={"code": "code-c", "state": state}, follow_redirects=False)
+    assert r.status_code == 303
+    assert "reason=no_eligible_tenant" in r.headers["location"]
+
+    # NoustAI never became connected, and Infosecurs's own binding is
+    # completely untouched -- the exact "no cross-company mapping"
+    # guarantee this case exists to prove.
+    noustai_status = dev_client.get(f"/internal/xero/{noustai_id}").json()
+    assert noustai_status["connected"] is False
+
+    infosecurs_status = dev_client.get(f"/internal/xero/{infosecurs_id}").json()
+    assert infosecurs_status["connected"] is True
+    assert infosecurs_status["connection"]["tenant_id"] == "tenant-infosecurs"
+
+
+def test_case_d_two_unmapped_tenants_require_governed_operator_choice(dev_client):
+    """Case D: two or more unmapped tenants returned -> no implicit
+    selection; governed operator choice required."""
+    comp = get_composition()
+    noustai_id = _entity_id_by_name(dev_client, "NOUSTAI_LIMITED")
+
+    state = _begin_connect(dev_client, noustai_id)
+    comp.xero_oauth_client.queue_exchange_result(XeroTokenResult(status=XeroOutcomeStatus.OK, tokens=fake_token_bundle()))
+    comp.xero_oauth_client.queue_connections_result(
+        XeroConnectionsResult(
+            status=XeroOutcomeStatus.OK,
+            connections=(
+                XeroConnectionInfo("c1", "tenant-x", "Organisation X", "ORGANISATION"),
+                XeroConnectionInfo("c2", "tenant-y", "Organisation Y", "ORGANISATION"),
+            ),
+        )
+    )
+    r = dev_client.get("/internal/xero/oauth/callback", params={"code": "code-d", "state": state}, follow_redirects=False)
+    assert r.status_code == 303
+    assert "reason=tenant_selection_required" in r.headers["location"]
+
+    # No implicit selection happened -- NoustAI is still unconnected.
+    assert dev_client.get(f"/internal/xero/{noustai_id}").json()["connected"] is False
+
+    import urllib.parse
+    selection_id = urllib.parse.parse_qs(urllib.parse.urlparse(r.headers["location"]).query)["selection_id"][0]
+
+    candidates = dev_client.get(f"/internal/xero/oauth/pending-selection/{selection_id}").json()
+    assert {c["tenant_id"] for c in candidates["candidates"]} == {"tenant-x", "tenant-y"}
+
+    # The operator's real, governed choice.
+    resolved = dev_client.post(f"/internal/xero/oauth/pending-selection/{selection_id}/resolve", json={"tenant_id": "tenant-y"})
+    assert resolved.status_code == 200
+    assert resolved.json()["tenant_id"] == "tenant-y"
+
+    status = dev_client.get(f"/internal/xero/{noustai_id}").json()
+    assert status["connected"] is True
+    assert status["connection"]["tenant_id"] == "tenant-y"
+    assert status["connection"]["tenant_name"] == "Organisation Y"
+
+
+def test_case_e_browser_cannot_substitute_an_arbitrary_tenant_id(dev_client):
+    """Case E: browser attempts tenant not in authorised candidate set
+    -> rejected."""
+    comp = get_composition()
+    noustai_id = _entity_id_by_name(dev_client, "NOUSTAI_LIMITED")
+
+    state = _begin_connect(dev_client, noustai_id)
+    comp.xero_oauth_client.queue_exchange_result(XeroTokenResult(status=XeroOutcomeStatus.OK, tokens=fake_token_bundle()))
+    comp.xero_oauth_client.queue_connections_result(
+        XeroConnectionsResult(
+            status=XeroOutcomeStatus.OK,
+            connections=(
+                XeroConnectionInfo("c1", "tenant-x", "Organisation X", "ORGANISATION"),
+                XeroConnectionInfo("c2", "tenant-y", "Organisation Y", "ORGANISATION"),
+            ),
+        )
+    )
+    r = dev_client.get("/internal/xero/oauth/callback", params={"code": "code-e", "state": state}, follow_redirects=False)
+    import urllib.parse
+    selection_id = urllib.parse.parse_qs(urllib.parse.urlparse(r.headers["location"]).query)["selection_id"][0]
+
+    hijack = dev_client.post(
+        f"/internal/xero/oauth/pending-selection/{selection_id}/resolve",
+        json={"tenant_id": "tenant-attacker-supplied-not-authorised"},
+    )
+    assert hijack.status_code == 403
+    assert dev_client.get(f"/internal/xero/{noustai_id}").json()["connected"] is False
+
+    # The real, legitimate candidates are still resolvable afterward --
+    # a rejected substitution attempt does not itself burn the
+    # selection (only a SUCCESSFUL resolve consumes it).
+    real = dev_client.post(f"/internal/xero/oauth/pending-selection/{selection_id}/resolve", json={"tenant_id": "tenant-x"})
+    assert real.status_code == 200
+
+
+def test_case_f_infosecurs_connection_and_accounts_untouched_by_noustai_attempts(dev_client):
+    """Case F: existing Infosecurs connection, tokens and account
+    projection remain untouched throughout both a failed and a
+    successful NoustAI attempt."""
+    comp = get_composition()
+    infosecurs_id = _entity_id_by_name(dev_client, "INFOSECURS_LIMITED")
+    noustai_id = _entity_id_by_name(dev_client, "NOUSTAI_LIMITED")
+
+    _connect_and_complete(dev_client, infosecurs_id, tenant_id="tenant-infosecurs", tenant_name="Infosecurs Limited")
+    comp.xero_accounting_client.queue_accounts_result(
+        XeroAccountsResult(
+            status=XeroOutcomeStatus.OK,
+            accounts=(
+                RawXeroAccount("A1", "400", "Advertising", "EXPENSE", "EXPENSE", "NONE", "ACTIVE", True, None, None, None),
+                RawXeroAccount("A2", "200", "Sales", "REVENUE", "REVENUE", "OUTPUT2", "ACTIVE", False, None, None, None),
+            ),
+        )
+    )
+    sync = dev_client.post(f"/internal/xero/{infosecurs_id}/sync", json={"actor_type": "USER", "actor_id": ACTOR_ID})
+    assert sync.status_code == 200 and sync.json()["status"] == "SUCCEEDED"
+
+    infosecurs_before = dev_client.get(f"/internal/xero/{infosecurs_id}").json()
+    accounts_before = dev_client.get(f"/internal/xero/{infosecurs_id}/accounts").json()
+    assert accounts_before["count"] == 2
+
+    # A FAILED NoustAI attempt (case C's own shape).
+    state = _begin_connect(dev_client, noustai_id)
+    comp.xero_oauth_client.queue_exchange_result(XeroTokenResult(status=XeroOutcomeStatus.OK, tokens=fake_token_bundle()))
+    comp.xero_oauth_client.queue_connections_result(
+        XeroConnectionsResult(status=XeroOutcomeStatus.OK, connections=(XeroConnectionInfo("c1", "tenant-infosecurs", "Infosecurs Limited", "ORGANISATION"),))
+    )
+    dev_client.get("/internal/xero/oauth/callback", params={"code": "code-f1", "state": state}, follow_redirects=False)
+
+    # A SUCCESSFUL NoustAI attempt right after.
+    _connect_and_complete(dev_client, noustai_id, tenant_id="tenant-noustai", tenant_name="NoustAI Limited")
+
+    infosecurs_after = dev_client.get(f"/internal/xero/{infosecurs_id}").json()
+    accounts_after = dev_client.get(f"/internal/xero/{infosecurs_id}/accounts").json()
+    assert infosecurs_after == infosecurs_before
+    assert accounts_after == accounts_before
+
+
+def test_case_g_no_token_written_for_noustai_until_tenant_resolution_succeeds(dev_client):
+    """Case G: no token is written to NoustAI until tenant resolution
+    has succeeded."""
+    comp = get_composition()
+    noustai_id = _entity_id_by_name(dev_client, "NOUSTAI_LIMITED")
+
+    state = _begin_connect(dev_client, noustai_id)
+    comp.xero_oauth_client.queue_exchange_result(XeroTokenResult(status=XeroOutcomeStatus.OK, tokens=fake_token_bundle()))
+    comp.xero_oauth_client.queue_connections_result(
+        XeroConnectionsResult(
+            status=XeroOutcomeStatus.OK,
+            connections=(
+                XeroConnectionInfo("c1", "tenant-x", "Organisation X", "ORGANISATION"),
+                XeroConnectionInfo("c2", "tenant-y", "Organisation Y", "ORGANISATION"),
+            ),
+        )
+    )
+    r = dev_client.get("/internal/xero/oauth/callback", params={"code": "code-g", "state": state}, follow_redirects=False)
+    assert "reason=tenant_selection_required" in r.headers["location"]
+
+    # Ambiguity alone must never write a token.
+    assert comp.xero_token_store.read(noustai_id) is None
+
+    import urllib.parse
+    selection_id = urllib.parse.parse_qs(urllib.parse.urlparse(r.headers["location"]).query)["selection_id"][0]
+    resolved = dev_client.post(f"/internal/xero/oauth/pending-selection/{selection_id}/resolve", json={"tenant_id": "tenant-x"})
+    assert resolved.status_code == 200
+
+    # Only NOW, after a successful, validated resolution, is a token written.
+    assert comp.xero_token_store.read(noustai_id) is not None
+
+
+def test_case_h_state_expiry_replay_and_supersession_protections_remain_intact(dev_client):
+    """Case H: existing state expiry/replay/supersession protections
+    remain intact through the new multi-candidate code path -- the
+    `state` value is still consumed exactly once at the TOP of
+    `oauth_callback`, before any tenant-resolution branching, so a
+    second presentation of the SAME state (regardless of which
+    resolution branch the first presentation took) is rejected
+    identically to every other callback outcome."""
+    comp = get_composition()
+    noustai_id = _entity_id_by_name(dev_client, "NOUSTAI_LIMITED")
+
+    state = _begin_connect(dev_client, noustai_id)
+    comp.xero_oauth_client.queue_exchange_result(XeroTokenResult(status=XeroOutcomeStatus.OK, tokens=fake_token_bundle()))
+    comp.xero_oauth_client.queue_connections_result(
+        XeroConnectionsResult(
+            status=XeroOutcomeStatus.OK,
+            connections=(
+                XeroConnectionInfo("c1", "tenant-x", "Organisation X", "ORGANISATION"),
+                XeroConnectionInfo("c2", "tenant-y", "Organisation Y", "ORGANISATION"),
+            ),
+        )
+    )
+    first = dev_client.get("/internal/xero/oauth/callback", params={"code": "code-h", "state": state}, follow_redirects=False)
+    assert "reason=tenant_selection_required" in first.headers["location"]
+
+    replay = dev_client.get("/internal/xero/oauth/callback", params={"code": "code-h", "state": state}, follow_redirects=False)
+    assert replay.status_code == 303
+    assert "reason=invalid_state" in replay.headers["location"]
+
+
+def test_connection_status_reports_account_count_zero_for_a_never_connected_entity(dev_client):
+    """Architect finding, live acceptance run: 'Matthew Scott Personal
+    currently renders undefined account(s) synced.' Root cause: `GET
+    /internal/xero/{entity_id}` omitted `account_count`/
+    `reference_data_stale` entirely when `connection is None` (an
+    entity with no XeroConnection row at all), so the GUI's
+    `status.account_count` was JS `undefined`, rendered verbatim into
+    the template string. Proves the real HTTP contract now always
+    includes these fields, honestly zero/false, never absent."""
+    entity_id = _entity_id_by_name(dev_client, "MATTHEW_SCOTT_PERSONAL")
+    r = dev_client.get(f"/internal/xero/{entity_id}")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["connected"] is False
+    assert body["connection"] is None
+    assert body["account_count"] == 0
+    assert body["reference_data_stale"] is False
+
+
+def test_connections_js_never_renders_the_literal_string_undefined_for_account_count():
+    """Belt-and-braces on the same finding, at the GUI layer: even if a
+    future response shape regressed, the rendering line itself must
+    coalesce a non-numeric `account_count` to a real fallback before
+    ever reaching template interpolation."""
+    source = (Path(__file__).resolve().parents[2] / "app/api/static/features/xero/connections.js").read_text()
+    assert 'typeof status.account_count === "number" ? status.account_count : 0' in source
+    assert "${status.account_count} account" not in source

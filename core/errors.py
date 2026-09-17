@@ -261,3 +261,22 @@ class OAuthStateError(BagmanError):
     """
 
     error_code = "OAUTH_STATE_INVALID"
+
+
+class TenantSelectionError(BagmanError):
+    """A server-side governed Xero tenant-selection token (CD-6 Slice 2,
+    PID §98.4, architect finding — real live acceptance run,
+    Infosecurs+NoustAI) failed validation: the `selection_id` is
+    missing/unknown, already expired, or already resolved (a replay),
+    OR the browser-submitted `tenant_id` was not part of the exact
+    candidate set Xero authorised for this flow (architect requirement:
+    "the browser must not be able to substitute an arbitrary tenant
+    ID"). Mirrors ``OAuthStateError`` exactly — its own error type
+    rather than ``ValidationError``/``ConflictError``, mapped to the
+    same HTTP 403 (a genuine security rejection, never a caller
+    input-shape error), always audited, never silently accepted. See
+    ``services.xero.tenant_selection``'s own docstring for the exact
+    checks this covers.
+    """
+
+    error_code = "TENANT_SELECTION_INVALID"

@@ -86,8 +86,15 @@ export const Connections = {
       })
     );
     if (status) {
+      // Architect finding, live acceptance run: rendered the literal
+      // string "undefined account(s) synced" for an entity with no
+      // XeroConnection at all — the backend now always includes
+      // `account_count` (see app/api/routers/xero.py's own fix), but
+      // this fallback stays as defence-in-depth against the same
+      // class of bug ever reappearing from either side.
+      const accountCount = typeof status.account_count === "number" ? status.account_count : 0;
       body.appendChild(
-        el("div", { class: "small muted", text: `${status.account_count} account(s) synced` })
+        el("div", { class: "small muted", text: `${accountCount} account(s) synced` })
       );
       if (status.reference_data_stale && connection && connection.status === "CONNECTED") {
         body.appendChild(el("div", { class: "small", text: "Reference data may be stale." }));
