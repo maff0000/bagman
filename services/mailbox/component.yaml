@@ -1,0 +1,63 @@
+# BAGMAN component manifest (CD-6 Slice 3: Mailbox Management) for
+# services/mailbox/.
+# Validated by scripts/generate_architecture_memory.py against
+# contracts/manifest/bagman.component_manifest.v1.schema.json.
+
+id: BAGMAN.MAILBOX
+version: 1
+
+responsibility: >
+  Own the operator-facing mailbox DEFINITION registry (MailboxSource) —
+  a governed record of which real mailbox addresses BAGMAN will later
+  monitor for evidence, their declared future provider adapter, an
+  optional display-only default-entity hint, and their own closed
+  ACTIVE/DISABLED/RETIRED lifecycle (retire preserves the row rather
+  than deleting it, so future evidence provenance is never orphaned).
+  This is a FOUNDATION-ONLY component: it creates, edits, enables,
+  disables, and retires mailbox definitions and nothing else. No
+  provider OAuth/IMAP login, no mail fetch, no sweep scheduler/worker,
+  no evidence creation from email, no email classification, and no
+  provider webhook of any kind is implemented anywhere behind this
+  component in this delivery.
+
+owns:
+  - MailboxSource
+
+# services/mailbox/mailbox.py depends on core/ exactly like every other
+# CD-2/CD-4/CD-5/CD-6 domain module: identity (id generation),
+# timestamps (UTC handling), errors (ConflictError,
+# InvalidStateTransitionError, NotFoundError, ValidationError), and
+# contract_validation (validate_against_contract). It deliberately does
+# NOT import core.entity/EntityRepository directly — default_entity_id
+# hint validation happens one layer up, in
+# app/api/routers/mailboxes.py, mirroring app/api/routers/xero.py's own
+# `_require_entity` layering choice (see services/mailbox/mailbox.py's
+# own module docstring).
+consumes:
+  - BAGMAN.CORE
+
+# This component does not itself emit AuditEvents — every
+# MAILBOX_* audit event is minted by the HTTP orchestration layer that
+# calls this component's repository (app/api/routers/mailboxes.py) via
+# core.api.BagmanCanonicalAPI.record_audit_event(), exactly like
+# services/xero/ and services/needs_you/ never emitting their own audit
+# events (see those components' own manifests).
+produces: []
+
+# No new third-party dependency: this component is pure Python domain
+# logic over core/'s existing primitives.
+dependencies:
+  - jsonschema
+  - rfc3339-validator
+
+# No external provider is ever called by this component in this
+# delivery — see `responsibility` above. Reserved false, exactly like
+# every other CD-2/CD-4 domain component that is not itself an adapter.
+external_access: false
+
+prohibited:
+  - direct_email_access
+  - direct_bank_access
+  - direct_chargebee_access
+  - mailbox_provider_oauth_or_login
+  - mailbox_sweep_or_fetch

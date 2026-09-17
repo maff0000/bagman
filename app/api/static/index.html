@@ -52,9 +52,12 @@
     <button class="tab-btn" data-tab="needs-you" type="button">Needs You</button>
     <div class="shell-nav__group-label">Records</div>
     <button class="tab-btn" data-tab="documents" type="button">Documents</button>
-    <button class="tab-btn tab-btn--disabled" type="button" disabled title="Not part of this delivery">
-      Email <span class="pill pill--muted">unavailable</span>
-    </button>
+    <!-- CD-6 Slice 3 (Mailbox Management) — was a disabled placeholder
+         in Slice 1/2; now a real, live mailbox-registry tab. Mail
+         fetch/monitoring itself remains a future delivery — this tab
+         manages mailbox DEFINITIONS only (see
+         app/api/static/features/mailbox/mailboxes.js's own docstring). -->
+    <button class="tab-btn" data-tab="mailboxes" type="button">Email</button>
     <button class="tab-btn tab-btn--disabled" type="button" disabled title="Not part of this delivery">
       Invoices <span class="pill pill--muted">unavailable</span>
     </button>
@@ -289,6 +292,22 @@
         </div>
       </div>
       <div id="activity-list" class="activity-list"></div>
+    </section>
+
+    <!-- ============================= EMAIL / MAILBOXES ============================= -->
+    <section id="panel-mailboxes" class="tab-panel" hidden>
+      <div class="page-head">
+        <div>
+          <h1>Email</h1>
+          <p class="muted">
+            Mailboxes BAGMAN will monitor for evidence — definitions only. A mailbox is a source of
+            evidence, never a company, ledger, or invoice owner. Connecting to a real provider and
+            fetching mail is a future delivery.
+          </p>
+        </div>
+        <button class="btn btn--primary" id="mailboxes-add" type="button">Add mailbox</button>
+      </div>
+      <div id="mailboxes-list" class="card-grid"></div>
     </section>
 
     <!-- ============================= CONNECTIONS ============================= -->

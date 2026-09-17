@@ -14,6 +14,7 @@ import { Detail } from "../features/documents/detail.js";
 import { NeedsYou } from "../features/needs-you/needs-you.js";
 import { Activity } from "../features/activity/activity.js";
 import { Connections } from "../features/xero/connections.js";
+import { Mailboxes } from "../features/mailbox/mailboxes.js";
 import * as AskBagman from "../features/ai/ask-bagman.js";
 import * as AddMenu from "./add-menu.js";
 import * as ReviewDrawer from "./drawer.js";
@@ -29,6 +30,8 @@ const TABS = {
   activity: { panel: "#panel-activity", onActivate: () => Activity.ensureLoaded() },
   //: CD-6 Slice 2 (architect spec §16) — the Settings/Connections tab.
   connections: { panel: "#panel-connections", onActivate: () => Connections.ensureLoaded() },
+  //: CD-6 Slice 3 (Mailbox Management) — the Email tab.
+  mailboxes: { panel: "#panel-mailboxes", onActivate: () => Mailboxes.ensureLoaded() },
 };
 
 function initTabs() {
@@ -74,6 +77,15 @@ function initTabs() {
 
 function initOverviewRefresh() {
   qs("#overview-refresh").addEventListener("click", () => Overview.load());
+}
+
+//: CD-6 Slice 3 (Mailbox Management) — the Email tab's own "Add
+//: mailbox" button (outside the global `+ Add` menu, which is scoped
+//: to evidence upload only — a mailbox definition is not evidence).
+function initMailboxesAdd() {
+  const btn = qs("#mailboxes-add");
+  if (!btn) return;
+  btn.addEventListener("click", () => Mailboxes.openAddDrawer());
 }
 
 function initOperatorIdentity() {
@@ -129,6 +141,7 @@ function initCrossFeatureRefresh() {
 export function initShell() {
   const activateTab = initTabs();
   initOverviewRefresh();
+  initMailboxesAdd();
   Detail.initClosePanel();
   ReviewDrawer.initClose();
   AddMenu.initAddMenu();

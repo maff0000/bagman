@@ -103,6 +103,17 @@ Own the single governed boundary through which untrusted, external/ user-supplie
 - **External access:** `false`
 - **Prohibited:** `direct_email_access`, `direct_bank_access`, `direct_xero_access`, `direct_chargebee_access`
 
+### `BAGMAN.MAILBOX` (v1)
+
+Own the operator-facing mailbox DEFINITION registry (MailboxSource) — a governed record of which real mailbox addresses BAGMAN will later monitor for evidence, their declared future provider adapter, an optional display-only default-entity hint, and their own closed ACTIVE/DISABLED/RETIRED lifecycle (retire preserves the row rather than deleting it, so future evidence provenance is never orphaned). This is a FOUNDATION-ONLY component: it creates, edits, enables, disables, and retires mailbox definitions and nothing else. No provider OAuth/IMAP login, no mail fetch, no sweep scheduler/worker, no evidence creation from email, no email classification, and no provider webhook of any kind is implemented anywhere behind this component in this delivery.
+
+- **Owns:** `MailboxSource`
+- **Consumes:** `BAGMAN.CORE`
+- **Produces:** _(none)_
+- **Dependencies:** `jsonschema`, `rfc3339-validator`
+- **External access:** `false`
+- **Prohibited:** `direct_email_access`, `direct_bank_access`, `direct_chargebee_access`, `mailbox_provider_oauth_or_login`, `mailbox_sweep_or_fetch`
+
 ### `BAGMAN.NEEDS_YOU` (v1)
 
 Own the universal, cross-domain NeedsYouItem domain object and its small closed state machine (OPEN -> RESOLVED/DISMISSED) — the one queue every BAGMAN producer (evidence intake today; email triage, invoice review, rule proposals in later CD-6 slices) raises a question into when a human decision is required before BAGMAN can keep going (PID §98.2/§98.5). Deliberately its own top-level component rather than folded into services/evidence/intake/ — see this module's own docstring ("What this is, and why it is its own top-level component") for the full rationale. Does not itself decide WHEN to raise an item for a given domain event (that orchestration lives in the calling HTTP router, e.g. app/api/routers/intake.py's own documented hook, exactly like core.api.BagmanCanonicalAPI never deciding when services.evidence.intake's pipeline should run).
@@ -182,6 +193,7 @@ Own the durable Company<->Xero-organisation mapping (XeroConnection, its closed 
 | `https://bagman.internal/contracts/entity/bagman.entity.v1.schema.json` | BAGMAN GovernedEntity | `contracts/entity/bagman.entity.v1.schema.json` |
 | `https://bagman.internal/contracts/evidence/bagman.evidence.v1.schema.json` | BAGMAN EvidenceItem | `contracts/evidence/bagman.evidence.v1.schema.json` |
 | `https://bagman.internal/contracts/intake/bagman.intake_record.v1.schema.json` | BAGMAN IntakeRecord | `contracts/intake/bagman.intake_record.v1.schema.json` |
+| `https://bagman.internal/contracts/mailbox/bagman.mailbox_source.v1.schema.json` | BAGMAN MailboxSource | `contracts/mailbox/bagman.mailbox_source.v1.schema.json` |
 | `https://bagman.internal/contracts/manifest/bagman.component_manifest.v1.schema.json` | BAGMAN Component Manifest | `contracts/manifest/bagman.component_manifest.v1.schema.json` |
 | `https://bagman.internal/contracts/needs_you/bagman.needs_you_item.v1.schema.json` | BAGMAN NeedsYouItem | `contracts/needs_you/bagman.needs_you_item.v1.schema.json` |
 | `https://bagman.internal/contracts/provenance/bagman.provenance.v1.schema.json` | BAGMAN Provenance | `contracts/provenance/bagman.provenance.v1.schema.json` |

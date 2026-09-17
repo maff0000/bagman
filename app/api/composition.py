@@ -66,6 +66,7 @@ from core.api import BagmanCanonicalAPI
 from persistence.objects.store import EvidenceObjectStore
 from services.evidence.intake.intake import IntakeRepository
 from services.evidence.intake.scanner import EvidenceSafetyScanner, ScanResult, ScanVerdict
+from services.mailbox.mailbox import MailboxSourceRepository
 from services.needs_you.needs_you import NeedsYouRepository
 from services.xero.account import XeroAccountRepository
 from services.xero.client import XeroAccountingClientProtocol, XeroOAuthClientProtocol
@@ -334,6 +335,15 @@ class RuntimeComposition:
     #: why this is the SAME implementation, never in-memory-vs-Postgres
     #: split, in both development and production).
     xero_pending_tenant_selection_store: PendingTenantSelectionStore
+    #: CD-6 Slice 3 (Mailbox Management, TAB 1 / Email) — the
+    #: mailbox-definition registry. In-memory in development/test, a
+    #: real `PostgresMailboxSourceRepository` (sharing `engine`) in
+    #: production — same never-mixed-across-modes discipline as every
+    #: repository above. No provider client is wired here at all (never
+    #: an `xero_oauth_client`-style adapter pair) — nothing in this
+    #: slice ever calls out to a mailbox provider, see
+    #: services/mailbox/mailbox.py's own module docstring.
+    mailbox_source_repository: MailboxSourceRepository
 
 
 def _build_development_or_test(runtime_environment: str) -> RuntimeComposition:
@@ -341,6 +351,7 @@ def _build_development_or_test(runtime_environment: str) -> RuntimeComposition:
     from ai.providers.litellm.fake import FakeLiteLLMClient
     from persistence.objects.memory_store import InMemoryObjectStore
     from services.evidence.intake.intake import InMemoryIntakeRepository
+    from services.mailbox.mailbox import InMemoryMailboxSourceRepository
     from services.needs_you.needs_you import InMemoryNeedsYouRepository
     from services.xero.account import InMemoryXeroAccountRepository
     from services.xero.connection import InMemoryXeroConnectionRepository
@@ -367,6 +378,7 @@ def _build_development_or_test(runtime_environment: str) -> RuntimeComposition:
     xero_accounting_client = FakeXeroAccountingClient()
     xero_token_store = InMemoryTokenStore()
     xero_pending_tenant_selection_store = InMemoryPendingTenantSelectionStore()
+    mailbox_source_repository = InMemoryMailboxSourceRepository()
 
     # CD-6 reliability delta: shares `api.audit_repository` so the
     # bounded stale-RUNNING recovery backstop's own audit events land in
@@ -407,6 +419,7 @@ def _build_development_or_test(runtime_environment: str) -> RuntimeComposition:
         xero_accounting_client=xero_accounting_client,
         xero_token_store=xero_token_store,
         xero_pending_tenant_selection_store=xero_pending_tenant_selection_store,
+        mailbox_source_repository=mailbox_source_repository,
     )
 
 
@@ -424,6 +437,7 @@ def _build_production() -> RuntimeComposition:
         PostgresExternalReferenceRepository,
     )
     from persistence.postgres.intake_repository import PostgresIntakeRepository
+    from persistence.postgres.mailbox_repository import PostgresMailboxSourceRepository
     from persistence.postgres.needs_you_repository import PostgresNeedsYouRepository
     from persistence.postgres.provenance_repository import PostgresProvenanceRepository
     from persistence.postgres.session import get_engine
@@ -554,6 +568,14 @@ def _build_production() -> RuntimeComposition:
     # mode.
     xero_pending_tenant_selection_store = InMemoryPendingTenantSelectionStore()
 
+    # CD-6 Slice 3 (Mailbox Management): durable mailbox-definition
+    # registry, sharing the same engine as every other Postgres-backed
+    # repository above. No provider client/adapter is constructed here
+    # at all — nothing in this slice ever calls out to a mailbox
+    # provider (see services/mailbox/mailbox.py's own module
+    # docstring).
+    mailbox_source_repository = PostgresMailboxSourceRepository(engine)
+
     return RuntimeComposition(
         runtime_environment=_PRODUCTION,
         api=api,
@@ -573,6 +595,7 @@ def _build_production() -> RuntimeComposition:
         xero_accounting_client=xero_accounting_client,
         xero_token_store=xero_token_store,
         xero_pending_tenant_selection_store=xero_pending_tenant_selection_store,
+        mailbox_source_repository=mailbox_source_repository,
     )
 
 

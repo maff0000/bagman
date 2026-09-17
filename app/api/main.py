@@ -92,7 +92,7 @@ from core.errors import (
     ValidationError,
 )
 from app.api.logging_config import configure_logging
-from app.api.routers import activity, ai, health, intake, internal, needs_you, operator, version, xero
+from app.api.routers import activity, ai, health, intake, internal, mailboxes, needs_you, operator, version, xero
 
 configure_logging(level=os.environ.get("BAGMAN_LOG_LEVEL", "INFO"))
 logger = logging.getLogger("bagman.runtime.api")
@@ -117,6 +117,12 @@ app.include_router(activity.router)
 #: read-only Chart-of-Accounts reference-data HTTP surface (PID
 #: §98.4, architect spec §1-24).
 app.include_router(xero.router)
+#: CD-6 Slice 3 — the mailbox-definition registry HTTP surface (Mailbox
+#: Management, TAB 1 / Email): create/list/get/edit/enable/disable/
+#: retire only — no provider connectivity of any kind exists behind
+#: this router (see app/api/routers/mailboxes.py's own module
+#: docstring).
+app.include_router(mailboxes.router)
 
 #: CD-4 WI-4 — the BAGMAN Documents GUI (PID §36-42), served as plain
 #: static assets. Mounted LAST and at "/" so it never shadows any

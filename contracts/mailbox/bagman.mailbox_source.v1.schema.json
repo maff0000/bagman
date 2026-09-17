@@ -1,0 +1,119 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://bagman.internal/contracts/mailbox/bagman.mailbox_source.v1.schema.json",
+  "title": "BAGMAN MailboxSource",
+  "description": "An operator-registered mailbox DEFINITION BAGMAN will later monitor for evidence (CD-6 Slice 3, PID §98.4-following, architect scope: 'operator-facing mailbox registry and management foundation only'). A `MailboxSource` is explicitly NOT a BAGMAN company/accounting entity/Xero organisation/ledger/invoice owner — it is a source of evidence, nothing more; `default_entity_id` is only ever an optional DISPLAY hint (never an ownership assertion — mirrors `core.source.Source.governed_entity_hint`'s own doctrine exactly, see `persistence/postgres/models.py`'s own note on that field). This slice creates/edits/enables/disables/retires mailbox definitions only — no provider OAuth/IMAP login, no mail fetch, no sweep scheduler, no evidence creation from email exists anywhere behind this contract yet (see `services/mailbox/mailbox.py`'s own module docstring for the full out-of-scope list). NEVER carries a password/OAuth token/refresh token/client secret/app secret/private key of any kind, anywhere, at any time (no such field exists on this contract, and none may ever be added to it) — see that module's own 'Secret doctrine' section.",
+  "type": "object",
+  "properties": {
+    "mailbox_id": {
+      "$ref": "https://bagman.internal/contracts/common/bagman.identifier.v1.schema.json",
+      "description": "Canonical BAGMAN identifier for this mailbox definition row."
+    },
+    "display_name": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Operator-facing label for this mailbox (e.g. 'Matt — Infosecurs'). Free text, never business truth on its own."
+    },
+    "email_address": {
+      "type": "string",
+      "minLength": 3,
+      "pattern": "^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$",
+      "format": "email",
+      "description": "The real mailbox address this definition names. Always stored and compared lowercase (normalised by `services/mailbox/mailbox.py`/`persistence/postgres/mailbox_repository.py` before either uniqueness comparison or storage — see those modules' own docstrings for the exact, documented uniqueness rule chosen: GLOBAL uniqueness across every mailbox regardless of provider or lifecycle status). Never itself a secret — an email address is not credential material — but never accompanied anywhere on this contract by a password/token of any kind."
+    },
+    "provider_kind": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The FUTURE adapter family this mailbox definition declares — deliberately an OPEN string field at the CONTRACT layer (never a closed JSON Schema `enum`/`const` naming a specific external provider brand): this repository's own `tests/integration/test_architecture_boundaries.py::test_no_schema_file_hardcodes_a_provider_name_inside_a_structural_constraint` forbids exactly that. `services/mailbox/mailbox.py` separately enforces a CLOSED, Python-level set (`PROVIDER_KINDS`) — mirroring `services.xero.connection.PROVIDERS`'s identical closed-set doctrine one layer down, and `ai.invocation.PROVIDERS` before that. No code anywhere behind this field ever calls out to any provider in this slice — it exists purely so a mailbox definition can declare which adapter a FUTURE slice will use."
+    },
+    "default_entity_id": {
+      "oneOf": [
+        { "$ref": "https://bagman.internal/contracts/common/bagman.identifier.v1.schema.json" },
+        { "type": "null" }
+      ],
+      "description": "An OPTIONAL hint at which canonical BAGMAN entity evidence from this mailbox will usually belong to — a DEFAULT/SUGGESTION only, exactly like `core.source.Source.governed_entity_hint`. Never an ownership assertion: evidence observed from this mailbox does not automatically become this entity's, and this field is never treated as a canonical invariant (`mailbox == company` must never be encoded anywhere as true). Validated (when non-null) against the real canonical entity registry at creation/update time by the HTTP layer (`app/api/routers/mailboxes.py`), mirroring `app/api/routers/xero.py::_require_entity`'s own pattern — this component does not import `core.entity`/`EntityRepository` directly to keep that validation at the same orchestration layer Xero's own does it at, rather than duplicating it here."
+    },
+    "enabled": {
+      "type": "boolean",
+      "description": "Convenience flag kept in lock-step with `status` by `services/mailbox/mailbox.py::transition` — `true` if and only if `status == \"ACTIVE\"`. Exists so a GUI/consumer can render enabled/disabled at a glance without decoding `status` itself."
+    },
+    "status": {
+      "type": "string",
+      "enum": ["ACTIVE", "DISABLED", "RETIRED"],
+      "description": "This mailbox definition's own closed lifecycle (see `services/mailbox/mailbox.py::ALLOWED_TRANSITIONS` for the full, documented transition table). `ACTIVE`/`DISABLED` are both non-destructive, freely reversible sub-states of 'still a live definition'; `RETIRED` is the GUI's 'Delete/Remove' action's real effect — the row is PRESERVED (never physically removed) so any future evidence provenance referencing this mailbox is never orphaned. `RETIRED` is terminal in this slice (a documented judgment call, see that module's own docstring) — there is no transition back out of it; a mistakenly-retired mailbox is corrected by creating a fresh definition, not by reviving the old row's history."
+    },
+    "connection_state": {
+      "type": "string",
+      "enum": ["NOT_CONFIGURED", "AUTH_REQUIRED", "READY_FOR_CONNECTION", "CONNECTED"],
+      "description": "Honest, non-secret connection/readiness status — NEVER faked. Every mailbox created in THIS slice is `NOT_CONFIGURED` and STAYS `NOT_CONFIGURED` for its entire lifetime here: no code path anywhere in this slice can ever set this field to anything else, `CONNECTED` above all (nothing actually connects to any provider yet — see `services/mailbox/mailbox.py`'s own module docstring). `AUTH_REQUIRED`/`READY_FOR_CONNECTION` are forward-declared vocabulary for a FUTURE slice's real adapter/OAuth work (mirrors `services.needs_you.needs_you.ITEM_TYPE_XERO_ACCOUNT_REQUIRED`'s own 'declared now, no producer yet' pattern) — not reachable today."
+    },
+    "last_connection_check_at": {
+      "oneOf": [
+        { "$ref": "https://bagman.internal/contracts/common/bagman.utc_timestamp.v1.schema.json" },
+        { "type": "null" }
+      ],
+      "description": "UTC timestamp of the most recent live connection/readiness check. Always `null` in this slice — no such check exists yet."
+    },
+    "last_successful_sweep_at": {
+      "oneOf": [
+        { "$ref": "https://bagman.internal/contracts/common/bagman.utc_timestamp.v1.schema.json" },
+        { "type": "null" }
+      ],
+      "description": "UTC timestamp of the most recent successful mail sweep. Always `null` in this slice — no sweep/fetch capability exists yet anywhere behind this contract."
+    },
+    "last_error_code": {
+      "oneOf": [
+        { "type": "string" },
+        { "type": "null" }
+      ],
+      "description": "Short, safe, non-secret error code from the most recent connection attempt. Always `null` in this slice."
+    },
+    "last_error_detail": {
+      "oneOf": [
+        { "type": "string" },
+        { "type": "null" }
+      ],
+      "description": "Short, safe, NON-SECRET description of the most recent connection error — never a raw token/header/provider response body. Always `null` in this slice."
+    },
+    "created_at": {
+      "$ref": "https://bagman.internal/contracts/common/bagman.utc_timestamp.v1.schema.json",
+      "description": "UTC timestamp this mailbox definition was first created."
+    },
+    "updated_at": {
+      "$ref": "https://bagman.internal/contracts/common/bagman.utc_timestamp.v1.schema.json",
+      "description": "UTC timestamp of the most recent change to this row (any field, not only `status`)."
+    },
+    "metadata": {
+      "type": "object",
+      "description": "Free-form, NON-SECRET display/context data only. Never a password/token/secret of any kind — see this schema's own top-level description.",
+      "additionalProperties": true,
+      "default": {}
+    },
+    "schema_version": {
+      "allOf": [
+        { "$ref": "https://bagman.internal/contracts/common/bagman.schema_version.v1.schema.json" }
+      ],
+      "const": "bagman.mailbox_source.v1",
+      "description": "Must literally equal `\"bagman.mailbox_source.v1\"`."
+    }
+  },
+  "required": [
+    "mailbox_id",
+    "display_name",
+    "email_address",
+    "provider_kind",
+    "default_entity_id",
+    "enabled",
+    "status",
+    "connection_state",
+    "last_connection_check_at",
+    "last_successful_sweep_at",
+    "last_error_code",
+    "last_error_detail",
+    "created_at",
+    "updated_at",
+    "metadata",
+    "schema_version"
+  ],
+  "additionalProperties": false
+}

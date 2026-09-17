@@ -33,6 +33,7 @@ EXPECTED_TABLES = {
     "xero_accounts",  # CD-6 Slice 2
     "xero_sync_runs",  # CD-6 Slice 2
     "xero_oauth_states",  # CD-6 Slice 2
+    "mailbox_sources",  # CD-6 Slice 3
 }
 
 
@@ -70,11 +71,20 @@ def test_re_running_upgrade_head_is_a_safe_no_op(postgres_container):
 def test_xero_migration_downgrade_genuinely_undoes_the_upgrade(postgres_container):
     """CD-6 Slice 2 migration safety proof: `5e8c1f42b9a7`'s own
     `downgrade()` genuinely removes exactly the four `xero_*` tables it
-    added (and nothing else), and `upgrade("head")` genuinely restores
-    them — a real round trip against a real database, not merely
-    reading the migration file's source and trusting it by inspection.
-    Restores the database to `head` again at the end (via the `finally`)
-    so later tests in this module/session are unaffected.
+    added (and nothing else IT is responsible for), and `upgrade("head")`
+    genuinely restores them — a real round trip against a real
+    database, not merely reading the migration file's source and
+    trusting it by inspection. Restores the database to `head` again at
+    the end (via the `finally`) so later tests in this module/session
+    are unaffected.
+
+    Downgrading to `712c5a2aab92` also necessarily removes
+    `mailbox_sources` (CD-6 Slice 3, `a3d7c1f9e246`) purely because that
+    migration is CHAINED downstream of this one (`down_revision =
+    "5e8c1f42b9a7"`) — alembic always downgrades every revision after
+    the target too. That is expected migration-chain behaviour, not
+    something `5e8c1f42b9a7`'s own `downgrade()` does — this test only
+    asserts about the four `xero_*` tables THIS migration owns.
     """
     cfg = _alembic_config()
     try:
@@ -85,9 +95,36 @@ def test_xero_migration_downgrade_genuinely_undoes_the_upgrade(postgres_containe
         assert "xero_accounts" not in tables_after_downgrade
         assert "xero_sync_runs" not in tables_after_downgrade
         assert "xero_oauth_states" not in tables_after_downgrade
-        # Every OTHER canonical table must still be present — downgrade
-        # must remove ONLY what this one migration added.
-        assert (EXPECTED_TABLES - {"xero_connections", "xero_accounts", "xero_sync_runs", "xero_oauth_states"}) <= tables_after_downgrade
+        # Every OTHER canonical table this migration is itself
+        # responsible for must still be present — downgrade must remove
+        # ONLY what this one migration added (mailbox_sources is
+        # excluded too, for the chained-downstream reason explained
+        # above, not because this migration removes it).
+        assert (
+            EXPECTED_TABLES
+            - {"xero_connections", "xero_accounts", "xero_sync_runs", "xero_oauth_states", "mailbox_sources"}
+        ) <= tables_after_downgrade
+
+        command.upgrade(cfg, "head")
+        inspector = sa.inspect(get_engine())
+        tables_after_reupgrade = set(inspector.get_table_names())
+        assert EXPECTED_TABLES <= tables_after_reupgrade
+    finally:
+        command.upgrade(cfg, "head")
+
+
+def test_mailbox_migration_downgrade_genuinely_undoes_the_upgrade(postgres_container):
+    """CD-6 Slice 3 migration safety proof, mirroring the Xero one
+    above exactly: `a3d7c1f9e246`'s own `downgrade()` genuinely removes
+    `mailbox_sources` (and nothing else), and `upgrade("head")`
+    genuinely restores it."""
+    cfg = _alembic_config()
+    try:
+        command.downgrade(cfg, "5e8c1f42b9a7")
+        inspector = sa.inspect(get_engine())
+        tables_after_downgrade = set(inspector.get_table_names())
+        assert "mailbox_sources" not in tables_after_downgrade
+        assert (EXPECTED_TABLES - {"mailbox_sources"}) <= tables_after_downgrade
 
         command.upgrade(cfg, "head")
         inspector = sa.inspect(get_engine())
