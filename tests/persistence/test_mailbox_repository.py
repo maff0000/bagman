@@ -17,7 +17,12 @@ from core.timestamps import utc_now
 from persistence.postgres.mailbox_models import MailboxSourceRow
 from persistence.postgres.mailbox_repository import PostgresMailboxSourceRepository
 from persistence.postgres.session import get_engine, session_scope
-from services.mailbox.mailbox import CONNECTION_STATE_NOT_CONFIGURED, PROVIDER_IMAP, PROVIDER_MICROSOFT_GRAPH
+from services.mailbox.mailbox import (
+    CONNECTION_STATE_CONNECTED,
+    CONNECTION_STATE_NOT_CONFIGURED,
+    PROVIDER_IMAP,
+    PROVIDER_MICROSOFT_GRAPH,
+)
 
 
 def _email() -> str:
@@ -215,3 +220,76 @@ def test_list_mailboxes_ordered_by_display_name():
 
     names = [m.display_name for m in repo.list_mailboxes() if unique in m.display_name]
     assert names == sorted(names)
+
+
+# ---------------------------------------------------------------------
+# CD-6 Slice 4: connection_state (Microsoft OAuth/sweep) — extends this
+# Slice 3 test file with the new real producer's own Postgres round
+# trip (see services/mailbox/mailbox.py::ALLOWED_CONNECTION_TRANSITIONS
+# for the domain-layer transition table these methods drive).
+# ---------------------------------------------------------------------
+
+
+def test_connection_state_round_trips_through_a_fresh_repository_instance(fresh_engine):
+    repo = PostgresMailboxSourceRepository()
+    mailbox = repo.create_mailbox(display_name="Matt", email_address=_email(), provider_kind=PROVIDER_MICROSOFT_GRAPH)
+    repo.begin_microsoft_connect(mailbox.mailbox_id)
+
+    fresh_repo = PostgresMailboxSourceRepository(engine=fresh_engine)
+    connected = fresh_repo.mark_microsoft_connected(mailbox.mailbox_id)
+    assert connected.connection_state == CONNECTION_STATE_CONNECTED
+    assert connected.last_connection_check_at is not None
+
+    fetched = fresh_repo.get_mailbox(mailbox.mailbox_id)
+    assert fetched.connection_state == CONNECTION_STATE_CONNECTED
+
+
+def test_begin_connect_is_idempotent_at_the_database_level():
+    repo = PostgresMailboxSourceRepository()
+    mailbox = repo.create_mailbox(display_name="Matt", email_address=_email(), provider_kind=PROVIDER_MICROSOFT_GRAPH)
+    first = repo.begin_microsoft_connect(mailbox.mailbox_id)
+    second = repo.begin_microsoft_connect(mailbox.mailbox_id)
+    assert first.connection_state == second.connection_state == "AUTH_REQUIRED"
+
+
+def test_refresh_failure_moves_connected_back_to_auth_required():
+    repo = PostgresMailboxSourceRepository()
+    mailbox = repo.create_mailbox(display_name="Matt", email_address=_email(), provider_kind=PROVIDER_MICROSOFT_GRAPH)
+    repo.begin_microsoft_connect(mailbox.mailbox_id)
+    repo.mark_microsoft_connected(mailbox.mailbox_id)
+    updated = repo.mark_microsoft_auth_required(mailbox.mailbox_id, error_detail="refresh_token invalid")
+    assert updated.connection_state == "AUTH_REQUIRED"
+    assert updated.last_error_detail == "refresh_token invalid"
+
+
+def test_connection_error_and_recovery_round_trip():
+    repo = PostgresMailboxSourceRepository()
+    mailbox = repo.create_mailbox(display_name="Matt", email_address=_email(), provider_kind=PROVIDER_MICROSOFT_GRAPH)
+    repo.begin_microsoft_connect(mailbox.mailbox_id)
+    repo.mark_microsoft_connected(mailbox.mailbox_id)
+    errored = repo.mark_microsoft_connection_error(mailbox.mailbox_id, error_code="PERMISSION_ERROR", error_detail="403")
+    assert errored.connection_state == "ERROR"
+    recovered = repo.mark_microsoft_connected(mailbox.mailbox_id)
+    assert recovered.connection_state == CONNECTION_STATE_CONNECTED
+
+
+def test_disconnect_returns_to_not_configured_and_is_idempotent():
+    repo = PostgresMailboxSourceRepository()
+    mailbox = repo.create_mailbox(display_name="Matt", email_address=_email(), provider_kind=PROVIDER_MICROSOFT_GRAPH)
+    repo.begin_microsoft_connect(mailbox.mailbox_id)
+    repo.mark_microsoft_connected(mailbox.mailbox_id)
+    first = repo.disconnect_microsoft(mailbox.mailbox_id)
+    second = repo.disconnect_microsoft(mailbox.mailbox_id)
+    assert first.connection_state == second.connection_state == CONNECTION_STATE_NOT_CONFIGURED
+
+
+def test_record_sweep_success_stamps_last_successful_sweep_at():
+    from core.timestamps import utc_now
+
+    repo = PostgresMailboxSourceRepository()
+    mailbox = repo.create_mailbox(display_name="Matt", email_address=_email(), provider_kind=PROVIDER_MICROSOFT_GRAPH)
+    repo.begin_microsoft_connect(mailbox.mailbox_id)
+    repo.mark_microsoft_connected(mailbox.mailbox_id)
+    now = utc_now()
+    updated = repo.record_microsoft_sweep_success(mailbox.mailbox_id, swept_at=now)
+    assert updated.last_successful_sweep_at == now

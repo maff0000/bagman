@@ -28,11 +28,15 @@ from persistence.postgres.db_errors import is_invalid_uuid_format, unique_violat
 from persistence.postgres.mailbox_models import MailboxSourceRow
 from persistence.postgres.session import get_engine, session_scope
 from services.mailbox.mailbox import (
+    CONNECTION_STATE_AUTH_REQUIRED,
+    CONNECTION_STATE_CONNECTED,
+    CONNECTION_STATE_ERROR,
     CONNECTION_STATE_NOT_CONFIGURED,
     MailboxSource,
     MailboxSourceRepository,
     normalize_email,
     transition as mailbox_transition,
+    transition_connection_state,
     validate_email_or_raise,
     validate_provider_kind_or_raise,
 )
@@ -288,3 +292,109 @@ class PostgresMailboxSourceRepository(MailboxSourceRepository):
                 return [_row_to_domain(r) for r in rows]
         except SQLAlchemyError as exc:
             raise PersistenceError(f"could not list MailboxSource rows: {exc}") from exc
+
+    # -- CD-6 Slice 4: connection_state ---------------------------------
+    #
+    # Same `with_for_update()` row-locking + idempotent-no-op discipline
+    # as `_simple_transition` above, applied to `connection_state`
+    # instead of lifecycle `status` — see
+    # `services/mailbox/mailbox.py::ALLOWED_CONNECTION_TRANSITIONS` for
+    # the full transition table.
+
+    def _connection_transition(
+        self, mailbox_id: str, new_connection_state: str, **field_updates: Any
+    ) -> MailboxSource:
+        try:
+            with session_scope(self._engine) as session:
+                row = self._locked_row(session, mailbox_id)
+                current = _row_to_domain(row)
+                if current.connection_state == new_connection_state:
+                    return current
+                updated = transition_connection_state(current, new_connection_state, **field_updates)
+                _apply_to_row(row, updated)
+        except (NotFoundError, InvalidStateTransitionError, ValidationError):
+            raise
+        except SQLAlchemyError as exc:
+            raise PersistenceError(f"could not transition MailboxSource connection_state: {exc}") from exc
+        return updated
+
+    def begin_microsoft_connect(self, mailbox_id: str) -> MailboxSource:
+        return self._connection_transition(
+            mailbox_id, CONNECTION_STATE_AUTH_REQUIRED, last_error_code=None, last_error_detail=None
+        )
+
+    def mark_microsoft_connected(self, mailbox_id: str, *, checked_at: Optional[Any] = None) -> MailboxSource:
+        return self._connection_transition(
+            mailbox_id,
+            CONNECTION_STATE_CONNECTED,
+            last_connection_check_at=checked_at if checked_at is not None else utc_now(),
+            last_error_code=None,
+            last_error_detail=None,
+        )
+
+    def mark_microsoft_auth_required(self, mailbox_id: str, *, error_detail: Optional[str] = None) -> MailboxSource:
+        return self._connection_transition(
+            mailbox_id,
+            CONNECTION_STATE_AUTH_REQUIRED,
+            last_error_code="AUTH_REQUIRED" if error_detail else None,
+            last_error_detail=error_detail,
+        )
+
+    def mark_microsoft_connection_error(
+        self, mailbox_id: str, *, error_code: str, error_detail: str
+    ) -> MailboxSource:
+        try:
+            with session_scope(self._engine) as session:
+                row = self._locked_row(session, mailbox_id)
+                current = _row_to_domain(row)
+                if current.connection_state == CONNECTION_STATE_ERROR:
+                    updated = dataclasses.replace(
+                        current, last_error_code=error_code, last_error_detail=error_detail, updated_at=utc_now()
+                    )
+                    validate_against_contract(updated.to_dict(), _SCHEMA)
+                else:
+                    updated = transition_connection_state(
+                        current, CONNECTION_STATE_ERROR, last_error_code=error_code, last_error_detail=error_detail
+                    )
+                _apply_to_row(row, updated)
+        except (NotFoundError, InvalidStateTransitionError, ValidationError):
+            raise
+        except SQLAlchemyError as exc:
+            raise PersistenceError(f"could not mark MailboxSource connection error: {exc}") from exc
+        return updated
+
+    def disconnect_microsoft(self, mailbox_id: str) -> MailboxSource:
+        try:
+            with session_scope(self._engine) as session:
+                row = self._locked_row(session, mailbox_id)
+                current = _row_to_domain(row)
+                if current.connection_state == CONNECTION_STATE_NOT_CONFIGURED:
+                    return current
+                updated = dataclasses.replace(
+                    current,
+                    connection_state=CONNECTION_STATE_NOT_CONFIGURED,
+                    last_error_code=None,
+                    last_error_detail=None,
+                    updated_at=utc_now(),
+                )
+                validate_against_contract(updated.to_dict(), _SCHEMA)
+                _apply_to_row(row, updated)
+        except (NotFoundError, ValidationError):
+            raise
+        except SQLAlchemyError as exc:
+            raise PersistenceError(f"could not disconnect MailboxSource: {exc}") from exc
+        return updated
+
+    def record_microsoft_sweep_success(self, mailbox_id: str, *, swept_at: Any) -> MailboxSource:
+        try:
+            with session_scope(self._engine) as session:
+                row = self._locked_row(session, mailbox_id)
+                current = _row_to_domain(row)
+                updated = dataclasses.replace(current, last_successful_sweep_at=swept_at, updated_at=utc_now())
+                validate_against_contract(updated.to_dict(), _SCHEMA)
+                _apply_to_row(row, updated)
+        except (NotFoundError, ValidationError):
+            raise
+        except SQLAlchemyError as exc:
+            raise PersistenceError(f"could not record MailboxSource sweep success: {exc}") from exc
+        return updated

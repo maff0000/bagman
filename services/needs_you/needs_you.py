@@ -152,6 +152,16 @@ ITEM_TYPE_GENERIC_QUESTION = "GENERIC_QUESTION"
 ITEM_TYPE_XERO_ACCOUNT_REQUIRED = "XERO_ACCOUNT_REQUIRED"
 ITEM_TYPE_XERO_REFERENCE_DATA_STALE = "XERO_REFERENCE_DATA_STALE"
 
+#: CD-6 Slice 4 addition (first real Microsoft Graph adapter + sweep
+#: engine) — the one real Needs You producer this slice adds: an
+#: ACTIVE Microsoft mailbox that needs a (re)connect action (see
+#: `app/api/routers/mailboxes_microsoft.py`'s own module docstring for
+#: exactly when this is created/auto-resolved). Mirrors
+#: `ITEM_TYPE_COMPANY_REQUIRED`'s own "one item, one real action type"
+#: shape.
+ITEM_TYPE_MAILBOX_AUTH_REQUIRED = "MAILBOX_AUTH_REQUIRED"
+ALLOWED_ACTION_CONNECT_MICROSOFT_MAILBOX = "CONNECT_MICROSOFT_MAILBOX"
+
 #: Slice 1's own single real allowed_action_type (see module docstring
 #: "Slice 1's one real trigger"). Also open (not contract-enforced).
 ALLOWED_ACTION_COMPANY_WHAT_WHY = "COMPANY_WHAT_WHY"

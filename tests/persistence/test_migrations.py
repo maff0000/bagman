@@ -34,6 +34,11 @@ EXPECTED_TABLES = {
     "xero_sync_runs",  # CD-6 Slice 2
     "xero_oauth_states",  # CD-6 Slice 2
     "mailbox_sources",  # CD-6 Slice 3
+    "mailbox_messages",  # CD-6 Slice 4
+    "mailbox_sweep_runs",  # CD-6 Slice 4
+    "mailbox_folder_cursors",  # CD-6 Slice 4
+    "mailbox_sweep_locks",  # CD-6 Slice 4
+    "mailbox_microsoft_oauth_states",  # CD-6 Slice 4
 }
 
 
@@ -79,14 +84,21 @@ def test_xero_migration_downgrade_genuinely_undoes_the_upgrade(postgres_containe
     are unaffected.
 
     Downgrading to `712c5a2aab92` also necessarily removes
-    `mailbox_sources` (CD-6 Slice 3, `a3d7c1f9e246`) purely because that
-    migration is CHAINED downstream of this one (`down_revision =
-    "5e8c1f42b9a7"`) — alembic always downgrades every revision after
-    the target too. That is expected migration-chain behaviour, not
-    something `5e8c1f42b9a7`'s own `downgrade()` does — this test only
-    asserts about the four `xero_*` tables THIS migration owns.
+    `mailbox_sources` (CD-6 Slice 3, `a3d7c1f9e246`) and every CD-6
+    Slice 4 mailbox table (`b7e2f5a9c1d3`, chained downstream of
+    Slice 3) purely because those migrations are CHAINED downstream of
+    this one (`down_revision = "5e8c1f42b9a7"`) — alembic always
+    downgrades every revision after the target too. That is expected
+    migration-chain behaviour, not something `5e8c1f42b9a7`'s own
+    `downgrade()` does — this test only asserts about the four
+    `xero_*` tables THIS migration owns.
     """
     cfg = _alembic_config()
+    _chained_downstream_tables = {
+        "xero_connections", "xero_accounts", "xero_sync_runs", "xero_oauth_states",
+        "mailbox_sources", "mailbox_messages", "mailbox_sweep_runs", "mailbox_folder_cursors",
+        "mailbox_sweep_locks", "mailbox_microsoft_oauth_states",
+    }
     try:
         command.downgrade(cfg, "712c5a2aab92")
         inspector = sa.inspect(get_engine())
@@ -97,13 +109,10 @@ def test_xero_migration_downgrade_genuinely_undoes_the_upgrade(postgres_containe
         assert "xero_oauth_states" not in tables_after_downgrade
         # Every OTHER canonical table this migration is itself
         # responsible for must still be present — downgrade must remove
-        # ONLY what this one migration added (mailbox_sources is
-        # excluded too, for the chained-downstream reason explained
-        # above, not because this migration removes it).
-        assert (
-            EXPECTED_TABLES
-            - {"xero_connections", "xero_accounts", "xero_sync_runs", "xero_oauth_states", "mailbox_sources"}
-        ) <= tables_after_downgrade
+        # ONLY what this one migration added (every chained-downstream
+        # table is excluded too, for the reason explained above, not
+        # because this migration removes it).
+        assert (EXPECTED_TABLES - _chained_downstream_tables) <= tables_after_downgrade
 
         command.upgrade(cfg, "head")
         inspector = sa.inspect(get_engine())
@@ -117,14 +126,46 @@ def test_mailbox_migration_downgrade_genuinely_undoes_the_upgrade(postgres_conta
     """CD-6 Slice 3 migration safety proof, mirroring the Xero one
     above exactly: `a3d7c1f9e246`'s own `downgrade()` genuinely removes
     `mailbox_sources` (and nothing else), and `upgrade("head")`
-    genuinely restores it."""
+    genuinely restores it. Downgrading to `5e8c1f42b9a7` also
+    necessarily removes every CD-6 Slice 4 mailbox table (`b7e2f5a9c1d3`,
+    chained downstream of this migration) — expected migration-chain
+    behaviour, not something THIS migration's own `downgrade()` does."""
     cfg = _alembic_config()
+    _slice4_tables = {
+        "mailbox_messages", "mailbox_sweep_runs", "mailbox_folder_cursors",
+        "mailbox_sweep_locks", "mailbox_microsoft_oauth_states",
+    }
     try:
         command.downgrade(cfg, "5e8c1f42b9a7")
         inspector = sa.inspect(get_engine())
         tables_after_downgrade = set(inspector.get_table_names())
         assert "mailbox_sources" not in tables_after_downgrade
-        assert (EXPECTED_TABLES - {"mailbox_sources"}) <= tables_after_downgrade
+        assert not (_slice4_tables & tables_after_downgrade)
+        assert (EXPECTED_TABLES - {"mailbox_sources"} - _slice4_tables) <= tables_after_downgrade
+
+        command.upgrade(cfg, "head")
+        inspector = sa.inspect(get_engine())
+        tables_after_reupgrade = set(inspector.get_table_names())
+        assert EXPECTED_TABLES <= tables_after_reupgrade
+    finally:
+        command.upgrade(cfg, "head")
+
+
+def test_mailbox_microsoft_sweep_migration_downgrade_genuinely_undoes_the_upgrade(postgres_container):
+    """CD-6 Slice 4 migration safety proof: `b7e2f5a9c1d3`'s own
+    `downgrade()` genuinely removes exactly its five mailbox tables (and
+    nothing else), and `upgrade("head")` genuinely restores them."""
+    cfg = _alembic_config()
+    _slice4_tables = {
+        "mailbox_messages", "mailbox_sweep_runs", "mailbox_folder_cursors",
+        "mailbox_sweep_locks", "mailbox_microsoft_oauth_states",
+    }
+    try:
+        command.downgrade(cfg, "a3d7c1f9e246")
+        inspector = sa.inspect(get_engine())
+        tables_after_downgrade = set(inspector.get_table_names())
+        assert not (_slice4_tables & tables_after_downgrade)
+        assert (EXPECTED_TABLES - _slice4_tables) <= tables_after_downgrade
 
         command.upgrade(cfg, "head")
         inspector = sa.inspect(get_engine())

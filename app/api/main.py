@@ -92,7 +92,19 @@ from core.errors import (
     ValidationError,
 )
 from app.api.logging_config import configure_logging
-from app.api.routers import activity, ai, health, intake, internal, mailboxes, needs_you, operator, version, xero
+from app.api.routers import (
+    activity,
+    ai,
+    health,
+    intake,
+    internal,
+    mailboxes,
+    mailboxes_microsoft,
+    needs_you,
+    operator,
+    version,
+    xero,
+)
 
 configure_logging(level=os.environ.get("BAGMAN_LOG_LEVEL", "INFO"))
 logger = logging.getLogger("bagman.runtime.api")
@@ -123,6 +135,10 @@ app.include_router(xero.router)
 #: this router (see app/api/routers/mailboxes.py's own module
 #: docstring).
 app.include_router(mailboxes.router)
+#: CD-6 Slice 4 — the first real mailbox connection lifecycle + sweep
+#: engine HTTP surface (Microsoft Graph adapter only; NoustAI IMAP has
+#: no working connect action and never reaches this router).
+app.include_router(mailboxes_microsoft.router)
 
 #: CD-4 WI-4 — the BAGMAN Documents GUI (PID §36-42), served as plain
 #: static assets. Mounted LAST and at "/" so it never shadows any

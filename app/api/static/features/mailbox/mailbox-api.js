@@ -13,6 +13,13 @@ export const MAILBOX_API = {
   enable: (mailboxId) => `/internal/mailboxes/${encodeURIComponent(mailboxId)}/enable`,
   disable: (mailboxId) => `/internal/mailboxes/${encodeURIComponent(mailboxId)}/disable`,
   retire: (mailboxId) => `/internal/mailboxes/${encodeURIComponent(mailboxId)}/retire`,
+  //: CD-6 Slice 4 — first real Microsoft Graph adapter + sweep engine.
+  //: Mirrors features/xero/xero-api.js's own endpoint-map shape exactly.
+  microsoftConnect: (mailboxId) => `/internal/mailboxes/${encodeURIComponent(mailboxId)}/microsoft/connect`,
+  microsoftDisconnect: (mailboxId) => `/internal/mailboxes/${encodeURIComponent(mailboxId)}/microsoft/disconnect`,
+  microsoftSweep: (mailboxId) => `/internal/mailboxes/${encodeURIComponent(mailboxId)}/microsoft/sweep`,
+  microsoftSweeps: (mailboxId) => `/internal/mailboxes/${encodeURIComponent(mailboxId)}/microsoft/sweeps`,
+  microsoftMessages: (mailboxId) => `/internal/mailboxes/${encodeURIComponent(mailboxId)}/microsoft/messages`,
 };
 
 export function listMailboxes() {
@@ -57,6 +64,31 @@ export function disableMailbox(mailboxId, actorId) {
 
 export function retireMailbox(mailboxId, actorId) {
   return apiPost(MAILBOX_API.retire(mailboxId), { actor_type: "USER", actor_id: actorId });
+}
+
+//: CD-6 Slice 4 — the first real mailbox connection lifecycle + sweep
+//: engine (Microsoft Graph adapter only). Browser never receives a
+//: token/secret/delta-link from any of these — see
+//: app/api/routers/mailboxes_microsoft.py's own module docstring.
+
+export function connectMicrosoftMailbox(mailboxId, actorId) {
+  return apiPost(MAILBOX_API.microsoftConnect(mailboxId), { actor_type: "USER", actor_id: actorId });
+}
+
+export function disconnectMicrosoftMailbox(mailboxId, actorId) {
+  return apiPost(MAILBOX_API.microsoftDisconnect(mailboxId), { actor_type: "USER", actor_id: actorId });
+}
+
+export function sweepMicrosoftMailboxNow(mailboxId, actorId) {
+  return apiPost(MAILBOX_API.microsoftSweep(mailboxId), { actor_type: "USER", actor_id: actorId });
+}
+
+export function listMicrosoftSweeps(mailboxId) {
+  return apiGet(MAILBOX_API.microsoftSweeps(mailboxId));
+}
+
+export function listMicrosoftMessages(mailboxId) {
+  return apiGet(MAILBOX_API.microsoftMessages(mailboxId));
 }
 
 /** `shared/api.js` exports `apiGet`/`apiPost` only (no `apiPut`) — this

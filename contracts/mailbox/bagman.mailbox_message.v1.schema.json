@@ -1,0 +1,121 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://bagman.internal/contracts/mailbox/bagman.mailbox_message.v1.schema.json",
+  "title": "BAGMAN MailboxMessage",
+  "description": "A durable, provider-neutral PROJECTION of one email message discovered by a mailbox sweep (CD-6 Slice 4: first real mailbox adapter + sweep engine). This is NOT the evidence bytes (the raw MIME lives in the canonical `EvidenceItem`/object-store architecture, see `evidence_id` below) and NOT an accounting fact (no invoice/classification/AI field exists here — that is Slice 5). Canonical uniqueness is (mailbox_id, immutable_provider_message_id) — a message moving between folders (e.g. Inbox to Junk) never creates a second row; `observed_folder` simply reflects wherever the message was last seen.",
+  "type": "object",
+  "properties": {
+    "mailbox_message_id": {
+      "$ref": "https://bagman.internal/contracts/common/bagman.identifier.v1.schema.json",
+      "description": "Canonical BAGMAN identifier for this message projection row."
+    },
+    "mailbox_id": {
+      "$ref": "https://bagman.internal/contracts/common/bagman.identifier.v1.schema.json",
+      "description": "The `MailboxSource` this message was swept from."
+    },
+    "provider_kind": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Deliberately open (mirrors `MailboxSource.provider_kind`'s own contract-layer doctrine) — the provider family this message was observed through, e.g. `MICROSOFT_GRAPH`."
+    },
+    "immutable_provider_message_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The provider's own IMMUTABLE, case-sensitive message identifier (for Microsoft Graph: the `Prefer: IdType=\"ImmutableId\"` id). Canonical uniqueness for this contract is (mailbox_id, immutable_provider_message_id) — enforced at the repository/database layer, not by this schema alone."
+    },
+    "internet_message_id": {
+      "oneOf": [
+        { "type": "string" },
+        { "type": "null" }
+      ],
+      "description": "The RFC 5322 `Message-ID` header value, if present. METADATA ONLY — never the idempotency key (a provider may legitimately reuse/omit this across distinct provider messages); see `immutable_provider_message_id` above for the real identity key."
+    },
+    "observed_folder": {
+      "type": "string",
+      "enum": ["INBOX", "JUNK"],
+      "description": "Which of the exactly-two folders in scope for this slice (Inbox, Junk Email) this message was most recently observed in. Never Sent Items/Deleted Items/Archive/a custom folder (out of scope for this slice)."
+    },
+    "subject": {
+      "oneOf": [
+        { "type": "string" },
+        { "type": "null" }
+      ],
+      "description": "Untrusted provider-supplied string — never rendered as HTML, never treated as an instruction of any kind."
+    },
+    "sender_address": {
+      "oneOf": [
+        { "type": "string" },
+        { "type": "null" }
+      ],
+      "description": "Untrusted provider-supplied sender email address string."
+    },
+    "sender_display_name": {
+      "oneOf": [
+        { "type": "string" },
+        { "type": "null" }
+      ],
+      "description": "Untrusted provider-supplied sender display name string."
+    },
+    "received_at": {
+      "$ref": "https://bagman.internal/contracts/common/bagman.utc_timestamp.v1.schema.json",
+      "description": "The provider's own `receivedDateTime` for this message."
+    },
+    "has_attachments": {
+      "type": "boolean",
+      "description": "Provider-reported attachment flag. This slice never extracts/lists individual attachments — the whole message (headers, body, attachments) is stored as one immutable `.eml` evidence artifact (see `evidence_id`)."
+    },
+    "evidence_id": {
+      "oneOf": [
+        { "$ref": "https://bagman.internal/contracts/common/bagman.identifier.v1.schema.json" },
+        { "type": "null" }
+      ],
+      "description": "The canonical `EvidenceItem` holding this message's immutable raw `.eml` bytes, once ingestion has succeeded. `null` while `ingestion_status` is not yet a terminal success (e.g. `QUARANTINED`/`FAILED` — a quarantined message's bytes live under the evidence architecture's own quarantine path, referenced by `EvidenceItem`/provenance records, not by this field)."
+    },
+    "ingestion_status": {
+      "type": "string",
+      "enum": ["INGESTED", "QUARANTINED", "FAILED", "VANISHED"],
+      "description": "Outcome of this message's own evidence-ingestion attempt. `INGESTED` — a real `EvidenceItem` exists (`evidence_id` is set). `QUARANTINED` — the content-safety scanner flagged it; retained via the governed quarantine path, never parsed, never silently discarded. `FAILED` — an oversized message or another explicit terminal ingestion fault. `VANISHED` — the message existed in a delta page but had disappeared by the time its MIME content was fetched (a real, deterministic, recorded outcome — never a fabricated evidence row)."
+    },
+    "first_seen_at": {
+      "$ref": "https://bagman.internal/contracts/common/bagman.utc_timestamp.v1.schema.json",
+      "description": "UTC timestamp this message was FIRST discovered by any sweep."
+    },
+    "last_seen_at": {
+      "$ref": "https://bagman.internal/contracts/common/bagman.utc_timestamp.v1.schema.json",
+      "description": "UTC timestamp this message was MOST RECENTLY observed by a sweep (e.g. re-seen after moving folders, or a safe idempotent replay)."
+    },
+    "metadata": {
+      "type": "object",
+      "description": "Free-form, non-secret context (e.g. the sweep_run_id that first discovered this message). Never raw MIME/body content — see this contract's own top-level description.",
+      "additionalProperties": true,
+      "default": {}
+    },
+    "schema_version": {
+      "allOf": [
+        { "$ref": "https://bagman.internal/contracts/common/bagman.schema_version.v1.schema.json" }
+      ],
+      "const": "bagman.mailbox_message.v1",
+      "description": "Must literally equal \"bagman.mailbox_message.v1\"."
+    }
+  },
+  "required": [
+    "mailbox_message_id",
+    "mailbox_id",
+    "provider_kind",
+    "immutable_provider_message_id",
+    "internet_message_id",
+    "observed_folder",
+    "subject",
+    "sender_address",
+    "sender_display_name",
+    "received_at",
+    "has_attachments",
+    "evidence_id",
+    "ingestion_status",
+    "first_seen_at",
+    "last_seen_at",
+    "metadata",
+    "schema_version"
+  ],
+  "additionalProperties": false
+}

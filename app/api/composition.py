@@ -66,7 +66,15 @@ from core.api import BagmanCanonicalAPI
 from persistence.objects.store import EvidenceObjectStore
 from services.evidence.intake.intake import IntakeRepository
 from services.evidence.intake.scanner import EvidenceSafetyScanner, ScanResult, ScanVerdict
+from services.mailbox.cursor import MailboxFolderCursorRepository
+from services.mailbox.lock import MailboxSweepLock
 from services.mailbox.mailbox import MailboxSourceRepository
+from services.mailbox.message import MailboxMessageRepository
+from services.mailbox.microsoft.adapter import MicrosoftGraphMailboxAdapter
+from services.mailbox.microsoft.graph_client import MicrosoftGraphClientProtocol, MicrosoftOAuthClientProtocol
+from services.mailbox.microsoft.oauth_state import MailboxOAuthStateRepository as MailboxMicrosoftOAuthStateRepository
+from services.mailbox.microsoft.secrets import MicrosoftTokenStoreProtocol
+from services.mailbox.sweep_run import MailboxSweepRunRepository
 from services.needs_you.needs_you import NeedsYouRepository
 from services.xero.account import XeroAccountRepository
 from services.xero.client import XeroAccountingClientProtocol, XeroOAuthClientProtocol
@@ -344,6 +352,30 @@ class RuntimeComposition:
     #: slice ever calls out to a mailbox provider, see
     #: services/mailbox/mailbox.py's own module docstring.
     mailbox_source_repository: MailboxSourceRepository
+    #: CD-6 Slice 4 (first real mailbox adapter + sweep engine) — the
+    #: Microsoft Graph provider adapter's own durable state, in-memory
+    #: in development/test, real `Postgres*` implementations (sharing
+    #: `engine`) in production — same never-mixed-across-modes
+    #: discipline as every repository above.
+    #: `microsoft_oauth_client`/`microsoft_graph_client` are the real
+    #: `services.mailbox.microsoft.graph_client` adapters in production
+    #: and `services.mailbox.microsoft.fake_client`'s deterministic
+    #: substitutes in development/test (mirrors
+    #: `xero_oauth_client`/`xero_accounting_client` above exactly — no
+    #: real Microsoft Entra app registration exists yet, PID/this
+    #: delivery's own stated constraint). `microsoft_mailbox_adapter` is
+    #: the one seam the HTTP router and the sweep engine both call
+    #: through — see `services/mailbox/microsoft/adapter.py`'s own
+    #: module docstring.
+    mailbox_message_repository: MailboxMessageRepository
+    mailbox_sweep_run_repository: MailboxSweepRunRepository
+    mailbox_folder_cursor_repository: MailboxFolderCursorRepository
+    mailbox_sweep_lock: MailboxSweepLock
+    mailbox_microsoft_oauth_state_repository: MailboxMicrosoftOAuthStateRepository
+    microsoft_oauth_client: MicrosoftOAuthClientProtocol
+    microsoft_graph_client: MicrosoftGraphClientProtocol
+    microsoft_token_store: MicrosoftTokenStoreProtocol
+    microsoft_mailbox_adapter: MicrosoftGraphMailboxAdapter
 
 
 def _build_development_or_test(runtime_environment: str) -> RuntimeComposition:
@@ -351,7 +383,15 @@ def _build_development_or_test(runtime_environment: str) -> RuntimeComposition:
     from ai.providers.litellm.fake import FakeLiteLLMClient
     from persistence.objects.memory_store import InMemoryObjectStore
     from services.evidence.intake.intake import InMemoryIntakeRepository
+    from services.mailbox.cursor import InMemoryMailboxFolderCursorRepository
+    from services.mailbox.lock import InMemoryMailboxSweepLock
     from services.mailbox.mailbox import InMemoryMailboxSourceRepository
+    from services.mailbox.message import InMemoryMailboxMessageRepository
+    from services.mailbox.microsoft.adapter import MicrosoftGraphMailboxAdapter
+    from services.mailbox.microsoft.fake_client import FakeMicrosoftGraphClient, FakeMicrosoftOAuthClient
+    from services.mailbox.microsoft.oauth_state import InMemoryMailboxOAuthStateRepository
+    from services.mailbox.microsoft.secrets import InMemoryMicrosoftTokenStore
+    from services.mailbox.sweep_run import InMemoryMailboxSweepRunRepository
     from services.needs_you.needs_you import InMemoryNeedsYouRepository
     from services.xero.account import InMemoryXeroAccountRepository
     from services.xero.connection import InMemoryXeroConnectionRepository
@@ -379,6 +419,25 @@ def _build_development_or_test(runtime_environment: str) -> RuntimeComposition:
     xero_token_store = InMemoryTokenStore()
     xero_pending_tenant_selection_store = InMemoryPendingTenantSelectionStore()
     mailbox_source_repository = InMemoryMailboxSourceRepository()
+
+    # CD-6 Slice 4: no real Microsoft Entra app exists yet — development/
+    # test composition ALWAYS uses the deterministic fakes, never the
+    # real network-speaking adapters (same doctrine as xero_oauth_client/
+    # xero_accounting_client above).
+    mailbox_message_repository = InMemoryMailboxMessageRepository()
+    mailbox_sweep_run_repository = InMemoryMailboxSweepRunRepository()
+    mailbox_folder_cursor_repository = InMemoryMailboxFolderCursorRepository()
+    mailbox_sweep_lock = InMemoryMailboxSweepLock()
+    mailbox_microsoft_oauth_state_repository = InMemoryMailboxOAuthStateRepository()
+    microsoft_oauth_client = FakeMicrosoftOAuthClient()
+    microsoft_graph_client = FakeMicrosoftGraphClient()
+    microsoft_token_store = InMemoryMicrosoftTokenStore()
+    microsoft_mailbox_adapter = MicrosoftGraphMailboxAdapter(
+        oauth_client=microsoft_oauth_client,
+        graph_client=microsoft_graph_client,
+        token_store=microsoft_token_store,
+        mailbox_repository=mailbox_source_repository,
+    )
 
     # CD-6 reliability delta: shares `api.audit_repository` so the
     # bounded stale-RUNNING recovery backstop's own audit events land in
@@ -420,6 +479,15 @@ def _build_development_or_test(runtime_environment: str) -> RuntimeComposition:
         xero_token_store=xero_token_store,
         xero_pending_tenant_selection_store=xero_pending_tenant_selection_store,
         mailbox_source_repository=mailbox_source_repository,
+        mailbox_message_repository=mailbox_message_repository,
+        mailbox_sweep_run_repository=mailbox_sweep_run_repository,
+        mailbox_folder_cursor_repository=mailbox_folder_cursor_repository,
+        mailbox_sweep_lock=mailbox_sweep_lock,
+        mailbox_microsoft_oauth_state_repository=mailbox_microsoft_oauth_state_repository,
+        microsoft_oauth_client=microsoft_oauth_client,
+        microsoft_graph_client=microsoft_graph_client,
+        microsoft_token_store=microsoft_token_store,
+        microsoft_mailbox_adapter=microsoft_mailbox_adapter,
     )
 
 
@@ -437,6 +505,13 @@ def _build_production() -> RuntimeComposition:
         PostgresExternalReferenceRepository,
     )
     from persistence.postgres.intake_repository import PostgresIntakeRepository
+    from persistence.postgres.mailbox_message_repository import PostgresMailboxMessageRepository
+    from persistence.postgres.mailbox_microsoft_repository import (
+        PostgresMailboxFolderCursorRepository,
+        PostgresMailboxMicrosoftOAuthStateRepository,
+        PostgresMailboxSweepLock,
+        PostgresMailboxSweepRunRepository,
+    )
     from persistence.postgres.mailbox_repository import PostgresMailboxSourceRepository
     from persistence.postgres.needs_you_repository import PostgresNeedsYouRepository
     from persistence.postgres.provenance_repository import PostgresProvenanceRepository
@@ -449,6 +524,9 @@ def _build_production() -> RuntimeComposition:
         PostgresXeroSyncRunRepository,
     )
     from services.evidence.intake.scanner import ClamAVScanner
+    from services.mailbox.microsoft.adapter import MicrosoftGraphMailboxAdapter
+    from services.mailbox.microsoft.graph_client import MicrosoftGraphClient, MicrosoftOAuthClient
+    from services.mailbox.microsoft.secrets import FileMicrosoftTokenStore
     from services.xero.client import XeroAccountingClient, XeroOAuthClient
     from services.xero.secrets import FileTokenStore
     from services.xero.tenant_selection import InMemoryPendingTenantSelectionStore
@@ -576,6 +654,30 @@ def _build_production() -> RuntimeComposition:
     # docstring).
     mailbox_source_repository = PostgresMailboxSourceRepository(engine)
 
+    # CD-6 Slice 4 (first real Microsoft Graph adapter + sweep engine):
+    # durable repositories sharing `engine`, plus the two real Microsoft
+    # adapters and the real file-backed per-mailbox token store — same
+    # "no eager I/O at construction, config errors surface honestly at
+    # first real call" discipline as every other adapter in this
+    # function. No real Microsoft Entra app credential is provisioned
+    # yet (this delivery's own stated constraint) — `is_configured()`
+    # returns False until the PL places one, exactly like Xero's own
+    # `is_configured()` today.
+    mailbox_message_repository = PostgresMailboxMessageRepository(engine)
+    mailbox_sweep_run_repository = PostgresMailboxSweepRunRepository(engine)
+    mailbox_folder_cursor_repository = PostgresMailboxFolderCursorRepository(engine)
+    mailbox_sweep_lock = PostgresMailboxSweepLock(engine)
+    mailbox_microsoft_oauth_state_repository = PostgresMailboxMicrosoftOAuthStateRepository(engine)
+    microsoft_oauth_client = MicrosoftOAuthClient()
+    microsoft_graph_client = MicrosoftGraphClient()
+    microsoft_token_store = FileMicrosoftTokenStore()
+    microsoft_mailbox_adapter = MicrosoftGraphMailboxAdapter(
+        oauth_client=microsoft_oauth_client,
+        graph_client=microsoft_graph_client,
+        token_store=microsoft_token_store,
+        mailbox_repository=mailbox_source_repository,
+    )
+
     return RuntimeComposition(
         runtime_environment=_PRODUCTION,
         api=api,
@@ -596,6 +698,15 @@ def _build_production() -> RuntimeComposition:
         xero_token_store=xero_token_store,
         xero_pending_tenant_selection_store=xero_pending_tenant_selection_store,
         mailbox_source_repository=mailbox_source_repository,
+        mailbox_message_repository=mailbox_message_repository,
+        mailbox_sweep_run_repository=mailbox_sweep_run_repository,
+        mailbox_folder_cursor_repository=mailbox_folder_cursor_repository,
+        mailbox_sweep_lock=mailbox_sweep_lock,
+        mailbox_microsoft_oauth_state_repository=mailbox_microsoft_oauth_state_repository,
+        microsoft_oauth_client=microsoft_oauth_client,
+        microsoft_graph_client=microsoft_graph_client,
+        microsoft_token_store=microsoft_token_store,
+        microsoft_mailbox_adapter=microsoft_mailbox_adapter,
     )
 
 
@@ -646,6 +757,7 @@ def reset_composition_for_tests() -> None:
         _composition = None
         _manual_upload_source_id = None
         _seed_entity_ids = None
+        _mailbox_source_ids.clear()
 
 
 # ---------------------------------------------------------------------
@@ -832,3 +944,64 @@ def ensure_seed_entities(composition: "RuntimeComposition") -> dict[str, str]:
 
         _seed_entity_ids = resolved
         return _seed_entity_ids
+
+
+# ---------------------------------------------------------------------
+# Stable per-mailbox evidence Source lifecycle (CD-6 Slice 4)
+# ---------------------------------------------------------------------
+#
+# Mirrors `get_manual_upload_source_id`'s own resolve-or-create lifecycle
+# exactly (see that section's own docstring for the full "why lazy,
+# why memoized, why the known intra-process-only race is accepted"
+# reasoning — not repeated here), applied to one `Source` row PER
+# MAILBOX rather than one shared row for every manual upload. Keyed by
+# the well-known, closed pair (source_type="EMAIL_MAILBOX",
+# provider=<mailbox_id>) — `provider` is a plain string field with no
+# format constraint, and using the mailbox's own canonical id there
+# (rather than, say, its email address, which per
+# `services/mailbox/mailbox.py`'s own doctrine is never a fact this
+# module should encode identity around) keeps this lookup exact and
+# collision-free per mailbox without inventing a new field anywhere.
+
+_mailbox_source_ids: dict[str, str] = {}
+_mailbox_source_lock = threading.Lock()
+
+_MAILBOX_EVIDENCE_SOURCE_TYPE = "EMAIL_MAILBOX"
+
+
+def get_mailbox_source_id(composition: "RuntimeComposition", mailbox) -> str:
+    """Resolve (or, on first use, create) the single stable evidence
+    `Source` row for `mailbox` (a `services.mailbox.mailbox.MailboxSource`).
+    Memoized in-process for the life of this mailbox_id."""
+    cached = _mailbox_source_ids.get(mailbox.mailbox_id)
+    if cached is not None:
+        return cached
+
+    with _mailbox_source_lock:
+        cached = _mailbox_source_ids.get(mailbox.mailbox_id)
+        if cached is not None:
+            return cached
+
+        existing = composition.api.source_repository.find_by_provider(
+            source_type=_MAILBOX_EVIDENCE_SOURCE_TYPE, provider=mailbox.mailbox_id
+        )
+        if existing is not None:
+            _mailbox_source_ids[mailbox.mailbox_id] = existing.source_id
+            return existing.source_id
+
+        source = composition.api.register_source(
+            source_type=_MAILBOX_EVIDENCE_SOURCE_TYPE,
+            provider=mailbox.mailbox_id,
+            status="ACTIVE",
+            actor_type=actor.SYSTEM,
+            actor_id="bagman-mailbox-sweep-bootstrap",
+            governed_entity_hint=mailbox.default_entity_id,
+            metadata={
+                "note": "stable per-mailbox evidence source, resolved-or-created once per "
+                "process (CD-6 Slice 4) — never one Source per swept message",
+                "mailbox_id": mailbox.mailbox_id,
+                "provider_kind": mailbox.provider_kind,
+            },
+        )
+        _mailbox_source_ids[mailbox.mailbox_id] = source.source_id
+        return source.source_id

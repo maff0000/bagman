@@ -23,6 +23,10 @@ import {
   enableMailbox,
   disableMailbox,
   retireMailbox,
+  connectMicrosoftMailbox,
+  disconnectMicrosoftMailbox,
+  sweepMicrosoftMailboxNow,
+  listMicrosoftMessages,
 } from "./mailbox-api.js";
 
 //: provider_kind (the governed, closed Python-level enum —
@@ -60,6 +64,15 @@ const CONNECTION_STATE_LABEL = {
 
 function connectionStateLabel(connectionState) {
   return CONNECTION_STATE_LABEL[connectionState] || connectionState;
+}
+
+//: CD-6 Slice 4 — only MICROSOFT_GRAPH has a real adapter behind it.
+//: NoustAI IMAP (and any future Gmail row) stays exactly as Slice 3
+//: left it: honest NOT_CONFIGURED, no connect/sweep button of any kind
+//: — "no dead controls, no fake availability" (architect doctrine,
+//: mirrors features/xero/connections.js's own identical discipline).
+function hasWorkingAdapter(providerKind) {
+  return providerKind === "MICROSOFT_GRAPH";
 }
 
 export const Mailboxes = {
@@ -134,15 +147,19 @@ export const Mailboxes = {
     }
 
     // "Omit if never happened" (spec) — last_successful_sweep_at is
-    // always null in this slice (no sweep capability exists yet), so
-    // this line simply never renders today; kept honest/forward-safe
-    // for the future slice that will actually populate it.
+    // null until a real sweep has ever succeeded for this mailbox
+    // (CD-6 Slice 4's own first real producer — see
+    // services/mailbox/mailbox.py::record_microsoft_sweep_success).
     if (mailbox.last_successful_sweep_at) {
       body.appendChild(
         el("div", { class: "small muted", text: `Last swept: ${fmtDateTime(mailbox.last_successful_sweep_at)}` })
       );
     }
     card.appendChild(body);
+
+    if (hasWorkingAdapter(mailbox.provider_kind)) {
+      card.appendChild(await this._sweepSummary(mailbox));
+    }
 
     const actions = el("div", { class: "card__actions" });
 
@@ -162,9 +179,96 @@ export const Mailboxes = {
       retireBtn.addEventListener("click", () => this._retire(mailbox));
       actions.appendChild(retireBtn);
     }
+
+    if (hasWorkingAdapter(mailbox.provider_kind) && mailbox.status === "ACTIVE") {
+      // "No dead controls, no fake availability" — Sweep now is ONLY
+      // ever rendered when genuinely CONNECTED (architect doctrine,
+      // mirrors features/xero/connections.js's Sync-now button exactly).
+      const canConnect = mailbox.connection_state !== "CONNECTED";
+      const connectLabel = mailbox.connection_state === "AUTH_REQUIRED" || mailbox.connection_state === "ERROR"
+        ? "Reconnect Microsoft 365"
+        : "Connect Microsoft 365";
+      if (canConnect) {
+        const connectBtn = el("button", { class: "btn btn--primary btn--sm", text: connectLabel, attrs: { type: "button" } });
+        connectBtn.addEventListener("click", () => this._connectMicrosoft(mailbox));
+        actions.appendChild(connectBtn);
+      } else {
+        const sweepBtn = el("button", { class: "btn btn--primary btn--sm", text: "Sweep now", attrs: { type: "button" } });
+        sweepBtn.addEventListener("click", () => this._sweepMicrosoft(mailbox));
+        actions.appendChild(sweepBtn);
+
+        const disconnectBtn = el("button", { class: "btn btn--ghost btn--sm", text: "Disconnect", attrs: { type: "button" } });
+        disconnectBtn.addEventListener("click", () => this._disconnectMicrosoft(mailbox));
+        actions.appendChild(disconnectBtn);
+      }
+    }
     card.appendChild(actions);
 
     return card;
+  },
+
+  /** A minimal, NON-classifying recent-mail summary line (architect
+   * spec's hard scope boundary — see services/mailbox/sweep.py's own
+   * module docstring: relevant/irrelevant, invoice/not-invoice,
+   * account coding, What/Why — none of that exists here, not even a
+   * stub). Only ever rendered for a mailbox with a real adapter. */
+  async _sweepSummary(mailbox) {
+    if (mailbox.connection_state !== "CONNECTED") return el("div", { class: "small muted" });
+    const { ok, body } = await listMicrosoftMessages(mailbox.mailbox_id);
+    if (!ok || !body || body.count === 0) {
+      return el("div", { class: "small muted", text: "No messages swept yet." });
+    }
+    const wrap = el("div", { class: "small muted mailbox-card__recent" }, [
+      el("div", { text: `${body.count} message(s) evidenced from this mailbox.` }),
+    ]);
+    for (const m of body.items.slice(0, 3)) {
+      wrap.appendChild(
+        el("div", {
+          class: "small",
+          text: `${fmtDateTime(m.received_at)} — ${m.sender_address || "(unknown sender)"} — ${m.subject || "(no subject)"}`,
+        })
+      );
+    }
+    return wrap;
+  },
+
+  async _connectMicrosoft(mailbox) {
+    const { ok, status, body } = await connectMicrosoftMailbox(mailbox.mailbox_id, getActorId());
+    if (!ok || !body || !body.authorize_url) {
+      notify.error(`Could not start Microsoft connect: ${errorMessage(status, body)}`);
+      return;
+    }
+    // Mirrors features/xero/connections.js's own OAuth-begin pattern
+    // exactly — a full-page navigation to the real Microsoft consent
+    // screen; the browser never receives a token here.
+    window.location.href = body.authorize_url;
+  },
+
+  async _disconnectMicrosoft(mailbox) {
+    const { ok, status, body } = await disconnectMicrosoftMailbox(mailbox.mailbox_id, getActorId());
+    if (!ok) {
+      notify.error(`Could not disconnect: ${errorMessage(status, body)}`);
+      return;
+    }
+    notify.ok(`Disconnected ${mailbox.display_name} from Microsoft 365.`);
+    this.load();
+  },
+
+  async _sweepMicrosoft(mailbox) {
+    notify.ok("Sweep started…");
+    const { ok, status, body } = await sweepMicrosoftMailboxNow(mailbox.mailbox_id, getActorId());
+    if (!ok || !body) {
+      notify.error(`Sweep request failed: ${errorMessage(status, body)}`);
+      return;
+    }
+    if (body.status === "SUCCEEDED") {
+      notify.ok(`Sweep complete — ${body.evidence_created} new item(s) evidenced.`);
+    } else if (body.status === "PARTIAL") {
+      notify.error(`Sweep partially completed — ${body.failures} failure(s). It will retry next time.`);
+    } else {
+      notify.error(`Sweep failed: ${body.error_code || body.status}`);
+    }
+    this.load();
   },
 
   openAddDrawer() {

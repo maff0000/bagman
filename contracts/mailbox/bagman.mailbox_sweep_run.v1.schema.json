@@ -1,0 +1,112 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://bagman.internal/contracts/mailbox/bagman.mailbox_sweep_run.v1.schema.json",
+  "title": "BAGMAN MailboxSweepRun",
+  "description": "One durable sweep-attempt ledger row for a single `MailboxSource` (CD-6 Slice 4). Mirrors `services.xero.sync.XeroSyncRun`'s own role for the Xero domain: a terminal record of exactly what one sweep attempt did, never SUCCEEDED if a message that should have ingested failed irrecoverably.",
+  "type": "object",
+  "properties": {
+    "sweep_run_id": {
+      "$ref": "https://bagman.internal/contracts/common/bagman.identifier.v1.schema.json",
+      "description": "Canonical BAGMAN identifier for this sweep attempt."
+    },
+    "mailbox_id": {
+      "$ref": "https://bagman.internal/contracts/common/bagman.identifier.v1.schema.json",
+      "description": "The `MailboxSource` this sweep ran against."
+    },
+    "trigger": {
+      "type": "string",
+      "enum": ["MANUAL", "SCHEDULED"],
+      "description": "`MANUAL` — an operator clicked 'Sweep now'. `SCHEDULED` — the optional dedicated worker (see `services/mailbox/sweep.py`'s module docstring for whether this slice built one)."
+    },
+    "status": {
+      "type": "string",
+      "enum": ["RUNNING", "SUCCEEDED", "PARTIAL", "FAILED"],
+      "description": "`SUCCEEDED` — every folder's delta round completed and every discovered message reached a durably-handled terminal record (ingested, quarantined, or a governed vanished/oversize outcome). `PARTIAL` — at least one folder/message hit a transient failure but at least one other folder/message succeeded; the affected folder's cursor is NOT advanced. `FAILED` — nothing durable was accomplished this run (e.g. token refresh failed before any folder could even be attempted)."
+    },
+    "started_at": {
+      "$ref": "https://bagman.internal/contracts/common/bagman.utc_timestamp.v1.schema.json"
+    },
+    "completed_at": {
+      "oneOf": [
+        { "$ref": "https://bagman.internal/contracts/common/bagman.utc_timestamp.v1.schema.json" },
+        { "type": "null" }
+      ],
+      "description": "`null` while `status == \"RUNNING\"`."
+    },
+    "folders_attempted": {
+      "type": "array",
+      "items": { "type": "string", "enum": ["INBOX", "JUNK"] },
+      "description": "Which of the two in-scope folders this run attempted."
+    },
+    "messages_seen": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Total messages observed across every attempted folder's delta pages this run (including ones already known from a prior sweep)."
+    },
+    "messages_new": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Messages discovered for the FIRST time this run (new `MailboxMessage` rows created)."
+    },
+    "evidence_created": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "New `EvidenceItem` rows successfully registered this run."
+    },
+    "duplicates": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Messages seen this run whose (mailbox_id, immutable_provider_message_id) already had a `MailboxMessage`/`EvidenceItem` — an idempotent re-observation (e.g. a re-seen page, or a message that moved folders), never double-ingested."
+    },
+    "quarantined": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Messages whose content-safety scan was not CLEAN — governed-quarantined, never parsed/classified."
+    },
+    "failures": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Messages that hit a transient, non-durably-handled failure this run (their folder's cursor is not advanced past them)."
+    },
+    "error_code": {
+      "oneOf": [
+        { "type": "string" },
+        { "type": "null" }
+      ],
+      "description": "Closed-vocabulary failure reason when `status` is `PARTIAL`/`FAILED` (see `services/mailbox/sweep.py::SweepFailureReason`). `null` for `RUNNING`/`SUCCEEDED`."
+    },
+    "error_detail": {
+      "oneOf": [
+        { "type": "string" },
+        { "type": "null" }
+      ],
+      "description": "Short, non-secret detail. NEVER a raw token/deltaLink/authorization code/OAuth state."
+    },
+    "schema_version": {
+      "allOf": [
+        { "$ref": "https://bagman.internal/contracts/common/bagman.schema_version.v1.schema.json" }
+      ],
+      "const": "bagman.mailbox_sweep_run.v1",
+      "description": "Must literally equal \"bagman.mailbox_sweep_run.v1\"."
+    }
+  },
+  "required": [
+    "sweep_run_id",
+    "mailbox_id",
+    "trigger",
+    "status",
+    "started_at",
+    "completed_at",
+    "folders_attempted",
+    "messages_seen",
+    "messages_new",
+    "evidence_created",
+    "duplicates",
+    "quarantined",
+    "failures",
+    "error_code",
+    "error_detail",
+    "schema_version"
+  ],
+  "additionalProperties": false
+}

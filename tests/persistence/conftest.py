@@ -107,6 +107,12 @@ CANONICAL_TABLES = (
     "xero_accounts",  # CD-6 Slice 2
     "xero_sync_runs",  # CD-6 Slice 2
     "xero_oauth_states",  # CD-6 Slice 2
+    "mailbox_sources",  # CD-6 Slice 3 (previously missing from this list)
+    "mailbox_messages",  # CD-6 Slice 4
+    "mailbox_sweep_runs",  # CD-6 Slice 4
+    "mailbox_folder_cursors",  # CD-6 Slice 4
+    "mailbox_sweep_locks",  # CD-6 Slice 4
+    "mailbox_microsoft_oauth_states",  # CD-6 Slice 4
 )
 
 

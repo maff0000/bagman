@@ -27,6 +27,26 @@ to Microsoft/Google/an IMAP server/anything else. ``provider_kind``
 exists purely so an operator can declare which FUTURE adapter a
 mailbox definition is destined for.
 
+CD-6 Slice 4 update — connection_state now has a real producer
+------------------------------------------------------------------
+Slice 4 (first real Microsoft Graph adapter + sweep engine) is the
+FIRST delivery to actually drive `connection_state` away from
+`NOT_CONFIGURED` — via the five new `begin_microsoft_connect`/
+`mark_microsoft_connected`/`mark_microsoft_auth_required`/
+`mark_microsoft_connection_error`/`disconnect_microsoft` repository
+methods and :data:`ALLOWED_CONNECTION_TRANSITIONS` below. This module
+itself REMAINS provider-neutral — no Microsoft/Graph/OAuth-specific
+code exists anywhere in this file; that all lives in
+`services/mailbox/microsoft/`. Lifecycle `status`
+(ACTIVE/DISABLED/RETIRED, via :func:`transition`/
+:data:`ALLOWED_TRANSITIONS` above) and `connection_state`
+(NOT_CONFIGURED/AUTH_REQUIRED/CONNECTED/ERROR, via
+:func:`transition_connection_state`/:data:`ALLOWED_CONNECTION_TRANSITIONS`
+below) remain two fully independent state machines on the same row,
+exactly as Slice 3 designed — see "connection_state is a SEPARATE
+field from lifecycle status" below, which otherwise remains accurate
+as written for Slice 3's own scope.
+
 Critical identity doctrine — a mailbox is NOT a company
 ------------------------------------------------------------
 A ``MailboxSource`` is never a BAGMAN company/accounting entity/Xero
@@ -182,14 +202,79 @@ CONNECTION_STATE_NOT_CONFIGURED = "NOT_CONFIGURED"
 CONNECTION_STATE_AUTH_REQUIRED = "AUTH_REQUIRED"
 CONNECTION_STATE_READY_FOR_CONNECTION = "READY_FOR_CONNECTION"
 CONNECTION_STATE_CONNECTED = "CONNECTED"
+#: CD-6 Slice 4 addition (Microsoft Graph adapter + sweep engine) — see
+#: module docstring section "connection_state now has a real producer
+#: (Slice 4)" below. Extends (never weakens) the contract's own
+#: `connection_state` enum, which already forward-declared
+#: `AUTH_REQUIRED`/`READY_FOR_CONNECTION`/`CONNECTED` in Slice 3 with no
+#: producer yet — `ERROR` is the one value Slice 3 did not anticipate,
+#: needed for a genuine PERSISTENT provider/config fault distinct from
+#: "needs a fresh OAuth consent" (`AUTH_REQUIRED`) — mirrors
+#: `services.xero.connection.XeroConnection`'s own `ERROR` vs. `REVOKED`
+#: distinction, collapsed here to one extra state since this slice has
+#: no separate revoke-vs-refresh-failure story (see
+#: `services/mailbox/microsoft/adapter.py`'s module docstring for
+#: exactly which provider outcomes map to `ERROR` vs. `AUTH_REQUIRED`).
+CONNECTION_STATE_ERROR = "ERROR"
 CONNECTION_STATES = frozenset(
     {
         CONNECTION_STATE_NOT_CONFIGURED,
         CONNECTION_STATE_AUTH_REQUIRED,
         CONNECTION_STATE_READY_FOR_CONNECTION,
         CONNECTION_STATE_CONNECTED,
+        CONNECTION_STATE_ERROR,
     }
 )
+
+#: CD-6 Slice 4 — the real, closed `connection_state` state machine
+#: (mirrors `services.xero.connection.ALLOWED_TRANSITIONS`'s own
+#: pattern, per the architect's explicit instruction). Deliberately
+#: SEPARATE from `ALLOWED_TRANSITIONS` above (lifecycle `status`) —
+#: see this module's docstring section "connection_state is a SEPARATE
+#: field from lifecycle status": a `RETIRED`/`DISABLED` mailbox can
+#: still carry a real `connection_state` (e.g. a disabled mailbox that
+#: was previously `CONNECTED` stays `CONNECTED` at the connection
+#: layer — disabling only stops future sweeps, it is not a disconnect
+#: action; an explicit Disconnect is the only thing that moves
+#: connection_state itself).
+#:
+#: * `NOT_CONFIGURED -> AUTH_REQUIRED` — an operator clicks "Connect
+#:   Microsoft 365" for the first time (OAuth flow initiated).
+#: * `AUTH_REQUIRED -> CONNECTED` — the OAuth callback succeeded AND
+#:   server-side identity verification (the authenticated Microsoft
+#:   account really is this mailbox's own `email_address`) passed.
+#: * `AUTH_REQUIRED -> ERROR` — the OAuth flow itself failed for a
+#:   reason that is not simply "needs a retry of the same consent
+#:   flow" (e.g. BAGMAN itself is not configured — no
+#:   client_id/client_secret/tenant_id on disk yet).
+#: * `CONNECTED -> AUTH_REQUIRED` — a live token refresh failed
+#:   (Microsoft revoked/expired the consent) — see
+#:   `services/mailbox/microsoft/adapter.py`'s own docstring for why
+#:   this specific case is `AUTH_REQUIRED`, not `ERROR`: the remedy is
+#:   "reconnect", identical to the first-time flow, so the SAME Needs
+#:   You item type/action applies.
+#: * `CONNECTED -> ERROR` — a genuine, non-auth provider fault
+#:   (403 permission error on a scope BAGMAN should have; a malformed/
+#:   unexpected provider response outside any single sweep run) that
+#:   reconnecting alone would not necessarily fix.
+#: * `ERROR -> AUTH_REQUIRED` / `ERROR -> CONNECTED` — an operator
+#:   retries the connect flow from `ERROR` (mirrors
+#:   `XeroConnection.ALLOWED_TRANSITIONS`'s own "every non-PENDING
+#:   state can re-enter PENDING" doctrine, applied here to `ERROR`
+#:   specifically since Slice 4 does not need every other state to
+#:   re-enter `AUTH_REQUIRED` — a `NOT_CONFIGURED` mailbox is not
+#:   "erroring", it has simply never been attempted).
+#:
+#: `READY_FOR_CONNECTION` remains untouched — still Slice 3's
+#: forward-declared, unreached vocabulary for a later delivery; no
+#: transition in this table produces or consumes it.
+ALLOWED_CONNECTION_TRANSITIONS: dict[str, frozenset[str]] = {
+    CONNECTION_STATE_NOT_CONFIGURED: frozenset({CONNECTION_STATE_AUTH_REQUIRED}),
+    CONNECTION_STATE_AUTH_REQUIRED: frozenset({CONNECTION_STATE_CONNECTED, CONNECTION_STATE_ERROR}),
+    CONNECTION_STATE_CONNECTED: frozenset({CONNECTION_STATE_AUTH_REQUIRED, CONNECTION_STATE_ERROR}),
+    CONNECTION_STATE_ERROR: frozenset({CONNECTION_STATE_AUTH_REQUIRED, CONNECTION_STATE_CONNECTED}),
+    CONNECTION_STATE_READY_FOR_CONNECTION: frozenset(),
+}
 
 #: A deliberately simple, non-RFC-5322-exhaustive structural check —
 #: this is an operator-curated governance registry, not a mail
@@ -317,6 +402,48 @@ def transition(mailbox: MailboxSource, new_status: str) -> MailboxSource:
     return updated
 
 
+def transition_connection_state(
+    mailbox: MailboxSource, new_connection_state: str, **field_updates: Any
+) -> MailboxSource:
+    """Move ``mailbox.connection_state`` to ``new_connection_state``,
+    enforcing :data:`ALLOWED_CONNECTION_TRANSITIONS` (CD-6 Slice 4).
+    Mirrors :func:`transition` above exactly, but operates on the
+    connection_state field, which lives and evolves entirely
+    independently of lifecycle ``status`` — see module docstring.
+    Stamps ``updated_at`` automatically; never touches ``status``/
+    ``enabled``.
+
+    Raises:
+        core.errors.InvalidStateTransitionError: if
+            ``new_connection_state`` is not a valid transition from
+            ``mailbox.connection_state``.
+        core.errors.ValidationError: if the resulting mailbox fails
+            contract validation.
+    """
+    allowed = ALLOWED_CONNECTION_TRANSITIONS.get(mailbox.connection_state, frozenset())
+    if new_connection_state not in allowed:
+        raise InvalidStateTransitionError(
+            f"MailboxSource '{mailbox.mailbox_id}' cannot transition connection_state from "
+            f"'{mailbox.connection_state}' to '{new_connection_state}'; allowed transitions from "
+            f"'{mailbox.connection_state}' are {sorted(allowed) or '(none)'}"
+        )
+
+    try:
+        updated = dataclasses.replace(
+            mailbox,
+            connection_state=new_connection_state,
+            updated_at=utc_now(),
+            **field_updates,
+        )
+        validate_against_contract(updated.to_dict(), _SCHEMA)
+    except ValidationError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - never leak a raw exception
+        raise ValidationError(f"could not transition MailboxSource connection_state: {exc}") from exc
+
+    return updated
+
+
 class MailboxSourceRepository(abc.ABC):
     """Repository abstraction for MailboxSource. See module docstring's
     "Uniqueness" section for the exact, documented global/
@@ -403,6 +530,78 @@ class MailboxSourceRepository(abc.ABC):
 
     @abc.abstractmethod
     def list_mailboxes(self) -> list[MailboxSource]:
+        raise NotImplementedError
+
+    # -- CD-6 Slice 4: connection_state (Microsoft OAuth/sweep) --------
+    #
+    # See :data:`ALLOWED_CONNECTION_TRANSITIONS`'s own docstring for the
+    # full transition table these five methods drive. Every one of them
+    # is idempotent-safe the same way `enable_mailbox`/`disable_mailbox`/
+    # `retire_mailbox` already are: calling one of these with the
+    # mailbox already in the TARGET connection_state is a safe no-op
+    # (current snapshot returned unchanged), never
+    # `InvalidStateTransitionError` — a second stale browser tab/a
+    # genuine double-click/a retried sweep attempt must never 500 here.
+
+    @abc.abstractmethod
+    def begin_microsoft_connect(self, mailbox_id: str) -> MailboxSource:
+        """`NOT_CONFIGURED|ERROR -> AUTH_REQUIRED` — an operator
+        initiated (or re-initiated) the Microsoft OAuth connect flow.
+        Already-`AUTH_REQUIRED` is a no-op (re-clicking Connect while a
+        flow is already in flight)."""
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def mark_microsoft_connected(self, mailbox_id: str, *, checked_at: Optional[datetime] = None) -> MailboxSource:
+        """`AUTH_REQUIRED|ERROR -> CONNECTED` — the OAuth callback
+        succeeded and server-side identity verification passed. Stamps
+        `last_connection_check_at` and clears `last_error_code`/
+        `last_error_detail`. Already-`CONNECTED` is a no-op (the
+        connection layer, not the caller, decides whether a
+        reconfirmation is actually a state change)."""
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def mark_microsoft_auth_required(self, mailbox_id: str, *, error_detail: Optional[str] = None) -> MailboxSource:
+        """`CONNECTED|ERROR -> AUTH_REQUIRED` — a live token refresh
+        failed (Microsoft revoked/expired consent); the remedy is a
+        fresh OAuth consent, exactly like the first-time flow. Already-
+        `AUTH_REQUIRED` is a no-op."""
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def mark_microsoft_connection_error(
+        self, mailbox_id: str, *, error_code: str, error_detail: str
+    ) -> MailboxSource:
+        """`AUTH_REQUIRED|CONNECTED -> ERROR` — a genuine, non-auth
+        provider/config fault. Already-`ERROR` updates the recorded
+        error_code/error_detail in place rather than re-raising (the
+        error DETAIL of an ongoing error condition may legitimately
+        change between attempts)."""
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def disconnect_microsoft(self, mailbox_id: str) -> MailboxSource:
+        """An operator explicitly disconnected this mailbox:
+        `CONNECTED|AUTH_REQUIRED|ERROR -> NOT_CONFIGURED` (local
+        credential material is revoked — see
+        `services/mailbox/microsoft/secrets.py` — there is no real
+        provider-side revoke action for this slice). This is the one
+        connection_state transition NOT reachable via
+        :data:`ALLOWED_CONNECTION_TRANSITIONS` alone (an explicit
+        operator action re-arms the WHOLE flow from scratch, unlike a
+        provider-driven `AUTH_REQUIRED`/`ERROR`), so implementations
+        apply it directly rather than through
+        :func:`transition_connection_state`. Already-`NOT_CONFIGURED`
+        is a no-op."""
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def record_microsoft_sweep_success(self, mailbox_id: str, *, swept_at: datetime) -> MailboxSource:
+        """Stamp `last_successful_sweep_at` — called only after a
+        `MailboxSweepRun` reaches `SUCCEEDED` (see
+        `services/mailbox/sweep.py`). Never itself changes
+        `connection_state`."""
         raise NotImplementedError
 
 
@@ -552,3 +751,76 @@ class InMemoryMailboxSourceRepository(MailboxSourceRepository):
 
     def list_mailboxes(self) -> list[MailboxSource]:
         return sorted(self._by_id.values(), key=lambda m: (m.display_name, m.mailbox_id))
+
+    # -- CD-6 Slice 4: connection_state --------------------------------
+
+    def _idempotent_connection_transition(
+        self, mailbox_id: str, new_connection_state: str, **field_updates: Any
+    ) -> MailboxSource:
+        current = self.get_mailbox(mailbox_id)
+        if current.connection_state == new_connection_state:
+            return current
+        updated = transition_connection_state(current, new_connection_state, **field_updates)
+        self._by_id[mailbox_id] = updated
+        return updated
+
+    def begin_microsoft_connect(self, mailbox_id: str) -> MailboxSource:
+        return self._idempotent_connection_transition(
+            mailbox_id, CONNECTION_STATE_AUTH_REQUIRED, last_error_code=None, last_error_detail=None
+        )
+
+    def mark_microsoft_connected(self, mailbox_id: str, *, checked_at: Optional[datetime] = None) -> MailboxSource:
+        return self._idempotent_connection_transition(
+            mailbox_id,
+            CONNECTION_STATE_CONNECTED,
+            last_connection_check_at=checked_at if checked_at is not None else utc_now(),
+            last_error_code=None,
+            last_error_detail=None,
+        )
+
+    def mark_microsoft_auth_required(self, mailbox_id: str, *, error_detail: Optional[str] = None) -> MailboxSource:
+        return self._idempotent_connection_transition(
+            mailbox_id,
+            CONNECTION_STATE_AUTH_REQUIRED,
+            last_error_code="AUTH_REQUIRED" if error_detail else None,
+            last_error_detail=error_detail,
+        )
+
+    def mark_microsoft_connection_error(
+        self, mailbox_id: str, *, error_code: str, error_detail: str
+    ) -> MailboxSource:
+        current = self.get_mailbox(mailbox_id)
+        if current.connection_state == CONNECTION_STATE_ERROR:
+            updated = dataclasses.replace(
+                current, last_error_code=error_code, last_error_detail=error_detail, updated_at=utc_now()
+            )
+            validate_against_contract(updated.to_dict(), _SCHEMA)
+            self._by_id[mailbox_id] = updated
+            return updated
+        updated = transition_connection_state(
+            current, CONNECTION_STATE_ERROR, last_error_code=error_code, last_error_detail=error_detail
+        )
+        self._by_id[mailbox_id] = updated
+        return updated
+
+    def disconnect_microsoft(self, mailbox_id: str) -> MailboxSource:
+        current = self.get_mailbox(mailbox_id)
+        if current.connection_state == CONNECTION_STATE_NOT_CONFIGURED:
+            return current
+        updated = dataclasses.replace(
+            current,
+            connection_state=CONNECTION_STATE_NOT_CONFIGURED,
+            last_error_code=None,
+            last_error_detail=None,
+            updated_at=utc_now(),
+        )
+        validate_against_contract(updated.to_dict(), _SCHEMA)
+        self._by_id[mailbox_id] = updated
+        return updated
+
+    def record_microsoft_sweep_success(self, mailbox_id: str, *, swept_at: datetime) -> MailboxSource:
+        current = self.get_mailbox(mailbox_id)
+        updated = dataclasses.replace(current, last_successful_sweep_at=swept_at, updated_at=utc_now())
+        validate_against_contract(updated.to_dict(), _SCHEMA)
+        self._by_id[mailbox_id] = updated
+        return updated

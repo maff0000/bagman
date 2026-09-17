@@ -1,63 +1,112 @@
-# BAGMAN component manifest (CD-6 Slice 3: Mailbox Management) for
-# services/mailbox/.
+# BAGMAN component manifest (CD-6 Slice 3: Mailbox Management; CD-6
+# Slice 4: first real Microsoft Graph mailbox adapter + sweep engine)
+# for services/mailbox/.
 # Validated by scripts/generate_architecture_memory.py against
 # contracts/manifest/bagman.component_manifest.v1.schema.json.
 
 id: BAGMAN.MAILBOX
-version: 1
+version: 2
 
 responsibility: >
   Own the operator-facing mailbox DEFINITION registry (MailboxSource) —
-  a governed record of which real mailbox addresses BAGMAN will later
-  monitor for evidence, their declared future provider adapter, an
-  optional display-only default-entity hint, and their own closed
-  ACTIVE/DISABLED/RETIRED lifecycle (retire preserves the row rather
-  than deleting it, so future evidence provenance is never orphaned).
-  This is a FOUNDATION-ONLY component: it creates, edits, enables,
-  disables, and retires mailbox definitions and nothing else. No
-  provider OAuth/IMAP login, no mail fetch, no sweep scheduler/worker,
-  no evidence creation from email, no email classification, and no
-  provider webhook of any kind is implemented anywhere behind this
-  component in this delivery.
+  a governed record of which real mailbox addresses BAGMAN monitors for
+  evidence, their declared provider adapter, an optional display-only
+  default-entity hint, their own closed ACTIVE/DISABLED/RETIRED
+  lifecycle (retire preserves the row rather than deleting it, so
+  future evidence provenance is never orphaned), and — as of Slice 4 —
+  their own independent connection/authentication state machine
+  (NOT_CONFIGURED/AUTH_REQUIRED/CONNECTED/ERROR). Also owns the
+  provider-neutral sweep orchestration (`services/mailbox/sweep.py`),
+  the durable message projection (MailboxMessage, idempotent on
+  (mailbox_id, immutable_provider_message_id) — a message observed in
+  more than one monitored folder is never duplicated), the sweep-run
+  ledger (MailboxSweepRun, honest SUCCEEDED/PARTIAL/FAILED semantics —
+  never SUCCEEDED if a message that should have ingested failed
+  irrecoverably), the per-folder durable delta cursor (only ever
+  advanced after a full round succeeds), and the per-mailbox sweep
+  exclusivity lease. The first concrete provider adapter,
+  `services/mailbox/microsoft/` (Microsoft Graph: delegated
+  authorization-code OAuth, `Mail.Read`-only delegated permissions, a
+  read-only Graph client, server-side account-identity verification,
+  and email-evidence ingestion via BAGMAN's own existing CD-4
+  evidence/provenance architecture — never a second private evidence
+  silo), lives inside this same component rather than a separate one,
+  mirroring `services/xero/`'s own precedent of keeping provider-
+  neutral domain logic and real provider-calling code under one
+  component even though the files are internally separated (see
+  `services/mailbox/mailbox.py`'s own module docstring: "no Microsoft-
+  specific OAuth logic inside the generic mailbox domain model" is a
+  file-layering discipline, not a component-boundary one). This is a
+  READ-ONLY integration against Microsoft mail: no mark-read, move,
+  delete, or send capability exists anywhere behind this component.
+  Email classification, AI, correction/learned rules, and any
+  accounting-relevance decision are explicitly Slice 5's scope — no
+  such field or code path exists anywhere in this component.
 
 owns:
   - MailboxSource
+  - MailboxMessage
+  - MailboxSweepRun
 
-# services/mailbox/mailbox.py depends on core/ exactly like every other
-# CD-2/CD-4/CD-5/CD-6 domain module: identity (id generation),
-# timestamps (UTC handling), errors (ConflictError,
-# InvalidStateTransitionError, NotFoundError, ValidationError), and
-# contract_validation (validate_against_contract). It deliberately does
-# NOT import core.entity/EntityRepository directly — default_entity_id
-# hint validation happens one layer up, in
-# app/api/routers/mailboxes.py, mirroring app/api/routers/xero.py's own
-# `_require_entity` layering choice (see services/mailbox/mailbox.py's
-# own module docstring).
+# services/mailbox/*.py depends on core/ exactly like every other CD-2/
+# CD-4/CD-5/CD-6 domain module: identity (id generation), timestamps
+# (UTC handling), errors (ConflictError, InvalidStateTransitionError,
+# NotFoundError, ValidationError), and contract_validation
+# (validate_against_contract). It deliberately does NOT import
+# core.entity/EntityRepository directly — default_entity_id hint
+# validation happens one layer up, in app/api/routers/mailboxes.py,
+# mirroring app/api/routers/xero.py's own `_require_entity` layering
+# choice (see services/mailbox/mailbox.py's own module docstring).
+# services/mailbox/microsoft/evidence_ingest.py additionally consumes
+# BAGMAN.EVIDENCE.INTAKE directly (its bounded/streaming spool helper
+# and EvidenceSafetyScanner interface) — the same governed content-
+# safety discipline CD-4's own manual-upload pipeline uses, reused
+# rather than duplicated (architect spec's explicit instruction: "do
+# not build a second private evidence silo").
 consumes:
   - BAGMAN.CORE
+  - BAGMAN.EVIDENCE.INTAKE
 
 # This component does not itself emit AuditEvents — every
-# MAILBOX_* audit event is minted by the HTTP orchestration layer that
-# calls this component's repository (app/api/routers/mailboxes.py) via
+# MAILBOX_*/EMAIL_EVIDENCE_* audit event is minted by the HTTP
+# orchestration layer that calls this component's repository/sweep
+# service (app/api/routers/mailboxes.py, app/api/routers/
+# mailboxes_microsoft.py, services/mailbox/sweep.py's own caller) via
 # core.api.BagmanCanonicalAPI.record_audit_event(), exactly like
 # services/xero/ and services/needs_you/ never emitting their own audit
 # events (see those components' own manifests).
 produces: []
 
-# No new third-party dependency: this component is pure Python domain
-# logic over core/'s existing primitives.
+# No new third-party dependency: services/mailbox/microsoft/graph_client.py
+# speaks HTTP via stdlib urllib.request only, exactly like
+# services/xero/client.py (see that module's own "Dependency choice"
+# docstring section for the identical reasoning, applied here to the
+# Microsoft identity platform + Graph API instead of Xero's).
 dependencies:
   - jsonschema
   - rfc3339-validator
 
-# No external provider is ever called by this component in this
-# delivery — see `responsibility` above. Reserved false, exactly like
-# every other CD-2/CD-4 domain component that is not itself an adapter.
-external_access: false
+# CD-6 Slice 4: services/mailbox/microsoft/ makes real outbound calls
+# to Microsoft's identity platform (OAuth token endpoint) and Graph API
+# (delegated, read-only: /me, mail folder delta, message content) — the
+# same "provider adapter genuinely calls out" shape services/xero/'s
+# own external_access: true already establishes. No real Microsoft
+# Entra credentials exist yet at the time of this delivery; every test
+# exercises FakeMicrosoftOAuthClient/FakeMicrosoftGraphClient only.
+external_access: true
 
+# Note: `direct_email_access` is deliberately ABSENT from this list —
+# every other component.yaml in this repository declares it prohibited
+# (a repo-wide "we don't touch email" catalog entry), but this is the
+# ONE component where that is no longer true as of Slice 4: governed,
+# delegated-permission, read-only email access via Microsoft Graph is
+# this component's actual job. What remains genuinely prohibited is
+# listed below.
 prohibited:
-  - direct_email_access
   - direct_bank_access
   - direct_chargebee_access
-  - mailbox_provider_oauth_or_login
-  - mailbox_sweep_or_fetch
+  - direct_xero_access
+  - microsoft_graph_write_endpoints
+  - mailbox_mark_read_move_or_delete
+  - mailbox_send_mail
+  - email_classification_or_ai_decisions

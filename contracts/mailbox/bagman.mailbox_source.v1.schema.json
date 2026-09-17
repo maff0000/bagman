@@ -44,8 +44,8 @@
     },
     "connection_state": {
       "type": "string",
-      "enum": ["NOT_CONFIGURED", "AUTH_REQUIRED", "READY_FOR_CONNECTION", "CONNECTED"],
-      "description": "Honest, non-secret connection/readiness status — NEVER faked. Every mailbox created in THIS slice is `NOT_CONFIGURED` and STAYS `NOT_CONFIGURED` for its entire lifetime here: no code path anywhere in this slice can ever set this field to anything else, `CONNECTED` above all (nothing actually connects to any provider yet — see `services/mailbox/mailbox.py`'s own module docstring). `AUTH_REQUIRED`/`READY_FOR_CONNECTION` are forward-declared vocabulary for a FUTURE slice's real adapter/OAuth work (mirrors `services.needs_you.needs_you.ITEM_TYPE_XERO_ACCOUNT_REQUIRED`'s own 'declared now, no producer yet' pattern) — not reachable today."
+      "enum": ["NOT_CONFIGURED", "AUTH_REQUIRED", "READY_FOR_CONNECTION", "CONNECTED", "ERROR"],
+      "description": "Honest, non-secret connection/readiness status — NEVER faked. CD-6 Slice 3 minted every mailbox `NOT_CONFIGURED` with no producer ever changing it. CD-6 Slice 4 (first real Microsoft Graph adapter + sweep engine) is the first delivery with a REAL producer for `AUTH_REQUIRED`/`CONNECTED`/`ERROR` — see `services/mailbox/mailbox.py::ALLOWED_CONNECTION_TRANSITIONS` for the full, closed transition table. `ERROR` is a Slice 4 addition (extends, never narrows, this enum) for a genuine persistent provider/config fault distinct from `AUTH_REQUIRED` (which means 'needs a fresh OAuth consent'). `READY_FOR_CONNECTION` remains forward-declared vocabulary for a still-later delivery (mirrors `services.needs_you.needs_you.ITEM_TYPE_XERO_ACCOUNT_REQUIRED`'s own 'declared now, no producer yet' pattern) — not reachable by Slice 4 either."
     },
     "last_connection_check_at": {
       "oneOf": [

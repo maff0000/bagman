@@ -103,16 +103,16 @@ Own the single governed boundary through which untrusted, external/ user-supplie
 - **External access:** `false`
 - **Prohibited:** `direct_email_access`, `direct_bank_access`, `direct_xero_access`, `direct_chargebee_access`
 
-### `BAGMAN.MAILBOX` (v1)
+### `BAGMAN.MAILBOX` (v2)
 
-Own the operator-facing mailbox DEFINITION registry (MailboxSource) — a governed record of which real mailbox addresses BAGMAN will later monitor for evidence, their declared future provider adapter, an optional display-only default-entity hint, and their own closed ACTIVE/DISABLED/RETIRED lifecycle (retire preserves the row rather than deleting it, so future evidence provenance is never orphaned). This is a FOUNDATION-ONLY component: it creates, edits, enables, disables, and retires mailbox definitions and nothing else. No provider OAuth/IMAP login, no mail fetch, no sweep scheduler/worker, no evidence creation from email, no email classification, and no provider webhook of any kind is implemented anywhere behind this component in this delivery.
+Own the operator-facing mailbox DEFINITION registry (MailboxSource) — a governed record of which real mailbox addresses BAGMAN monitors for evidence, their declared provider adapter, an optional display-only default-entity hint, their own closed ACTIVE/DISABLED/RETIRED lifecycle (retire preserves the row rather than deleting it, so future evidence provenance is never orphaned), and — as of Slice 4 — their own independent connection/authentication state machine (NOT_CONFIGURED/AUTH_REQUIRED/CONNECTED/ERROR). Also owns the provider-neutral sweep orchestration (`services/mailbox/sweep.py`), the durable message projection (MailboxMessage, idempotent on (mailbox_id, immutable_provider_message_id) — a message observed in more than one monitored folder is never duplicated), the sweep-run ledger (MailboxSweepRun, honest SUCCEEDED/PARTIAL/FAILED semantics — never SUCCEEDED if a message that should have ingested failed irrecoverably), the per-folder durable delta cursor (only ever advanced after a full round succeeds), and the per-mailbox sweep exclusivity lease. The first concrete provider adapter, `services/mailbox/microsoft/` (Microsoft Graph: delegated authorization-code OAuth, `Mail.Read`-only delegated permissions, a read-only Graph client, server-side account-identity verification, and email-evidence ingestion via BAGMAN's own existing CD-4 evidence/provenance architecture — never a second private evidence silo), lives inside this same component rather than a separate one, mirroring `services/xero/`'s own precedent of keeping provider- neutral domain logic and real provider-calling code under one component even though the files are internally separated (see `services/mailbox/mailbox.py`'s own module docstring: "no Microsoft- specific OAuth logic inside the generic mailbox domain model" is a file-layering discipline, not a component-boundary one). This is a READ-ONLY integration against Microsoft mail: no mark-read, move, delete, or send capability exists anywhere behind this component. Email classification, AI, correction/learned rules, and any accounting-relevance decision are explicitly Slice 5's scope — no such field or code path exists anywhere in this component.
 
-- **Owns:** `MailboxSource`
-- **Consumes:** `BAGMAN.CORE`
+- **Owns:** `MailboxSource`, `MailboxMessage`, `MailboxSweepRun`
+- **Consumes:** `BAGMAN.CORE`, `BAGMAN.EVIDENCE.INTAKE`
 - **Produces:** _(none)_
 - **Dependencies:** `jsonschema`, `rfc3339-validator`
-- **External access:** `false`
-- **Prohibited:** `direct_email_access`, `direct_bank_access`, `direct_chargebee_access`, `mailbox_provider_oauth_or_login`, `mailbox_sweep_or_fetch`
+- **External access:** `true`
+- **Prohibited:** `direct_bank_access`, `direct_chargebee_access`, `direct_xero_access`, `microsoft_graph_write_endpoints`, `mailbox_mark_read_move_or_delete`, `mailbox_send_mail`, `email_classification_or_ai_decisions`
 
 ### `BAGMAN.NEEDS_YOU` (v1)
 
@@ -193,7 +193,9 @@ Own the durable Company<->Xero-organisation mapping (XeroConnection, its closed 
 | `https://bagman.internal/contracts/entity/bagman.entity.v1.schema.json` | BAGMAN GovernedEntity | `contracts/entity/bagman.entity.v1.schema.json` |
 | `https://bagman.internal/contracts/evidence/bagman.evidence.v1.schema.json` | BAGMAN EvidenceItem | `contracts/evidence/bagman.evidence.v1.schema.json` |
 | `https://bagman.internal/contracts/intake/bagman.intake_record.v1.schema.json` | BAGMAN IntakeRecord | `contracts/intake/bagman.intake_record.v1.schema.json` |
+| `https://bagman.internal/contracts/mailbox/bagman.mailbox_message.v1.schema.json` | BAGMAN MailboxMessage | `contracts/mailbox/bagman.mailbox_message.v1.schema.json` |
 | `https://bagman.internal/contracts/mailbox/bagman.mailbox_source.v1.schema.json` | BAGMAN MailboxSource | `contracts/mailbox/bagman.mailbox_source.v1.schema.json` |
+| `https://bagman.internal/contracts/mailbox/bagman.mailbox_sweep_run.v1.schema.json` | BAGMAN MailboxSweepRun | `contracts/mailbox/bagman.mailbox_sweep_run.v1.schema.json` |
 | `https://bagman.internal/contracts/manifest/bagman.component_manifest.v1.schema.json` | BAGMAN Component Manifest | `contracts/manifest/bagman.component_manifest.v1.schema.json` |
 | `https://bagman.internal/contracts/needs_you/bagman.needs_you_item.v1.schema.json` | BAGMAN NeedsYouItem | `contracts/needs_you/bagman.needs_you_item.v1.schema.json` |
 | `https://bagman.internal/contracts/provenance/bagman.provenance.v1.schema.json` | BAGMAN Provenance | `contracts/provenance/bagman.provenance.v1.schema.json` |
