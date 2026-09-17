@@ -7,6 +7,7 @@
 import { el, clear, qs } from "../../shared/dom.js";
 import { fmtBytes, fmtDateTime, hashPrefix, statusBadge } from "../../shared/format.js";
 import { API, apiGet, errorMessage } from "../../shared/api.js";
+import { generateRequestId } from "../../shared/uuid.js";
 import { Detail } from "./detail.js";
 import { openUploadModal } from "../../shell/add-menu.js";
 
@@ -278,82 +279,100 @@ export const Documents = {
     if (submitBtn.disabled) return;
     submitBtn.disabled = true;
 
-    const file = fileInput.files && fileInput.files[0];
-    const actorId = actorInput.value.trim();
-
-    if (!file) {
-      statusEl.dataset.kind = "bad";
-      statusEl.textContent = "Choose a file before uploading.";
-      submitBtn.disabled = false;
-      return;
-    }
-    if (!actorId) {
-      statusEl.dataset.kind = "bad";
-      statusEl.textContent = "Enter who is uploading (operator identity) before uploading.";
-      submitBtn.disabled = false;
-      return;
-    }
-
-    let entityHint = entitySelect.value;
-    if (entityHint === "__custom__") entityHint = entityCustom.value.trim() || null;
-    if (entityHint === "") entityHint = null;
-
-    let evidenceType = evidenceTypeSelect.value || null;
-
-    const metadata = {
-      entity_hint: entityHint,
-      evidence_type: evidenceType,
-      actor_type: "USER",
-      actor_id: actorId,
-      note: noteInput.value.trim() || null,
-    };
-
-    const formData = new FormData();
-    formData.append("file", file);
-    formData.append("metadata", JSON.stringify(metadata));
-
-    const idempotencyKey = crypto.randomUUID();
-
-    statusEl.dataset.kind = "progress";
-    statusEl.textContent = "Uploading…"; // honest — this is the actual in-flight fetch, not a fabricated step (PID §38)
-
-    let response;
+    // Real bug found by a fresh Auditor testing live against the
+    // actual deployed URL (not a localhost/SSH-tunnel secure context):
+    // `crypto.randomUUID()` (used below, and previously called
+    // directly here) throws outside a browser secure context, which
+    // this plain-HTTP LAN deployment always is — and, because nothing
+    // wrapped that early a step, the exception silently left this
+    // button disabled and the status text stuck at "Uploading…"
+    // forever, indistinguishable from a hung request. Every step from
+    // here on is now wrapped so ANY unexpected exception — not just a
+    // network error from fetch() — surfaces a real, visible error and
+    // re-enables the button, matching PID §98.2's own "no fake
+    // buttons" doctrine in the failure direction too.
     try {
-      response = await fetch(API.intakeEvidence, {
-        method: "POST",
-        headers: { "Idempotency-Key": idempotencyKey },
-        body: formData,
-      });
-    } catch (networkErr) {
-      statusEl.dataset.kind = "bad";
-      statusEl.textContent = `Network error — could not reach BAGMAN: ${networkErr.message}`;
+      const file = fileInput.files && fileInput.files[0];
+      const actorId = actorInput.value.trim();
+
+      if (!file) {
+        statusEl.dataset.kind = "bad";
+        statusEl.textContent = "Choose a file before uploading.";
+        submitBtn.disabled = false;
+        return;
+      }
+      if (!actorId) {
+        statusEl.dataset.kind = "bad";
+        statusEl.textContent = "Enter who is uploading (operator identity) before uploading.";
+        submitBtn.disabled = false;
+        return;
+      }
+
+      let entityHint = entitySelect.value;
+      if (entityHint === "__custom__") entityHint = entityCustom.value.trim() || null;
+      if (entityHint === "") entityHint = null;
+
+      let evidenceType = evidenceTypeSelect.value || null;
+
+      const metadata = {
+        entity_hint: entityHint,
+        evidence_type: evidenceType,
+        actor_type: "USER",
+        actor_id: actorId,
+        note: noteInput.value.trim() || null,
+      };
+
+      const formData = new FormData();
+      formData.append("file", file);
+      formData.append("metadata", JSON.stringify(metadata));
+
+      const idempotencyKey = generateRequestId();
+
+      statusEl.dataset.kind = "progress";
+      statusEl.textContent = "Uploading…"; // honest — this is the actual in-flight fetch, not a fabricated step (PID §38)
+
+      let response;
+      try {
+        response = await fetch(API.intakeEvidence, {
+          method: "POST",
+          headers: { "Idempotency-Key": idempotencyKey },
+          body: formData,
+        });
+      } catch (networkErr) {
+        statusEl.dataset.kind = "bad";
+        statusEl.textContent = `Network error — could not reach BAGMAN: ${networkErr.message}`;
+        submitBtn.disabled = false;
+        return;
+      }
+
+      let body = null;
+      try {
+        body = await response.json();
+      } catch {
+        body = null;
+      }
+
+      // Distinguish a genuine workflow outcome (body carries "intake" —
+      // see app/api/routers/intake.py: this shape is returned for EVERY
+      // status the pipeline can honestly reach, including 422 REJECTED
+      // and 503 FAILED, which are real outcomes, not framework errors)
+      // from an actual request-level error (malformed metadata JSON,
+      // idempotency conflict, or an unrelated 5xx) that never reached
+      // the intake pipeline at all.
+      if (body && body.intake) {
+        await this._resolveOutcome(body, statusEl);
+      } else {
+        statusEl.dataset.kind = "bad";
+        statusEl.textContent = `Upload failed: ${errorMessage(response.status, body)}`;
+      }
+
       submitBtn.disabled = false;
-      return;
-    }
-
-    let body = null;
-    try {
-      body = await response.json();
-    } catch {
-      body = null;
-    }
-
-    // Distinguish a genuine workflow outcome (body carries "intake" —
-    // see app/api/routers/intake.py: this shape is returned for EVERY
-    // status the pipeline can honestly reach, including 422 REJECTED
-    // and 503 FAILED, which are real outcomes, not framework errors)
-    // from an actual request-level error (malformed metadata JSON,
-    // idempotency conflict, or an unrelated 5xx) that never reached
-    // the intake pipeline at all.
-    if (body && body.intake) {
-      await this._resolveOutcome(body, statusEl);
-    } else {
+      this.load();
+    } catch (unexpectedErr) {
       statusEl.dataset.kind = "bad";
-      statusEl.textContent = `Upload failed: ${errorMessage(response.status, body)}`;
+      statusEl.textContent = `Upload failed: ${unexpectedErr.message || "unexpected error"}`;
+      submitBtn.disabled = false;
     }
-
-    submitBtn.disabled = false;
-    this.load();
   },
 
   async _resolveOutcome(body, statusEl) {

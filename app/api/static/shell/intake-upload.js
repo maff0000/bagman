@@ -27,6 +27,7 @@
 // this GUI already calls (PID §98.3's own "There is no special
 // image-upload bypass").
 import { API, apiGet } from "../shared/api.js";
+import { generateRequestId } from "../shared/uuid.js";
 
 /**
  * @param {File} file
@@ -53,7 +54,11 @@ export async function submitIntakeUpload(file, { entityHint, evidenceType, actor
   formData.append("file", file);
   formData.append("metadata", JSON.stringify(metadata));
 
-  const idempotencyKey = crypto.randomUUID();
+  // `crypto.randomUUID()` (not `generateRequestId()`) would throw here
+  // outside a browser "secure context" — see shared/uuid.js's own
+  // docstring for the real bug this caused and why this call must
+  // never be the un-caught `crypto.randomUUID()` form again.
+  const idempotencyKey = generateRequestId();
 
   if (onProgress) onProgress("Uploading…");
 

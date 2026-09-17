@@ -141,16 +141,34 @@ export async function openUploadModal(kind) {
     statusEl.dataset.kind = "progress";
     statusEl.textContent = "Uploading…";
 
-    const result = await submitIntakeUpload(_selectedFile, {
-      entityHint: entitySelect.value || null,
-      evidenceType: evidenceTypeSelect.value || null,
-      actorId: getActorId(),
-      note: noteInput.value.trim() || null,
-      onProgress: (status) => {
-        statusEl.dataset.kind = "progress";
-        statusEl.textContent = `${status.charAt(0)}${status.slice(1).toLowerCase()}…`;
-      },
-    });
+    // Defensive try/catch around the whole call, not just its HTTP
+    // outcome (`result.ok`/`result.errorText` below already handle a
+    // clean failure `submitIntakeUpload` itself reports) — a fresh
+    // Auditor found live that an UNCAUGHT exception inside
+    // `submitIntakeUpload` (its own `crypto.randomUUID()` call, now
+    // fixed — see shared/uuid.js) left this button disabled and the
+    // status stuck at "Uploading…" forever with no visible error at
+    // all. This catch is the second, independent layer against that
+    // whole failure CLASS recurring for any other reason in future.
+    let result;
+    try {
+      result = await submitIntakeUpload(_selectedFile, {
+        entityHint: entitySelect.value || null,
+        evidenceType: evidenceTypeSelect.value || null,
+        actorId: getActorId(),
+        note: noteInput.value.trim() || null,
+        onProgress: (status) => {
+          statusEl.dataset.kind = "progress";
+          statusEl.textContent = `${status.charAt(0)}${status.slice(1).toLowerCase()}…`;
+        },
+      });
+    } catch (unexpectedErr) {
+      statusEl.dataset.kind = "bad";
+      statusEl.textContent = `Upload failed: ${unexpectedErr.message || "unexpected error"}`;
+      notify.error(`Upload failed: ${unexpectedErr.message || "unexpected error"}`);
+      submitBtn.disabled = false;
+      return;
+    }
 
     if (result.ok) {
       statusEl.dataset.kind = "ok";
