@@ -132,6 +132,54 @@ def test_list_messages_scoped_to_mailbox_most_recent_first(repo, mailbox_id, oth
     assert {m.immutable_provider_message_id for m in items} == {"m1", "m2"}
 
 
+def test_discovery_fields_are_preserved_on_a_benign_reobservation_that_omits_them(repo, mailbox_id):
+    """Second latent defect fix (WO instruction): a re-observation that
+    OMITS discovery_candidate/discovery_reason/discovery_checked_at
+    (leaving them at their default `None`) must never silently blank an
+    already-set value on the existing row — mirrors `sender_domain`'s
+    own established "supply None to mean not-provided" discipline."""
+    checked_at = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    first, _ = repo.record_observation(
+        mailbox_id=mailbox_id,
+        provider_kind="MICROSOFT_GRAPH",
+        immutable_provider_message_id="m1",
+        internet_message_id="<m1@b>",
+        observed_folder=FOLDER_INBOX,
+        subject="Invoice",
+        sender_address="billing@vendor.com",
+        sender_display_name="Vendor",
+        received_at=datetime.now(timezone.utc),
+        has_attachments=False,
+        ingestion_status=INGESTION_STATUS_CHECKED_NOT_CANDIDATE,
+        sender_domain="vendor.com",
+        discovery_candidate=True,
+        discovery_reason="subject contains keyword 'invoice'",
+        discovery_checked_at=checked_at,
+    )
+    assert first.discovery_candidate is True
+
+    # A benign re-observation (e.g. the sweep engine's own already-final
+    # short-circuit) that does NOT pass the discovery params at all.
+    second, created = repo.record_observation(
+        mailbox_id=mailbox_id,
+        provider_kind="MICROSOFT_GRAPH",
+        immutable_provider_message_id="m1",
+        internet_message_id="<m1@b>",
+        observed_folder=FOLDER_INBOX,
+        subject="Invoice",
+        sender_address="billing@vendor.com",
+        sender_display_name="Vendor",
+        received_at=datetime.now(timezone.utc),
+        has_attachments=False,
+        ingestion_status=INGESTION_STATUS_CHECKED_NOT_CANDIDATE,
+        sender_domain="vendor.com",
+    )
+    assert created is False
+    assert second.discovery_candidate is True
+    assert second.discovery_reason == "subject contains keyword 'invoice'"
+    assert second.discovery_checked_at == checked_at
+
+
 def test_failed_status_represents_a_governed_oversize_outcome(repo, mailbox_id):
     message, _ = _observe(repo, mailbox_id=mailbox_id, status=INGESTION_STATUS_FAILED)
     assert message.ingestion_status == INGESTION_STATUS_FAILED
@@ -146,7 +194,14 @@ def test_failed_status_represents_a_governed_oversize_outcome(repo, mailbox_id):
 
 
 def _observe_candidate(
-    repo, *, mailbox_id, msg_id, sender_domain, status=INGESTION_STATUS_CHECKED_NOT_CANDIDATE, received_at=None
+    repo,
+    *,
+    mailbox_id,
+    msg_id,
+    sender_domain,
+    status=INGESTION_STATUS_CHECKED_NOT_CANDIDATE,
+    received_at=None,
+    discovery_candidate=True,
 ):
     return repo.record_observation(
         mailbox_id=mailbox_id,
@@ -161,6 +216,8 @@ def _observe_candidate(
         has_attachments=False,
         ingestion_status=status,
         sender_domain=sender_domain,
+        discovery_candidate=discovery_candidate,
+        discovery_reason="subject contains keyword 'invoice'" if discovery_candidate else None,
     )
 
 
@@ -199,6 +256,24 @@ def test_list_candidate_messages_excludes_every_status_except_checked_not_candid
 
     results = repo.list_candidate_messages_for_domain(mailbox_id=mailbox_id, sender_domain="vendor.com")
     assert [m.immutable_provider_message_id for m in results] == ["eligible"]
+
+
+def test_list_candidate_messages_requires_discovery_candidate_true_not_merely_checked_not_candidate(repo, mailbox_id):
+    """Second CD-6 architect amendment (persisted discovery decision) —
+    the actual defect this WO fixes: `ingestion_status ==
+    CHECKED_NOT_CANDIDATE` alone used to be sufficient, which conflated
+    a real candidate with an IGNORED-domain message and an ordinary
+    non-candidate message sharing the same status. `discovery_candidate
+    is True` (the literal boolean, not merely "not None"/"not False")
+    is now also required."""
+    _observe_candidate(repo, mailbox_id=mailbox_id, msg_id="real-candidate", sender_domain="vendor.com", discovery_candidate=True)
+    # An IGNORED-domain message: heuristic never ran -> discovery_candidate is None.
+    _observe_candidate(repo, mailbox_id=mailbox_id, msg_id="ignored-domain", sender_domain="vendor.com", discovery_candidate=None)
+    # An ordinary UNKNOWN-domain, non-credible message: heuristic ran and said no.
+    _observe_candidate(repo, mailbox_id=mailbox_id, msg_id="non-credible", sender_domain="vendor.com", discovery_candidate=False)
+
+    results = repo.list_candidate_messages_for_domain(mailbox_id=mailbox_id, sender_domain="vendor.com")
+    assert [m.immutable_provider_message_id for m in results] == ["real-candidate"]
 
 
 def test_list_candidate_messages_ordered_oldest_received_first(repo, mailbox_id):

@@ -762,6 +762,174 @@ def test_reprocess_all_historical_candidates_back_processes_every_historical_can
 
 
 # ---------------------------------------------------------------------
+# Second CD-6 architect amendment — persisted discovery decision. The
+# above `reprocess_all_historical_candidates_for_domain` coverage was
+# insufficient: every fixture message in it happens to be a genuine
+# candidate, so it could never catch the real defect (approving a
+# domain back-processing EVERY historical CHECKED_NOT_CANDIDATE message
+# from it, including ordinary non-financial mail and previously-
+# IGNORED-domain messages sharing the identical status).
+# ---------------------------------------------------------------------
+
+
+def test_reprocess_mixed_domain_only_back_processes_actual_candidates_never_every_checked_not_candidate_message():
+    """The key differentiating proof for this WO: SEVEN historical
+    CHECKED_NOT_CANDIDATE messages from the SAME unknown domain — THREE
+    genuine candidates (default `_msg()` subject "Invoice") and FOUR
+    ordinary non-candidate messages. Exactly one MAILBOX_DOMAIN_REVIEW
+    item must exist (dedup unaffected), its candidate_message_count must
+    be 3 (not 7 — the aggregate accumulation was already correctly
+    gated on `signal.is_candidate`, only the PERSISTED per-message field
+    was the actual gap), and approving it must reprocess exactly the 3
+    real candidates — never all 7."""
+    from services.mailbox.sweep import reprocess_all_historical_candidates_for_domain
+
+    h = Harness(allow_default_domain=False)
+    candidate_msgs = [_msg(f"cand-{i}") for i in range(1, 4)]  # default subject "Invoice" -> is_candidate True
+    non_candidate_msgs = [
+        _msg(f"noncand-{i}", subject="Let's catch up for coffee next week") for i in range(1, 5)
+    ]
+    h.graph_client.queue_delta_result(
+        GraphDeltaPageResult(
+            status=GraphOutcomeStatus.OK, messages=tuple(candidate_msgs + non_candidate_msgs), delta_link="d1"
+        )
+    )
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link="d-junk"))
+    h.sweep()
+
+    messages = h.message_repo.list_messages(mailbox_id=h.mailbox.mailbox_id)
+    assert len(messages) == 7
+    assert all(m.ingestion_status == INGESTION_STATUS_CHECKED_NOT_CANDIDATE for m in messages)
+    # Persisted per-message discovery decision (the actual fix) — real
+    # candidates got `discovery_candidate is True`, ordinary mail got
+    # `False`.
+    by_id = {m.immutable_provider_message_id: m for m in messages}
+    for i in range(1, 4):
+        assert by_id[f"cand-{i}"].discovery_candidate is True
+        assert by_id[f"cand-{i}"].discovery_reason
+    for i in range(1, 5):
+        assert by_id[f"noncand-{i}"].discovery_candidate is False
+        assert by_id[f"noncand-{i}"].discovery_reason is None
+
+    # Exactly ONE Needs You item, with the honest candidate-only count.
+    items = h.needs_you_repo.list_needs_you_items(item_type=ITEM_TYPE_MAILBOX_DOMAIN_REVIEW)
+    assert len(items) == 1
+    assert items[0].metadata["candidate_message_count"] == 3
+
+    rule = h.domain_rule_repo.upsert_rule(
+        mailbox_id=h.mailbox.mailbox_id, sender_domain="vendor.com", match_mode="EXACT", policy="ALLOWED",
+        destination_entity_id=None, destination_mode="REVIEW_REQUIRED", source="OPERATOR",
+    )
+    h.graph_client.queue_content_result(_content())
+    h.graph_client.queue_content_result(_content())
+    h.graph_client.queue_content_result(_content())
+
+    reprocessed = reprocess_all_historical_candidates_for_domain(
+        mailbox=h.mailbox, mailbox_source_id=h.source_id, sender_domain="vendor.com",
+        rule=rule, adapter=h.adapter, message_repository=h.message_repo, api=h.api, object_store=h.object_store,
+        scanner=h.scanner, actor_type="SYSTEM", actor_id="test",
+    )
+    # Exactly 3 messages returned/reprocessed — NEVER 7.
+    assert len(reprocessed) == 3
+    assert {m.immutable_provider_message_id for m in reprocessed} == {"cand-1", "cand-2", "cand-3"}
+    assert {m.ingestion_status for m in reprocessed} == {"INGESTED"}
+    # Exactly 3 MIME content fetches occurred — never 7.
+    assert sorted(h.graph_client.content_calls) == ["cand-1", "cand-2", "cand-3"]
+
+    refreshed = h.message_repo.list_messages(mailbox_id=h.mailbox.mailbox_id)
+    remaining_non_candidates = [m for m in refreshed if m.immutable_provider_message_id.startswith("noncand-")]
+    assert len(remaining_non_candidates) == 4
+    assert all(m.ingestion_status == INGESTION_STATUS_CHECKED_NOT_CANDIDATE for m in remaining_non_candidates)
+    assert all(m.evidence_id is None for m in remaining_non_candidates)
+
+    # Double-submit for the same domain: zero additional MIME fetches,
+    # empty result list — the 3 already-eligible candidates are now
+    # INGESTED (no longer CHECKED_NOT_CANDIDATE) and the 4 non-
+    # candidates were never eligible and still aren't.
+    second_call = reprocess_all_historical_candidates_for_domain(
+        mailbox=h.mailbox, mailbox_source_id=h.source_id, sender_domain="vendor.com",
+        rule=rule, adapter=h.adapter, message_repository=h.message_repo, api=h.api, object_store=h.object_store,
+        scanner=h.scanner, actor_type="SYSTEM", actor_id="test",
+    )
+    assert second_call == []
+    assert sorted(h.graph_client.content_calls) == ["cand-1", "cand-2", "cand-3"]
+
+
+def test_ignored_domain_message_is_never_swept_in_even_after_the_domain_is_later_allowed():
+    """An IGNORED-domain message's `ingestion_status` is the IDENTICAL
+    `CHECKED_NOT_CANDIDATE` value a real candidate carries — proving the
+    new `discovery_candidate` gate, not the status, is what keeps it out
+    of `list_candidate_messages_for_domain`. Also proves a realistic
+    scenario: a domain starts IGNORED, is later reconsidered and
+    approved — the OLD IGNORED-era message must not be swept into
+    back-processing merely because the domain's CURRENT policy changed
+    and the ingestion_status happens to match."""
+    h = Harness(allow_default_domain=False)
+    h.domain_rule_repo.upsert_rule(
+        mailbox_id=h.mailbox.mailbox_id, sender_domain="vendor.com", match_mode="EXACT", policy="IGNORED",
+        destination_entity_id=None, destination_mode=None, source="OPERATOR",
+    )
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(_msg("ignored-1"),), delta_link="d1"))
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link="d-junk"))
+    h.sweep()
+
+    message = h.message_repo.find_by_provider_id(h.mailbox.mailbox_id, "ignored-1")
+    assert message.ingestion_status == INGESTION_STATUS_CHECKED_NOT_CANDIDATE
+    assert message.discovery_candidate is None  # the heuristic never ran for an IGNORED-domain message
+    assert message.discovery_checked_at is not None  # but "checked" IS honestly recorded
+
+    assert h.message_repo.list_candidate_messages_for_domain(
+        mailbox_id=h.mailbox.mailbox_id, sender_domain="vendor.com"
+    ) == []
+
+    # Realistic scenario: the domain, originally IGNORED, is later
+    # reconsidered and approved by an operator.
+    h.domain_rule_repo.upsert_rule(
+        mailbox_id=h.mailbox.mailbox_id, sender_domain="vendor.com", match_mode="EXACT", policy="ALLOWED",
+        destination_entity_id=None, destination_mode="REVIEW_REQUIRED", source="OPERATOR",
+    )
+    # The old IGNORED-era message must still NOT be swept in — only
+    # messages the heuristic actually flagged discovery_candidate=True
+    # are ever eligible, regardless of the domain's CURRENT policy.
+    assert h.message_repo.list_candidate_messages_for_domain(
+        mailbox_id=h.mailbox.mailbox_id, sender_domain="vendor.com"
+    ) == []
+
+
+def test_reobserved_candidate_still_checked_not_candidate_preserves_its_discovery_fields():
+    """Second latent defect fix (WO instruction): the existing-final
+    re-observation short-circuit (a message already
+    CHECKED_NOT_CANDIDATE, re-seen on a later sweep round before any
+    operator decision) omits the new discovery params entirely — this
+    must never silently reset an already-set `discovery_candidate=True`
+    back to `None`."""
+    h = Harness(allow_default_domain=False)
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(_msg("m1"),), delta_link="d1"))
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link="d-junk"))
+    h.sweep()
+
+    message = h.message_repo.find_by_provider_id(h.mailbox.mailbox_id, "m1")
+    assert message.discovery_candidate is True
+    assert message.discovery_reason is not None
+    first_checked_at = message.discovery_checked_at
+    assert first_checked_at is not None
+
+    # Same message re-observed on a LATER sweep round, still unresolved
+    # (no operator decision yet) — hits the already-final short-circuit,
+    # never a Stage-B re-decision.
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(_msg("m1"),), delta_link="d2"))
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link="d-junk-2"))
+    second = h.sweep()
+    assert second.duplicates == 1
+
+    reobserved = h.message_repo.find_by_provider_id(h.mailbox.mailbox_id, "m1")
+    assert reobserved.ingestion_status == INGESTION_STATUS_CHECKED_NOT_CANDIDATE
+    assert reobserved.discovery_candidate is True  # NOT silently reset to None
+    assert reobserved.discovery_reason == message.discovery_reason
+    assert reobserved.discovery_checked_at == first_checked_at  # this path never recomputes it
+
+
+# ---------------------------------------------------------------------
 # compute_bootstrap_floor (architect spec §1/§10 — governed AND
 # mailbox-scoped, second correction: NEVER a global magic date)
 # ---------------------------------------------------------------------

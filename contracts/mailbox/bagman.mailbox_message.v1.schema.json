@@ -129,6 +129,27 @@
       "additionalProperties": true,
       "default": {}
     },
+    "discovery_candidate": {
+      "oneOf": [
+        { "type": "boolean" },
+        { "type": "null" }
+      ],
+      "description": "Second CD-6 architect amendment (persisted discovery decision). `true` only when `services.mailbox.discovery_signals.evaluate_discovery_candidate` actually ran for this message AND judged it a credible financial-document candidate. `false` when the heuristic ran and judged it NOT credible. `null` when the heuristic never ran at all — the honest state for an `IGNORED`-domain message (the domain gate short-circuits before Stage-A candidate evaluation ever executes) and for any `ALLOWED`-domain message (never sits in a discovery-only state at all), or for a row created before this amendment."
+    },
+    "discovery_reason": {
+      "oneOf": [
+        { "type": "string" },
+        { "type": "null" }
+      ],
+      "description": "Second CD-6 architect amendment (persisted discovery decision). The bounded, non-AI heuristic's own honest explanation of what it matched (e.g. \"subject contains keyword 'invoice'\") — set ONLY when `discovery_candidate` is `true`. `null` for the `discovery_candidate == false` case (no reason is required there) and for the `discovery_candidate == null` case (heuristic never ran)."
+    },
+    "discovery_checked_at": {
+      "oneOf": [
+        { "$ref": "https://bagman.internal/contracts/common/bagman.utc_timestamp.v1.schema.json" },
+        { "type": "null" }
+      ],
+      "description": "Second CD-6 architect amendment (persisted discovery decision). UTC timestamp Stage-A/B discovery processing actually happened for this message — set whenever discovery-only handling ran (both the `IGNORED`-domain branch AND the UNKNOWN-domain branch), regardless of `discovery_candidate`. `null` for any message that never went through discovery-only handling at all (an `ALLOWED`-domain message, or a row created before this amendment)."
+    },
     "schema_version": {
       "allOf": [
         { "$ref": "https://bagman.internal/contracts/common/bagman.schema_version.v1.schema.json" }
@@ -158,6 +179,9 @@
     "first_seen_at",
     "last_seen_at",
     "metadata",
+    "discovery_candidate",
+    "discovery_reason",
+    "discovery_checked_at",
     "schema_version"
   ],
   "additionalProperties": false

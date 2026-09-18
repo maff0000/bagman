@@ -58,3 +58,16 @@ class MailboxMessageRow(Base):
     first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     metadata_: Mapped[dict] = mapped_column("metadata", JSONB, nullable=False, default=dict)
+    # Second CD-6 architect amendment (persisted discovery decision) —
+    # additive, nullable columns; NO server_default that could be
+    # misread as a real decision. `NULL` is the only safe default: the
+    # real 128 already-ingested Infosecurs messages never went through
+    # discovery-only handling at all, so they must read back `NULL`
+    # (honestly "unknown/not applicable"), never a false `false` that
+    # would claim "the heuristic ran and said no" for a message that
+    # never ran it. See `services/mailbox/message.py`'s own
+    # `MailboxMessage.discovery_candidate`/`discovery_reason`/
+    # `discovery_checked_at` field docstrings for the full semantics.
+    discovery_candidate: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+    discovery_reason: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    discovery_checked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)

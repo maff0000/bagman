@@ -876,7 +876,22 @@ def run_sweep(
                         attachment_metadata = _attachment_metadata_dicts(msg.attachment_metadata)
                         auth_signals = dict(msg.auth_signals)
 
-                        def _record_discovery_only(status: str) -> MailboxMessage:
+                        def _record_discovery_only(
+                            status: str,
+                            *,
+                            discovery_candidate: Optional[bool] = None,
+                            discovery_reason: Optional[str] = None,
+                            discovery_checked_at: Optional[datetime] = None,
+                        ) -> MailboxMessage:
+                            """Second CD-6 architect amendment (persisted
+                            discovery decision) — the three new optional
+                            params default to the "not applicable" `None`
+                            state so the VANISHED call site (unrelated to
+                            domain-gate discovery) doesn't need to pass
+                            anything. The IGNORED-domain branch passes
+                            only `discovery_checked_at` (the heuristic
+                            never ran there); the UNKNOWN-domain branch
+                            passes all three."""
                             message, _ = message_repository.record_observation(
                                 mailbox_id=mailbox.mailbox_id,
                                 provider_kind=mailbox.provider_kind,
@@ -893,6 +908,9 @@ def run_sweep(
                                 sender_domain=sender_domain,
                                 attachment_metadata=attachment_metadata,
                                 auth_signals=auth_signals,
+                                discovery_candidate=discovery_candidate,
+                                discovery_reason=discovery_reason,
+                                discovery_checked_at=discovery_checked_at,
                             )
                             return message
 
@@ -909,7 +927,17 @@ def run_sweep(
                             )
                             messages_new += 1
                             folder_entry["new_discovery_records"] += 1
-                            _record_discovery_only(INGESTION_STATUS_CHECKED_NOT_CANDIDATE)
+                            # `discovery_candidate`/`discovery_reason`
+                            # stay `None` — the domain gate short-
+                            # circuits BEFORE `evaluate_discovery_candidate`
+                            # is ever called for an IGNORED-domain
+                            # message (see module docstring). Only
+                            # `discovery_checked_at` is honestly set —
+                            # this message WAS checked, just not by the
+                            # Stage-A heuristic.
+                            _record_discovery_only(
+                                INGESTION_STATUS_CHECKED_NOT_CANDIDATE, discovery_checked_at=resolved_now
+                            )
                             continue
 
                         if rule is None or rule.policy != POLICY_ALLOWED:
@@ -924,7 +952,12 @@ def run_sweep(
                                 likely_financial_candidates += 1
                             messages_new += 1
                             folder_entry["new_discovery_records"] += 1
-                            message = _record_discovery_only(INGESTION_STATUS_CHECKED_NOT_CANDIDATE)
+                            message = _record_discovery_only(
+                                INGESTION_STATUS_CHECKED_NOT_CANDIDATE,
+                                discovery_candidate=signal.is_candidate,
+                                discovery_reason=signal.reason if signal.is_candidate else None,
+                                discovery_checked_at=resolved_now,
+                            )
                             if signal.is_candidate and sender_domain:
                                 _create_or_reuse_domain_review_item(
                                     needs_you_repository,

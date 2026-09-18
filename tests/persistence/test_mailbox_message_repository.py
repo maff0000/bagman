@@ -92,6 +92,53 @@ def test_ingested_status_is_never_downgraded_by_a_later_lesser_replay():
     assert updated.evidence_id == evidence_id
 
 
+def test_discovery_fields_are_preserved_on_a_benign_reobservation_that_omits_them():
+    """Second latent defect fix (WO instruction) — at the Postgres layer
+    too: a re-observation that omits discovery_candidate/
+    discovery_reason/discovery_checked_at must not blank an already-set
+    value on the existing row."""
+    repo = PostgresMailboxMessageRepository()
+    mailbox_id = _mailbox_id()
+    checked_at = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    first, _ = repo.record_observation(
+        mailbox_id=mailbox_id,
+        provider_kind="MICROSOFT_GRAPH",
+        immutable_provider_message_id="m1",
+        internet_message_id="<m1@b>",
+        observed_folder=FOLDER_INBOX,
+        subject="Invoice",
+        sender_address="billing@vendor.com",
+        sender_display_name="Vendor",
+        received_at=datetime.now(timezone.utc),
+        has_attachments=False,
+        ingestion_status="CHECKED_NOT_CANDIDATE",
+        sender_domain="vendor.com",
+        discovery_candidate=True,
+        discovery_reason="subject contains keyword 'invoice'",
+        discovery_checked_at=checked_at,
+    )
+    assert first.discovery_candidate is True
+
+    second, created = repo.record_observation(
+        mailbox_id=mailbox_id,
+        provider_kind="MICROSOFT_GRAPH",
+        immutable_provider_message_id="m1",
+        internet_message_id="<m1@b>",
+        observed_folder=FOLDER_INBOX,
+        subject="Invoice",
+        sender_address="billing@vendor.com",
+        sender_display_name="Vendor",
+        received_at=datetime.now(timezone.utc),
+        has_attachments=False,
+        ingestion_status="CHECKED_NOT_CANDIDATE",
+        sender_domain="vendor.com",
+    )
+    assert created is False
+    assert second.discovery_candidate is True
+    assert second.discovery_reason == "subject contains keyword 'invoice'"
+    assert second.discovery_checked_at == checked_at
+
+
 def test_list_messages_most_recent_first_scoped_to_mailbox():
     repo = PostgresMailboxMessageRepository()
     mailbox_id = _mailbox_id()
@@ -115,7 +162,9 @@ def test_get_message_not_found_raises():
 # ---------------------------------------------------------------------
 
 
-def _observe_candidate(repo, *, mailbox_id, msg_id, sender_domain, status="CHECKED_NOT_CANDIDATE"):
+def _observe_candidate(
+    repo, *, mailbox_id, msg_id, sender_domain, status="CHECKED_NOT_CANDIDATE", discovery_candidate=True
+):
     return repo.record_observation(
         mailbox_id=mailbox_id,
         provider_kind="MICROSOFT_GRAPH",
@@ -129,6 +178,8 @@ def _observe_candidate(repo, *, mailbox_id, msg_id, sender_domain, status="CHECK
         has_attachments=False,
         ingestion_status=status,
         sender_domain=sender_domain,
+        discovery_candidate=discovery_candidate,
+        discovery_reason="subject contains keyword 'invoice'" if discovery_candidate else None,
     )
 
 
@@ -149,3 +200,20 @@ def test_list_candidate_messages_for_domain_filters_mailbox_domain_and_status(fr
     results = fresh_repo.list_candidate_messages_for_domain(mailbox_id=mailbox_id, sender_domain="Vendor.com")
     assert {m.immutable_provider_message_id for m in results} == {"eligible", "eligible-2"}
     assert all(m.mailbox_id == mailbox_id for m in results)
+
+
+def test_list_candidate_messages_for_domain_requires_discovery_candidate_true_at_the_sql_level(fresh_engine):
+    """Second CD-6 architect amendment (persisted discovery decision) —
+    an IGNORED-domain message and an ordinary non-credible UNKNOWN-domain
+    message can share the identical CHECKED_NOT_CANDIDATE status a real
+    candidate has; only `discovery_candidate is True` (filtered in SQL,
+    not Python) may make a message eligible for back-processing."""
+    repo = PostgresMailboxMessageRepository()
+    mailbox_id = _mailbox_id()
+    _observe_candidate(repo, mailbox_id=mailbox_id, msg_id="real-candidate", sender_domain="vendor.com", discovery_candidate=True)
+    _observe_candidate(repo, mailbox_id=mailbox_id, msg_id="ignored-domain", sender_domain="vendor.com", discovery_candidate=None)
+    _observe_candidate(repo, mailbox_id=mailbox_id, msg_id="non-credible", sender_domain="vendor.com", discovery_candidate=False)
+
+    fresh_repo = PostgresMailboxMessageRepository(engine=fresh_engine)
+    results = fresh_repo.list_candidate_messages_for_domain(mailbox_id=mailbox_id, sender_domain="vendor.com")
+    assert {m.immutable_provider_message_id for m in results} == {"real-candidate"}

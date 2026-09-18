@@ -50,6 +50,9 @@ def _row_to_domain(row: MailboxMessageRow) -> MailboxMessage:
         first_seen_at=row.first_seen_at,
         last_seen_at=row.last_seen_at,
         metadata=dict(row.metadata_),
+        discovery_candidate=row.discovery_candidate,
+        discovery_reason=row.discovery_reason,
+        discovery_checked_at=row.discovery_checked_at,
     )
 
 
@@ -77,6 +80,9 @@ class PostgresMailboxMessageRepository(MailboxMessageRepository):
         attachment_metadata=None,
         auth_signals: Optional[Mapping[str, Optional[str]]] = None,
         metadata: Optional[Mapping[str, Any]] = None,
+        discovery_candidate: Optional[bool] = None,
+        discovery_reason: Optional[str] = None,
+        discovery_checked_at=None,
     ) -> tuple[MailboxMessage, bool]:
         now = utc_now()
         try:
@@ -109,6 +115,9 @@ class PostgresMailboxMessageRepository(MailboxMessageRepository):
                         first_seen_at=now,
                         last_seen_at=now,
                         metadata=dict(metadata) if metadata is not None else {},
+                        discovery_candidate=discovery_candidate,
+                        discovery_reason=discovery_reason,
+                        discovery_checked_at=discovery_checked_at,
                     )
                     validate_against_contract(candidate.to_dict(), _SCHEMA)
                     new_row = MailboxMessageRow(
@@ -132,6 +141,9 @@ class PostgresMailboxMessageRepository(MailboxMessageRepository):
                         first_seen_at=candidate.first_seen_at,
                         last_seen_at=candidate.last_seen_at,
                         metadata_={},
+                        discovery_candidate=candidate.discovery_candidate,
+                        discovery_reason=candidate.discovery_reason,
+                        discovery_checked_at=candidate.discovery_checked_at,
                     )
                     session.add(new_row)
                     return candidate, True
@@ -158,6 +170,18 @@ class PostgresMailboxMessageRepository(MailboxMessageRepository):
                 if auth_signals is not None:
                     row.auth_signals = dict(auth_signals)
                 row.metadata_ = new_metadata
+                # Never silently blank out an already-set discovery
+                # decision on a benign re-observation that omits these
+                # params — see `services.mailbox.message
+                # .MailboxMessageRepository.record_observation`'s own
+                # abstract docstring for the full "preserve unless
+                # explicitly overwritten" discipline this mirrors.
+                if discovery_candidate is not None:
+                    row.discovery_candidate = discovery_candidate
+                if discovery_reason is not None:
+                    row.discovery_reason = discovery_reason
+                if discovery_checked_at is not None:
+                    row.discovery_checked_at = discovery_checked_at
                 updated = _row_to_domain(row)
                 validate_against_contract(updated.to_dict(), _SCHEMA)
                 return updated, False
@@ -216,6 +240,17 @@ class PostgresMailboxMessageRepository(MailboxMessageRepository):
                     .filter(
                         MailboxMessageRow.mailbox_id == mailbox_id,
                         MailboxMessageRow.ingestion_status == INGESTION_STATUS_CHECKED_NOT_CANDIDATE,
+                        # Second CD-6 architect amendment (persisted
+                        # discovery decision) — the real "was actually
+                        # identified as a credible financial candidate"
+                        # gate. Unlike `sender_domain` normalisation
+                        # below (a legitimate Python-side re-check, since
+                        # stored casing is only a convention, never
+                        # enforced at the DB layer), this is a plain
+                        # boolean equality with no such ambiguity, so it
+                        # IS filtered in SQL — never merely "not None"/
+                        # "not False", the literal boolean `True`.
+                        MailboxMessageRow.discovery_candidate.is_(True),
                         # `sender_domain` is stored lowercased already (see
                         # `services/mailbox/sweep.py::_extract_sender_domain`),
                         # but this repository re-normalises defensively

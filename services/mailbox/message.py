@@ -147,6 +147,36 @@ class MailboxMessage:
     #: field description ("Authentication/spoofing" doctrine).
     auth_signals: Mapping[str, Optional[str]] = field(default_factory=dict)
     metadata: Mapping[str, Any] = field(default_factory=dict)
+    #: Second CD-6 architect amendment (persisted discovery decision —
+    #: corrects the original two-stage design's own gap: three
+    #: semantically different `CHECKED_NOT_CANDIDATE` cases previously
+    #: shared no persisted distinguishing field). `True` only when
+    #: `services.mailbox.discovery_signals.evaluate_discovery_candidate`
+    #: actually ran for this message AND judged it a credible financial-
+    #: document candidate. `False` when the heuristic ran and judged it
+    #: NOT credible. `None` when the heuristic never ran at all — the
+    #: honest state for an `IGNORED`-domain message (the domain gate
+    #: short-circuits before Stage-A candidate evaluation ever executes)
+    #: and for any `ALLOWED`-domain message (never sits in a discovery-
+    #: only state at all). See `services/mailbox/sweep.py`'s own
+    #: `_record_discovery_only` call sites for exactly which branch sets
+    #: which value.
+    discovery_candidate: Optional[bool] = None
+    #: The heuristic's own honest explanation of what it matched (e.g.
+    #: "subject contains keyword 'invoice'") — set ONLY when
+    #: `discovery_candidate is True`. `None` for the `is_candidate ==
+    #: False` case (no reason is required there) and for the
+    #: `IGNORED`-domain case (heuristic never ran).
+    discovery_reason: Optional[str] = None
+    #: UTC timestamp Stage-A/B discovery processing actually happened
+    #: for this message — set whenever `_record_discovery_only` is
+    #: called (both the `IGNORED`-domain branch AND the UNKNOWN-domain
+    #: branch), regardless of `discovery_candidate`. `None` for any
+    #: message that never went through discovery-only handling at all
+    #: (an `ALLOWED`-domain message, or a message from a sweep run that
+    #: predates this addendum entirely — e.g. the real 128 already-
+    #: ingested Infosecurs messages).
+    discovery_checked_at: Optional[datetime] = None
     schema_version: str = SCHEMA_VERSION
 
     def to_dict(self) -> dict:
@@ -171,6 +201,11 @@ class MailboxMessage:
             "first_seen_at": to_contract_string(self.first_seen_at),
             "last_seen_at": to_contract_string(self.last_seen_at),
             "metadata": dict(self.metadata),
+            "discovery_candidate": self.discovery_candidate,
+            "discovery_reason": self.discovery_reason,
+            "discovery_checked_at": (
+                to_contract_string(self.discovery_checked_at) if self.discovery_checked_at is not None else None
+            ),
             "schema_version": self.schema_version,
         }
 
@@ -199,6 +234,9 @@ class MailboxMessageRepository(abc.ABC):
         attachment_metadata: Optional[Sequence[Mapping[str, Any]]] = None,
         auth_signals: Optional[Mapping[str, Optional[str]]] = None,
         metadata: Optional[Mapping[str, Any]] = None,
+        discovery_candidate: Optional[bool] = None,
+        discovery_reason: Optional[str] = None,
+        discovery_checked_at: Optional[datetime] = None,
     ) -> tuple[MailboxMessage, bool]:
         """Resolve-or-create by (mailbox_id, immutable_provider_message_id):
 
@@ -210,6 +248,24 @@ class MailboxMessageRepository(abc.ABC):
           regresses an already-``INGESTED`` row back to a lesser
           status on a benign re-observation). Returns ``(message,
           False)``.
+
+        ``discovery_candidate``/``discovery_reason``/``discovery_checked_at``
+        (second CD-6 architect amendment — persisted discovery decision)
+        follow the SAME "never silently blank out an already-set value on
+        a benign re-observation" discipline `sender_domain` and
+        `observed_folder_display_name` already established above: a
+        caller that OMITS one of these (leaves it at its default
+        ``None``) on a re-observation of an EXISTING row never clears an
+        already-set value — the existing stored value is preserved
+        unchanged. A caller that explicitly PASSES a non-``None`` value
+        (including ``False`` for `discovery_candidate`, a real,
+        meaningful value distinct from "not provided") always overwrites.
+        This matters concretely: the re-observation short-circuit in
+        ``services/mailbox/sweep.py`` (an already-final message, e.g.
+        still ``CHECKED_NOT_CANDIDATE``, re-seen on a later sweep round)
+        omits these three params entirely, so a message's own earlier
+        ``discovery_candidate=True`` verdict survives that benign replay
+        rather than being silently reset to ``None``.
 
         This single call is what makes the sweep engine's idempotency
         guarantee concrete at the persistence layer — see
@@ -241,23 +297,38 @@ class MailboxMessageRepository(abc.ABC):
         operator just approved, not only the one message that happened to
         trigger the ``MAILBOX_DOMAIN_REVIEW`` Needs You item.
 
-        Returns every ``MailboxMessage`` for ``mailbox_id`` whose
-        ``sender_domain`` (normalised via
+        Second CD-6 architect amendment (persisted discovery decision) —
+        corrects this method's own original, too-broad filter. Returns
+        every ``MailboxMessage`` that: belong to the specified mailbox;
+        match the normalized sender domain (via
         :func:`services.mailbox.domain_rule.normalize_domain`, the SAME
-        normalisation a governing ``MailboxDomainRule`` uses) matches
-        ``sender_domain`` (also normalised) AND whose
-        ``ingestion_status == INGESTION_STATUS_CHECKED_NOT_CANDIDATE`` —
-        this is deliberately the ONLY eligible status: every other
-        member of :data:`FINAL_INGESTION_STATUSES`
+        normalisation a governing ``MailboxDomainRule`` uses); were
+        explicitly identified as financial discovery candidates
+        (``discovery_candidate is True`` — the literal boolean ``True``,
+        never merely "not ``None``"/"not ``False``"); remain eligible
+        for deep processing (``ingestion_status ==
+        INGESTION_STATUS_CHECKED_NOT_CANDIDATE`` — the existing "still
+        eligible for reprocessing, not yet decided" gate, unchanged);
+        have not already reached another terminal/deep-ingested state
+        (every other member of :data:`FINAL_INGESTION_STATUSES`
         (``INGESTED``/``QUARANTINED``/``FAILED``/``VANISHED``) is
         already a genuinely final, already-decided outcome that must
-        never be re-fetched/re-ingested a second time (see
+        never be re-fetched/re-ingested a second time — see
         ``services/mailbox/sweep.py``'s own
         ``_reprocess_one_message``/former
         ``reprocess_message_after_domain_rule_approval`` idempotency
-        check, which this filter mirrors exactly —
-        ``CHECKED_NOT_CANDIDATE`` is deliberately excluded from "already
-        final" there for exactly this reprocessing purpose).
+        check, which this filter mirrors exactly).
+
+        The ``discovery_candidate is True`` gate is what makes this
+        method safe for the real operator-approval flow: an
+        ``IGNORED``-domain message and an ordinary (non-keyword-
+        matching) UNKNOWN-domain message both land on
+        ``CHECKED_NOT_CANDIDATE`` too, but neither ever has
+        ``discovery_candidate is True`` (the former never even ran the
+        heuristic; the latter ran it and got ``False``) — so neither is
+        ever back-processed merely because an operator later approves
+        that sender domain (see ``services/mailbox/sweep.py``'s own
+        module docstring for the full defect this correction closes).
 
         Ordered oldest-received-first (``received_at`` ascending, then
         ``mailbox_message_id`` for a stable tie-break) — a reasonable,
@@ -313,6 +384,9 @@ class InMemoryMailboxMessageRepository(MailboxMessageRepository):
         attachment_metadata: Optional[Sequence[Mapping[str, Any]]] = None,
         auth_signals: Optional[Mapping[str, Optional[str]]] = None,
         metadata: Optional[Mapping[str, Any]] = None,
+        discovery_candidate: Optional[bool] = None,
+        discovery_reason: Optional[str] = None,
+        discovery_checked_at: Optional[datetime] = None,
     ) -> tuple[MailboxMessage, bool]:
         key = (mailbox_id, immutable_provider_message_id)
         existing_id = self._id_by_tuple.get(key)
@@ -341,6 +415,9 @@ class InMemoryMailboxMessageRepository(MailboxMessageRepository):
                     first_seen_at=now,
                     last_seen_at=now,
                     metadata=dict(metadata) if metadata is not None else {},
+                    discovery_candidate=discovery_candidate,
+                    discovery_reason=discovery_reason,
+                    discovery_checked_at=discovery_checked_at,
                 )
                 validate_against_contract(candidate.to_dict(), _SCHEMA)
             except ValidationError:
@@ -379,6 +456,19 @@ class InMemoryMailboxMessageRepository(MailboxMessageRepository):
                 ),
                 auth_signals=dict(auth_signals) if auth_signals is not None else current.auth_signals,
                 metadata=new_metadata,
+                # Never silently blank out an already-set discovery
+                # decision on a benign re-observation that omits these
+                # params (e.g. the already-final re-observation short-
+                # circuit in services/mailbox/sweep.py) — see this
+                # method's own abstract docstring above for the full
+                # "preserve unless explicitly overwritten" discipline.
+                discovery_candidate=(
+                    discovery_candidate if discovery_candidate is not None else current.discovery_candidate
+                ),
+                discovery_reason=discovery_reason if discovery_reason is not None else current.discovery_reason,
+                discovery_checked_at=(
+                    discovery_checked_at if discovery_checked_at is not None else current.discovery_checked_at
+                ),
             )
             validate_against_contract(updated.to_dict(), _SCHEMA)
         except ValidationError:
@@ -416,6 +506,7 @@ class InMemoryMailboxMessageRepository(MailboxMessageRepository):
             and m.sender_domain is not None
             and normalize_domain(m.sender_domain) == normalized_domain
             and m.ingestion_status == INGESTION_STATUS_CHECKED_NOT_CANDIDATE
+            and m.discovery_candidate is True
         ]
         items.sort(key=lambda m: (m.received_at, m.mailbox_message_id))
         return items
