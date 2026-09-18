@@ -35,8 +35,16 @@
     },
     "folders_attempted": {
       "type": "array",
-      "items": { "type": "string", "enum": ["INBOX", "JUNK"] },
-      "description": "Which of the two in-scope folders this run attempted."
+      "items": {
+        "type": "object",
+        "properties": {
+          "folder_id": { "type": "string", "minLength": 1, "description": "The provider's own real, immutable folder identifier — the canonical value; never a display name." },
+          "display_name": { "type": "string", "description": "Human-readable label for GUI/operator rendering only." }
+        },
+        "required": ["folder_id", "display_name"],
+        "additionalProperties": false
+      },
+      "description": "CD-6 architect amendment (recursive folder discovery). Which folders this run actually attempted — now the REAL, per-mailbox discovered/monitored folder set (Inbox, Junk Email, Deleted Items, every custom/nested/hidden folder discovered; never Sent Items/Drafts/Outbox), not a hardcoded two-value list. Each entry carries both the canonical folder id and a human-readable display name so a GUI never has to render a raw opaque Graph folder id as if it were a friendly name."
     },
     "messages_seen": {
       "type": "integer",

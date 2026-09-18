@@ -129,6 +129,94 @@ concurrent sweep attempt for the SAME mailbox raises
 before any `MailboxSweepRun` row is even created — there is nothing
 for THIS declined attempt to durably record; the mailbox is simply
 busy (the caller — the HTTP router — maps this to an honest 409).
+
+Folder discovery — a whole-sweep precondition (CD-6 architect amendment,
+supersedes Slice 4/CD-6's own original hardcoded ``[Inbox, Junk]`` sweep)
+------------------------------------------------------------------------
+Before iterating any folder, :func:`run_sweep` calls
+``adapter.discover_monitored_folders(mailbox_id=...)`` EXACTLY ONCE —
+this module stays genuinely provider-neutral: it never resolves a
+well-known folder name, never applies the monitored/excluded-folder
+doctrine itself, and never assumes Inbox/Junk are the only two folders
+— see ``services/mailbox/microsoft/adapter.py``'s own module docstring
+for the real Microsoft-Graph-specific recursive enumeration + well-
+known-id classification + monitored-set computation this delegates to.
+The returned monitored folder list now includes Inbox, Junk Email,
+Deleted Items, and every custom/nested/hidden folder the mailbox's own
+folder tree contains (Sent Items/Drafts/Outbox are excluded from
+monitoring entirely) — **Deleted Items is explicitly in scope**: a
+message discovered there runs through the EXACT SAME Stage-A/Stage-B
+gate, MIME-fetch, evidence-ingest pipeline as any other monitored
+folder; its deleted location is recorded as provenance
+(`observed_folder`/`observed_folder_display_name`), never an instruction
+to skip or discard it.
+
+A non-``OK`` folder-discovery outcome is a WHOLE-SWEEP precondition
+failure, not an ordinary per-folder transient failure — without a real
+folder list, nothing in this sweep can be safely attempted at all, so
+:func:`run_sweep` raises :class:`_SweepStopped` for every non-``OK``
+discovery outcome except ``RATE_LIMITED`` (given the SAME bounded
+single-retry-then-fail treatment as an ordinary delta page — see
+``_MAX_RATE_LIMIT_BACKOFF_SECONDS`` below). ``AUTH_ERROR``/
+``CONFIG_ERROR``/``PERMISSION_ERROR`` map to their own existing
+``SweepFailureReason`` codes (identical to the per-folder handling
+below); any other non-``OK`` status uses the new, dedicated
+``SweepFailureReason.FOLDER_DISCOVERY_FAILED`` — flagged here
+prominently as a documented judgment call, not a silent choice.
+
+Folder-ID-keyed cursors — the Part D migration judgment call (read
+before changing anything about cursor keys)
+------------------------------------------------------------------------
+``services.mailbox.cursor.MailboxFolderCursor`` was ALREADY keyed by a
+generic ``folder: str`` — never a Postgres enum, never constrained to
+``"INBOX"``/``"JUNK"`` at the schema layer (see that module's own
+docstring). This amendment changes ONLY what VALUE the sweep engine now
+passes as ``folder``: the real, resolved Microsoft Graph folder id
+(``MonitoredFolder.folder_id``) instead of the old closed-set literal
+strings ``"INBOX"``/``"JUNK"``.
+
+**The judgment call**: the real, live Infosecurs mailbox already has
+durable cursor rows keyed by the OLD literal strings ``"INBOX"``/
+``"JUNK"`` from Slice 4A's acceptance run (128 real messages already
+ingested). This delivery does **not** attempt to remap those old rows
+to their real Graph folder ids — doing so would require a LIVE Graph
+call to resolve ``"INBOX"``/``"JUNK"`` to this specific mailbox's real
+folder ids, which is not something a data migration can do offline, and
+is unnecessary. Instead: the very first sweep after this change simply
+finds NO cursor row for Inbox/Junk Email's own real folder ids (a
+brand-new key), so ``get_or_bootstrap`` creates a FRESH cursor and Inbox/
+Junk Email re-run a full BOOTSTRAP-floor-bounded delta round, exactly
+like a folder BAGMAN is discovering for the very first time. This is
+safe — never a source of duplicate evidence — because
+``services.mailbox.message.MailboxMessageRepository.record_observation``'s
+own (mailbox_id, immutable_provider_message_id) idempotency (see module
+docstring's "Idempotency" section above) means every one of the 128
+already-known messages simply resolves to its EXISTING
+``MailboxMessage``/``EvidenceItem`` row again — counted as a
+``duplicates`` re-observation, never a second evidence object. The OLD
+``"INBOX"``/``"JUNK"``-keyed cursor rows are deliberately left in place
+in ``mailbox_folder_cursors`` (never deleted) as a historical audit
+trail of exactly where the old, pre-amendment cursor scheme left off —
+see the accompanying Alembic migration's own comment for the identical
+reasoning at the schema-change layer. This was the simpler and safer of
+two reasonable designs (the alternative — an offline remap script
+cross-referencing old labels against real Graph folder ids — is not
+even correctly possible without a live Graph call).
+
+``MailboxSweepRun.folders_attempted`` — now a structured list, never a
+raw folder id alone
+------------------------------------------------------------------------
+``folders_attempted`` now reflects the REAL discovered/monitored folder
+set for this mailbox, not a hardcoded ``["INBOX", "JUNK"]``. Each entry
+is a small ``{"folder_id": ..., "display_name": ...}`` mapping — never
+a bare folder id string (a raw Graph folder id is an opaque, non-human-
+readable value that must never be presented to an operator as if it
+were a friendly folder name) and never a bare display name alone
+(display names are not a safe identity key — see the "well-known
+folder identity" doctrine in
+``services/mailbox/microsoft/graph_client.py``'s own module docstring).
+A GUI surface rendering this list uses ``display_name``; anything
+treating folder identity/equality uses ``folder_id``.
 """
 from __future__ import annotations
 
@@ -156,8 +244,6 @@ from services.mailbox.mailbox import (
 )
 from services.mailbox.message import (
     FINAL_INGESTION_STATUSES,
-    FOLDER_INBOX,
-    FOLDER_JUNK,
     INGESTION_STATUS_CHECKED_NOT_CANDIDATE,
     INGESTION_STATUS_FAILED,
     INGESTION_STATUS_INGESTED,
@@ -166,6 +252,7 @@ from services.mailbox.message import (
     MailboxMessage,
     MailboxMessageRepository,
 )
+from services.mailbox.microsoft.adapter import FolderDiscoveryResult
 from services.mailbox.microsoft.evidence_ingest import (
     INGEST_STATUS_FAILED,
     INGEST_STATUS_INGESTED,
@@ -179,10 +266,6 @@ from services.needs_you.needs_you import (
     ITEM_TYPE_MAILBOX_DOMAIN_REVIEW,
     NeedsYouRepository,
 )
-
-#: The two, and only two, folders this slice ever sweeps (architect
-#: spec — never Sent Items/Deleted Items/Archive/custom folders).
-SWEPT_FOLDERS = (FOLDER_INBOX, FOLDER_JUNK)
 
 
 def compute_bootstrap_floor(entity_repository: EntityRepository) -> datetime:
@@ -329,6 +412,8 @@ class _AdapterProtocol(Protocol):
 
     def report_connection_error(self, mailbox_id: str, *, error_code: str, error_detail: str) -> None: ...
 
+    def discover_monitored_folders(self, *, mailbox_id: str) -> FolderDiscoveryResult: ...
+
 
 class _EvidenceAPIProtocol(Protocol):
     def register_evidence(self, **kwargs): ...
@@ -408,7 +493,7 @@ def run_sweep(
     with sweep_lock.held(mailbox.mailbox_id):
         run = sweep_run_repository.create_run(mailbox_id=mailbox.mailbox_id, trigger=trigger)
 
-        folders_attempted: list[str] = []
+        folders_attempted: list[dict] = []
         messages_seen = 0
         messages_new = 0
         evidence_created = 0
@@ -430,8 +515,50 @@ def run_sweep(
         any_folder_needs_resync = False
 
         try:
-            for folder in SWEPT_FOLDERS:
-                folders_attempted.append(folder)
+            # -- Folder discovery (CD-6 architect amendment) — a
+            # whole-sweep precondition, called exactly once, BEFORE any
+            # folder is iterated. See module docstring's own "Folder
+            # discovery" section for the full reasoning below.
+            discovery = adapter.discover_monitored_folders(mailbox_id=mailbox.mailbox_id)
+            if discovery.status == GraphOutcomeStatus.RATE_LIMITED:
+                backoff = min(discovery.retry_after_seconds or 5.0, _MAX_RATE_LIMIT_BACKOFF_SECONDS)
+                sleep_fn(backoff)
+                discovery = adapter.discover_monitored_folders(mailbox_id=mailbox.mailbox_id)
+
+            if discovery.status == GraphOutcomeStatus.AUTH_ERROR:
+                raise _SweepStopped(
+                    error_code=SweepFailureReason.TOKEN_REFRESH_FAILED,
+                    error_detail=discovery.error_detail or "Microsoft OAuth token invalid/expired; reconnect required",
+                )
+            if discovery.status == GraphOutcomeStatus.CONFIG_ERROR:
+                raise _SweepStopped(
+                    error_code=SweepFailureReason.CONFIG_ERROR,
+                    error_detail=discovery.error_detail or "Microsoft mail is not configured",
+                )
+            if discovery.status == GraphOutcomeStatus.PERMISSION_ERROR:
+                adapter.report_connection_error(
+                    mailbox.mailbox_id,
+                    error_code=SweepFailureReason.PERMISSION_ERROR,
+                    error_detail=discovery.error_detail or "permission error during folder discovery",
+                )
+                raise _SweepStopped(
+                    error_code=SweepFailureReason.PERMISSION_ERROR,
+                    error_detail=discovery.error_detail or "permission error during folder discovery",
+                )
+            if discovery.status != GraphOutcomeStatus.OK:
+                # Folder discovery itself could not be completed this
+                # round — without a real folder list, nothing can be
+                # safely attempted (see module docstring; never blended
+                # into a per-folder transient-failure code).
+                raise _SweepStopped(
+                    error_code=SweepFailureReason.FOLDER_DISCOVERY_FAILED,
+                    error_detail=discovery.error_detail or f"folder discovery failed ({discovery.status.value})",
+                )
+
+            for monitored_folder in discovery.folders:
+                folder = monitored_folder.folder_id
+                folder_display_name = monitored_folder.display_name
+                folders_attempted.append({"folder_id": folder, "display_name": folder_display_name})
                 cursor = cursor_repository.get_or_bootstrap(
                     mailbox_id=mailbox.mailbox_id,
                     provider_kind=mailbox.provider_kind,
@@ -518,6 +645,7 @@ def run_sweep(
                                 immutable_provider_message_id=msg.immutable_id,
                                 internet_message_id=msg.internet_message_id,
                                 observed_folder=folder,
+                                observed_folder_display_name=folder_display_name,
                                 subject=msg.subject,
                                 sender_address=msg.sender_address,
                                 sender_display_name=msg.sender_display_name,
@@ -543,6 +671,7 @@ def run_sweep(
                                 immutable_provider_message_id=msg.immutable_id,
                                 internet_message_id=msg.internet_message_id,
                                 observed_folder=folder,
+                                observed_folder_display_name=folder_display_name,
                                 subject=msg.subject,
                                 sender_address=msg.sender_address,
                                 sender_display_name=msg.sender_display_name,
@@ -651,6 +780,7 @@ def run_sweep(
                                 immutable_provider_message_id=msg.immutable_id,
                                 internet_message_id=msg.internet_message_id,
                                 observed_folder=folder,
+                                observed_folder_display_name=folder_display_name,
                                 subject=msg.subject,
                                 sender_address=msg.sender_address,
                                 sender_display_name=msg.sender_display_name,
@@ -700,6 +830,7 @@ def run_sweep(
                                 immutable_provider_message_id=msg.immutable_id,
                                 internet_message_id=msg.internet_message_id,
                                 observed_folder=folder,
+                                observed_folder_display_name=folder_display_name,
                                 subject=msg.subject,
                                 sender_address=msg.sender_address,
                                 sender_display_name=msg.sender_display_name,
@@ -728,6 +859,7 @@ def run_sweep(
                                 immutable_provider_message_id=msg.immutable_id,
                                 internet_message_id=msg.internet_message_id,
                                 observed_folder=folder,
+                                observed_folder_display_name=folder_display_name,
                                 subject=msg.subject,
                                 sender_address=msg.sender_address,
                                 sender_display_name=msg.sender_display_name,
@@ -894,6 +1026,7 @@ def reprocess_message_after_domain_rule_approval(
             immutable_provider_message_id=current.immutable_provider_message_id,
             internet_message_id=current.internet_message_id,
             observed_folder=current.observed_folder,
+            observed_folder_display_name=current.observed_folder_display_name,
             subject=current.subject,
             sender_address=current.sender_address,
             sender_display_name=current.sender_display_name,
@@ -936,6 +1069,7 @@ def reprocess_message_after_domain_rule_approval(
             immutable_provider_message_id=current.immutable_provider_message_id,
             internet_message_id=current.internet_message_id,
             observed_folder=current.observed_folder,
+            observed_folder_display_name=current.observed_folder_display_name,
             subject=current.subject,
             sender_address=current.sender_address,
             sender_display_name=current.sender_display_name,
@@ -981,6 +1115,7 @@ def reprocess_message_after_domain_rule_approval(
             immutable_provider_message_id=current.immutable_provider_message_id,
             internet_message_id=current.internet_message_id,
             observed_folder=current.observed_folder,
+            observed_folder_display_name=current.observed_folder_display_name,
             subject=current.subject,
             sender_address=current.sender_address,
             sender_display_name=current.sender_display_name,
@@ -1011,6 +1146,7 @@ def reprocess_message_after_domain_rule_approval(
         immutable_provider_message_id=current.immutable_provider_message_id,
         internet_message_id=current.internet_message_id,
         observed_folder=current.observed_folder,
+        observed_folder_display_name=current.observed_folder_display_name,
         subject=current.subject,
         sender_address=current.sender_address,
         sender_display_name=current.sender_display_name,

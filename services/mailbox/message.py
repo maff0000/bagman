@@ -44,9 +44,18 @@ from core.timestamps import to_contract_string, utc_now
 _SCHEMA = "mailbox/bagman.mailbox_message.v1.schema.json"
 SCHEMA_VERSION = "bagman.mailbox_message.v1"
 
+#: CD-6 architect amendment (recursive Microsoft Graph folder discovery)
+#: — `observed_folder` is now an OPEN, provider-defined folder
+#: identifier (any real Graph folder id — Inbox/Junk Email/Deleted
+#: Items/any custom/nested/hidden monitored folder), never a closed
+#: two-value enum. `FOLDER_INBOX`/`FOLDER_JUNK` remain defined purely as
+#: historical/example identifier VALUES (several tests still use them
+#: as two arbitrary, distinct folder-identity strings) — they are no
+#: longer a closed set the contract/schema enforces; see
+#: `services/mailbox/sweep.py`'s own module docstring for how the real
+#: monitored-folder set is now discovered per mailbox instead.
 FOLDER_INBOX = "INBOX"
 FOLDER_JUNK = "JUNK"
-FOLDERS = frozenset({FOLDER_INBOX, FOLDER_JUNK})
 
 INGESTION_STATUS_INGESTED = "INGESTED"
 INGESTION_STATUS_QUARANTINED = "QUARANTINED"
@@ -96,6 +105,14 @@ class MailboxMessage:
     provider_kind: str
     immutable_provider_message_id: str
     internet_message_id: Optional[str]
+    #: The provider's own real, immutable folder identifier this
+    #: message was MOST RECENTLY observed in (CD-6 architect amendment —
+    #: recursive folder discovery; for Microsoft Graph: the real Graph
+    #: folder id, e.g. resolved `inbox`/`junkemail`/`deleteditems`, or a
+    #: custom/nested folder's own id) — the CANONICAL, gate-relevant
+    #: value. Never a display name (folder display names can be
+    #: renamed/localized — see `observed_folder_display_name` below for
+    #: the human-readable counterpart).
     observed_folder: str
     subject: Optional[str]
     sender_address: Optional[str]
@@ -110,6 +127,16 @@ class MailboxMessage:
     #: portion of `sender_address`, lowercased; the actual Stage-B gate
     #: key. `None` only when `sender_address` itself is absent.
     sender_domain: Optional[str] = None
+    #: CD-6 architect amendment (recursive folder discovery) — the
+    #: HUMAN-READABLE label for `observed_folder`'s own real folder id,
+    #: for GUI/operator display ONLY (e.g. "Inbox", "Deleted Items", a
+    #: custom folder's own display name) — never used for identity,
+    #: gating, or cursor lookup (that is `observed_folder`'s own job).
+    #: `None` for a row created before this amendment (the real 128
+    #: already-ingested Infosecurs messages — additive/nullable, never a
+    #: silently-invented backfilled value) or when a caller genuinely has
+    #: no display name to report.
+    observed_folder_display_name: Optional[str] = None
     #: Bounded, discovery-only per-attachment metadata (filename/
     #: content_type/size_bytes — NEVER content). See contract's own
     #: field description.
@@ -129,6 +156,7 @@ class MailboxMessage:
             "immutable_provider_message_id": self.immutable_provider_message_id,
             "internet_message_id": self.internet_message_id,
             "observed_folder": self.observed_folder,
+            "observed_folder_display_name": self.observed_folder_display_name,
             "subject": self.subject,
             "sender_address": self.sender_address,
             "sender_display_name": self.sender_display_name,
@@ -166,6 +194,7 @@ class MailboxMessageRepository(abc.ABC):
         ingestion_status: str,
         evidence_id: Optional[str] = None,
         sender_domain: Optional[str] = None,
+        observed_folder_display_name: Optional[str] = None,
         attachment_metadata: Optional[Sequence[Mapping[str, Any]]] = None,
         auth_signals: Optional[Mapping[str, Optional[str]]] = None,
         metadata: Optional[Mapping[str, Any]] = None,
@@ -244,6 +273,7 @@ class InMemoryMailboxMessageRepository(MailboxMessageRepository):
         ingestion_status: str,
         evidence_id: Optional[str] = None,
         sender_domain: Optional[str] = None,
+        observed_folder_display_name: Optional[str] = None,
         attachment_metadata: Optional[Sequence[Mapping[str, Any]]] = None,
         auth_signals: Optional[Mapping[str, Optional[str]]] = None,
         metadata: Optional[Mapping[str, Any]] = None,
@@ -261,6 +291,7 @@ class InMemoryMailboxMessageRepository(MailboxMessageRepository):
                     immutable_provider_message_id=immutable_provider_message_id,
                     internet_message_id=internet_message_id,
                     observed_folder=observed_folder,
+                    observed_folder_display_name=observed_folder_display_name,
                     subject=subject,
                     sender_address=sender_address,
                     sender_display_name=sender_display_name,
@@ -298,6 +329,11 @@ class InMemoryMailboxMessageRepository(MailboxMessageRepository):
             updated = dataclasses.replace(
                 current,
                 observed_folder=observed_folder,
+                observed_folder_display_name=(
+                    observed_folder_display_name
+                    if observed_folder_display_name is not None
+                    else current.observed_folder_display_name
+                ),
                 last_seen_at=now,
                 evidence_id=new_evidence_id,
                 ingestion_status=new_status,

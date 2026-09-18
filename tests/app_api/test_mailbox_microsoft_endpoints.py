@@ -19,15 +19,47 @@ from app.api.main import app
 from services.mailbox.microsoft.fake_client import fake_token_bundle
 from services.mailbox.microsoft.graph_client import (
     GraphDeltaPageResult,
+    GraphFolderListResult,
+    GraphFolderSummary,
     GraphMessageContentResult,
     GraphMessageSummary,
     GraphOutcomeStatus,
+    GraphWellKnownFoldersResult,
     MicrosoftIdentity,
     MicrosoftIdentityResult,
     MicrosoftTokenResult,
 )
 
 ACTOR_ID = "bagman-mailbox-microsoft-endpoint-tests"
+
+#: CD-6 architect amendment (recursive folder discovery) — `run_sweep`
+#: now calls `adapter.discover_monitored_folders` once before iterating
+#: any folder; queue a plain Inbox+Junk discovery result (matches the
+#: OLD, pre-amendment monitored set) so this file's existing HTTP-level
+#: sweep tests need no other changes.
+_INBOX_FOLDER_ID = "AAMkADinbox000000000000000000000"
+_JUNK_FOLDER_ID = "AAMkADjunkemail0000000000000000"
+
+
+def _queue_folder_discovery(comp) -> None:
+    comp.microsoft_graph_client.queue_folder_list_result(
+        GraphFolderListResult(
+            status=GraphOutcomeStatus.OK,
+            folders=(
+                GraphFolderSummary(
+                    folder_id=_INBOX_FOLDER_ID, display_name="Inbox", parent_folder_id=None, child_folder_count=0
+                ),
+                GraphFolderSummary(
+                    folder_id=_JUNK_FOLDER_ID, display_name="Junk Email", parent_folder_id=None, child_folder_count=0
+                ),
+            ),
+        )
+    )
+    comp.microsoft_graph_client.queue_well_known_folders_result(
+        GraphWellKnownFoldersResult(
+            status=GraphOutcomeStatus.OK, folder_ids={"inbox": _INBOX_FOLDER_ID, "junkemail": _JUNK_FOLDER_ID}
+        )
+    )
 
 
 @pytest.fixture
@@ -240,6 +272,7 @@ def test_sweep_after_connect_ingests_a_message_and_lists_it(dev_client):
         immutable_id="AAMk-1", internet_message_id="<a@b>", subject="Invoice", sender_address="v@example.com",
         sender_display_name="Vendor", received_at=now, has_attachments=False,
     )
+    _queue_folder_discovery(comp)
     comp.microsoft_graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(msg,), delta_link="d1"))
     comp.microsoft_graph_client.queue_content_result(
         GraphMessageContentResult(status=GraphOutcomeStatus.OK, content=b"From: v@example.com\r\nSubject: Invoice\r\n\r\nBody")
@@ -266,6 +299,7 @@ def test_sweep_response_never_leaks_a_token_or_delta_link(dev_client):
     mailbox_id = _create_mailbox(dev_client)
     _connect_and_complete(dev_client, mailbox_id)
     comp = get_composition()
+    _queue_folder_discovery(comp)
     comp.microsoft_graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link="super-secret-delta-token"))
     comp.microsoft_graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link="super-secret-delta-token-2"))
 
@@ -298,6 +332,7 @@ def _sweep_unknown_domain_message(client, mailbox_id):
         sender_address="billing@new-supplier.example", sender_display_name="New Supplier", received_at=now,
         has_attachments=False,
     )
+    _queue_folder_discovery(comp)
     comp.microsoft_graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(msg,), delta_link="d1"))
     comp.microsoft_graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link="d-junk"))
     r = client.post(f"/internal/mailboxes/{mailbox_id}/microsoft/sweep", json={"actor_type": "USER", "actor_id": ACTOR_ID})

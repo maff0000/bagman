@@ -49,26 +49,82 @@ claim (case-insensitively) against the mailbox's own stored
 ``email_address`` (architect spec, verbatim). A mismatch fails
 honestly, persists no usable token, and never mutates the mailbox's
 connection_state — see that method's own docstring.
+
+Folder discovery (CD-6 architect amendment — recursive Microsoft Graph
+folder discovery, before the real historical sweep runs)
+--------------------------------------------------------------------------
+:meth:`discover_monitored_folders` is the OTHER place Microsoft-Graph-
+specific request shaping lives (alongside token lifecycle above) — it
+is the seam that keeps ``services/mailbox/sweep.py`` genuinely
+provider-neutral (that module never sees a "well-known name", never
+resolves an id, never applies the Sent/Drafts/Outbox exclusion itself).
+This method: (1) calls :meth:`~services.mailbox.microsoft.graph_client
+.MicrosoftGraphClient.list_mail_folders` (the full, real recursive
+enumeration — see that module's own docstring) with the SAME pre-
+emptive/reactive token-refresh discipline as :meth:`fetch_folder_delta`
+below; (2) calls :meth:`~....resolve_well_known_folders` once, for
+exactly the six names in ``graph_client.WELL_KNOWN_FOLDER_NAMES_TO_RESOLVE``
+(never re-resolved per folder — one call covers a whole sweep); (3)
+classifies every enumerated folder against those resolved ids (never by
+display name — see ``graph_client.classify_folders``); (4) computes the
+monitored set (``graph_client.compute_monitored_folders`` — Inbox+Junk
+Email+Deleted Items+every custom/nested/hidden folder, MINUS Sent
+Items/Drafts/Outbox); (5) returns a deliberately provider-neutral
+:class:`FolderDiscoveryResult` — a flat list of :class:`MonitoredFolder`
+(``folder_id``/``display_name`` only) — the shape ``run_sweep`` actually
+iterates. A non-OK outcome at ANY of steps (1)/(2) is a whole-sweep
+precondition failure (see ``services/mailbox/sweep.py``'s own module
+docstring for exactly how ``run_sweep`` reacts) — without a real folder
+list, nothing in this sweep can be safely attempted at all.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Sequence
 
 from core.timestamps import utc_now
 from services.mailbox.mailbox import MailboxSourceRepository
 from services.mailbox.microsoft.graph_client import (
+    WELL_KNOWN_FOLDER_NAMES_TO_RESOLVE,
     GraphDeltaPageResult,
     GraphMessageContentResult,
     GraphOutcomeStatus,
     MicrosoftGraphClientProtocol,
     MicrosoftOAuthClientProtocol,
+    classify_folders,
+    compute_monitored_folders,
 )
 from services.mailbox.microsoft.secrets import MicrosoftTokenStoreProtocol
 
 #: Same safety-margin reasoning as `services.xero.sync._REFRESH_SKEW_SECONDS`.
 _REFRESH_SKEW_SECONDS = 120.0
+
+
+@dataclass(frozen=True)
+class MonitoredFolder:
+    """One folder this sweep will iterate — the OUTPUT of
+    `MicrosoftGraphMailboxAdapter.discover_monitored_folders`'s own
+    discovery + classification + monitored-set computation.
+    Deliberately provider-neutral shaped (just an id + a display label)
+    — this is what `services/mailbox/sweep.py` (provider-neutral) is
+    allowed to know about a folder; it never sees `well_known_name`/
+    `is_hidden`/any other Graph-specific classification detail.
+    `folder_id` is the REAL, immutable Graph folder id — the actual
+    cursor/delta identity key. `display_name` is for GUI/human-facing
+    rendering only, never used for identity/classification (see
+    `graph_client.classify_folders`'s own doctrine)."""
+
+    folder_id: str
+    display_name: str
+
+
+@dataclass(frozen=True)
+class FolderDiscoveryResult:
+    status: GraphOutcomeStatus
+    folders: Sequence[MonitoredFolder] = field(default_factory=tuple)
+    retry_after_seconds: Optional[float] = None
+    error_detail: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -205,6 +261,53 @@ class MicrosoftGraphMailboxAdapter:
             return GraphMessageContentResult(status=GraphOutcomeStatus.AUTH_ERROR, error_detail=retry_error)
         return self._graph_client.fetch_message_content(
             access_token=retried_token, immutable_message_id=immutable_message_id
+        )
+
+    # -- folder discovery (CD-6 architect amendment) ----------------------
+
+    def discover_monitored_folders(self, *, mailbox_id: str) -> FolderDiscoveryResult:
+        """See module docstring's 'Folder discovery' section for the
+        full five-step sequence this performs."""
+        access_token, error_detail = self._ensure_fresh_access_token(mailbox_id)
+        if access_token is None:
+            return FolderDiscoveryResult(status=GraphOutcomeStatus.AUTH_ERROR, error_detail=error_detail)
+
+        folder_list = self._graph_client.list_mail_folders(access_token=access_token)
+        if folder_list.status == GraphOutcomeStatus.AUTH_ERROR:
+            retried_token, retry_error = self._reactive_refresh(mailbox_id)
+            if retried_token is None:
+                return FolderDiscoveryResult(status=GraphOutcomeStatus.AUTH_ERROR, error_detail=retry_error)
+            access_token = retried_token
+            folder_list = self._graph_client.list_mail_folders(access_token=access_token)
+        if folder_list.status != GraphOutcomeStatus.OK:
+            return FolderDiscoveryResult(
+                status=folder_list.status,
+                retry_after_seconds=folder_list.retry_after_seconds,
+                error_detail=folder_list.error_detail,
+            )
+
+        well_known = self._graph_client.resolve_well_known_folders(
+            access_token=access_token, well_known_names=WELL_KNOWN_FOLDER_NAMES_TO_RESOLVE
+        )
+        if well_known.status == GraphOutcomeStatus.AUTH_ERROR:
+            retried_token, retry_error = self._reactive_refresh(mailbox_id)
+            if retried_token is None:
+                return FolderDiscoveryResult(status=GraphOutcomeStatus.AUTH_ERROR, error_detail=retry_error)
+            well_known = self._graph_client.resolve_well_known_folders(
+                access_token=retried_token, well_known_names=WELL_KNOWN_FOLDER_NAMES_TO_RESOLVE
+            )
+        if well_known.status != GraphOutcomeStatus.OK:
+            return FolderDiscoveryResult(
+                status=well_known.status,
+                retry_after_seconds=well_known.retry_after_seconds,
+                error_detail=well_known.error_detail,
+            )
+
+        classified = classify_folders(folder_list.folders, well_known_folder_ids=well_known.folder_ids)
+        monitored = compute_monitored_folders(classified)
+        return FolderDiscoveryResult(
+            status=GraphOutcomeStatus.OK,
+            folders=tuple(MonitoredFolder(folder_id=f.folder_id, display_name=f.display_name) for f in monitored),
         )
 
     # -- OAuth begin / callback identity verification ---------------------

@@ -32,8 +32,15 @@
     },
     "observed_folder": {
       "type": "string",
-      "enum": ["INBOX", "JUNK"],
-      "description": "Which of the exactly-two folders in scope for this slice (Inbox, Junk Email) this message was most recently observed in. Never Sent Items/Deleted Items/Archive/a custom folder (out of scope for this slice)."
+      "minLength": 1,
+      "description": "CD-6 architect amendment (recursive folder discovery). The provider's own real, immutable folder identifier (e.g. Microsoft Graph's own resolved folder id) this message was most recently observed in — deliberately OPEN (no longer a closed Inbox/Junk enum): the monitored set now includes Inbox, Junk Email, Deleted Items, and every custom/nested/hidden folder the mailbox's own folder discovery surfaces (Sent Items/Drafts/Outbox are excluded from monitoring entirely and never appear here). This is the CANONICAL, gate-relevant value — never a display name; see `observed_folder_display_name` for the human-readable counterpart."
+    },
+    "observed_folder_display_name": {
+      "oneOf": [
+        { "type": "string" },
+        { "type": "null" }
+      ],
+      "description": "CD-6 architect amendment (recursive folder discovery). The human-readable label for `observed_folder`'s own real folder id, for GUI/operator display ONLY — never used for identity, gating, or cursor lookup. `null` for a row created before this amendment, or when a caller genuinely has no display name to report."
     },
     "subject": {
       "oneOf": [
@@ -137,6 +144,7 @@
     "immutable_provider_message_id",
     "internet_message_id",
     "observed_folder",
+    "observed_folder_display_name",
     "subject",
     "sender_address",
     "sender_display_name",

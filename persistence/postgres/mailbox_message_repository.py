@@ -30,6 +30,7 @@ def _row_to_domain(row: MailboxMessageRow) -> MailboxMessage:
         immutable_provider_message_id=row.immutable_provider_message_id,
         internet_message_id=row.internet_message_id,
         observed_folder=row.observed_folder,
+        observed_folder_display_name=row.observed_folder_display_name,
         subject=row.subject,
         sender_address=row.sender_address,
         sender_display_name=row.sender_display_name,
@@ -66,6 +67,7 @@ class PostgresMailboxMessageRepository(MailboxMessageRepository):
         ingestion_status: str,
         evidence_id: Optional[str] = None,
         sender_domain: Optional[str] = None,
+        observed_folder_display_name: Optional[str] = None,
         attachment_metadata=None,
         auth_signals: Optional[Mapping[str, Optional[str]]] = None,
         metadata: Optional[Mapping[str, Any]] = None,
@@ -87,6 +89,7 @@ class PostgresMailboxMessageRepository(MailboxMessageRepository):
                         immutable_provider_message_id=immutable_provider_message_id,
                         internet_message_id=internet_message_id,
                         observed_folder=observed_folder,
+                        observed_folder_display_name=observed_folder_display_name,
                         subject=subject,
                         sender_address=sender_address,
                         sender_display_name=sender_display_name,
@@ -109,6 +112,7 @@ class PostgresMailboxMessageRepository(MailboxMessageRepository):
                         immutable_provider_message_id=candidate.immutable_provider_message_id,
                         internet_message_id=candidate.internet_message_id,
                         observed_folder=candidate.observed_folder,
+                        observed_folder_display_name=candidate.observed_folder_display_name,
                         subject=candidate.subject,
                         sender_address=candidate.sender_address,
                         sender_display_name=candidate.sender_display_name,
@@ -137,6 +141,8 @@ class PostgresMailboxMessageRepository(MailboxMessageRepository):
                         new_metadata.update(dict(metadata))
 
                 row.observed_folder = observed_folder
+                if observed_folder_display_name is not None:
+                    row.observed_folder_display_name = observed_folder_display_name
                 row.last_seen_at = now
                 row.evidence_id = new_evidence_id
                 row.ingestion_status = new_status

@@ -22,8 +22,6 @@ from services.mailbox.domain_rule import InMemoryMailboxDomainRuleRepository
 from services.mailbox.lock import InMemoryMailboxSweepLock, MailboxSweepLockError
 from services.mailbox.mailbox import PROVIDER_MICROSOFT_GRAPH, InMemoryMailboxSourceRepository
 from services.mailbox.message import (
-    FOLDER_INBOX,
-    FOLDER_JUNK,
     INGESTION_STATUS_CHECKED_NOT_CANDIDATE,
     INGESTION_STATUS_VANISHED,
     InMemoryMailboxMessageRepository,
@@ -31,10 +29,14 @@ from services.mailbox.message import (
 from services.mailbox.microsoft.adapter import MicrosoftGraphMailboxAdapter
 from services.mailbox.microsoft.fake_client import FakeMicrosoftGraphClient, FakeMicrosoftOAuthClient
 from services.mailbox.microsoft.graph_client import (
+    EXCLUDED_WELL_KNOWN_FOLDER_NAMES,
     GraphDeltaPageResult,
+    GraphFolderListResult,
+    GraphFolderSummary,
     GraphMessageContentResult,
     GraphMessageSummary,
     GraphOutcomeStatus,
+    GraphWellKnownFoldersResult,
     MicrosoftTokenResult,
 )
 from services.mailbox.microsoft.secrets import InMemoryMicrosoftTokenStore
@@ -89,7 +91,29 @@ def _content(body: bytes = b"From: billing@vendor.com\r\nSubject: Invoice\r\n\r\
 _DEFAULT_ALLOWED_DOMAIN = "vendor.com"
 
 
+#: Deliberately kept to exactly Inbox + Junk Email — matches the OLD
+#: (pre-folder-expansion) monitored set — so the bulk of this file's
+#: EXISTING coverage below needs zero changes to its own delta-queue
+#: call counts/ordering. Dedicated new tests further down (see "CD-6
+#: architect amendment — recursive folder discovery") opt into the
+#: FULL monitored set (Deleted Items, nested/hidden/custom folders, the
+#: Sent/Drafts/Outbox exclusion) via `h.sweep(folders=..., well_known_ids=...)`.
+INBOX_FOLDER_ID = "AAMkADinbox000000000000000000000"
+JUNK_FOLDER_ID = "AAMkADjunkemail0000000000000000"
+DEFAULT_MONITORED_FOLDERS = (
+    GraphFolderSummary(folder_id=INBOX_FOLDER_ID, display_name="Inbox", parent_folder_id=None, child_folder_count=0),
+    GraphFolderSummary(
+        folder_id=JUNK_FOLDER_ID, display_name="Junk Email", parent_folder_id=None, child_folder_count=0
+    ),
+)
+DEFAULT_WELL_KNOWN_IDS = {"inbox": INBOX_FOLDER_ID, "junkemail": JUNK_FOLDER_ID}
+
+
 class Harness:
+    INBOX_FOLDER_ID = INBOX_FOLDER_ID
+    JUNK_FOLDER_ID = JUNK_FOLDER_ID
+    DEFAULT_MONITORED_FOLDERS = DEFAULT_MONITORED_FOLDERS
+
     def __init__(self, scanner=None, *, allow_default_domain: bool = True):
         self.api = BagmanCanonicalAPI()
         self.object_store = InMemoryObjectStore()
@@ -145,7 +169,26 @@ class Harness:
         self.mailbox = self.mailbox_repo.get_mailbox(self.mailbox.mailbox_id)
         return self.mailbox
 
-    def sweep(self):
+    def _queue_folder_discovery(self, *, folders=None, well_known_ids=None):
+        """CD-6 architect amendment (recursive folder discovery) —
+        `run_sweep` now calls `adapter.discover_monitored_folders` ONCE
+        before iterating any folder; queue that discovery result here so
+        every existing/new test's own `sweep()` call continues to "just
+        work" without hand-queuing it individually. Uses a SEPARATE Fake
+        queue from delta/content (see `FakeMicrosoftGraphClient`'s own
+        docstring) — never interferes with a test's own queued delta/
+        content results."""
+        resolved_folders = folders if folders is not None else self.DEFAULT_MONITORED_FOLDERS
+        resolved_well_known = well_known_ids if well_known_ids is not None else DEFAULT_WELL_KNOWN_IDS
+        self.graph_client.queue_folder_list_result(
+            GraphFolderListResult(status=GraphOutcomeStatus.OK, folders=tuple(resolved_folders))
+        )
+        self.graph_client.queue_well_known_folders_result(
+            GraphWellKnownFoldersResult(status=GraphOutcomeStatus.OK, folder_ids=dict(resolved_well_known))
+        )
+
+    def sweep(self, *, folders=None, well_known_ids=None):
+        self._queue_folder_discovery(folders=folders, well_known_ids=well_known_ids)
         run = run_sweep(
             mailbox=self.mailbox, mailbox_source_id=self.source_id, trigger=TRIGGER_MANUAL, adapter=self.adapter,
             message_repository=self.message_repo, sweep_run_repository=self.sweep_run_repo,
@@ -193,7 +236,8 @@ def test_both_folders_are_attempted_and_succeed(h):
     h.queue_empty_both_folders()
     run = h.sweep()
     assert run.status == "SUCCEEDED"
-    assert set(run.folders_attempted) == {FOLDER_INBOX, FOLDER_JUNK}
+    assert {f['folder_id'] for f in run.folders_attempted} == {h.INBOX_FOLDER_ID, h.JUNK_FOLDER_ID}
+    assert {f['display_name'] for f in run.folders_attempted} == {"Inbox", "Junk Email"}
 
 
 def test_a_new_message_is_ingested_as_real_evidence(h):
@@ -253,7 +297,7 @@ def test_same_immutable_id_seen_in_another_folder_never_duplicates_evidence(h):
     assert run.duplicates == 1
     messages = h.message_repo.list_messages(mailbox_id=h.mailbox.mailbox_id)
     assert len(messages) == 1
-    assert messages[0].observed_folder == FOLDER_JUNK  # last-seen wins
+    assert messages[0].observed_folder == h.JUNK_FOLDER_ID  # last-seen wins
 
 
 def test_idempotent_replay_of_a_whole_sweep_creates_no_new_evidence(h):
@@ -280,7 +324,7 @@ def test_cursor_advances_only_after_a_folder_round_fully_succeeds(h):
     h.queue_empty_both_folders(inbox_delta="final-inbox-link", junk_delta="final-junk-link")
     h.sweep()
     cursor = h.cursor_repo.get_or_bootstrap(
-        mailbox_id=h.mailbox.mailbox_id, provider_kind=h.mailbox.provider_kind, folder=FOLDER_INBOX,
+        mailbox_id=h.mailbox.mailbox_id, provider_kind=h.mailbox.provider_kind, folder=h.INBOX_FOLDER_ID,
         bootstrap_timestamp=datetime.now(timezone.utc),
     )
     assert cursor.delta_link == "final-inbox-link"
@@ -297,7 +341,7 @@ def test_transient_content_fetch_failure_leaves_cursor_unadvanced_then_succeeds_
     assert len(h.message_repo.list_messages(mailbox_id=h.mailbox.mailbox_id)) == 0  # no row left behind
 
     cursor = h.cursor_repo.get_or_bootstrap(
-        mailbox_id=h.mailbox.mailbox_id, provider_kind=h.mailbox.provider_kind, folder=FOLDER_INBOX,
+        mailbox_id=h.mailbox.mailbox_id, provider_kind=h.mailbox.provider_kind, folder=h.INBOX_FOLDER_ID,
         bootstrap_timestamp=datetime.now(timezone.utc),
     )
     assert cursor.delta_link is None  # never advanced past the failure
@@ -328,7 +372,7 @@ def test_quarantined_message_counts_as_durably_handled_and_advances_cursor():
     assert run.quarantined == 1
     assert run.evidence_created == 0
     cursor = h.cursor_repo.get_or_bootstrap(
-        mailbox_id=h.mailbox.mailbox_id, provider_kind=h.mailbox.provider_kind, folder=FOLDER_INBOX,
+        mailbox_id=h.mailbox.mailbox_id, provider_kind=h.mailbox.provider_kind, folder=h.INBOX_FOLDER_ID,
         bootstrap_timestamp=datetime.now(timezone.utc),
     )
     assert cursor.delta_link == "final-link"
@@ -395,7 +439,7 @@ def test_resync_required_never_silently_restarts_and_duplicates(h):
     run = h.sweep()
     assert run.status in ("PARTIAL", "FAILED")
     cursor = h.cursor_repo.get_or_bootstrap(
-        mailbox_id=h.mailbox.mailbox_id, provider_kind=h.mailbox.provider_kind, folder=FOLDER_INBOX,
+        mailbox_id=h.mailbox.mailbox_id, provider_kind=h.mailbox.provider_kind, folder=h.INBOX_FOLDER_ID,
         bootstrap_timestamp=datetime.now(timezone.utc),
     )
     # Never automatically reset/advanced — an explicit operator action
@@ -712,3 +756,238 @@ def test_sweep_fails_honestly_when_entity_bootstrap_configuration_is_incomplete(
     h.queue_empty_both_folders()
     with pytest.raises(ConflictError):
         h.sweep()
+
+
+# ---------------------------------------------------------------------
+# CD-6 architect amendment — recursive Microsoft Graph folder discovery
+# ---------------------------------------------------------------------
+
+DELETED_ITEMS_FOLDER_ID = "AAMkADdeleteditems00000000000000"
+CUSTOM_FOLDER_ID = "AAMkADcustom0000000000000000000"
+CUSTOM_CHILD_FOLDER_ID = "AAMkADcustomchild000000000000000"
+SENT_FOLDER_ID = "AAMkADsentitems00000000000000000"
+DRAFTS_FOLDER_ID = "AAMkADdrafts000000000000000000000"
+OUTBOX_FOLDER_ID = "AAMkADoutbox000000000000000000000"
+HIDDEN_FOLDER_ID = "AAMkADhidden000000000000000000000"
+
+
+def test_folder_discovery_error_stops_the_whole_sweep_before_any_folder_is_attempted():
+    """A non-OK folder-discovery outcome is a WHOLE-SWEEP precondition
+    failure — never blended into a per-folder transient-failure code
+    (module docstring's own 'Folder discovery' section)."""
+    h = Harness()
+    h.graph_client.queue_folder_list_result(
+        GraphFolderListResult(status=GraphOutcomeStatus.PROVIDER_ERROR, error_detail="boom")
+    )
+    h.graph_client.queue_well_known_folders_result(GraphWellKnownFoldersResult(status=GraphOutcomeStatus.OK))
+    run = run_sweep(
+        mailbox=h.mailbox, mailbox_source_id=h.source_id, trigger=TRIGGER_MANUAL, adapter=h.adapter,
+        message_repository=h.message_repo, sweep_run_repository=h.sweep_run_repo,
+        cursor_repository=h.cursor_repo, sweep_lock=h.lock, mailbox_repository=h.mailbox_repo,
+        domain_rule_repository=h.domain_rule_repo, needs_you_repository=h.needs_you_repo,
+        entity_repository=h.api.entity_repository,
+        api=h.api, object_store=h.object_store, scanner=h.scanner, actor_type="SYSTEM", actor_id="test",
+    )
+    assert run.status == "FAILED"
+    assert run.error_code == SweepFailureReason.FOLDER_DISCOVERY_FAILED
+    assert list(run.folders_attempted) == []
+
+
+def test_full_monitored_set_excludes_sent_drafts_outbox_and_includes_nested_hidden_custom():
+    h = Harness()
+    full_raw_folders = (
+        GraphFolderSummary(folder_id=h.INBOX_FOLDER_ID, display_name="Inbox", parent_folder_id=None, child_folder_count=0),
+        GraphFolderSummary(folder_id=h.JUNK_FOLDER_ID, display_name="Junk Email", parent_folder_id=None, child_folder_count=0),
+        GraphFolderSummary(folder_id=DELETED_ITEMS_FOLDER_ID, display_name="Deleted Items", parent_folder_id=None, child_folder_count=0),
+        GraphFolderSummary(folder_id=SENT_FOLDER_ID, display_name="Sent Items", parent_folder_id=None, child_folder_count=0),
+        GraphFolderSummary(folder_id=DRAFTS_FOLDER_ID, display_name="Drafts", parent_folder_id=None, child_folder_count=0),
+        GraphFolderSummary(folder_id=OUTBOX_FOLDER_ID, display_name="Outbox", parent_folder_id=None, child_folder_count=0),
+        GraphFolderSummary(folder_id=CUSTOM_FOLDER_ID, display_name="Supplier Invoices", parent_folder_id=None, child_folder_count=1),
+        GraphFolderSummary(folder_id=CUSTOM_CHILD_FOLDER_ID, display_name="2026", parent_folder_id=CUSTOM_FOLDER_ID, child_folder_count=0),
+        GraphFolderSummary(folder_id=HIDDEN_FOLDER_ID, display_name="Clutter", parent_folder_id=None, child_folder_count=0, is_hidden=True),
+    )
+    full_well_known_ids = {
+        "inbox": h.INBOX_FOLDER_ID, "junkemail": h.JUNK_FOLDER_ID, "deleteditems": DELETED_ITEMS_FOLDER_ID,
+        "sentitems": SENT_FOLDER_ID, "drafts": DRAFTS_FOLDER_ID, "outbox": OUTBOX_FOLDER_ID,
+    }
+    # Six MONITORED folders (Sent/Drafts/Outbox filtered out before the
+    # sweep ever iterates) — one empty delta round each.
+    for i in range(6):
+        h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link=f"d{i}"))
+
+    run = h.sweep(folders=full_raw_folders, well_known_ids=full_well_known_ids)
+    assert run.status == "SUCCEEDED"
+    attempted_ids = {f["folder_id"] for f in run.folders_attempted}
+    assert attempted_ids == {
+        h.INBOX_FOLDER_ID, h.JUNK_FOLDER_ID, DELETED_ITEMS_FOLDER_ID, CUSTOM_FOLDER_ID, CUSTOM_CHILD_FOLDER_ID, HIDDEN_FOLDER_ID,
+    }
+    assert SENT_FOLDER_ID not in attempted_ids
+    assert DRAFTS_FOLDER_ID not in attempted_ids
+    assert OUTBOX_FOLDER_ID not in attempted_ids
+
+
+_THREE_FOLDER_SET = (
+    GraphFolderSummary(folder_id=Harness.INBOX_FOLDER_ID, display_name="Inbox", parent_folder_id=None, child_folder_count=0),
+    GraphFolderSummary(folder_id=Harness.JUNK_FOLDER_ID, display_name="Junk Email", parent_folder_id=None, child_folder_count=0),
+    GraphFolderSummary(folder_id=DELETED_ITEMS_FOLDER_ID, display_name="Deleted Items", parent_folder_id=None, child_folder_count=0),
+)
+_THREE_FOLDER_WELL_KNOWN_IDS = {
+    "inbox": Harness.INBOX_FOLDER_ID, "junkemail": Harness.JUNK_FOLDER_ID, "deleteditems": DELETED_ITEMS_FOLDER_ID,
+}
+
+
+def test_deleted_items_is_genuinely_swept_through_the_full_pipeline_same_as_inbox():
+    """Deleted Items is explicitly in scope — a message discovered
+    there runs through the EXACT SAME Stage-A/Stage-B gate, MIME-fetch,
+    evidence-ingest pipeline as an Inbox message; its deleted location
+    is recorded as provenance only."""
+    h = Harness()
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link="d-inbox"))
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link="d-junk"))
+    h.graph_client.queue_delta_result(
+        GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(_msg("del-1"),), delta_link="d-deleted")
+    )
+    h.graph_client.queue_content_result(_content())
+
+    run = h.sweep(folders=_THREE_FOLDER_SET, well_known_ids=_THREE_FOLDER_WELL_KNOWN_IDS)
+    assert run.status == "SUCCEEDED"
+    assert run.evidence_created == 1
+    message = h.message_repo.list_messages(mailbox_id=h.mailbox.mailbox_id)[0]
+    assert message.ingestion_status == "INGESTED"
+    assert message.evidence_id is not None
+    assert message.observed_folder == DELETED_ITEMS_FOLDER_ID
+    assert message.observed_folder_display_name == "Deleted Items"
+
+
+def test_no_mime_fetch_for_a_non_candidate_message_in_deleted_items():
+    """Data-volume proof (architect §9), extended to a non-Inbox/Junk
+    folder: an IGNORED-domain message in Deleted Items still costs
+    metadata processing only — never a MIME fetch."""
+    h = Harness(allow_default_domain=False)
+    h.domain_rule_repo.upsert_rule(
+        mailbox_id=h.mailbox.mailbox_id, sender_domain="vendor.com", match_mode="EXACT", policy="IGNORED",
+        destination_entity_id=None, destination_mode=None, source="OPERATOR",
+    )
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link="d-inbox"))
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link="d-junk"))
+    h.graph_client.queue_delta_result(
+        GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(_msg("del-ignored"),), delta_link="d-deleted")
+    )
+
+    run = h.sweep(folders=_THREE_FOLDER_SET, well_known_ids=_THREE_FOLDER_WELL_KNOWN_IDS)
+    assert run.status == "SUCCEEDED"
+    assert h.graph_client.content_calls == []
+    message = h.message_repo.list_messages(mailbox_id=h.mailbox.mailbox_id)[0]
+    assert message.ingestion_status == INGESTION_STATUS_CHECKED_NOT_CANDIDATE
+    assert message.observed_folder == DELETED_ITEMS_FOLDER_ID
+
+
+def test_message_moving_to_a_third_folder_deleted_items_still_resolves_to_one_canonical_row():
+    """Extends the original Inbox<->Junk idempotency proof to a THIRD
+    folder — canonical uniqueness is (mailbox_id,
+    immutable_provider_message_id) alone, folder-count-independent."""
+    h = Harness()
+    h.graph_client.queue_delta_result(
+        GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(_msg("m-moved"),), delta_link="d-inbox")
+    )
+    h.graph_client.queue_content_result(_content())
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link="d-junk"))
+    h.graph_client.queue_delta_result(
+        GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(_msg("m-moved"),), delta_link="d-deleted")
+    )
+
+    run = h.sweep(folders=_THREE_FOLDER_SET, well_known_ids=_THREE_FOLDER_WELL_KNOWN_IDS)
+    assert run.evidence_created == 1
+    assert run.duplicates == 1
+    messages = h.message_repo.list_messages(mailbox_id=h.mailbox.mailbox_id)
+    assert len(messages) == 1
+    assert messages[0].observed_folder == DELETED_ITEMS_FOLDER_ID  # last-seen wins
+
+
+def test_folder_id_keyed_cursors_never_collide_even_constructed_at_the_same_moment(h):
+    """Folder-ID-keyed cursor independence with real, GUID-shaped
+    identifiers (not just the generic 'INBOX'/'JUNK' strings other
+    cursor tests use) — proves the identity key is genuinely the real
+    folder id, not a coincidence of two short literal strings."""
+    ts = datetime.now(timezone.utc)
+    custom_a = h.cursor_repo.get_or_bootstrap(
+        mailbox_id=h.mailbox.mailbox_id, provider_kind=h.mailbox.provider_kind, folder=CUSTOM_FOLDER_ID,
+        bootstrap_timestamp=ts,
+    )
+    custom_b = h.cursor_repo.get_or_bootstrap(
+        mailbox_id=h.mailbox.mailbox_id, provider_kind=h.mailbox.provider_kind, folder=CUSTOM_CHILD_FOLDER_ID,
+        bootstrap_timestamp=ts,
+    )
+    h.cursor_repo.advance_cursor(
+        mailbox_id=h.mailbox.mailbox_id, provider_kind=h.mailbox.provider_kind, folder=CUSTOM_FOLDER_ID,
+        delta_link="custom-a-delta",
+    )
+    still_none = h.cursor_repo.get_or_bootstrap(
+        mailbox_id=h.mailbox.mailbox_id, provider_kind=h.mailbox.provider_kind, folder=CUSTOM_CHILD_FOLDER_ID,
+        bootstrap_timestamp=ts,
+    )
+    assert custom_a.delta_link is None
+    assert custom_b.delta_link is None
+    assert still_none.delta_link is None  # advancing custom_a never touched custom_b's own cursor
+
+
+def test_old_inbox_junk_literal_cursor_rows_are_left_untouched_and_new_folder_id_cursor_starts_fresh_safely():
+    """Part D's own migration judgment call, proven directly (see
+    services/mailbox/sweep.py's own module docstring, 'Folder-ID-keyed
+    cursors'): a pre-existing OLD-scheme cursor row keyed by the
+    literal string "INBOX" (Slice 4A's own pre-amendment convention) is
+    NEVER read or written by the new folder-ID-keyed sweep — and
+    re-establishing a FRESH bootstrap-floor-bounded cursor for Inbox's
+    own REAL folder id does not re-ingest/duplicate a message already
+    known under the old scheme; idempotency alone makes this safe."""
+    h = Harness()
+    # Simulate the OLD, pre-amendment cursor scheme's own row, still
+    # sitting in the cursor repository (a real Slice 4A artifact) —
+    # never touched by the new folder-ID-keyed lookups below.
+    h.cursor_repo.get_or_bootstrap(
+        mailbox_id=h.mailbox.mailbox_id, provider_kind=h.mailbox.provider_kind, folder="INBOX",
+        bootstrap_timestamp=datetime.now(timezone.utc) - timedelta(days=400),
+    )
+    h.cursor_repo.advance_cursor(
+        mailbox_id=h.mailbox.mailbox_id, provider_kind=h.mailbox.provider_kind, folder="INBOX",
+        delta_link="old-scheme-delta-link",
+    )
+
+    # A message ingested "under the new folder-ID-keyed scheme" —
+    # stands in for one of the real 128 already-known Infosecurs
+    # messages.
+    h.graph_client.queue_delta_result(
+        GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(_msg("already-known"),), delta_link="d1")
+    )
+    h.graph_client.queue_content_result(_content())
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link="d-junk"))
+    first = h.sweep()
+    assert first.evidence_created == 1
+
+    # The OLD "INBOX"-keyed cursor row is completely untouched.
+    still_old = h.cursor_repo.get_or_bootstrap(
+        mailbox_id=h.mailbox.mailbox_id, provider_kind=h.mailbox.provider_kind, folder="INBOX",
+        bootstrap_timestamp=datetime.now(timezone.utc),
+    )
+    assert still_old.delta_link == "old-scheme-delta-link"
+
+    # A later sweep re-discovers the SAME already-known message from
+    # the (real, folder-id-keyed) bootstrap floor — idempotency
+    # ((mailbox_id, immutable_provider_message_id)) makes this safe:
+    # never a new MailboxMessage row, never a second evidence object.
+    h.graph_client.queue_delta_result(
+        GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(_msg("already-known"),), delta_link="d2")
+    )
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link="d-junk-2"))
+    second = h.sweep()
+    assert second.evidence_created == 0
+    assert second.duplicates == 1
+    assert len(h.message_repo.list_messages(mailbox_id=h.mailbox.mailbox_id)) == 1
+
+    # The new, real-folder-id-keyed cursor is its OWN row, independent
+    # of the old "INBOX"-keyed one.
+    new_style = h.cursor_repo.get_or_bootstrap(
+        mailbox_id=h.mailbox.mailbox_id, provider_kind=h.mailbox.provider_kind, folder=h.INBOX_FOLDER_ID,
+        bootstrap_timestamp=datetime.now(timezone.utc),
+    )
+    assert new_style.delta_link == "d2"

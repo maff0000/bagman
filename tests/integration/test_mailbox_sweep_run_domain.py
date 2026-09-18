@@ -34,7 +34,11 @@ def test_create_run_starts_running(repo, mailbox_id):
 def test_complete_run_succeeded_stamps_completed_at(repo, mailbox_id):
     run = repo.create_run(mailbox_id=mailbox_id, trigger=TRIGGER_MANUAL)
     completed = repo.complete_run(
-        run.sweep_run_id, new_status="SUCCEEDED", folders_attempted=["INBOX", "JUNK"],
+        run.sweep_run_id, new_status="SUCCEEDED",
+        folders_attempted=[
+            {"folder_id": "AAMkADinbox00000000000000000000", "display_name": "Inbox"},
+            {"folder_id": "AAMkADjunkemail000000000000000", "display_name": "Junk Email"},
+        ],
         messages_seen=5, messages_new=2, evidence_created=2, duplicates=3, quarantined=0, failures=0,
     )
     assert completed.status == "SUCCEEDED"
@@ -45,7 +49,8 @@ def test_complete_run_succeeded_stamps_completed_at(repo, mailbox_id):
 def test_complete_run_partial_carries_error_code(repo, mailbox_id):
     run = repo.create_run(mailbox_id=mailbox_id, trigger=TRIGGER_MANUAL)
     completed = repo.complete_run(
-        run.sweep_run_id, new_status="PARTIAL", folders_attempted=["INBOX"],
+        run.sweep_run_id, new_status="PARTIAL",
+        folders_attempted=[{"folder_id": "AAMkADinbox00000000000000000000", "display_name": "Inbox"}],
         messages_seen=1, messages_new=1, evidence_created=1, duplicates=0, quarantined=0, failures=1,
         error_code=SweepFailureReason.PARTIAL_FAILURES, error_detail="one message failed",
     )

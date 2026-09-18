@@ -22,12 +22,14 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
-from typing import Deque, Optional
+from typing import Deque, Optional, Sequence
 
 from services.mailbox.microsoft.graph_client import (
     GraphDeltaPageResult,
+    GraphFolderListResult,
     GraphMessageContentResult,
     GraphOutcomeStatus,
+    GraphWellKnownFoldersResult,
     MicrosoftIdentityResult,
     MicrosoftTokenBundle,
     MicrosoftTokenResult,
@@ -99,14 +101,29 @@ class FakeMicrosoftGraphClient:
     def __init__(self) -> None:
         self._delta_queue: Deque[GraphDeltaPageResult] = deque()
         self._content_queue: Deque[GraphMessageContentResult] = deque()
+        #: CD-6 architect amendment (recursive folder discovery) — a
+        #: SEPARATE queue per method, exactly like `_delta_queue`/
+        #: `_content_queue` above: queuing folder discovery for a sweep
+        #: never interferes with, or needs to be interleaved with,
+        #: delta/content queuing.
+        self._folder_list_queue: Deque[GraphFolderListResult] = deque()
+        self._well_known_folders_queue: Deque[GraphWellKnownFoldersResult] = deque()
         self.delta_calls: list[dict] = []
         self.content_calls: list[str] = []
+        self.folder_list_calls: int = 0
+        self.well_known_folder_calls: list[tuple[str, ...]] = []
 
     def queue_delta_result(self, result: GraphDeltaPageResult) -> None:
         self._delta_queue.append(result)
 
     def queue_content_result(self, result: GraphMessageContentResult) -> None:
         self._content_queue.append(result)
+
+    def queue_folder_list_result(self, result: GraphFolderListResult) -> None:
+        self._folder_list_queue.append(result)
+
+    def queue_well_known_folders_result(self, result: GraphWellKnownFoldersResult) -> None:
+        self._well_known_folders_queue.append(result)
 
     def fetch_delta(
         self,
@@ -134,6 +151,20 @@ class FakeMicrosoftGraphClient:
         if not self._content_queue:
             raise AssertionError("FakeMicrosoftGraphClient.fetch_message_content() called with nothing queued")
         return self._content_queue.popleft()
+
+    def list_mail_folders(self, *, access_token: str) -> GraphFolderListResult:
+        self.folder_list_calls += 1
+        if not self._folder_list_queue:
+            raise AssertionError("FakeMicrosoftGraphClient.list_mail_folders() called with nothing queued")
+        return self._folder_list_queue.popleft()
+
+    def resolve_well_known_folders(
+        self, *, access_token: str, well_known_names: Sequence[str]
+    ) -> GraphWellKnownFoldersResult:
+        self.well_known_folder_calls.append(tuple(well_known_names))
+        if not self._well_known_folders_queue:
+            raise AssertionError("FakeMicrosoftGraphClient.resolve_well_known_folders() called with nothing queued")
+        return self._well_known_folders_queue.popleft()
 
 
 def fake_token_bundle(*, access_token: str = "fake-ms-access-token", expires_in_seconds: float = 3600.0) -> MicrosoftTokenBundle:

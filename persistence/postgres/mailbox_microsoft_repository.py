@@ -10,7 +10,7 @@ discipline throughout.
 from __future__ import annotations
 
 from datetime import datetime, timedelta
-from typing import Optional, Sequence
+from typing import Mapping, Optional, Sequence
 
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
@@ -92,7 +92,7 @@ class PostgresMailboxSweepRunRepository(MailboxSweepRunRepository):
         sweep_run_id: str,
         *,
         new_status: str,
-        folders_attempted: Sequence[str],
+        folders_attempted: Sequence[Mapping[str, str]],
         messages_seen: int,
         messages_new: int,
         evidence_created: int,

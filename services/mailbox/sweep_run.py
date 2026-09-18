@@ -10,7 +10,7 @@ import abc
 import dataclasses
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Optional, Sequence
+from typing import Mapping, Optional, Sequence
 
 from core import identity
 from core.contract_validation import validate_against_contract
@@ -54,6 +54,12 @@ class SweepFailureReason:
     PARTIAL_FAILURES = "PARTIAL_FAILURES"
     CONCURRENT_SWEEP_IN_PROGRESS = "CONCURRENT_SWEEP_IN_PROGRESS"
     PERSISTENCE_ERROR = "PERSISTENCE_ERROR"
+    #: CD-6 architect amendment (recursive folder discovery) — the
+    #: mailbox's own folder tree/well-known-folder resolution itself
+    #: could not be completed this round (a whole-sweep precondition
+    #: failure, distinct from a single folder's own delta-page failure
+    #: — see `services/mailbox/sweep.py`'s own module docstring).
+    FOLDER_DISCOVERY_FAILED = "FOLDER_DISCOVERY_FAILED"
 
 
 @dataclass(frozen=True)
@@ -64,7 +70,11 @@ class MailboxSweepRun:
     status: str
     started_at: datetime
     completed_at: Optional[datetime] = None
-    folders_attempted: Sequence[str] = field(default_factory=tuple)
+    #: CD-6 architect amendment (recursive folder discovery) — each
+    #: entry is a small {"folder_id": ..., "display_name": ...} mapping
+    #: (never a raw folder id alone, never a display name alone — see
+    #: this delivery's own contract description for why).
+    folders_attempted: Sequence[Mapping[str, str]] = field(default_factory=tuple)
     messages_seen: int = 0
     messages_new: int = 0
     evidence_created: int = 0
@@ -83,7 +93,7 @@ class MailboxSweepRun:
             "status": self.status,
             "started_at": to_contract_string(self.started_at),
             "completed_at": to_contract_string(self.completed_at) if self.completed_at is not None else None,
-            "folders_attempted": list(self.folders_attempted),
+            "folders_attempted": [dict(f) for f in self.folders_attempted],
             "messages_seen": self.messages_seen,
             "messages_new": self.messages_new,
             "evidence_created": self.evidence_created,
@@ -125,7 +135,7 @@ class MailboxSweepRunRepository(abc.ABC):
         sweep_run_id: str,
         *,
         new_status: str,
-        folders_attempted: Sequence[str],
+        folders_attempted: Sequence[Mapping[str, str]],
         messages_seen: int,
         messages_new: int,
         evidence_created: int,
@@ -173,7 +183,7 @@ class InMemoryMailboxSweepRunRepository(MailboxSweepRunRepository):
         sweep_run_id: str,
         *,
         new_status: str,
-        folders_attempted: Sequence[str],
+        folders_attempted: Sequence[Mapping[str, str]],
         messages_seen: int,
         messages_new: int,
         evidence_created: int,
@@ -187,7 +197,7 @@ class InMemoryMailboxSweepRunRepository(MailboxSweepRunRepository):
         updated = transition(
             current,
             new_status,
-            folders_attempted=tuple(folders_attempted),
+            folders_attempted=tuple(dict(f) for f in folders_attempted),
             messages_seen=messages_seen,
             messages_new=messages_new,
             evidence_created=evidence_created,

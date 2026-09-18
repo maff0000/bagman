@@ -38,8 +38,12 @@ def test_sweep_run_persists_and_completes(fresh_engine):
     assert run.status == "RUNNING"
 
     fresh_repo = PostgresMailboxSweepRunRepository(engine=fresh_engine)
+    folders_attempted = [
+        {"folder_id": "AAMkADinbox00000000000000000000", "display_name": "Inbox"},
+        {"folder_id": "AAMkADjunkemail000000000000000", "display_name": "Junk Email"},
+    ]
     completed = fresh_repo.complete_run(
-        run.sweep_run_id, new_status="SUCCEEDED", folders_attempted=["INBOX", "JUNK"],
+        run.sweep_run_id, new_status="SUCCEEDED", folders_attempted=folders_attempted,
         messages_seen=3, messages_new=1, evidence_created=1, duplicates=2, quarantined=0, failures=0,
     )
     assert completed.status == "SUCCEEDED"
@@ -47,7 +51,7 @@ def test_sweep_run_persists_and_completes(fresh_engine):
 
     fetched = fresh_repo.get_run(run.sweep_run_id)
     assert fetched.messages_seen == 3
-    assert fetched.folders_attempted == ("INBOX", "JUNK")
+    assert list(fetched.folders_attempted) == folders_attempted
 
 
 def test_sweep_run_get_not_found_raises():

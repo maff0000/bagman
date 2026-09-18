@@ -43,11 +43,50 @@ to only ever expose read operations")
 ------------------------------------------------------------------------
 This module (and its Fake sibling) exposes ONLY: build an authorize
 URL, exchange/refresh a token, read `/me`, read a folder's delta page,
-read one message's raw content. No method anywhere in this module (or
-`fake_client.py`) can mark a message read, move it, delete it, or send
-mail — there is no such method to call, by construction, not merely by
-convention. Any future PL-driven live acceptance run that finds this
-module calling a write-shaped Graph endpoint is a genuine regression.
+read one message's raw content, read the mailbox's own folder tree,
+read a handful of well-known folder ids. No method anywhere in this
+module (or `fake_client.py`) can mark a message read, move it, delete
+it, or send mail — there is no such method to call, by construction,
+not merely by convention. Any future PL-driven live acceptance run
+that finds this module calling a write-shaped Graph endpoint is a
+genuine regression.
+
+Folder discovery (CD-6 architect amendment — recursive Microsoft Graph
+folder discovery, before the real historical sweep runs)
+------------------------------------------------------------------------
+`GET /me/mailFolders` returns only TOP-LEVEL folders; each folder's own
+`childFolderCount` says whether a SEPARATE `GET .../childFolders` call
+is needed to see its children — and THEIR children, at whatever depth.
+:meth:`MicrosoftGraphClient.list_mail_folders` performs the full,
+genuinely recursive traversal (see :func:`_walk_folder_tree` — a pure,
+HTTP-free helper this method wires to real, paginated HTTP calls, and
+that this module's own tests exercise directly with an in-memory
+multi-level tree, proving real recursion without needing to mock
+`urllib`). `?includeHiddenFolders=true` is requested on every folder-
+listing call (architect spec: "include hidden folders in discovery if
+Microsoft Graph exposes them") — `GraphFolderSummary.is_hidden` simply
+reflects whatever Graph returns for each folder; this module never
+decides on its own that a folder is hidden.
+
+Well-known folder identity is resolved, NEVER guessed from a display
+name (architect spec's explicit warning — display names can be
+renamed/localized). :meth:`MicrosoftGraphClient.resolve_well_known_folders`
+calls `GET /me/mailFolders/{wellKnownName}` once per name in
+`WELL_KNOWN_FOLDER_NAMES_TO_RESOLVE` — deliberately ONLY the six this
+delivery's own monitored/excluded doctrine needs to distinguish
+(`inbox`/`junkemail`/`deleteditems`/`sentitems`/`drafts`/`outbox`), not
+every well-known name Graph supports. :func:`classify_folders` then
+stamps `well_known_name` onto any enumerated folder whose real `id`
+matches one of those resolved ids — by ID, never by `display_name`.
+:func:`compute_monitored_folders` applies the architect's own explicit
+default exclusion set, :data:`EXCLUDED_WELL_KNOWN_FOLDER_NAMES`
+(Sent Items/Drafts/Outbox) — everything else (Inbox, Junk Email,
+Deleted Items, every custom/user-created folder, nested or hidden) is
+monitored. See `services/mailbox/microsoft/adapter.py`'s own
+`discover_monitored_folders` for how these three steps are actually
+wired together against a live token, and `services/mailbox/sweep.py`'s
+own module docstring for how the resulting monitored folder list drives
+the sweep itself.
 """
 from __future__ import annotations
 
@@ -57,26 +96,58 @@ import re
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass, field
+from collections import deque
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
-from typing import Mapping, Optional, Protocol, Sequence
-
-from services.mailbox.message import FOLDER_INBOX, FOLDER_JUNK
+from typing import Callable, Deque, Mapping, Optional, Protocol, Sequence
 
 AUTHORIZE_URL_TEMPLATE = "https://login.microsoftonline.com/{tenant}/oauth2/v2.0/authorize"
 TOKEN_URL_TEMPLATE = "https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token"
 GRAPH_ME_URL = "https://graph.microsoft.com/v1.0/me"
 GRAPH_DELTA_URL_TEMPLATE = "https://graph.microsoft.com/v1.0/me/mailFolders/{folder}/messages/delta"
 GRAPH_MESSAGE_CONTENT_URL_TEMPLATE = "https://graph.microsoft.com/v1.0/me/messages/{message_id}/$value"
+GRAPH_MAIL_FOLDERS_URL = "https://graph.microsoft.com/v1.0/me/mailFolders"
+GRAPH_CHILD_FOLDERS_URL_TEMPLATE = "https://graph.microsoft.com/v1.0/me/mailFolders/{folder_id}/childFolders"
+GRAPH_WELL_KNOWN_FOLDER_URL_TEMPLATE = "https://graph.microsoft.com/v1.0/me/mailFolders/{well_known_name}"
 
 #: Architect's own minimum, read-only scope set — see module docstring.
 OAUTH_SCOPES = "openid profile offline_access User.Read Mail.Read"
 
-#: Microsoft Graph's own well-known folder ids for the exactly-two
-#: folders this slice ever reads (architect spec: "never string-scrape
-#: display names"). Keyed by this codebase's own generic
-#: `services.mailbox.message` folder constants.
-GRAPH_WELL_KNOWN_FOLDER = {FOLDER_INBOX: "inbox", FOLDER_JUNK: "junkemail"}
+#: Graph's own opt-in query param that surfaces hidden folders through
+#: the ordinary folder-enumeration endpoints (architect spec: "include
+#: hidden folders in discovery if Microsoft Graph exposes them through
+#: the supported folder enumeration API").
+_INCLUDE_HIDDEN_FOLDERS_PARAM = "includeHiddenFolders=true"
+
+#: The well-known Graph folder names this delivery deliberately
+#: resolves via `GET /me/mailFolders/{name}` ONCE per sweep (see
+#: `MicrosoftGraphClient.resolve_well_known_folders`) — CD-6 architect
+#: amendment (recursive folder discovery). `inbox`/`junkemail`/
+#: `deleteditems` are always MONITORED; `sentitems`/`drafts`/`outbox`
+#: are the architect's own explicit default EXCLUSION set (see
+#: `EXCLUDED_WELL_KNOWN_FOLDER_NAMES` below). Deliberately NOT
+#: exhaustive of every well-known name Graph supports (e.g.
+#: `archive`/`clutter`/`conversationhistory`) — only the ones this
+#: delivery's own monitored/excluded doctrine actually needs to
+#: distinguish; a folder Graph does NOT resolve one of these six names
+#: to (e.g. a real user-created "Archive" folder) is correctly
+#: classified CUSTOM and therefore MONITORED — never silently excluded.
+WELL_KNOWN_FOLDER_NAMES_TO_RESOLVE: tuple[str, ...] = (
+    "inbox",
+    "junkemail",
+    "deleteditems",
+    "sentitems",
+    "drafts",
+    "outbox",
+)
+
+#: CD-6 architect amendment's own explicit default exclusion list, and
+#: ONLY these three — a real, named, documented product decision (kept
+#: easy to find/revisit, never a mysterious hardcoded list buried in
+#: sweep logic). Every other folder (Inbox, Junk Email, Deleted Items,
+#: every custom/user-created folder, nested or hidden) is monitored —
+#: see `compute_monitored_folders` below.
+EXCLUDED_WELL_KNOWN_FOLDER_NAMES: frozenset[str] = frozenset({"sentitems", "drafts", "outbox"})
 
 #: Every Graph request that touches a message identity uses this header
 #: (architect spec — canonical uniqueness depends on it).
@@ -254,6 +325,127 @@ class GraphMessageContentResult:
     error_detail: Optional[str] = None
 
 
+@dataclass(frozen=True)
+class GraphFolderSummary:
+    """One folder entry from `list_mail_folders`'s own recursive
+    enumeration (CD-6 architect amendment — folder discovery). `is_hidden`
+    is whatever Graph itself reports for this folder (via
+    `?includeHiddenFolders=true`) — this module never decides on its own
+    that a folder is hidden."""
+
+    folder_id: str
+    display_name: str
+    parent_folder_id: Optional[str]
+    child_folder_count: int
+    is_hidden: bool = False
+    #: NEVER populated by `list_mail_folders` itself — Graph's folder-
+    #: listing endpoints do not return a well-known-name field, only a
+    #: real `id`. Populated ONLY by :func:`classify_folders`, which
+    #: matches this folder's `folder_id` against a SEPARATELY resolved
+    #: `{name: real_id}` mapping (see `resolve_well_known_folders`) —
+    #: never by string-matching `display_name`. `None` means either
+    #: "not yet classified" or "a genuine custom/user-created folder".
+    well_known_name: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class GraphFolderListResult:
+    status: GraphOutcomeStatus
+    #: The FULL, flattened, recursively-enumerated folder tree — every
+    #: depth, not just top-level (see `list_mail_folders`'s own
+    #: docstring).
+    folders: Sequence[GraphFolderSummary] = field(default_factory=tuple)
+    retry_after_seconds: Optional[float] = None
+    error_detail: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class GraphWellKnownFoldersResult:
+    status: GraphOutcomeStatus
+    #: `well_known_name -> real, resolved Graph folder id`, present only
+    #: for the names Graph actually resolved OK this call — a single
+    #: name Graph 404s on (this mailbox genuinely has no such folder) is
+    #: silently absent from this mapping rather than failing the whole
+    #: batch; see `resolve_well_known_folders`'s own docstring.
+    folder_ids: Mapping[str, str] = field(default_factory=dict)
+    retry_after_seconds: Optional[float] = None
+    error_detail: Optional[str] = None
+
+
+def classify_folders(
+    folders: Sequence[GraphFolderSummary], *, well_known_folder_ids: Mapping[str, str]
+) -> tuple[GraphFolderSummary, ...]:
+    """Stamp `well_known_name` onto every folder whose real, resolved
+    Graph `id` matches one of `well_known_folder_ids` — BY ID, never by
+    `display_name` (architect spec's explicit warning: display names
+    can be renamed/localized). `well_known_folder_ids` must be exactly
+    the mapping `resolve_well_known_folders` actually returned this
+    sweep (`name -> real id`, see `WELL_KNOWN_FOLDER_NAMES_TO_RESOLVE`
+    above) — a folder that merely happens to be named e.g. "Archive" is
+    left `well_known_name=None` (classified CUSTOM) unless `"archive"`
+    was itself one of the deliberately-resolved names (it is not)."""
+    id_to_name = {folder_id: name for name, folder_id in well_known_folder_ids.items()}
+    return tuple(
+        replace(f, well_known_name=id_to_name[f.folder_id]) if f.folder_id in id_to_name else f for f in folders
+    )
+
+
+def compute_monitored_folders(classified_folders: Sequence[GraphFolderSummary]) -> tuple[GraphFolderSummary, ...]:
+    """Default monitored set (CD-6 architect amendment, folder
+    expansion): Inbox + Junk Email + Deleted Items + every custom/
+    user-created folder (including nested/hidden ones Graph's own
+    enumeration surfaced), MINUS `EXCLUDED_WELL_KNOWN_FOLDER_NAMES`
+    (Sent Items/Drafts/Outbox — the architect's own explicit default
+    exclusion, see that constant's own docstring). Never silently
+    excludes anything else — a folder this function does not recognise
+    as one of the six resolved well-known names is always monitored."""
+    return tuple(f for f in classified_folders if f.well_known_name not in EXCLUDED_WELL_KNOWN_FOLDER_NAMES)
+
+
+def _walk_folder_tree(
+    roots: Sequence[Mapping], *, fetch_children: Callable[[str], Sequence[Mapping]]
+) -> list[Mapping]:
+    """Pure, HTTP-free, bounded (cycle-guarded) breadth-first flatten of
+    a Graph folder tree — GENUINE multi-level recursion (repeatedly
+    calling `fetch_children` on any folder whose own `childFolderCount`
+    is > 0, at WHATEVER depth, not just one level below `roots`), never
+    an assumption that the root `mailFolders` response is the complete
+    mailbox (architect spec's explicit instruction).
+
+    `fetch_children(folder_id)` returns that folder's own immediate
+    child-folder raw dicts (empty for a leaf) — `list_mail_folders`
+    wires this to a real, paginated `GET .../childFolders` HTTP call;
+    this module's own unit tests wire it to an in-memory dict instead,
+    proving the real recursion algorithm itself (parent -> children ->
+    grandchildren) without any HTTP mocking. A folder id already
+    visited is never re-queued/re-fetched — real mailbox folder trees
+    are finite, but this guards defensively against a pathological
+    cycle/self-reference in whatever Graph ever returns."""
+    collected: list[Mapping] = []
+    visited: set[str] = set()
+    queue: Deque[Mapping] = deque(roots)
+    while queue:
+        raw = queue.popleft()
+        folder_id = raw.get("id")
+        if not folder_id or folder_id in visited:
+            continue
+        visited.add(folder_id)
+        collected.append(raw)
+        if int(raw.get("childFolderCount") or 0) > 0:
+            queue.extend(fetch_children(folder_id))
+    return collected
+
+
+def _parse_folder_summary(item: Mapping) -> GraphFolderSummary:
+    return GraphFolderSummary(
+        folder_id=item["id"],
+        display_name=item.get("displayName") or "",
+        parent_folder_id=item.get("parentFolderId"),
+        child_folder_count=int(item.get("childFolderCount") or 0),
+        is_hidden=bool(item.get("isHidden", False)),
+    )
+
+
 class MicrosoftOAuthClientProtocol(Protocol):
     def is_configured(self) -> bool: ...
 
@@ -278,6 +470,12 @@ class MicrosoftGraphClientProtocol(Protocol):
     ) -> GraphDeltaPageResult: ...
 
     def fetch_message_content(self, *, access_token: str, immutable_message_id: str) -> GraphMessageContentResult: ...
+
+    def list_mail_folders(self, *, access_token: str) -> GraphFolderListResult: ...
+
+    def resolve_well_known_folders(
+        self, *, access_token: str, well_known_names: Sequence[str]
+    ) -> GraphWellKnownFoldersResult: ...
 
 
 def _read_body(exc: urllib.error.HTTPError) -> str:
@@ -520,7 +718,12 @@ class MicrosoftGraphClient:
         elif delta_link is not None:
             url = delta_link
         else:
-            well_known = GRAPH_WELL_KNOWN_FOLDER[folder]
+            # `folder` is the caller's own real, resolved Graph folder
+            # id (CD-6 architect amendment — folder expansion; see
+            # `services/mailbox/microsoft/adapter.py::discover_monitored_folders`)
+            # — Graph's delta endpoint accepts either a real folder id
+            # or a well-known name as this path segment, so this module
+            # no longer needs its own well-known-name lookup table here.
             # `$select`/`$expand` are requested on every FIRST-page-of-
             # a-round request (bootstrap or fresh delta_link round) —
             # bounded (headers + attachment metadata only, never body/
@@ -531,7 +734,7 @@ class MicrosoftGraphClient:
             if bootstrap_timestamp is not None:
                 iso = bootstrap_timestamp.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
                 params["$filter"] = f"receivedDateTime ge {iso}"
-            base = GRAPH_DELTA_URL_TEMPLATE.format(folder=well_known)
+            base = GRAPH_DELTA_URL_TEMPLATE.format(folder=folder)
             url = f"{base}?{urllib.parse.urlencode(params)}" if params else base
 
         request = urllib.request.Request(
@@ -619,3 +822,149 @@ class MicrosoftGraphClient:
             return GraphMessageContentResult(status=status, error_detail=str(exc)[:500])
 
         return GraphMessageContentResult(status=GraphOutcomeStatus.OK, content=raw)
+
+    # -- folder discovery (CD-6 architect amendment) ---------------------
+
+    def _get_json_page(self, url: str, access_token: str) -> Mapping:
+        """One GET, returning the parsed JSON body — or raising
+        `_FolderFetchAborted` carrying a fully-classified
+        `GraphFolderListResult` failure outcome (the SAME error
+        taxonomy discipline as `fetch_delta`/`fetch_message_content`
+        above)."""
+        request = urllib.request.Request(
+            url, method="GET", headers={"Authorization": f"Bearer {access_token}", "Accept": "application/json"}
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=self._timeout_seconds) as response:
+                raw = response.read()
+        except urllib.error.HTTPError as exc:
+            if exc.code == 401:
+                raise _FolderFetchAborted(
+                    GraphFolderListResult(status=GraphOutcomeStatus.AUTH_ERROR, error_detail=f"HTTP 401: {_read_body(exc)}")
+                )
+            if exc.code == 403:
+                raise _FolderFetchAborted(
+                    GraphFolderListResult(
+                        status=GraphOutcomeStatus.PERMISSION_ERROR, error_detail=f"HTTP 403: {_read_body(exc)}"
+                    )
+                )
+            if exc.code == 429:
+                raise _FolderFetchAborted(
+                    GraphFolderListResult(
+                        status=GraphOutcomeStatus.RATE_LIMITED,
+                        retry_after_seconds=_retry_after_seconds(exc),
+                        error_detail=f"HTTP 429: {_read_body(exc)}",
+                    )
+                )
+            raise _FolderFetchAborted(
+                GraphFolderListResult(status=GraphOutcomeStatus.PROVIDER_ERROR, error_detail=f"HTTP {exc.code}: {_read_body(exc)}")
+            )
+        except Exception as exc:  # noqa: BLE001
+            is_timeout = isinstance(exc, TimeoutError) or "timed out" in str(exc).lower()
+            status = GraphOutcomeStatus.TIMEOUT if is_timeout else GraphOutcomeStatus.TRANSPORT_ERROR
+            raise _FolderFetchAborted(GraphFolderListResult(status=status, error_detail=str(exc)[:500]))
+
+        try:
+            return json.loads(raw.decode("utf-8"))
+        except (json.JSONDecodeError, TypeError) as exc:
+            raise _FolderFetchAborted(
+                GraphFolderListResult(
+                    status=GraphOutcomeStatus.MALFORMED_RESPONSE, error_detail=f"could not parse mailFolders response: {exc}"
+                )
+            )
+
+    def _iter_all_pages(self, first_url: str, access_token: str) -> list[Mapping]:
+        """Follows `@odata.nextLink` across every page of ONE folder
+        collection (a top-level `mailFolders` listing, or one folder's
+        own `childFolders` listing) — in-memory pagination only, never a
+        durable cursor (mirrors `fetch_delta`'s own in-round `next_link`
+        handling)."""
+        url: Optional[str] = first_url
+        items: list[Mapping] = []
+        while url:
+            payload = self._get_json_page(url, access_token)
+            value = payload.get("value")
+            if not isinstance(value, list):
+                raise _FolderFetchAborted(
+                    GraphFolderListResult(
+                        status=GraphOutcomeStatus.MALFORMED_RESPONSE,
+                        error_detail="mailFolders response missing a 'value' array",
+                    )
+                )
+            items.extend(value)
+            url = payload.get("@odata.nextLink")
+        return items
+
+    def list_mail_folders(self, *, access_token: str) -> GraphFolderListResult:
+        try:
+            roots = self._iter_all_pages(f"{GRAPH_MAIL_FOLDERS_URL}?{_INCLUDE_HIDDEN_FOLDERS_PARAM}", access_token)
+
+            def _fetch_children(folder_id: str) -> Sequence[Mapping]:
+                child_url = (
+                    f"{GRAPH_CHILD_FOLDERS_URL_TEMPLATE.format(folder_id=folder_id)}?{_INCLUDE_HIDDEN_FOLDERS_PARAM}"
+                )
+                return self._iter_all_pages(child_url, access_token)
+
+            raw_folders = _walk_folder_tree(roots, fetch_children=_fetch_children)
+        except _FolderFetchAborted as aborted:
+            return aborted.result
+
+        return GraphFolderListResult(status=GraphOutcomeStatus.OK, folders=tuple(_parse_folder_summary(f) for f in raw_folders))
+
+    def resolve_well_known_folders(
+        self, *, access_token: str, well_known_names: Sequence[str]
+    ) -> GraphWellKnownFoldersResult:
+        resolved: dict[str, str] = {}
+        for name in well_known_names:
+            url = f"{GRAPH_WELL_KNOWN_FOLDER_URL_TEMPLATE.format(well_known_name=name)}?$select=id"
+            request = urllib.request.Request(
+                url, method="GET", headers={"Authorization": f"Bearer {access_token}", "Accept": "application/json"}
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=self._timeout_seconds) as response:
+                    raw = response.read()
+            except urllib.error.HTTPError as exc:
+                if exc.code == 404:
+                    # This mailbox genuinely has no such well-known
+                    # folder — skip it, not fatal to the batch (see
+                    # module docstring).
+                    continue
+                if exc.code == 401:
+                    return GraphWellKnownFoldersResult(status=GraphOutcomeStatus.AUTH_ERROR, error_detail=f"HTTP 401: {_read_body(exc)}")
+                if exc.code == 403:
+                    return GraphWellKnownFoldersResult(
+                        status=GraphOutcomeStatus.PERMISSION_ERROR, error_detail=f"HTTP 403: {_read_body(exc)}"
+                    )
+                if exc.code == 429:
+                    return GraphWellKnownFoldersResult(
+                        status=GraphOutcomeStatus.RATE_LIMITED,
+                        retry_after_seconds=_retry_after_seconds(exc),
+                        error_detail=f"HTTP 429: {_read_body(exc)}",
+                    )
+                return GraphWellKnownFoldersResult(
+                    status=GraphOutcomeStatus.PROVIDER_ERROR, error_detail=f"HTTP {exc.code}: {_read_body(exc)}"
+                )
+            except Exception as exc:  # noqa: BLE001
+                is_timeout = isinstance(exc, TimeoutError) or "timed out" in str(exc).lower()
+                status = GraphOutcomeStatus.TIMEOUT if is_timeout else GraphOutcomeStatus.TRANSPORT_ERROR
+                return GraphWellKnownFoldersResult(status=status, error_detail=str(exc)[:500])
+
+            try:
+                payload = json.loads(raw.decode("utf-8"))
+                resolved[name] = payload["id"]
+            except (json.JSONDecodeError, KeyError, TypeError) as exc:
+                return GraphWellKnownFoldersResult(
+                    status=GraphOutcomeStatus.MALFORMED_RESPONSE,
+                    error_detail=f"could not parse well-known folder response for {name!r}: {exc}",
+                )
+        return GraphWellKnownFoldersResult(status=GraphOutcomeStatus.OK, folder_ids=resolved)
+
+
+class _FolderFetchAborted(Exception):
+    """Internal-only signal: a `list_mail_folders` HTTP call failed —
+    raised, caught once inside `list_mail_folders` itself, never
+    escapes `graph_client.py`."""
+
+    def __init__(self, result: GraphFolderListResult) -> None:
+        super().__init__(result.error_detail or result.status.value)
+        self.result = result

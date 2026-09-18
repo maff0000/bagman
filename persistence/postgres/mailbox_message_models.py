@@ -37,6 +37,10 @@ class MailboxMessageRow(Base):
     immutable_provider_message_id: Mapped[str] = mapped_column(String, nullable=False)
     internet_message_id: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     observed_folder: Mapped[str] = mapped_column(String, nullable=False)
+    # CD-6 architect amendment (recursive folder discovery) — additive,
+    # nullable column; existing rows (the real 128-message Slice 4A
+    # acceptance-test ingest) get NULL, never a silently-invented label.
+    observed_folder_display_name: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     subject: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     sender_address: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     sender_display_name: Mapped[Optional[str]] = mapped_column(String, nullable=True)
