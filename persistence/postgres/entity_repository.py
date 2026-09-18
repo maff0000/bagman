@@ -9,6 +9,7 @@ durability.
 """
 from __future__ import annotations
 
+import dataclasses
 from typing import Any, Mapping, Optional
 
 from sqlalchemy.engine import Engine
@@ -34,6 +35,8 @@ def _row_to_entity(row: GovernedEntityRow) -> GovernedEntity:
         display_name=row.display_name,
         status=row.status,
         created_at=row.created_at,
+        fiscal_year_start_month_day=row.fiscal_year_start_month_day,
+        email_bootstrap_floor_at=row.email_bootstrap_floor_at,
         metadata=dict(row.metadata_),
     )
 
@@ -57,6 +60,8 @@ class PostgresEntityRepository(EntityRepository):
         status: str,
         metadata: Optional[Mapping[str, Any]] = None,
         entity_id: Optional[str] = None,
+        fiscal_year_start_month_day: Optional[str] = None,
+        email_bootstrap_floor_at=None,
     ) -> GovernedEntity:
         resolved_id = entity_id if entity_id is not None else identity.generate_id()
 
@@ -68,6 +73,8 @@ class PostgresEntityRepository(EntityRepository):
                 display_name=display_name,
                 status=status,
                 created_at=utc_now(),
+                fiscal_year_start_month_day=fiscal_year_start_month_day,
+                email_bootstrap_floor_at=email_bootstrap_floor_at,
                 metadata=dict(metadata) if metadata is not None else {},
             )
             validate_against_contract(candidate.to_dict(), _SCHEMA)
@@ -83,6 +90,8 @@ class PostgresEntityRepository(EntityRepository):
             display_name=candidate.display_name,
             status=candidate.status,
             created_at=candidate.created_at,
+            fiscal_year_start_month_day=candidate.fiscal_year_start_month_day,
+            email_bootstrap_floor_at=candidate.email_bootstrap_floor_at,
             metadata_=dict(candidate.metadata),
         )
 
@@ -102,6 +111,41 @@ class PostgresEntityRepository(EntityRepository):
             raise PersistenceError(f"could not register GovernedEntity: {exc}") from exc
 
         return candidate
+
+    def set_accounting_period_configuration(
+        self,
+        entity_id: str,
+        *,
+        fiscal_year_start_month_day: str,
+        email_bootstrap_floor_at,
+    ) -> GovernedEntity:
+        try:
+            with session_scope(self._engine) as session:
+                try:
+                    row = session.get(GovernedEntityRow, entity_id, with_for_update=True)
+                except DataError as exc:
+                    if is_invalid_uuid_format(exc):
+                        raise NotFoundError(
+                            f"no GovernedEntity with entity_id '{entity_id}' "
+                            "(malformed identifier can never exist)"
+                        ) from exc
+                    raise
+                if row is None:
+                    raise NotFoundError(f"no GovernedEntity with entity_id '{entity_id}'")
+                current = _row_to_entity(row)
+                updated = dataclasses.replace(
+                    current,
+                    fiscal_year_start_month_day=fiscal_year_start_month_day,
+                    email_bootstrap_floor_at=email_bootstrap_floor_at,
+                )
+                validate_against_contract(updated.to_dict(), _SCHEMA)
+                row.fiscal_year_start_month_day = updated.fiscal_year_start_month_day
+                row.email_bootstrap_floor_at = updated.email_bootstrap_floor_at
+        except (NotFoundError, ValidationError):
+            raise
+        except SQLAlchemyError as exc:
+            raise PersistenceError(f"could not update GovernedEntity accounting-period configuration: {exc}") from exc
+        return updated
 
     def get_entity(self, entity_id: str) -> GovernedEntity:
         try:

@@ -113,6 +113,7 @@ CANONICAL_TABLES = (
     "mailbox_folder_cursors",  # CD-6 Slice 4
     "mailbox_sweep_locks",  # CD-6 Slice 4
     "mailbox_microsoft_oauth_states",  # CD-6 Slice 4
+    "mailbox_domain_rules",  # CD-6 architect amendment (two-stage mail processing)
 )
 
 

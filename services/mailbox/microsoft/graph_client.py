@@ -53,6 +53,7 @@ from __future__ import annotations
 
 import enum
 import json
+import re
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -80,6 +81,30 @@ GRAPH_WELL_KNOWN_FOLDER = {FOLDER_INBOX: "inbox", FOLDER_JUNK: "junkemail"}
 #: Every Graph request that touches a message identity uses this header
 #: (architect spec — canonical uniqueness depends on it).
 IMMUTABLE_ID_PREFER_HEADER = 'IdType="ImmutableId"'
+
+#: CD-6 architect amendment (Stage A discovery, bounded — never a full
+#: MIME `/$value` fetch). Requested on the SAME delta round-trip as
+#: every other summary field: `internetMessageHeaders` carries the raw
+#: header list (parsed for `Authentication-Results`/`Received-SPF` by
+#: `_parse_auth_signals` below); `$expand=attachments(...)` carries
+#: per-attachment filename/contentType/size WITHOUT attachment bytes.
+GRAPH_DELTA_SELECT_FIELDS = (
+    "id,internetMessageId,subject,sender,receivedDateTime,hasAttachments,internetMessageHeaders"
+)
+GRAPH_DELTA_EXPAND_ATTACHMENTS = "attachments($select=name,contentType,size)"
+
+#: Graph's own header names this module parses for authentication
+#: signals — matched case-insensitively (Graph/most MTAs are
+#: inconsistent about header-name casing).
+_AUTH_RESULTS_HEADER_NAMES = frozenset({"authentication-results", "arc-authentication-results"})
+_RECEIVED_SPF_HEADER_NAME = "received-spf"
+
+#: `Authentication-Results` embeds `spf=<verdict>`/`dkim=<verdict>`/
+#: `dmarc=<verdict>` tokens per RFC 8601 — a deliberately simple,
+#: bounded regex extraction (never a full RFC 8601 parser); a value
+#: this cannot find stays `None` (this module never invents a verdict
+#: the provider did not supply).
+_AUTH_RESULT_TOKEN_PATTERN = re.compile(r"\b(spf|dkim|dmarc)\s*=\s*([a-zA-Z]+)")
 
 DEFAULT_TIMEOUT_SECONDS = 15.0
 
@@ -180,6 +205,27 @@ class GraphMessageSummary:
     #: adapter's own parsing is complete/honest rather than silently
     #: dropping a shape it does not recognise.
     removed: bool = False
+    #: CD-6 architect amendment (Stage A discovery — "attachment
+    #: metadata sufficient for discovery"). Bounded, discovery-only
+    #: per-attachment metadata: `{"filename": ..., "content_type": ...,
+    #: "size_bytes": ...}`. The REAL client requests this via
+    #: `$expand=attachments($select=name,contentType,size)` on the SAME
+    #: delta request (see `GRAPH_DELTA_SELECT_EXPAND` below) — never a
+    #: second per-message round trip, and never attachment CONTENT.
+    #: Empty when the delta item carried no `attachments` array (e.g.
+    #: `has_attachments` is `false`, or the real endpoint's `$expand`
+    #: was not honoured for this item).
+    attachment_metadata: Sequence[Mapping[str, Optional[object]]] = field(default_factory=tuple)
+    #: CD-6 architect amendment (§7 — authentication/spoofing). Parsed,
+    #: best-effort SPF/DKIM/DMARC verdict tokens from the message's own
+    #: `Authentication-Results`/`Received-SPF` headers — see
+    #: `_parse_auth_signals` below. The REAL client requests raw headers
+    #: via `$select=...,internetMessageHeaders` on the SAME delta
+    #: request (never a full `/$value` MIME fetch). Keys present only
+    #: when the provider actually returned a parseable header for that
+    #: mechanism — this module never invents a verdict Graph did not
+    #: supply.
+    auth_signals: Mapping[str, Optional[str]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -376,6 +422,50 @@ class MicrosoftOAuthClient:
         return MicrosoftIdentityResult(status=GraphOutcomeStatus.OK, identity=identity)
 
 
+def _parse_auth_signals(headers: Optional[Sequence[Mapping]]) -> Mapping[str, Optional[str]]:
+    """Best-effort SPF/DKIM/DMARC verdict extraction from a Graph
+    `internetMessageHeaders` list (`[{"name": ..., "value": ...}, ...]`)
+    — see `_AUTH_RESULT_TOKEN_PATTERN`'s own docstring for the bounded,
+    non-exhaustive parsing this performs. Returns `{}` (never a dict of
+    `None`s) when no relevant header was present at all — this module
+    never fabricates a verdict Graph did not supply."""
+    signals: dict[str, Optional[str]] = {}
+    for header in headers or ():
+        name = str(header.get("name") or "").strip().lower()
+        value = str(header.get("value") or "")
+        if name in _AUTH_RESULTS_HEADER_NAMES:
+            for mechanism, verdict in _AUTH_RESULT_TOKEN_PATTERN.findall(value):
+                signals.setdefault(mechanism.lower(), verdict.lower())
+        elif name == _RECEIVED_SPF_HEADER_NAME:
+            first_token = value.strip().split(" ", 1)[0].lower() if value.strip() else None
+            if first_token:
+                signals.setdefault("spf", first_token)
+    return signals
+
+
+def _parse_attachment_metadata(item: Mapping) -> Sequence[Mapping[str, Optional[object]]]:
+    """Bounded, discovery-only per-attachment metadata from a Graph
+    delta item's own (`$expand`-ed) `attachments` array — NEVER
+    attachment content. Empty when the item carries no such array
+    (e.g. a real endpoint response that did not honour `$expand`, or a
+    message with no attachments)."""
+    raw_attachments = item.get("attachments")
+    if not isinstance(raw_attachments, list):
+        return ()
+    parsed = []
+    for attachment in raw_attachments:
+        if not isinstance(attachment, Mapping):
+            continue
+        parsed.append(
+            {
+                "filename": attachment.get("name"),
+                "content_type": attachment.get("contentType"),
+                "size_bytes": attachment.get("size"),
+            }
+        )
+    return tuple(parsed)
+
+
 def _parse_message_summary(item: Mapping) -> Optional[GraphMessageSummary]:
     if "@removed" in item:
         return GraphMessageSummary(
@@ -405,6 +495,8 @@ def _parse_message_summary(item: Mapping) -> Optional[GraphMessageSummary]:
         received_at=received_at,
         has_attachments=bool(item.get("hasAttachments", False)),
         removed=False,
+        attachment_metadata=_parse_attachment_metadata(item),
+        auth_signals=_parse_auth_signals(item.get("internetMessageHeaders")),
     )
 
 
@@ -429,7 +521,13 @@ class MicrosoftGraphClient:
             url = delta_link
         else:
             well_known = GRAPH_WELL_KNOWN_FOLDER[folder]
-            params = {}
+            # `$select`/`$expand` are requested on every FIRST-page-of-
+            # a-round request (bootstrap or fresh delta_link round) —
+            # bounded (headers + attachment metadata only, never body/
+            # `$value`), on the SAME request as everything else this
+            # module already fetches (see GRAPH_DELTA_SELECT_FIELDS/
+            # GRAPH_DELTA_EXPAND_ATTACHMENTS' own docstring above).
+            params = {"$select": GRAPH_DELTA_SELECT_FIELDS, "$expand": GRAPH_DELTA_EXPAND_ATTACHMENTS}
             if bootstrap_timestamp is not None:
                 iso = bootstrap_timestamp.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
                 params["$filter"] = f"receivedDateTime ge {iso}"

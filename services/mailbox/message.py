@@ -34,7 +34,7 @@ import abc
 import dataclasses
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Mapping, Optional
+from typing import Any, Mapping, Optional, Sequence
 
 from core import identity
 from core.contract_validation import validate_against_contract
@@ -52,8 +52,35 @@ INGESTION_STATUS_INGESTED = "INGESTED"
 INGESTION_STATUS_QUARANTINED = "QUARANTINED"
 INGESTION_STATUS_FAILED = "FAILED"
 INGESTION_STATUS_VANISHED = "VANISHED"
+#: CD-6 architect amendment (two-stage mail processing) — "seen,
+#: checked, no meaningful signal (or an IGNORED domain rule matched),
+#: nothing further happens". See services/mailbox/sweep.py's own
+#: module docstring for exactly which Stage-B outcomes produce this.
+INGESTION_STATUS_CHECKED_NOT_CANDIDATE = "CHECKED_NOT_CANDIDATE"
 INGESTION_STATUSES = frozenset(
-    {INGESTION_STATUS_INGESTED, INGESTION_STATUS_QUARANTINED, INGESTION_STATUS_FAILED, INGESTION_STATUS_VANISHED}
+    {
+        INGESTION_STATUS_INGESTED,
+        INGESTION_STATUS_QUARANTINED,
+        INGESTION_STATUS_FAILED,
+        INGESTION_STATUS_VANISHED,
+        INGESTION_STATUS_CHECKED_NOT_CANDIDATE,
+    }
+)
+
+#: A message in ANY of these statuses has already been FINALLY decided
+#: — the sweep engine's own duplicate short-circuit (see
+#: services/mailbox/sweep.py) never re-runs the Stage-B gate for a
+#: message already in one of these states, even if the governing
+#: MailboxDomainRule has since changed (a documented judgment call —
+#: see sweep.py's own module docstring).
+FINAL_INGESTION_STATUSES = frozenset(
+    {
+        INGESTION_STATUS_INGESTED,
+        INGESTION_STATUS_QUARANTINED,
+        INGESTION_STATUS_FAILED,
+        INGESTION_STATUS_VANISHED,
+        INGESTION_STATUS_CHECKED_NOT_CANDIDATE,
+    }
 )
 
 
@@ -79,6 +106,18 @@ class MailboxMessage:
     ingestion_status: str
     first_seen_at: datetime
     last_seen_at: datetime
+    #: CD-6 architect amendment (Stage A discovery) — the domain
+    #: portion of `sender_address`, lowercased; the actual Stage-B gate
+    #: key. `None` only when `sender_address` itself is absent.
+    sender_domain: Optional[str] = None
+    #: Bounded, discovery-only per-attachment metadata (filename/
+    #: content_type/size_bytes — NEVER content). See contract's own
+    #: field description.
+    attachment_metadata: Sequence[Mapping[str, Any]] = field(default_factory=tuple)
+    #: Provider-supplied authentication-domain signals (spf/dkim/dmarc),
+    #: captured separately from `sender_domain` — see contract's own
+    #: field description ("Authentication/spoofing" doctrine).
+    auth_signals: Mapping[str, Optional[str]] = field(default_factory=dict)
     metadata: Mapping[str, Any] = field(default_factory=dict)
     schema_version: str = SCHEMA_VERSION
 
@@ -93,8 +132,11 @@ class MailboxMessage:
             "subject": self.subject,
             "sender_address": self.sender_address,
             "sender_display_name": self.sender_display_name,
+            "sender_domain": self.sender_domain,
             "received_at": to_contract_string(self.received_at),
             "has_attachments": self.has_attachments,
+            "attachment_metadata": [dict(a) for a in self.attachment_metadata],
+            "auth_signals": dict(self.auth_signals),
             "evidence_id": self.evidence_id,
             "ingestion_status": self.ingestion_status,
             "first_seen_at": to_contract_string(self.first_seen_at),
@@ -123,6 +165,9 @@ class MailboxMessageRepository(abc.ABC):
         has_attachments: bool,
         ingestion_status: str,
         evidence_id: Optional[str] = None,
+        sender_domain: Optional[str] = None,
+        attachment_metadata: Optional[Sequence[Mapping[str, Any]]] = None,
+        auth_signals: Optional[Mapping[str, Optional[str]]] = None,
         metadata: Optional[Mapping[str, Any]] = None,
     ) -> tuple[MailboxMessage, bool]:
         """Resolve-or-create by (mailbox_id, immutable_provider_message_id):
@@ -161,9 +206,19 @@ class MailboxMessageRepository(abc.ABC):
 def _terminal_rank(status: str) -> int:
     """INGESTED is the most 'advanced' outcome; never let a later,
     lesser re-observation (e.g. a stale replay that only knows
-    QUARANTINED/FAILED) downgrade an already-INGESTED row."""
-    return {INGESTION_STATUS_INGESTED: 3, INGESTION_STATUS_QUARANTINED: 2, INGESTION_STATUS_VANISHED: 1,
-            INGESTION_STATUS_FAILED: 0}.get(status, 0)
+    QUARANTINED/FAILED) downgrade an already-INGESTED row.
+    CHECKED_NOT_CANDIDATE (CD-6 architect amendment) is the WEAKEST
+    real outcome — pure discovery, nothing happened — so it ranks
+    below every other terminal status; any later, stronger outcome
+    (e.g. a rule-approval-triggered reprocess that reaches INGESTED)
+    can always supersede it."""
+    return {
+        INGESTION_STATUS_INGESTED: 4,
+        INGESTION_STATUS_QUARANTINED: 3,
+        INGESTION_STATUS_VANISHED: 2,
+        INGESTION_STATUS_FAILED: 1,
+        INGESTION_STATUS_CHECKED_NOT_CANDIDATE: 0,
+    }.get(status, 0)
 
 
 class InMemoryMailboxMessageRepository(MailboxMessageRepository):
@@ -188,6 +243,9 @@ class InMemoryMailboxMessageRepository(MailboxMessageRepository):
         has_attachments: bool,
         ingestion_status: str,
         evidence_id: Optional[str] = None,
+        sender_domain: Optional[str] = None,
+        attachment_metadata: Optional[Sequence[Mapping[str, Any]]] = None,
+        auth_signals: Optional[Mapping[str, Optional[str]]] = None,
         metadata: Optional[Mapping[str, Any]] = None,
     ) -> tuple[MailboxMessage, bool]:
         key = (mailbox_id, immutable_provider_message_id)
@@ -206,8 +264,11 @@ class InMemoryMailboxMessageRepository(MailboxMessageRepository):
                     subject=subject,
                     sender_address=sender_address,
                     sender_display_name=sender_display_name,
+                    sender_domain=sender_domain,
                     received_at=received_at,
                     has_attachments=has_attachments,
+                    attachment_metadata=tuple(attachment_metadata) if attachment_metadata is not None else (),
+                    auth_signals=dict(auth_signals) if auth_signals is not None else {},
                     evidence_id=evidence_id,
                     ingestion_status=ingestion_status,
                     first_seen_at=now,
@@ -226,9 +287,12 @@ class InMemoryMailboxMessageRepository(MailboxMessageRepository):
         current = self._by_id[existing_id]
         new_evidence_id = current.evidence_id
         new_status = current.ingestion_status
+        new_metadata = dict(current.metadata)
         if _terminal_rank(ingestion_status) >= _terminal_rank(current.ingestion_status):
             new_status = ingestion_status
             new_evidence_id = evidence_id if evidence_id is not None else current.evidence_id
+            if metadata is not None:
+                new_metadata.update(dict(metadata))
 
         try:
             updated = dataclasses.replace(
@@ -237,6 +301,12 @@ class InMemoryMailboxMessageRepository(MailboxMessageRepository):
                 last_seen_at=now,
                 evidence_id=new_evidence_id,
                 ingestion_status=new_status,
+                sender_domain=sender_domain if sender_domain is not None else current.sender_domain,
+                attachment_metadata=(
+                    tuple(attachment_metadata) if attachment_metadata is not None else current.attachment_metadata
+                ),
+                auth_signals=dict(auth_signals) if auth_signals is not None else current.auth_signals,
+                metadata=new_metadata,
             )
             validate_against_contract(updated.to_dict(), _SCHEMA)
         except ValidationError:

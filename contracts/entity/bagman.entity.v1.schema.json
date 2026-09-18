@@ -33,6 +33,20 @@
       "$ref": "https://bagman.internal/contracts/common/bagman.utc_timestamp.v1.schema.json",
       "description": "UTC timestamp at which this entity was registered in BAGMAN."
     },
+    "fiscal_year_start_month_day": {
+      "oneOf": [
+        { "type": "string", "pattern": "^(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])$" },
+        { "type": "null" }
+      ],
+      "description": "CD-6 architect amendment (email historical-ingestion boundary). The RECURRING month-day (MM-DD, always UTC-calendar) on which this entity's accounting/financial year starts in every FUTURE year, e.g. `\"11-01\"` for a 1 November fiscal year start, `\"04-06\"` for the UK personal tax year. Deliberately separate from `email_bootstrap_floor_at` below — the two can legitimately differ for a real entity (e.g. a company incorporated mid-year has a recurring rule that would, naively applied, predate its own incorporation for THIS migration's one-off bootstrap). Required key, explicit `null` when this configuration is not yet known for a given entity (never invented, never silently defaulted) — a `null` here is a real, actionable 'missing configuration' state a caller must surface, not an oversight."
+    },
+    "email_bootstrap_floor_at": {
+      "oneOf": [
+        { "$ref": "https://bagman.internal/contracts/common/bagman.utc_timestamp.v1.schema.json" },
+        { "type": "null" }
+      ],
+      "description": "CD-6 architect amendment (email historical-ingestion boundary). The explicit, literal, real UTC floor date used for THIS actual historical mailbox-sweep bootstrap for this entity — never derived on the fly from `fiscal_year_start_month_day` (which describes a RECURRING future rule, not necessarily this one-off migration's real floor; see that field's own description for the documented NoustAI incorporation-date example). Required key, explicit `null` when not yet configured — `services.mailbox.sweep.compute_bootstrap_floor` refuses to run any historical sweep while any governed entity carries `null` here, rather than inventing a fallback or silently skipping that entity (architect spec: 'surface the missing configuration before historical sweep')."
+    },
     "metadata": {
       "type": "object",
       "description": "Free-form, genuinely open metadata about the entity. Additional properties are intentionally permitted here (unlike the top level of this schema) per the PID's own metadata examples. Must not contain secrets or sensitive company/account data (PID §23, §29).",
@@ -46,7 +60,10 @@
     "canonical_name",
     "display_name",
     "status",
-    "created_at"
+    "created_at",
+    "fiscal_year_start_month_day",
+    "email_bootstrap_floor_at",
+    "metadata"
   ],
   "additionalProperties": false
 }

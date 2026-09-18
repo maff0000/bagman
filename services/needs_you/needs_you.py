@@ -162,6 +162,24 @@ ITEM_TYPE_XERO_REFERENCE_DATA_STALE = "XERO_REFERENCE_DATA_STALE"
 ITEM_TYPE_MAILBOX_AUTH_REQUIRED = "MAILBOX_AUTH_REQUIRED"
 ALLOWED_ACTION_CONNECT_MICROSOFT_MAILBOX = "CONNECT_MICROSOFT_MAILBOX"
 
+#: CD-6 architect amendment (two-stage mail processing §4) — a mail
+#: from a domain BAGMAN has never seen a MailboxDomainRule for, that
+#: `services.mailbox.discovery_signals` judged a credible new
+#: accounting-document candidate. Raised/resolved entirely by
+#: `services/mailbox/sweep.py`/`app/api/routers/mailboxes_microsoft.py`
+#: (kept there, not here — mirrors `ITEM_TYPE_MAILBOX_AUTH_REQUIRED`'s
+#: own "producer lives next to its trigger" placement). Deduped
+#: per-(mailbox_id, sender_domain) by the PRODUCER (a metadata scan,
+#: not the generic `(item_type, source_object_reference)` mechanism —
+#: `source_object_reference` here is the real, canonical
+#: `mailbox_message_id` of the ONE message that first triggered this
+#: item, since a domain string is not itself a valid canonical
+#: identifier; see sweep.py's own module docstring for why that is
+#: also exactly the correlation needed to reprocess that message
+#: immediately on approval).
+ITEM_TYPE_MAILBOX_DOMAIN_REVIEW = "MAILBOX_DOMAIN_REVIEW"
+ALLOWED_ACTION_MAILBOX_DOMAIN_REVIEW = "MAILBOX_DOMAIN_REVIEW"
+
 #: Slice 1's own single real allowed_action_type (see module docstring
 #: "Slice 1's one real trigger"). Also open (not contract-enforced).
 ALLOWED_ACTION_COMPANY_WHAT_WHY = "COMPANY_WHAT_WHY"

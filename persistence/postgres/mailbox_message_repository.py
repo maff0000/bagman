@@ -33,8 +33,11 @@ def _row_to_domain(row: MailboxMessageRow) -> MailboxMessage:
         subject=row.subject,
         sender_address=row.sender_address,
         sender_display_name=row.sender_display_name,
+        sender_domain=row.sender_domain,
         received_at=row.received_at,
         has_attachments=row.has_attachments,
+        attachment_metadata=tuple(row.attachment_metadata_ or []),
+        auth_signals=dict(row.auth_signals or {}),
         evidence_id=row.evidence_id,
         ingestion_status=row.ingestion_status,
         first_seen_at=row.first_seen_at,
@@ -62,6 +65,9 @@ class PostgresMailboxMessageRepository(MailboxMessageRepository):
         has_attachments: bool,
         ingestion_status: str,
         evidence_id: Optional[str] = None,
+        sender_domain: Optional[str] = None,
+        attachment_metadata=None,
+        auth_signals: Optional[Mapping[str, Optional[str]]] = None,
         metadata: Optional[Mapping[str, Any]] = None,
     ) -> tuple[MailboxMessage, bool]:
         now = utc_now()
@@ -84,8 +90,11 @@ class PostgresMailboxMessageRepository(MailboxMessageRepository):
                         subject=subject,
                         sender_address=sender_address,
                         sender_display_name=sender_display_name,
+                        sender_domain=sender_domain,
                         received_at=received_at,
                         has_attachments=has_attachments,
+                        attachment_metadata=tuple(attachment_metadata) if attachment_metadata is not None else (),
+                        auth_signals=dict(auth_signals) if auth_signals is not None else {},
                         evidence_id=evidence_id,
                         ingestion_status=ingestion_status,
                         first_seen_at=now,
@@ -103,8 +112,11 @@ class PostgresMailboxMessageRepository(MailboxMessageRepository):
                         subject=candidate.subject,
                         sender_address=candidate.sender_address,
                         sender_display_name=candidate.sender_display_name,
+                        sender_domain=candidate.sender_domain,
                         received_at=candidate.received_at,
                         has_attachments=candidate.has_attachments,
+                        attachment_metadata_=[dict(a) for a in candidate.attachment_metadata],
+                        auth_signals=dict(candidate.auth_signals),
                         evidence_id=candidate.evidence_id,
                         ingestion_status=candidate.ingestion_status,
                         first_seen_at=candidate.first_seen_at,
@@ -117,14 +129,23 @@ class PostgresMailboxMessageRepository(MailboxMessageRepository):
                 current = _row_to_domain(row)
                 new_evidence_id = current.evidence_id
                 new_status = current.ingestion_status
+                new_metadata = dict(current.metadata)
                 if _terminal_rank(ingestion_status) >= _terminal_rank(current.ingestion_status):
                     new_status = ingestion_status
                     new_evidence_id = evidence_id if evidence_id is not None else current.evidence_id
+                    if metadata is not None:
+                        new_metadata.update(dict(metadata))
 
                 row.observed_folder = observed_folder
                 row.last_seen_at = now
                 row.evidence_id = new_evidence_id
                 row.ingestion_status = new_status
+                row.sender_domain = sender_domain if sender_domain is not None else current.sender_domain
+                if attachment_metadata is not None:
+                    row.attachment_metadata_ = [dict(a) for a in attachment_metadata]
+                if auth_signals is not None:
+                    row.auth_signals = dict(auth_signals)
+                row.metadata_ = new_metadata
                 updated = _row_to_domain(row)
                 validate_against_contract(updated.to_dict(), _SCHEMA)
                 return updated, False

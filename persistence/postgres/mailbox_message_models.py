@@ -40,8 +40,15 @@ class MailboxMessageRow(Base):
     subject: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     sender_address: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     sender_display_name: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    # CD-6 architect amendment (two-stage mail processing) — additive,
+    # nullable/defaulted columns; existing rows (the real 128-message
+    # Slice 4A acceptance-test ingest) get NULL/[]/{} defaults, never a
+    # silently-invented value.
+    sender_domain: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     has_attachments: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    attachment_metadata_: Mapped[list] = mapped_column("attachment_metadata", JSONB, nullable=False, default=list)
+    auth_signals: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
     evidence_id: Mapped[Optional[str]] = mapped_column(_UUID, nullable=True)
     ingestion_status: Mapped[str] = mapped_column(String, nullable=False)
     first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)

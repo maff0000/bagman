@@ -220,6 +220,20 @@ def test_sweep_after_connect_ingests_a_message_and_lists_it(dev_client):
     mailbox_id = _create_mailbox(dev_client)
     _connect_and_complete(dev_client, mailbox_id)
     comp = get_composition()
+    # CD-6 architect amendment (two-stage mail processing) — Stage B
+    # only proceeds to full MIME fetch/evidence-ingest for a domain
+    # under an ALLOWED MailboxDomainRule; this test is proving the
+    # ALLOWED-path behaviour end to end, so the rule is set up first
+    # exactly like a real operator approval would.
+    comp.mailbox_domain_rule_repository.upsert_rule(
+        mailbox_id=mailbox_id,
+        sender_domain="example.com",
+        match_mode="EXACT",
+        policy="ALLOWED",
+        destination_entity_id=None,
+        destination_mode="REVIEW_REQUIRED",
+        source="OPERATOR",
+    )
 
     now = datetime.now(timezone.utc)
     msg = GraphMessageSummary(
@@ -257,6 +271,160 @@ def test_sweep_response_never_leaks_a_token_or_delta_link(dev_client):
 
     r = dev_client.post(f"/internal/mailboxes/{mailbox_id}/microsoft/sweep", json={"actor_type": "USER", "actor_id": ACTOR_ID})
     assert "super-secret-delta-token" not in r.text
+
+
+# ---------------------------------------------------------------------
+# CD-6 architect amendment — domain-review resolution (Stage B gate)
+# ---------------------------------------------------------------------
+
+
+def _connected_mailbox_with_entity_seeded(client):
+    mailbox_id = _create_mailbox(client)
+    _connect_and_complete(client, mailbox_id)
+    comp = get_composition()
+    entity = comp.api.register_entity(
+        entity_type="COMPANY", canonical_name="TEST_DOMAIN_REVIEW_LTD", display_name="Test Ltd", status="ACTIVE",
+        actor_type="SYSTEM", actor_id=ACTOR_ID,
+        fiscal_year_start_month_day="01-01", email_bootstrap_floor_at=datetime(2025, 1, 1, tzinfo=timezone.utc),
+    )
+    return mailbox_id, comp, entity
+
+
+def _sweep_unknown_domain_message(client, mailbox_id):
+    comp = get_composition()
+    now = datetime.now(timezone.utc)
+    msg = GraphMessageSummary(
+        immutable_id="AAMk-unknown-1", internet_message_id="<u1@b>", subject="Invoice attached",
+        sender_address="billing@new-supplier.example", sender_display_name="New Supplier", received_at=now,
+        has_attachments=False,
+    )
+    comp.microsoft_graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(msg,), delta_link="d1"))
+    comp.microsoft_graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link="d-junk"))
+    r = client.post(f"/internal/mailboxes/{mailbox_id}/microsoft/sweep", json={"actor_type": "USER", "actor_id": ACTOR_ID})
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+def test_unknown_domain_credible_message_raises_a_domain_review_item(dev_client):
+    mailbox_id, comp, _entity = _connected_mailbox_with_entity_seeded(dev_client)
+    _sweep_unknown_domain_message(dev_client, mailbox_id)
+
+    items = comp.needs_you_repository.list_needs_you_items(item_type="MAILBOX_DOMAIN_REVIEW")
+    matching = [i for i in items if i.metadata.get("mailbox_id") == mailbox_id]
+    assert len(matching) == 1
+    assert matching[0].metadata["sender_domain"] == "new-supplier.example"
+    assert matching[0].status == "OPEN"
+
+
+def test_resolve_domain_review_allow_fixed_creates_rule_and_reprocesses_message(dev_client):
+    mailbox_id, comp, entity = _connected_mailbox_with_entity_seeded(dev_client)
+    _sweep_unknown_domain_message(dev_client, mailbox_id)
+    item = [
+        i for i in comp.needs_you_repository.list_needs_you_items(item_type="MAILBOX_DOMAIN_REVIEW")
+        if i.metadata.get("mailbox_id") == mailbox_id
+    ][0]
+
+    comp.microsoft_graph_client.queue_content_result(
+        GraphMessageContentResult(
+            status=GraphOutcomeStatus.OK, content=b"From: billing@new-supplier.example\r\nSubject: Invoice\r\n\r\nBody"
+        )
+    )
+    r = dev_client.post(
+        f"/internal/mailboxes/{mailbox_id}/microsoft/domain-review/{item.item_id}/resolve",
+        json={
+            "actor_type": "USER", "actor_id": ACTOR_ID, "decision": "ALLOW",
+            "destination_entity_id": entity.entity_id, "destination_mode": "FIXED",
+        },
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["needs_you_item"]["status"] == "RESOLVED"
+    assert body["mailbox_domain_rule"]["policy"] == "ALLOWED"
+    assert body["mailbox_domain_rule"]["destination_entity_id"] == entity.entity_id
+    assert body["reprocessed_message"]["ingestion_status"] == "INGESTED"
+    assert body["reprocessed_message"]["evidence_id"] is not None
+
+    rules = dev_client.get(f"/internal/mailboxes/{mailbox_id}/microsoft/domain-rules").json()
+    assert rules["count"] == 1
+    assert rules["items"][0]["sender_domain"] == "new-supplier.example"
+
+
+def test_resolve_domain_review_allow_review_required_needs_no_entity(dev_client):
+    mailbox_id, comp, _entity = _connected_mailbox_with_entity_seeded(dev_client)
+    _sweep_unknown_domain_message(dev_client, mailbox_id)
+    item = [
+        i for i in comp.needs_you_repository.list_needs_you_items(item_type="MAILBOX_DOMAIN_REVIEW")
+        if i.metadata.get("mailbox_id") == mailbox_id
+    ][0]
+
+    comp.microsoft_graph_client.queue_content_result(
+        GraphMessageContentResult(status=GraphOutcomeStatus.OK, content=b"From: x\r\nSubject: Invoice\r\n\r\nBody")
+    )
+    r = dev_client.post(
+        f"/internal/mailboxes/{mailbox_id}/microsoft/domain-review/{item.item_id}/resolve",
+        json={"actor_type": "USER", "actor_id": ACTOR_ID, "decision": "ALLOW", "destination_mode": "REVIEW_REQUIRED"},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["mailbox_domain_rule"]["destination_entity_id"] is None
+    assert body["mailbox_domain_rule"]["destination_mode"] == "REVIEW_REQUIRED"
+    assert body["reprocessed_message"]["ingestion_status"] == "INGESTED"
+
+
+def test_resolve_domain_review_ignore_creates_ignored_rule_no_reprocess(dev_client):
+    mailbox_id, comp, _entity = _connected_mailbox_with_entity_seeded(dev_client)
+    _sweep_unknown_domain_message(dev_client, mailbox_id)
+    item = [
+        i for i in comp.needs_you_repository.list_needs_you_items(item_type="MAILBOX_DOMAIN_REVIEW")
+        if i.metadata.get("mailbox_id") == mailbox_id
+    ][0]
+
+    r = dev_client.post(
+        f"/internal/mailboxes/{mailbox_id}/microsoft/domain-review/{item.item_id}/resolve",
+        json={"actor_type": "USER", "actor_id": ACTOR_ID, "decision": "IGNORE"},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["mailbox_domain_rule"]["policy"] == "IGNORED"
+    assert body["reprocessed_message"] is None
+    # No content fetch happened for an IGNORE decision.
+    assert comp.microsoft_graph_client.content_calls == []
+
+
+def test_resolve_domain_review_double_submit_same_decision_is_idempotent(dev_client):
+    mailbox_id, comp, _entity = _connected_mailbox_with_entity_seeded(dev_client)
+    _sweep_unknown_domain_message(dev_client, mailbox_id)
+    item = [
+        i for i in comp.needs_you_repository.list_needs_you_items(item_type="MAILBOX_DOMAIN_REVIEW")
+        if i.metadata.get("mailbox_id") == mailbox_id
+    ][0]
+    payload = {"actor_type": "USER", "actor_id": ACTOR_ID, "decision": "IGNORE"}
+    first = dev_client.post(f"/internal/mailboxes/{mailbox_id}/microsoft/domain-review/{item.item_id}/resolve", json=payload)
+    assert first.status_code == 200
+    second = dev_client.post(f"/internal/mailboxes/{mailbox_id}/microsoft/domain-review/{item.item_id}/resolve", json=payload)
+    assert second.status_code == 200
+    assert second.json()["needs_you_item"]["status"] == "RESOLVED"
+
+
+def test_resolve_domain_review_conflicting_second_decision_is_409(dev_client):
+    mailbox_id, comp, entity = _connected_mailbox_with_entity_seeded(dev_client)
+    _sweep_unknown_domain_message(dev_client, mailbox_id)
+    item = [
+        i for i in comp.needs_you_repository.list_needs_you_items(item_type="MAILBOX_DOMAIN_REVIEW")
+        if i.metadata.get("mailbox_id") == mailbox_id
+    ][0]
+    dev_client.post(
+        f"/internal/mailboxes/{mailbox_id}/microsoft/domain-review/{item.item_id}/resolve",
+        json={"actor_type": "USER", "actor_id": ACTOR_ID, "decision": "IGNORE"},
+    )
+    r = dev_client.post(
+        f"/internal/mailboxes/{mailbox_id}/microsoft/domain-review/{item.item_id}/resolve",
+        json={
+            "actor_type": "USER", "actor_id": ACTOR_ID, "decision": "ALLOW",
+            "destination_entity_id": entity.entity_id, "destination_mode": "FIXED",
+        },
+    )
+    assert r.status_code == 409
 
 
 def test_noustai_imap_mailbox_never_reaches_the_microsoft_router(dev_client):

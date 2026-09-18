@@ -1,11 +1,12 @@
 # BAGMAN component manifest (CD-6 Slice 3: Mailbox Management; CD-6
-# Slice 4: first real Microsoft Graph mailbox adapter + sweep engine)
-# for services/mailbox/.
+# Slice 4: first real Microsoft Graph mailbox adapter + sweep engine;
+# CD-6 architect amendment: two-stage discovery/domain-gate + governed
+# historical-ingestion boundary) for services/mailbox/.
 # Validated by scripts/generate_architecture_memory.py against
 # contracts/manifest/bagman.component_manifest.v1.schema.json.
 
 id: BAGMAN.MAILBOX
-version: 2
+version: 3
 
 responsibility: >
   Own the operator-facing mailbox DEFINITION registry (MailboxSource) —
@@ -24,7 +25,22 @@ responsibility: >
   never SUCCEEDED if a message that should have ingested failed
   irrecoverably), the per-folder durable delta cursor (only ever
   advanced after a full round succeeds), and the per-mailbox sweep
-  exclusivity lease. The first concrete provider adapter,
+  exclusivity lease. As of the CD-6 architect amendment, this
+  component ALSO owns the two-stage discover-then-gate mail-processing
+  model: bounded, MIME-free Stage-A discovery (sender domain,
+  attachment metadata, SPF/DKIM/DMARC-style authentication signals
+  captured separately from the visible From domain) for every message,
+  and a mailbox-specific `MailboxDomainRule` policy registry (Stage B)
+  that decides whether a message is worth a full, evidence-creating
+  MIME fetch at all — never fetching/storing full MIME for irrelevant
+  mail. An unknown domain showing a credible, bounded, non-AI
+  accounting-document signal creates exactly one governed Needs You
+  item; operator approval creates the routing rule AND immediately
+  reprocesses the specific triggering message. The historical
+  bootstrap boundary is the real, architect-verified, per-entity
+  accounting-period configuration (never an invented default; the
+  sweep refuses to run while any governed entity's configuration is
+  missing). The first concrete provider adapter,
   `services/mailbox/microsoft/` (Microsoft Graph: delegated
   authorization-code OAuth, `Mail.Read`-only delegated permissions, a
   read-only Graph client, server-side account-identity verification,
@@ -47,6 +63,7 @@ owns:
   - MailboxSource
   - MailboxMessage
   - MailboxSweepRun
+  - MailboxDomainRule
 
 # services/mailbox/*.py depends on core/ exactly like every other CD-2/
 # CD-4/CD-5/CD-6 domain module: identity (id generation), timestamps

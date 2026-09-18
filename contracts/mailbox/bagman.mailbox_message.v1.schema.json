@@ -56,13 +56,45 @@
       ],
       "description": "Untrusted provider-supplied sender display name string."
     },
+    "sender_domain": {
+      "oneOf": [
+        { "type": "string" },
+        { "type": "null" }
+      ],
+      "description": "CD-6 architect amendment (two-stage mail processing). The domain portion of `sender_address`, lowercased — stored explicitly (rather than only derived on demand) because it is the actual gate key `services.mailbox.domain_rule.MailboxDomainRuleRepository.find_for_sender` matches against. `null` only when `sender_address` itself is absent/unparseable."
+    },
     "received_at": {
       "$ref": "https://bagman.internal/contracts/common/bagman.utc_timestamp.v1.schema.json",
       "description": "The provider's own `receivedDateTime` for this message."
     },
     "has_attachments": {
       "type": "boolean",
-      "description": "Provider-reported attachment flag. This slice never extracts/lists individual attachments — the whole message (headers, body, attachments) is stored as one immutable `.eml` evidence artifact (see `evidence_id`)."
+      "description": "Provider-reported attachment flag. The whole message (headers, body, attachments) is stored as one immutable `.eml` evidence artifact once ingested (see `evidence_id`) — this flag and `attachment_metadata` below exist purely for the Stage-A discovery gate; this slice never extracts/parses individual attachment CONTENT."
+    },
+    "attachment_metadata": {
+      "type": "array",
+      "description": "CD-6 architect amendment (Stage A discovery — 'attachment metadata sufficient for discovery'). Bounded, discovery-only per-attachment metadata (filename/content type/size) — NEVER attachment bytes/content. Empty when `has_attachments` is `false`, or when the provider attachment listing itself could not be retrieved (a best-effort discovery signal, never a blocking failure).",
+      "items": {
+        "type": "object",
+        "properties": {
+          "filename": { "oneOf": [{ "type": "string" }, { "type": "null" }] },
+          "content_type": { "oneOf": [{ "type": "string" }, { "type": "null" }] },
+          "size_bytes": { "oneOf": [{ "type": "integer", "minimum": 0 }, { "type": "null" }] }
+        },
+        "additionalProperties": false
+      },
+      "default": []
+    },
+    "auth_signals": {
+      "type": "object",
+      "description": "CD-6 architect amendment (§7 — authentication/spoofing). Provider-supplied authentication-domain signals (SPF/DKIM/DMARC-alignment-style), captured SEPARATELY from the visible `sender_address`/`sender_domain` — never used by this slice to silently trust or distrust a message, only preserved honestly for a later stage. Each key is one of `spf`/`dkim`/`dmarc`; each value is whatever short verdict token the provider actually supplied (e.g. `\"pass\"`/`\"fail\"`/`\"softfail\"`/`\"none\"`), or `null` when the provider supplied nothing parseable for that mechanism — this slice never invents a verdict Graph did not actually return.",
+      "properties": {
+        "spf": { "oneOf": [{ "type": "string" }, { "type": "null" }] },
+        "dkim": { "oneOf": [{ "type": "string" }, { "type": "null" }] },
+        "dmarc": { "oneOf": [{ "type": "string" }, { "type": "null" }] }
+      },
+      "additionalProperties": false,
+      "default": {}
     },
     "evidence_id": {
       "oneOf": [
@@ -73,8 +105,8 @@
     },
     "ingestion_status": {
       "type": "string",
-      "enum": ["INGESTED", "QUARANTINED", "FAILED", "VANISHED"],
-      "description": "Outcome of this message's own evidence-ingestion attempt. `INGESTED` — a real `EvidenceItem` exists (`evidence_id` is set). `QUARANTINED` — the content-safety scanner flagged it; retained via the governed quarantine path, never parsed, never silently discarded. `FAILED` — an oversized message or another explicit terminal ingestion fault. `VANISHED` — the message existed in a delta page but had disappeared by the time its MIME content was fetched (a real, deterministic, recorded outcome — never a fabricated evidence row)."
+      "enum": ["INGESTED", "QUARANTINED", "FAILED", "VANISHED", "CHECKED_NOT_CANDIDATE"],
+      "description": "Outcome of this message's own Stage-A/Stage-B processing attempt (CD-6 architect amendment — two-stage mail processing). `INGESTED` — a real `EvidenceItem` exists (`evidence_id` is set); only reachable via an `ALLOWED` `MailboxDomainRule`. `QUARANTINED` — the content-safety scanner flagged it; retained via the governed quarantine path, never parsed, never silently discarded. `FAILED` — an oversized message or another explicit terminal ingestion fault. `VANISHED` — the message existed in a delta page but had disappeared by the time its MIME content was fetched (a real, deterministic, recorded outcome — never a fabricated evidence row). `CHECKED_NOT_CANDIDATE` — this message was observed and its sender domain gate was evaluated (an `IGNORED` rule matched, or no rule matched and `services.mailbox.discovery_signals` found no credible accounting-document signal) — seen, checked, deliberately never fetched/stored beyond this discovery projection (architect §9's data-volume doctrine)."
     },
     "first_seen_at": {
       "$ref": "https://bagman.internal/contracts/common/bagman.utc_timestamp.v1.schema.json",
@@ -108,8 +140,11 @@
     "subject",
     "sender_address",
     "sender_display_name",
+    "sender_domain",
     "received_at",
     "has_attachments",
+    "attachment_metadata",
+    "auth_signals",
     "evidence_id",
     "ingestion_status",
     "first_seen_at",

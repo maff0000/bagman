@@ -72,6 +72,17 @@ Endpoints
   message projections (received time/sender/subject/folder/ingestion
   state ONLY — never a body, never a classification field; see
   ``services/mailbox/sweep.py``'s own hard scope boundary).
+* ``GET /internal/mailboxes/{mailbox_id}/microsoft/domain-rules`` — the
+  mailbox's own governed ``MailboxDomainRule`` list (CD-6 architect
+  amendment).
+* ``POST /internal/mailboxes/{mailbox_id}/microsoft/domain-review/{item_id}/resolve``
+  — resolve one ``ITEM_TYPE_MAILBOX_DOMAIN_REVIEW`` Needs You item
+  (architect spec §4's operator decision: Allow -> a real canonical
+  entity / Allow -> destination review required / Ignore domain — "Review
+  candidate"/defer needs no call at all, the item simply stays OPEN).
+  Creates/updates the real ``MailboxDomainRule`` and, on ALLOW,
+  immediately reprocesses the one triggering message — see
+  ``ResolveMailboxDomainReviewRequest``'s own docstring below.
 
 Needs You integration (architect spec)
 ------------------------------------------
@@ -109,19 +120,30 @@ from fastapi import APIRouter
 from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel
 
-from app.api.composition import get_composition, get_mailbox_source_id
+from app.api.composition import ensure_seed_entities, get_composition, get_mailbox_source_id
 from core.errors import ConflictError, NotFoundError, OAuthStateError, ValidationError
+from core.timestamps import utc_now
+from services.mailbox.domain_rule import (
+    DESTINATION_MODE_FIXED,
+    DESTINATION_MODE_REVIEW_REQUIRED,
+    MATCH_MODE_EXACT,
+    MATCH_MODE_INCLUDE_SUBDOMAINS,
+    POLICY_ALLOWED,
+    POLICY_IGNORED,
+    SOURCE_OPERATOR,
+)
 from services.mailbox.lock import MailboxSweepLockError
 from services.mailbox.mailbox import (
     CONNECTION_STATE_CONNECTED,
     PROVIDER_MICROSOFT_GRAPH,
 )
 from services.mailbox.microsoft.oauth_state import consume_state
-from services.mailbox.sweep import run_sweep
+from services.mailbox.sweep import reprocess_message_after_domain_rule_approval, run_sweep
 from services.mailbox.sweep_run import TRIGGER_MANUAL
 from services.needs_you.needs_you import (
     ALLOWED_ACTION_CONNECT_MICROSOFT_MAILBOX,
     ITEM_TYPE_MAILBOX_AUTH_REQUIRED,
+    ITEM_TYPE_MAILBOX_DOMAIN_REVIEW,
 )
 
 router = APIRouter(prefix="/internal/mailboxes")
@@ -386,6 +408,12 @@ async def sweep_microsoft(mailbox_id: str, payload: SweepMicrosoftRequest) -> di
     composition = get_composition()
     mailbox = _require_microsoft_mailbox(composition, mailbox_id)
     mailbox_source_id = get_mailbox_source_id(composition, mailbox)
+    # The governed-entity bootstrap-floor configuration
+    # (`services.mailbox.sweep.compute_bootstrap_floor`) must exist
+    # before any sweep can compute its historical boundary — ensure the
+    # canonical seed has run rather than requiring a prior, unrelated
+    # `GET /internal/entities` call first.
+    ensure_seed_entities(composition)
 
     composition.api.record_audit_event(
         event_type="MAILBOX_SWEEP_STARTED",
@@ -409,6 +437,9 @@ async def sweep_microsoft(mailbox_id: str, payload: SweepMicrosoftRequest) -> di
             cursor_repository=composition.mailbox_folder_cursor_repository,
             sweep_lock=composition.mailbox_sweep_lock,
             mailbox_repository=composition.mailbox_source_repository,
+            domain_rule_repository=composition.mailbox_domain_rule_repository,
+            needs_you_repository=composition.needs_you_repository,
+            entity_repository=composition.api.entity_repository,
             api=composition.api,
             object_store=composition.object_store,
             scanner=composition.scanner,
@@ -470,3 +501,158 @@ async def list_microsoft_messages(mailbox_id: str, limit: int = 50) -> dict[str,
         raise ValidationError(f"limit must be between 1 and 200 (got {limit})")
     messages = composition.mailbox_message_repository.list_messages(mailbox_id=mailbox_id, limit=limit)
     return {"mailbox_id": mailbox_id, "items": [m.to_dict() for m in messages], "count": len(messages)}
+
+
+@router.get("/{mailbox_id}/microsoft/domain-rules")
+async def list_microsoft_domain_rules(mailbox_id: str) -> dict[str, Any]:
+    composition = get_composition()
+    _require_microsoft_mailbox(composition, mailbox_id)
+    rules = composition.mailbox_domain_rule_repository.list_rules(mailbox_id=mailbox_id)
+    return {"mailbox_id": mailbox_id, "items": [r.to_dict() for r in rules], "count": len(rules)}
+
+
+class ResolveMailboxDomainReviewRequest(BaseModel):
+    """Request body for
+    ``POST /internal/mailboxes/{mailbox_id}/microsoft/domain-review/{item_id}/resolve``
+    — CD-6 architect amendment §4's own operator action set, collapsed
+    to two `decision` values (`DEFER`/"Review candidate" needs no
+    endpoint call at all — an item simply stays `OPEN` until an
+    operator acts; see this router's own module docstring addendum
+    below):
+
+    * ``decision="ALLOW"`` + ``destination_mode="FIXED"`` +
+      ``destination_entity_id=<Infosecurs|NoustAI|Matthew Scott
+      Personal's real entity_id>`` — "Allow -> <company>".
+    * ``decision="ALLOW"`` + ``destination_mode="REVIEW_REQUIRED"`` (no
+      ``destination_entity_id``) — "Allow -> destination review
+      required".
+    * ``decision="IGNORE"`` — "Ignore domain".
+    """
+
+    actor_type: str
+    actor_id: str
+    decision: str  # "ALLOW" | "IGNORE"
+    destination_entity_id: Optional[str] = None
+    destination_mode: Optional[str] = None  # "FIXED" | "REVIEW_REQUIRED" — required when decision == "ALLOW"
+    match_mode: str = MATCH_MODE_EXACT  # "EXACT" | "INCLUDE_SUBDOMAINS"
+    processor_hint: Optional[str] = None
+
+
+@router.post("/{mailbox_id}/microsoft/domain-review/{item_id}/resolve")
+async def resolve_mailbox_domain_review(
+    mailbox_id: str, item_id: str, payload: ResolveMailboxDomainReviewRequest
+) -> dict[str, Any]:
+    """Resolve one ``ITEM_TYPE_MAILBOX_DOMAIN_REVIEW`` Needs You item —
+    the architect spec §4 operator-decision endpoint. On ``ALLOW``/
+    ``IGNORE``, creates or updates the real
+    ``services.mailbox.domain_rule.MailboxDomainRule`` for this
+    ``(mailbox_id, sender_domain)`` (``source="OPERATOR"``,
+    ``approved_at=now``) — never auto-adds a domain to any allowlist
+    outside this explicit operator action (architect spec §4). On
+    ``ALLOW``, the ONE specific triggering message (the item's own
+    ``source_object_reference``) is reprocessed IMMEDIATELY — fetched
+    and ingested now, not deferred to the next sweep (architect spec's
+    own explicit requirement; see
+    `services.mailbox.sweep.reprocess_message_after_domain_rule_approval`).
+
+    Idempotent-safe against a genuine double-submit of the exact same
+    decision (mirrors `app/api/routers/needs_you.py::resolve_needs_you_item`'s
+    own doctrine) — a real attempt to change an already-decided item to
+    a DIFFERENT outcome raises `ConflictError` -> HTTP 409.
+    """
+    composition = get_composition()
+    mailbox = _require_microsoft_mailbox(composition, mailbox_id)
+    item = composition.needs_you_repository.get_needs_you_item(item_id)
+
+    if item.item_type != ITEM_TYPE_MAILBOX_DOMAIN_REVIEW:
+        raise ValidationError(f"NeedsYouItem '{item_id}' is not a {ITEM_TYPE_MAILBOX_DOMAIN_REVIEW} item")
+    if item.metadata.get("mailbox_id") != mailbox_id:
+        raise ValidationError(f"NeedsYouItem '{item_id}' does not belong to mailbox '{mailbox_id}'")
+
+    if payload.decision not in ("ALLOW", "IGNORE"):
+        raise ValidationError(f"decision must be 'ALLOW' or 'IGNORE' (got {payload.decision!r})")
+    if payload.match_mode not in (MATCH_MODE_EXACT, MATCH_MODE_INCLUDE_SUBDOMAINS):
+        raise ValidationError(f"match_mode must be 'EXACT' or 'INCLUDE_SUBDOMAINS' (got {payload.match_mode!r})")
+
+    sender_domain = item.metadata.get("sender_domain")
+    resolution = {
+        "decision": payload.decision,
+        "destination_entity_id": payload.destination_entity_id,
+        "destination_mode": payload.destination_mode,
+        "match_mode": payload.match_mode,
+    }
+
+    if item.status != "OPEN":
+        if item.status == "RESOLVED" and (item.resolution or {}) == resolution:
+            return {"needs_you_item": item.to_dict(), "mailbox_domain_rule": None, "reprocessed_message": None}
+        raise ConflictError(
+            f"NeedsYouItem '{item_id}' is already '{item.status}' with a different resolution — "
+            "refusing to silently change an already-decided item; this is a genuine conflict, not "
+            "an idempotent retry"
+        )
+
+    if payload.decision == "ALLOW":
+        policy = POLICY_ALLOWED
+        if payload.destination_mode not in (DESTINATION_MODE_FIXED, DESTINATION_MODE_REVIEW_REQUIRED):
+            raise ValidationError(
+                "destination_mode must be 'FIXED' or 'REVIEW_REQUIRED' when decision is 'ALLOW'"
+            )
+        if payload.destination_mode == DESTINATION_MODE_FIXED and not payload.destination_entity_id:
+            raise ValidationError("destination_entity_id is required when destination_mode is 'FIXED'")
+        if payload.destination_entity_id:
+            # Real existence check — mirrors `app/api/routers/xero.py
+            # ::_require_entity`'s own pattern (never trust a
+            # caller-supplied entity_id without proving it real).
+            composition.api.entity_repository.get_entity(payload.destination_entity_id)
+    else:
+        policy = POLICY_IGNORED
+
+    rule = composition.mailbox_domain_rule_repository.upsert_rule(
+        mailbox_id=mailbox_id,
+        sender_domain=sender_domain,
+        match_mode=payload.match_mode,
+        policy=policy,
+        destination_entity_id=payload.destination_entity_id if policy == POLICY_ALLOWED else None,
+        destination_mode=payload.destination_mode if policy == POLICY_ALLOWED else None,
+        source=SOURCE_OPERATOR,
+        processor_hint=payload.processor_hint,
+        approved_at=utc_now(),
+    )
+
+    updated_item = composition.needs_you_repository.resolve_needs_you_item(
+        item_id, new_status="RESOLVED", resolution=resolution, actor_type=payload.actor_type, actor_id=payload.actor_id
+    )
+    composition.api.record_audit_event(
+        event_type="MAILBOX_DOMAIN_RULE_ALLOWED" if policy == POLICY_ALLOWED else "MAILBOX_DOMAIN_RULE_IGNORED",
+        actor_type=payload.actor_type,
+        actor_id=payload.actor_id,
+        subject_type="MailboxDomainRule",
+        subject_id=rule.rule_id,
+        correlation_id=updated_item.correlation_id,
+        causation_id=None,
+        payload={"mailbox_id": mailbox_id, "sender_domain": sender_domain, "needs_you_item_id": item_id},
+    )
+
+    reprocessed = None
+    if policy == POLICY_ALLOWED and item.source_object_reference is not None:
+        mailbox_source_id = get_mailbox_source_id(composition, mailbox)
+        reprocessed = reprocess_message_after_domain_rule_approval(
+            mailbox=mailbox,
+            mailbox_source_id=mailbox_source_id,
+            message_id=item.source_object_reference,
+            rule=rule,
+            adapter=composition.microsoft_mailbox_adapter,
+            message_repository=composition.mailbox_message_repository,
+            api=composition.api,
+            object_store=composition.object_store,
+            scanner=composition.scanner,
+            actor_type=payload.actor_type,
+            actor_id=payload.actor_id,
+            correlation_id=updated_item.correlation_id,
+        )
+
+    return {
+        "needs_you_item": updated_item.to_dict(),
+        "mailbox_domain_rule": rule.to_dict(),
+        "reprocessed_message": reprocessed.to_dict() if reprocessed is not None else None,
+    }

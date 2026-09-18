@@ -52,6 +52,7 @@ from __future__ import annotations
 import os
 import threading
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -67,6 +68,7 @@ from persistence.objects.store import EvidenceObjectStore
 from services.evidence.intake.intake import IntakeRepository
 from services.evidence.intake.scanner import EvidenceSafetyScanner, ScanResult, ScanVerdict
 from services.mailbox.cursor import MailboxFolderCursorRepository
+from services.mailbox.domain_rule import MailboxDomainRuleRepository
 from services.mailbox.lock import MailboxSweepLock
 from services.mailbox.mailbox import MailboxSourceRepository
 from services.mailbox.message import MailboxMessageRepository
@@ -376,6 +378,12 @@ class RuntimeComposition:
     microsoft_graph_client: MicrosoftGraphClientProtocol
     microsoft_token_store: MicrosoftTokenStoreProtocol
     microsoft_mailbox_adapter: MicrosoftGraphMailboxAdapter
+    #: CD-6 architect amendment (two-stage mail processing) — the
+    #: mailbox-specific domain-policy gate registry. In-memory in
+    #: development/test, a real `PostgresMailboxDomainRuleRepository`
+    #: (sharing `engine`) in production — same never-mixed-across-modes
+    #: discipline as every repository above.
+    mailbox_domain_rule_repository: MailboxDomainRuleRepository
 
 
 def _build_development_or_test(runtime_environment: str) -> RuntimeComposition:
@@ -384,6 +392,7 @@ def _build_development_or_test(runtime_environment: str) -> RuntimeComposition:
     from persistence.objects.memory_store import InMemoryObjectStore
     from services.evidence.intake.intake import InMemoryIntakeRepository
     from services.mailbox.cursor import InMemoryMailboxFolderCursorRepository
+    from services.mailbox.domain_rule import InMemoryMailboxDomainRuleRepository
     from services.mailbox.lock import InMemoryMailboxSweepLock
     from services.mailbox.mailbox import InMemoryMailboxSourceRepository
     from services.mailbox.message import InMemoryMailboxMessageRepository
@@ -429,6 +438,7 @@ def _build_development_or_test(runtime_environment: str) -> RuntimeComposition:
     mailbox_folder_cursor_repository = InMemoryMailboxFolderCursorRepository()
     mailbox_sweep_lock = InMemoryMailboxSweepLock()
     mailbox_microsoft_oauth_state_repository = InMemoryMailboxOAuthStateRepository()
+    mailbox_domain_rule_repository = InMemoryMailboxDomainRuleRepository()
     microsoft_oauth_client = FakeMicrosoftOAuthClient()
     microsoft_graph_client = FakeMicrosoftGraphClient()
     microsoft_token_store = InMemoryMicrosoftTokenStore()
@@ -488,6 +498,7 @@ def _build_development_or_test(runtime_environment: str) -> RuntimeComposition:
         microsoft_graph_client=microsoft_graph_client,
         microsoft_token_store=microsoft_token_store,
         microsoft_mailbox_adapter=microsoft_mailbox_adapter,
+        mailbox_domain_rule_repository=mailbox_domain_rule_repository,
     )
 
 
@@ -505,6 +516,7 @@ def _build_production() -> RuntimeComposition:
         PostgresExternalReferenceRepository,
     )
     from persistence.postgres.intake_repository import PostgresIntakeRepository
+    from persistence.postgres.mailbox_domain_rule_repository import PostgresMailboxDomainRuleRepository
     from persistence.postgres.mailbox_message_repository import PostgresMailboxMessageRepository
     from persistence.postgres.mailbox_microsoft_repository import (
         PostgresMailboxFolderCursorRepository,
@@ -668,6 +680,7 @@ def _build_production() -> RuntimeComposition:
     mailbox_folder_cursor_repository = PostgresMailboxFolderCursorRepository(engine)
     mailbox_sweep_lock = PostgresMailboxSweepLock(engine)
     mailbox_microsoft_oauth_state_repository = PostgresMailboxMicrosoftOAuthStateRepository(engine)
+    mailbox_domain_rule_repository = PostgresMailboxDomainRuleRepository(engine)
     microsoft_oauth_client = MicrosoftOAuthClient()
     microsoft_graph_client = MicrosoftGraphClient()
     microsoft_token_store = FileMicrosoftTokenStore()
@@ -707,6 +720,7 @@ def _build_production() -> RuntimeComposition:
         microsoft_graph_client=microsoft_graph_client,
         microsoft_token_store=microsoft_token_store,
         microsoft_mailbox_adapter=microsoft_mailbox_adapter,
+        mailbox_domain_rule_repository=mailbox_domain_rule_repository,
     )
 
 
@@ -897,12 +911,43 @@ def get_manual_upload_source_id(composition: "RuntimeComposition") -> str:
 _SEED_ENTITY_TYPE_COMPANY = "COMPANY"
 _SEED_ENTITY_TYPE_PERSON = "PERSON"
 
-#: (canonical_name, display_name, entity_type) — PID §98.3's own three
-#: "initial expected entities", in the order the GUI should offer them.
-SEED_ENTITIES: tuple[tuple[str, str, str], ...] = (
-    ("INFOSECURS_LIMITED", "Infosecurs Limited", _SEED_ENTITY_TYPE_COMPANY),
-    ("NOUSTAI_LIMITED", "NoustAI Limited", _SEED_ENTITY_TYPE_COMPANY),
-    ("MATTHEW_SCOTT_PERSONAL", "Matthew Scott Personal", _SEED_ENTITY_TYPE_PERSON),
+#: CD-6 architect amendment (email historical-ingestion boundary) —
+#: the REAL, architect-verified accounting-period configuration for
+#: each of the three canonical entities (cross-checked against
+#: Companies House's own public register — NOT invented). Recorded on
+#: `GovernedEntity` as BOTH the recurring fiscal-year-start rule (for a
+#: later rolling-incremental system) AND the explicit one-off bootstrap
+#: FLOOR used for THIS migration — the two legitimately differ: NoustAI
+#: Limited's recurring rule is 1 January, but it was incorporated
+#: 5 December 2025, so a naive "most recent 1 January" would predate
+#: the company's own existence — the real floor for this migration is
+#: the incorporation date instead.
+#: (canonical_name, display_name, entity_type, fiscal_year_start_month_day, email_bootstrap_floor_at)
+SEED_ENTITIES: tuple[tuple[str, str, str, str, datetime], ...] = (
+    (
+        "INFOSECURS_LIMITED",
+        "Infosecurs Limited",
+        _SEED_ENTITY_TYPE_COMPANY,
+        "11-01",
+        datetime(2025, 11, 1, tzinfo=timezone.utc),
+    ),
+    (
+        "NOUSTAI_LIMITED",
+        "NoustAI Limited",
+        _SEED_ENTITY_TYPE_COMPANY,
+        "01-01",
+        # Incorporated 5 Dec 2025 — see module section docstring above
+        # for why this migration's real floor is incorporation date,
+        # not the recurring 1 Jan rule naively applied.
+        datetime(2025, 12, 5, tzinfo=timezone.utc),
+    ),
+    (
+        "MATTHEW_SCOTT_PERSONAL",
+        "Matthew Scott Personal",
+        _SEED_ENTITY_TYPE_PERSON,
+        "04-06",
+        datetime(2025, 4, 6, tzinfo=timezone.utc),
+    ),
 )
 
 _seed_entity_ids: Optional[dict[str, str]] = None
@@ -922,9 +967,27 @@ def ensure_seed_entities(composition: "RuntimeComposition") -> dict[str, str]:
             return _seed_entity_ids
 
         resolved: dict[str, str] = {}
-        for canonical_name, display_name, entity_type in SEED_ENTITIES:
+        for canonical_name, display_name, entity_type, fiscal_year_start_month_day, email_bootstrap_floor_at in SEED_ENTITIES:
             existing = composition.api.entity_repository.find_by_canonical_name(canonical_name)
             if existing is not None:
+                # PL-review finding: an entity registered before these
+                # two fields existed (every entity from CD-6 Slice 1,
+                # including all three already live on the production
+                # appliance) has them permanently None unless
+                # backfilled here — register_entity only ever sets
+                # them at creation time, and without this, the
+                # architect's own verified accounting-period dates
+                # could never actually reach the real entities, and
+                # compute_bootstrap_floor would refuse the historical
+                # sweep forever. Backfill-only: never overwrites a
+                # value that is already set (a real future operator
+                # correction is not this function's concern).
+                if existing.email_bootstrap_floor_at is None and email_bootstrap_floor_at is not None:
+                    existing = composition.api.entity_repository.set_accounting_period_configuration(
+                        existing.entity_id,
+                        fiscal_year_start_month_day=fiscal_year_start_month_day,
+                        email_bootstrap_floor_at=email_bootstrap_floor_at,
+                    )
                 resolved[canonical_name] = existing.entity_id
                 continue
 
@@ -935,9 +998,14 @@ def ensure_seed_entities(composition: "RuntimeComposition") -> dict[str, str]:
                 status="ACTIVE",
                 actor_type=actor.SYSTEM,
                 actor_id="bagman-entity-seed-bootstrap",
+                fiscal_year_start_month_day=fiscal_year_start_month_day,
+                email_bootstrap_floor_at=email_bootstrap_floor_at,
                 metadata={
                     "note": "canonical entity seed, resolved-or-created once per process "
-                    "(CD-6 Slice 1, PID §98.3) — never re-created on a later call"
+                    "(CD-6 Slice 1, PID §98.3) — never re-created on a later call; "
+                    "fiscal_year_start_month_day/email_bootstrap_floor_at set from the "
+                    "architect-verified accounting-period configuration (CD-6 architect "
+                    "amendment, email historical-ingestion boundary)"
                 },
             )
             resolved[canonical_name] = entity.entity_id

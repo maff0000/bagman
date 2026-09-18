@@ -121,6 +121,8 @@ class BagmanCanonicalAPI:
         metadata: Optional[Mapping[str, Any]] = None,
         correlation_id: Optional[str] = None,
         causation_id: Optional[str] = None,
+        fiscal_year_start_month_day: Optional[str] = None,
+        email_bootstrap_floor_at: Optional[datetime] = None,
     ) -> GovernedEntity:
         resolved_correlation_id = correlation_id or identity.generate_id()
 
@@ -130,6 +132,8 @@ class BagmanCanonicalAPI:
             display_name=display_name,
             status=status,
             metadata=metadata,
+            fiscal_year_start_month_day=fiscal_year_start_month_day,
+            email_bootstrap_floor_at=email_bootstrap_floor_at,
         )
 
         self.record_audit_event(

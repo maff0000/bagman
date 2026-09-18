@@ -30,6 +30,99 @@ def test_entity_persists_and_is_retrievable_via_a_fresh_repository_instance(fres
     assert fetched.created_at.tzinfo is not None
 
 
+def test_fiscal_year_and_email_bootstrap_floor_round_trip_through_postgres(fresh_engine):
+    """CD-6 architect amendment (email historical-ingestion boundary) —
+    ``fiscal_year_start_month_day``/``email_bootstrap_floor_at`` must
+    survive a real Postgres round trip via a BRAND-NEW repository
+    instance, exactly like every other field this module already
+    proves durability for."""
+    import datetime as _dt
+
+    repo = PostgresEntityRepository()
+    floor = _dt.datetime(2025, 11, 1, tzinfo=_dt.timezone.utc)
+    entity = repo.register_entity(
+        entity_type="COMPANY",
+        canonical_name="SYNTHETIC_FISCAL_LTD",
+        display_name="Synthetic Fiscal Ltd",
+        status="ACTIVE",
+        fiscal_year_start_month_day="11-01",
+        email_bootstrap_floor_at=floor,
+    )
+    assert entity.fiscal_year_start_month_day == "11-01"
+    assert entity.email_bootstrap_floor_at == floor
+
+    fresh_repo = PostgresEntityRepository(engine=fresh_engine)
+    fetched = fresh_repo.get_entity(entity.entity_id)
+    assert fetched.fiscal_year_start_month_day == "11-01"
+    assert fetched.email_bootstrap_floor_at == floor
+
+
+def test_fiscal_year_and_email_bootstrap_floor_default_to_null_when_omitted(fresh_engine):
+    """A caller that omits the two new fields (e.g. an entity registered
+    before this amendment, or a genuinely not-yet-configured future
+    entity) gets real, honest `None` — never an invented default."""
+    repo = PostgresEntityRepository()
+    entity = repo.register_entity(
+        entity_type="COMPANY", canonical_name="SYNTHETIC_UNCONFIGURED_LTD", display_name="X", status="ACTIVE"
+    )
+    assert entity.fiscal_year_start_month_day is None
+    assert entity.email_bootstrap_floor_at is None
+
+    fresh_repo = PostgresEntityRepository(engine=fresh_engine)
+    fetched = fresh_repo.get_entity(entity.entity_id)
+    assert fetched.fiscal_year_start_month_day is None
+    assert fetched.email_bootstrap_floor_at is None
+
+
+def test_set_accounting_period_configuration_backfills_an_existing_entity(fresh_engine):
+    """PL-review finding, CD-6 architect amendment: an entity registered
+    BEFORE fiscal_year_start_month_day/email_bootstrap_floor_at existed
+    (every entity from CD-6 Slice 1, including the three already live
+    on the production appliance) has both fields permanently None
+    unless a real update path exists -- register_entity only ever sets
+    them at creation time, and GovernedEntity is otherwise immutable.
+    Without this, the architect's own verified accounting-period dates
+    could never reach an already-existing entity, and
+    compute_bootstrap_floor would refuse the real historical sweep
+    forever. Proven against a real Postgres round trip via a brand-new
+    repository instance."""
+    import datetime as _dt
+
+    repo = PostgresEntityRepository()
+    entity = repo.register_entity(
+        entity_type="COMPANY", canonical_name="SYNTHETIC_BACKFILL_LTD", display_name="X", status="ACTIVE"
+    )
+    assert entity.email_bootstrap_floor_at is None
+
+    floor = _dt.datetime(2025, 11, 1, tzinfo=_dt.timezone.utc)
+    updated = repo.set_accounting_period_configuration(
+        entity.entity_id, fiscal_year_start_month_day="11-01", email_bootstrap_floor_at=floor
+    )
+    assert updated.fiscal_year_start_month_day == "11-01"
+    assert updated.email_bootstrap_floor_at == floor
+    # Every other field is untouched by this narrow update.
+    assert updated.display_name == entity.display_name
+    assert updated.status == entity.status
+    assert updated.canonical_name == entity.canonical_name
+
+    fresh_repo = PostgresEntityRepository(engine=fresh_engine)
+    fetched = fresh_repo.get_entity(entity.entity_id)
+    assert fetched.fiscal_year_start_month_day == "11-01"
+    assert fetched.email_bootstrap_floor_at == floor
+
+
+def test_set_accounting_period_configuration_unknown_entity_raises_not_found():
+    import datetime as _dt
+
+    repo = PostgresEntityRepository()
+    with pytest.raises(NotFoundError):
+        repo.set_accounting_period_configuration(
+            identity.generate_id(),
+            fiscal_year_start_month_day="11-01",
+            email_bootstrap_floor_at=_dt.datetime(2025, 11, 1, tzinfo=_dt.timezone.utc),
+        )
+
+
 def test_unknown_entity_id_raises_not_found():
     repo = PostgresEntityRepository()
     with pytest.raises(NotFoundError):
