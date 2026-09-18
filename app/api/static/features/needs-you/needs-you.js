@@ -16,6 +16,23 @@ import { listEntities } from "../../shell/entities.js";
 import { renderEvidencePreview } from "../../shell/preview.js";
 import { listNeedsYou, resolveNeedsYouItem } from "./needs-you-api.js";
 import { getXeroAccounts } from "../xero/xero-api.js";
+// CD-6 GUI-operations-foundation WO — teaches this generic queue's own
+// review drawer a real summary for MAILBOX_DOMAIN_REVIEW items (see
+// `_renderReviewBody` below) instead of the "not yet supported"
+// fallback every non-COMPANY_WHAT_WHY item used to hit. The full
+// batch-triage experience stays on the dedicated mailbox page
+// (`features/mailbox/domain-review.js::open`) — this is a lighter
+// summary-only render, reusing that module's own metadata-row helper
+// rather than duplicating it.
+import { DomainReview } from "../mailbox/domain-review.js";
+
+//: services.needs_you.needs_you.ALLOWED_ACTION_MAILBOX_DOMAIN_REVIEW's
+//: own real string value (services/needs_you/needs_you.py) — kept here
+//: as a plain literal, matching this file's own existing convention of
+//: comparing `allowed_action_type` against a literal string
+//: ("COMPANY_WHAT_WHY" below) rather than importing a Python constant
+//: across the wire.
+const ALLOWED_ACTION_MAILBOX_DOMAIN_REVIEW = "MAILBOX_DOMAIN_REVIEW";
 
 //: item_type -> human phrase template for both the queue card heading
 //: and Overview's own greeting breakdown (PID §98.2's worked example —
@@ -157,6 +174,16 @@ export const NeedsYou = {
     } else {
       clear(previewHost);
       previewHost.appendChild(emptyState("This item is not anchored to a single evidence record."));
+    }
+
+    if (item.allowed_action_type === ALLOWED_ACTION_MAILBOX_DOMAIN_REVIEW) {
+      // A real, useful summary (CD-6 GUI-operations-foundation WO) —
+      // never the generic "not yet supported" placeholder below for
+      // this item type any more. The full Allow/Ignore/batch-triage
+      // experience lives on the dedicated mailbox Domain Review page;
+      // this is a summary-only render reached via the generic queue.
+      DomainReview.renderGenericQueueSummary(body, item);
+      return;
     }
 
     if (item.allowed_action_type !== "COMPANY_WHAT_WHY") {

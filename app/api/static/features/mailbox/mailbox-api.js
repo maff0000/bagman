@@ -20,6 +20,24 @@ export const MAILBOX_API = {
   microsoftSweep: (mailboxId) => `/internal/mailboxes/${encodeURIComponent(mailboxId)}/microsoft/sweep`,
   microsoftSweeps: (mailboxId) => `/internal/mailboxes/${encodeURIComponent(mailboxId)}/microsoft/sweeps`,
   microsoftMessages: (mailboxId) => `/internal/mailboxes/${encodeURIComponent(mailboxId)}/microsoft/messages`,
+  //: CD-6 GUI-operations-foundation WO — the domain-review batch-triage
+  //: surface (services.xero.supplier_correlation-assisted review of the
+  //: real 90 OPEN MAILBOX_DOMAIN_REVIEW items a Phase A historical
+  //: discovery sweep produced). `microsoftDomainReviewResolveOne` is the
+  //: SAME governed single-item endpoint
+  //: `app/api/routers/mailboxes_microsoft.py::resolve_mailbox_domain_review`
+  //: already offers (it creates the real MailboxDomainRule and
+  //: back-processes history on ALLOW) — used by the "Details" drawer's
+  //: own individual Allow/Ignore controls, never the generic
+  //: `/internal/needs-you/{id}/resolve` endpoint (that one has no idea
+  //: what a `MailboxDomainRule` is).
+  microsoftDomainReview: (mailboxId) => `/internal/mailboxes/${encodeURIComponent(mailboxId)}/microsoft/domain-review`,
+  microsoftDomainReviewXeroCorrelate: (mailboxId) =>
+    `/internal/mailboxes/${encodeURIComponent(mailboxId)}/microsoft/domain-review/xero-correlate`,
+  microsoftDomainReviewResolveOne: (mailboxId, itemId) =>
+    `/internal/mailboxes/${encodeURIComponent(mailboxId)}/microsoft/domain-review/${encodeURIComponent(itemId)}/resolve`,
+  microsoftDomainReviewBatchResolve: (mailboxId) =>
+    `/internal/mailboxes/${encodeURIComponent(mailboxId)}/microsoft/domain-review/batch-resolve`,
 };
 
 export function listMailboxes() {
@@ -89,6 +107,78 @@ export function listMicrosoftSweeps(mailboxId) {
 
 export function listMicrosoftMessages(mailboxId) {
   return apiGet(MAILBOX_API.microsoftMessages(mailboxId));
+}
+
+//: CD-6 GUI-operations-foundation WO — domain-review batch-triage.
+
+/** `status` defaults server-side to `"OPEN"` when omitted (see
+ * app/api/routers/mailboxes_microsoft.py
+ * ::list_microsoft_domain_review_items's own docstring) — pass an
+ * explicit value (e.g. `"RESOLVED"`) only when the caller genuinely
+ * wants a different slice. */
+export function listDomainReviewItems(mailboxId, status) {
+  const suffix = status ? `?status=${encodeURIComponent(status)}` : "";
+  return apiGet(`${MAILBOX_API.microsoftDomainReview(mailboxId)}${suffix}`);
+}
+
+/** Triggers one bounded Xero-assisted supplier-domain correlation run
+ * for `mailboxId` against `entityId`'s Xero connection. The response
+ * body's own `ok` field (NOT the HTTP status — this always resolves to
+ * a normal 200 for the "Xero access itself failed" case, see the
+ * endpoint's own docstring) tells the caller whether the correlation
+ * itself actually succeeded; a genuine HTTP-level failure (bad
+ * mailbox/entity, no Xero connection at all) still comes back as
+ * `{ok: false}` at THIS wrapper's own `{ok, status, body}` envelope
+ * level (`apiPost`'s standard contract) — callers must check both. */
+export function runXeroCorrelation(mailboxId, { entityId, actorId }) {
+  return apiPost(MAILBOX_API.microsoftDomainReviewXeroCorrelate(mailboxId), {
+    entity_id: entityId,
+    actor_type: "USER",
+    actor_id: actorId,
+  });
+}
+
+/** The single-item domain-review resolve call (creates/updates the real
+ * `MailboxDomainRule` and, on ALLOW, immediately back-processes every
+ * historical candidate for that domain — see the endpoint's own
+ * docstring). `destinationMode`/`destinationEntityId` are required when
+ * `decision === "ALLOW"`; omitted entirely for `"IGNORE"`. */
+export function resolveMailboxDomainReviewItem(
+  mailboxId,
+  itemId,
+  { decision, destinationEntityId, destinationMode, matchMode, processorHint, actorId }
+) {
+  return apiPost(MAILBOX_API.microsoftDomainReviewResolveOne(mailboxId, itemId), {
+    actor_type: "USER",
+    actor_id: actorId,
+    decision,
+    destination_entity_id: destinationEntityId || null,
+    destination_mode: destinationMode || null,
+    match_mode: matchMode || "EXACT",
+    processor_hint: processorHint || null,
+  });
+}
+
+/** Batched version of `resolveMailboxDomainReviewItem` — `items` is an
+ * array of `{itemId, decision, destinationEntityId, destinationMode,
+ * matchMode, processorHint}` (camelCase in, snake_case on the wire).
+ * Partial batch success is normal (see the endpoint's own docstring) —
+ * this wrapper does no interpretation of `body.results` itself; the
+ * caller (`features/mailbox/domain-review.js`) renders per-item
+ * outcomes. */
+export function batchResolveMailboxDomainReview(mailboxId, { actorId, items }) {
+  return apiPost(MAILBOX_API.microsoftDomainReviewBatchResolve(mailboxId), {
+    actor_type: "USER",
+    actor_id: actorId,
+    items: items.map((item) => ({
+      item_id: item.itemId,
+      decision: item.decision,
+      destination_entity_id: item.destinationEntityId || null,
+      destination_mode: item.destinationMode || null,
+      match_mode: item.matchMode || "EXACT",
+      processor_hint: item.processorHint || null,
+    })),
+  });
 }
 
 /** `shared/api.js` exports `apiGet`/`apiPost` only (no `apiPut`) — this

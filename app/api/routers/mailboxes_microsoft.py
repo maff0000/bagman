@@ -75,6 +75,21 @@ Endpoints
 * ``GET /internal/mailboxes/{mailbox_id}/microsoft/domain-rules`` — the
   mailbox's own governed ``MailboxDomainRule`` list (CD-6 architect
   amendment).
+* ``GET /internal/mailboxes/{mailbox_id}/microsoft/domain-review`` — the
+  mailbox's own ``MAILBOX_DOMAIN_REVIEW`` Needs You items (default
+  ``status=OPEN``; CD-6 GUI-operations-foundation WO), a plain read used
+  by the new domain-review batch-triage GUI page to render the operator
+  worklist the 90 real Phase A discovery items produced.
+* ``POST /internal/mailboxes/{mailbox_id}/microsoft/domain-review/xero-correlate``
+  — trigger one bounded Xero-assisted supplier-domain correlation run
+  (``services.xero.supplier_correlation``) against an explicitly
+  operator-supplied ``entity_id``'s Xero connection, enriching every
+  still-OPEN domain-review item's own ``metadata`` with a review-aid
+  ``xero_*`` block (CD-6 GUI-operations-foundation WO). A genuine
+  ``XeroSupplierCorrelationFailedError`` (e.g. the real Infosecurs
+  connection's current scope shortfall) is DATA (``{"ok": false, ...}``
+  on a normal 200), never an HTTP-level failure — see
+  ``xero_correlate_mailbox_domain_review``'s own docstring.
 * ``POST /internal/mailboxes/{mailbox_id}/microsoft/domain-review/{item_id}/resolve``
   — resolve one ``ITEM_TYPE_MAILBOX_DOMAIN_REVIEW`` Needs You item
   (architect spec §4's operator decision: Allow -> a real canonical
@@ -111,10 +126,18 @@ that module's own docstring for why — a future dedicated worker needs
 the identical audit trail without this HTTP layer wrapping it). Never
 audits body/raw MIME/tokens/codes/OAuth state — payloads carry only
 canonical IDs (architect spec: "prefer canonical IDs over subject/
-sender").
+sender"). `MAILBOX_XERO_CORRELATION_SUCCEEDED`/`_FAILED` (CD-6
+GUI-operations-foundation WO addition, not part of the original
+architect-named list above — a documented judgment call, mirroring the
+same "every mutating/attempted action here is audited" discipline every
+other endpoint in this router already follows) are emitted around the
+call to `services.xero.supplier_correlation
+.correlate_xero_suppliers_for_open_domain_review_items` in
+`xero_correlate_mailbox_domain_review`.
 """
 from __future__ import annotations
 
+import dataclasses
 import os
 import urllib.parse
 from typing import Any, Optional
@@ -148,6 +171,11 @@ from services.needs_you.needs_you import (
     ITEM_TYPE_MAILBOX_AUTH_REQUIRED,
     ITEM_TYPE_MAILBOX_DOMAIN_REVIEW,
 )
+from services.xero.supplier_correlation import (
+    XeroSupplierCorrelationFailedError,
+    correlate_xero_suppliers_for_open_domain_review_items,
+)
+from services.xero.sync import resolve_fresh_access_token
 
 router = APIRouter(prefix="/internal/mailboxes")
 
@@ -514,6 +542,188 @@ async def list_microsoft_domain_rules(mailbox_id: str) -> dict[str, Any]:
     _require_microsoft_mailbox(composition, mailbox_id)
     rules = composition.mailbox_domain_rule_repository.list_rules(mailbox_id=mailbox_id)
     return {"mailbox_id": mailbox_id, "items": [r.to_dict() for r in rules], "count": len(rules)}
+
+
+@router.get("/{mailbox_id}/microsoft/domain-review")
+async def list_microsoft_domain_review_items(mailbox_id: str, status: str = "OPEN") -> dict[str, Any]:
+    """List this mailbox's own ``MAILBOX_DOMAIN_REVIEW`` Needs You
+    items — a plain read, no side effects (CD-6 GUI-operations-
+    foundation WO), feeding the new domain-review batch-triage GUI page
+    (``app/api/static/features/mailbox/domain-review.js``).
+
+    ``status`` mirrors ``GET /internal/needs-you``'s own established
+    query-param convention/naming exactly (a plain equality filter
+    passed straight to ``NeedsYouRepository.list_needs_you_items``) —
+    the one deliberate difference from that general-purpose endpoint is
+    the DEFAULT: this endpoint defaults to ``status="OPEN"`` rather than
+    "every status", since the real, immediate operator need this WO
+    exists for is "show me what still needs a decision" (the 90 real
+    OPEN Phase A discovery items) — an operator who wants the full
+    history (RESOLVED/DISMISSED items too) passes ``?status=`` a
+    different explicit value, or a future ``status=ALL``-style extension
+    if that need arises; not built speculatively here.
+
+    Filters to `item.metadata["mailbox_id"] == mailbox_id` in Python —
+    the EXACT SAME filter
+    ``services.xero.supplier_correlation.correlate_xero_suppliers_for_open_domain_review_items``
+    and ``services/mailbox/sweep.py``'s own
+    ``_find_open_domain_review_item`` already use (see that module's own
+    docstring) — a second mailbox's items are never even considered, let
+    alone returned.
+    """
+    composition = get_composition()
+    _require_microsoft_mailbox(composition, mailbox_id)
+    items = [
+        item
+        for item in composition.needs_you_repository.list_needs_you_items(
+            item_type=ITEM_TYPE_MAILBOX_DOMAIN_REVIEW, domain="MAILBOX", status=status
+        )
+        if item.metadata.get("mailbox_id") == mailbox_id
+    ]
+    return {"mailbox_id": mailbox_id, "items": [i.to_dict() for i in items], "count": len(items)}
+
+
+class XeroCorrelateMailboxDomainReviewRequest(BaseModel):
+    """Request body for
+    ``POST /internal/mailboxes/{mailbox_id}/microsoft/domain-review/xero-correlate``
+    (CD-6 GUI-operations-foundation WO).
+
+    ``entity_id`` is the ``GovernedEntity`` whose Xero connection to
+    correlate the mailbox's own OPEN domain-review items against —
+    ALWAYS explicit, operator-supplied, NEVER inferred from the
+    mailbox's own optional ``default_entity_id`` hint. This mirrors an
+    established doctrine already applied elsewhere in this same router
+    (``ResolveMailboxDomainReviewRequest.destination_entity_id`` is
+    likewise never defaulted from the mailbox) — a mailbox's own
+    "likely destination" hint is a GUI convenience for pre-selecting a
+    dropdown, never something a server-side endpoint silently trusts as
+    the real decision.
+    """
+
+    entity_id: str
+    actor_type: str
+    actor_id: str
+
+
+@router.post("/{mailbox_id}/microsoft/domain-review/xero-correlate")
+async def xero_correlate_mailbox_domain_review(
+    mailbox_id: str, payload: XeroCorrelateMailboxDomainReviewRequest
+) -> dict[str, Any]:
+    """Trigger one bounded Xero-assisted supplier-domain correlation run
+    (``services.xero.supplier_correlation
+    .correlate_xero_suppliers_for_open_domain_review_items``) for this
+    mailbox's currently-OPEN ``MAILBOX_DOMAIN_REVIEW`` items, against
+    ``payload.entity_id``'s Xero connection (CD-6 GUI-operations-
+    foundation WO).
+
+    Token resolution — reuses `run_sync`'s own proven sequence
+    ------------------------------------------------------------------
+    Resolves ``payload.entity_id``'s ``CONNECTED`` ``XeroConnection``
+    and a fresh access token via the SAME
+    ``services.xero.sync.resolve_fresh_access_token`` helper
+    ``services.xero.sync.run_sync`` itself now calls (extracted from
+    that function for exactly this reuse — see that module's own
+    docstring for the extraction-boundary judgment call) — never a
+    reimplementation of that refresh-then-write-back sequence. No
+    connection at all, a non-``CONNECTED`` connection, missing stored
+    tokens, or a failed refresh are ALL genuine request-level
+    preconditions this endpoint cannot proceed past — each raises
+    ``core.errors.ConflictError`` (-> HTTP 409 via this app's existing
+    ``core.errors.BagmanError`` exception-handler mapping in
+    ``app/api/main.py`` — no new special-case mapping added here), the
+    SAME status a caller already gets from every other "no usable Xero
+    connection" precondition in this codebase
+    (``services.xero.sync.run_sync``'s own identical "no CONNECTED
+    connection" `ConflictError`). This is a deliberate, documented
+    judgment call: `run_sync` itself treats "missing tokens"/"refresh
+    failed" as an ordinary FAILED sync run rather than a raised error
+    (because a sync run object already exists to record it in) — THIS
+    endpoint has no such run object to record into, so it raises
+    instead, exactly as `run_sync` already does for its own "no
+    connection at all" case.
+
+    Xero data-access failure is DATA, not an HTTP failure
+    ------------------------------------------------------------------
+    Once a fresh access token is in hand, a genuine
+    ``XeroSupplierCorrelationFailedError`` (Contacts/Invoices access
+    itself failing — e.g. the REAL current Infosecurs Xero connection,
+    which only has ``accounting.settings.read`` scope today and will
+    hit exactly this until a real, later, operator-driven re-consent
+    grants Contacts/Invoices access) is caught here and returned as
+    ``{"ok": false, "error": ..., "error_type":
+    "XeroSupplierCorrelationFailedError"}`` on a normal HTTP 200 — this
+    mirrors ``batch_resolve_mailbox_domain_review``'s own established
+    "ok:false is data, not a request-level failure" precedent in this
+    same router file exactly: the HTTP REQUEST was handled correctly
+    (mailbox resolved, entity resolved, a real token obtained, a real
+    call attempted); it is the underlying CORRELATION that failed, an
+    entirely expected, common, pre-re-authorization outcome the GUI
+    must render calmly, never as an alarming error banner.
+    """
+    composition = get_composition()
+    mailbox = _require_microsoft_mailbox(composition, mailbox_id)
+    # Real existence check before anything else — mirrors
+    # `app/api/routers/xero.py::_require_entity`'s own pattern (never
+    # trust a caller-supplied entity_id without proving it real first).
+    composition.api.entity_repository.get_entity(payload.entity_id)
+
+    connection = composition.xero_connection_repository.get_by_entity(payload.entity_id)
+    if connection is None or connection.status != "CONNECTED" or not connection.tenant_id:
+        raise ConflictError(
+            f"entity '{payload.entity_id}' has no CONNECTED XeroConnection — cannot run Xero "
+            "supplier-domain correlation (the caller should not offer this action in this state)"
+        )
+
+    token_resolution = resolve_fresh_access_token(
+        entity_id=payload.entity_id,
+        connection=connection,
+        connection_repository=composition.xero_connection_repository,
+        token_store=composition.xero_token_store,
+        oauth_client=composition.xero_oauth_client,
+    )
+    if not token_resolution.ok:
+        raise ConflictError(
+            f"could not resolve a fresh Xero access token for entity '{payload.entity_id}': "
+            f"{token_resolution.error_detail or token_resolution.failure_reason}"
+        )
+
+    try:
+        summary = correlate_xero_suppliers_for_open_domain_review_items(
+            mailbox_id=mailbox_id,
+            tenant_id=connection.tenant_id,
+            access_token=token_resolution.access_token,
+            xero_client=composition.xero_accounting_client,
+            needs_you_repository=composition.needs_you_repository,
+        )
+    except XeroSupplierCorrelationFailedError as exc:
+        composition.api.record_audit_event(
+            event_type="MAILBOX_XERO_CORRELATION_FAILED",
+            actor_type=payload.actor_type,
+            actor_id=payload.actor_id,
+            subject_type="MailboxSource",
+            subject_id=mailbox.mailbox_id,
+            correlation_id=mailbox.mailbox_id,
+            causation_id=None,
+            payload={"mailbox_id": mailbox_id, "entity_id": payload.entity_id, "error": str(exc)},
+        )
+        return {"ok": False, "error": str(exc), "error_type": "XeroSupplierCorrelationFailedError"}
+
+    composition.api.record_audit_event(
+        event_type="MAILBOX_XERO_CORRELATION_SUCCEEDED",
+        actor_type=payload.actor_type,
+        actor_id=payload.actor_id,
+        subject_type="MailboxSource",
+        subject_id=mailbox.mailbox_id,
+        correlation_id=mailbox.mailbox_id,
+        causation_id=None,
+        payload={
+            "mailbox_id": mailbox_id,
+            "entity_id": payload.entity_id,
+            "domain_review_items_updated": summary.domain_review_items_updated,
+            "strong_correlation_count": summary.strong_correlation_count,
+        },
+    )
+    return {"ok": True, **dataclasses.asdict(summary)}
 
 
 class ResolveMailboxDomainReviewRequest(BaseModel):

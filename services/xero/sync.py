@@ -34,6 +34,20 @@ Xero-side condition maps to which reason AND whether it also changes the
 owning `XeroConnection.status` (most do not — see
 `services.xero.connection`'s own module docstring for why only a
 refresh failure or a 401/403 change connection-level state).
+
+Shared token resolution (CD-6 GUI-operations-foundation WO)
+------------------------------------------------------------------------
+:func:`resolve_fresh_access_token` extracts `run_sync`'s own original
+"read stored tokens, pre-emptively refresh if near expiry, write the
+refreshed tokens back" sequence into a small reusable helper — added so
+`app/api/routers/mailboxes_microsoft.py`'s new
+`POST .../domain-review/xero-correlate` endpoint (CD-6, "trigger the
+bounded Xero-assisted supplier-domain correlation run for one mailbox")
+can obtain a fresh access token for a `GovernedEntity`'s Xero connection
+without re-implementing (and risking drift from) this already-proven
+logic. See that function's own docstring for the deliberate judgment
+call on exactly where the extraction boundary sits (connection
+resolution itself stays in each caller, not in the shared helper).
 """
 from __future__ import annotations
 
@@ -291,6 +305,124 @@ _REFRESH_SKEW_SECONDS = 120.0
 _MAX_RATE_LIMIT_BACKOFF_SECONDS = 30.0
 
 
+@dataclass(frozen=True)
+class XeroAccessTokenResolution:
+    """Result of :func:`resolve_fresh_access_token` — a discriminated
+    outcome, not an exception, for the two "ordinary" failure modes
+    (`run_sync`'s own long-established, already-tested contract treats
+    "no stored tokens" and "a failed refresh" as expected outcomes it
+    records as a `FAILED` sync run and returns normally, never as an
+    uncaught exception — see this module's own "Failure taxonomy"
+    docstring section). `ok` is `True` only when `access_token` is
+    genuinely fresh and usable; a caller must check it before using any
+    other field.
+
+    A caller that instead wants either failure mode to be a
+    request-level failure (this WO's own new
+    `POST .../domain-review/xero-correlate` endpoint) is free to raise
+    whatever error type it prefers from `failure_reason`/`error_detail`
+    itself — this function never presumes at which severity the caller
+    wants to escalate an ordinary "not fresh yet" outcome.
+    """
+
+    access_token: Optional[str]
+    refresh_token: Optional[str]
+    token_expires_at: Optional[datetime]
+    #: One of `SyncFailureReason.CONFIG_ERROR`/`TOKEN_REFRESH_FAILED`
+    #: (as plain strings, matching `XeroSyncRun.error_code`'s own
+    #: string-not-enum contract field) when `ok` is `False`, else `None`.
+    failure_reason: Optional[str] = None
+    error_detail: Optional[str] = None
+
+    @property
+    def ok(self) -> bool:
+        return self.failure_reason is None
+
+
+def resolve_fresh_access_token(
+    *,
+    entity_id: str,
+    connection: XeroConnection,
+    connection_repository: XeroConnectionRepository,
+    token_store: TokenStoreProtocol,
+    oauth_client: XeroOAuthClientProtocol,
+) -> XeroAccessTokenResolution:
+    """Read `entity_id`'s stored Xero OAuth tokens for its
+    already-resolved, `CONNECTED` `connection`, refreshing pre-emptively
+    if within `_REFRESH_SKEW_SECONDS` of expiry — the EXACT sequence
+    `run_sync` has always used for this (originally that function's own
+    steps 1b/2, per its docstring), extracted here (CD-6 GUI-operations
+    WO) so both `run_sync` and the new
+    `POST /internal/mailboxes/{mailbox_id}/microsoft/domain-review/xero-correlate`
+    endpoint (`app/api/routers/mailboxes_microsoft.py`) share ONE real
+    implementation of "give me a fresh access token for this entity's
+    Xero connection" rather than two independently-maintained copies of
+    the same refresh-then-write-back logic.
+
+    Deliberate extraction-boundary judgment call: resolving `connection`
+    itself (the original step 1 — `connection_repository.get_by_entity`
+    + raise `ConflictError` if not `CONNECTED`) is NOT folded into this
+    helper; every caller resolves `connection` itself first and passes
+    it in. This is because `run_sync` must keep calling
+    `connection_repository.record_sync_attempt` and creating its own
+    `XeroSyncRun` row IMMEDIATELY after resolving the connection —
+    BEFORE this (network-speaking, potentially slow-or-failing) token
+    refresh — exactly as this module's own docstring already documents
+    ("stamp `last_attempted_sync_at` immediately... so a stuck/crashed
+    attempt is still observable even if nothing further completes").
+    Folding connection resolution into this helper would have silently
+    reordered that and changed `run_sync`'s already-tested behaviour —
+    a real regression this narrow extraction must not introduce.
+
+    Raises:
+        Nothing of its own — a caller-error precondition (no connection/
+        not CONNECTED) is the caller's own responsibility to check
+        before calling this (see above); this function only ever
+        returns a non-ok :class:`XeroAccessTokenResolution` for "no
+        stored tokens"/"refresh failed".
+    """
+    tokens = token_store.read(entity_id)
+    if tokens is None:
+        return XeroAccessTokenResolution(
+            access_token=None,
+            refresh_token=None,
+            token_expires_at=None,
+            failure_reason=SyncFailureReason.CONFIG_ERROR.value,
+            error_detail="no stored OAuth tokens for this connection",
+        )
+
+    now = utc_now()
+    if (tokens.expires_at - now).total_seconds() <= _REFRESH_SKEW_SECONDS:
+        refreshed = oauth_client.refresh(refresh_token=tokens.refresh_token)
+        if refreshed.status != XeroOutcomeStatus.OK or refreshed.tokens is None:
+            connection_repository.fail_refresh(
+                connection.xero_connection_id,
+                error_detail=refreshed.error_detail or "token refresh failed",
+            )
+            return XeroAccessTokenResolution(
+                access_token=None,
+                refresh_token=None,
+                token_expires_at=None,
+                failure_reason=SyncFailureReason.TOKEN_REFRESH_FAILED.value,
+                error_detail=refreshed.error_detail or "token refresh failed",
+            )
+        token_store.write(
+            entity_id,
+            access_token=refreshed.tokens.access_token,
+            refresh_token=refreshed.tokens.refresh_token,
+            expires_at=refreshed.tokens.expires_at,
+        )
+        tokens = token_store.read(entity_id)
+
+    return XeroAccessTokenResolution(
+        access_token=tokens.access_token,
+        refresh_token=tokens.refresh_token,
+        token_expires_at=tokens.expires_at,
+        failure_reason=None,
+        error_detail=None,
+    )
+
+
 def run_sync(
     *,
     entity_id: str,
@@ -345,42 +477,35 @@ def run_sync(
     connection_repository.record_sync_attempt(connection.xero_connection_id)
     run = sync_run_repository.create_run(entity_id=entity_id, tenant_id=connection.tenant_id)
 
-    tokens = token_store.read(entity_id)
-    if tokens is None:
+    # Steps 1b/2 (read stored tokens; pre-emptive refresh if near expiry)
+    # now live in the shared `resolve_fresh_access_token` helper — see
+    # that function's own docstring for exactly why connection
+    # resolution itself (immediately above) stays here rather than
+    # being folded into it.
+    token_resolution = resolve_fresh_access_token(
+        entity_id=entity_id,
+        connection=connection,
+        connection_repository=connection_repository,
+        token_store=token_store,
+        oauth_client=oauth_client,
+    )
+    if not token_resolution.ok:
         return sync_run_repository.fail_run(
             run.sync_run_id,
-            error_code=SyncFailureReason.CONFIG_ERROR.value,
-            error_detail="no stored OAuth tokens for this connection",
+            error_code=token_resolution.failure_reason,
+            error_detail=token_resolution.error_detail,
         )
+    access_token = token_resolution.access_token
+    refresh_token = token_resolution.refresh_token
+    token_expires_at = token_resolution.token_expires_at
 
-    now = utc_now()
-    if (tokens.expires_at - now).total_seconds() <= _REFRESH_SKEW_SECONDS:
-        refreshed = oauth_client.refresh(refresh_token=tokens.refresh_token)
-        if refreshed.status != XeroOutcomeStatus.OK or refreshed.tokens is None:
-            connection_repository.fail_refresh(
-                connection.xero_connection_id,
-                error_detail=refreshed.error_detail or "token refresh failed",
-            )
-            return sync_run_repository.fail_run(
-                run.sync_run_id,
-                error_code=SyncFailureReason.TOKEN_REFRESH_FAILED.value,
-                error_detail=refreshed.error_detail or "token refresh failed",
-            )
-        token_store.write(
-            entity_id,
-            access_token=refreshed.tokens.access_token,
-            refresh_token=refreshed.tokens.refresh_token,
-            expires_at=refreshed.tokens.expires_at,
-        )
-        tokens = token_store.read(entity_id)
-
-    result = accounting_client.list_accounts(tenant_id=connection.tenant_id, access_token=tokens.access_token)
+    result = accounting_client.list_accounts(tenant_id=connection.tenant_id, access_token=access_token)
 
     if result.status == XeroOutcomeStatus.AUTH_ERROR:
         # Reactive path: a token this module believed was fresh was
         # rejected anyway — one refresh + one retry before concluding
         # REVOKED (see docstring, step 3).
-        refreshed = oauth_client.refresh(refresh_token=tokens.refresh_token)
+        refreshed = oauth_client.refresh(refresh_token=refresh_token)
         if refreshed.status != XeroOutcomeStatus.OK or refreshed.tokens is None:
             connection_repository.fail_refresh(
                 connection.xero_connection_id,
@@ -414,7 +539,7 @@ def run_sync(
     if result.status == XeroOutcomeStatus.RATE_LIMITED:
         backoff = min(result.retry_after_seconds or 5.0, _MAX_RATE_LIMIT_BACKOFF_SECONDS)
         sleep_fn(backoff)
-        result = accounting_client.list_accounts(tenant_id=connection.tenant_id, access_token=tokens.access_token)
+        result = accounting_client.list_accounts(tenant_id=connection.tenant_id, access_token=access_token)
         if result.status == XeroOutcomeStatus.RATE_LIMITED:
             return sync_run_repository.fail_run(
                 run.sync_run_id,
@@ -461,6 +586,6 @@ def run_sync(
         accounts_updated_count=updated,
     )
     connection_repository.record_sync_success(
-        connection.xero_connection_id, tenant_name=connection.tenant_name, token_expires_at=tokens.expires_at
+        connection.xero_connection_id, tenant_name=connection.tenant_name, token_expires_at=token_expires_at
     )
     return succeeded

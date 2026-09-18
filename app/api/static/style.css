@@ -1229,6 +1229,41 @@ select {
   .evidence-preview--image img { height: 360px; max-height: 360px; }
 }
 
+/* ---------------- domain-review batch-triage page
+   (features/mailbox/domain-review.js — CD-6 GUI-operations-foundation
+   WO). Reuses `.review-drawer__section`/`.filters`/`.table-wrap`/
+   `.doc-table`/`.list-panel__toolbar`/`.upload-status`/`.field--inline`
+   (all above) wherever they already fit; the few rules below are only
+   for the handful of things genuinely new to this page. ---------------- */
+
+/* This page has no "original evidence" left-hand pane the way the
+   Needs You review form does — `.review-drawer__body` is a 2-column
+   grid built for that split layout; this spans it as ONE full-width
+   column instead. */
+.domain-review-panel { grid-column: 1 / -1; }
+
+.domain-review__table-host { margin-top: var(--sp-5); }
+
+/* `.doc-table`'s own default row styling assumes "click anywhere on
+   the row to open it" (Documents' own table); this table's rows are
+   selected via their own checkbox / acted on via their own "Details"
+   button instead, so the whole-row pointer cursor/hover highlight
+   would be misleading here. */
+.domain-review__table tbody tr { cursor: default; }
+.domain-review__table tbody tr:hover { background: none; }
+
+.domain-review__batch-results { display: flex; flex-direction: column; gap: 2px; margin: var(--sp-3) 0; }
+.domain-review__result--ok { color: var(--ok); }
+.domain-review__result--bad { color: var(--bad); font-weight: 650; }
+
+.domain-review__meta-row { padding: 2px 0; }
+
+/* No extra narrow-viewport override needed here — `.doc-table`'s own
+   base rule (min-width: 1040px, inside `.table-wrap`'s own
+   `overflow-x: auto` container, both above) already gives this table
+   the exact same "the table scrolls within its own box, never the
+   whole page" behaviour the Documents table already established. */
+
 /* ---------------- progressive Company / What / Why steps
    (features/needs-you/needs-you.js) — one question at a time,
    each step revealed once the previous is answered. ---------------- */

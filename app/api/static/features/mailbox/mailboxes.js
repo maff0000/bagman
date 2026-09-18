@@ -27,7 +27,9 @@ import {
   disconnectMicrosoftMailbox,
   sweepMicrosoftMailboxNow,
   listMicrosoftMessages,
+  listDomainReviewItems,
 } from "./mailbox-api.js";
+import { DomainReview } from "./domain-review.js";
 
 //: provider_kind (the governed, closed Python-level enum —
 //: services/mailbox/mailbox.py::PROVIDER_KINDS) -> human-readable
@@ -180,6 +182,27 @@ export const Mailboxes = {
       actions.appendChild(retireBtn);
     }
 
+    // CD-6 GUI-operations-foundation WO — the domain-review batch-triage
+    // page. Shown for ANY Microsoft-provider mailbox with at least one
+    // OPEN MAILBOX_DOMAIN_REVIEW item, regardless of the mailbox's own
+    // enabled/connected state (these items describe REAL history a
+    // historical discovery sweep already produced — an operator should
+    // still be able to see/triage them even while a mailbox is
+    // temporarily disabled or disconnected; unlike "Sweep now"/"Connect",
+    // this is not an action that requires a live connection to perform).
+    if (hasWorkingAdapter(mailbox.provider_kind)) {
+      const domainReviewCount = await this._domainReviewOpenCount(mailbox);
+      if (domainReviewCount > 0) {
+        const domainReviewBtn = el("button", {
+          class: "btn btn--secondary btn--sm",
+          text: `Domain Review (${domainReviewCount})`,
+          attrs: { type: "button" },
+        });
+        domainReviewBtn.addEventListener("click", () => DomainReview.open(mailbox));
+        actions.appendChild(domainReviewBtn);
+      }
+    }
+
     if (hasWorkingAdapter(mailbox.provider_kind) && mailbox.status === "ACTIVE") {
       // "No dead controls, no fake availability" — Sweep now is ONLY
       // ever rendered when genuinely CONNECTED (architect doctrine,
@@ -205,6 +228,20 @@ export const Mailboxes = {
     card.appendChild(actions);
 
     return card;
+  },
+
+  /** How many OPEN `MAILBOX_DOMAIN_REVIEW` items this mailbox currently
+   * has (CD-6 GUI-operations-foundation WO) — drives whether the
+   * "Domain Review (N)" button even appears at all (see `_card()`
+   * above: "no dead controls, no fake availability" applies here
+   * exactly as it does to Connect/Sweep). Returns `0` on a fetch
+   * failure — a transient error here should never crash the whole
+   * mailbox card, it just means the button doesn't render this load
+   * (the operator can still reach the items via the generic Needs You
+   * queue in the meantime). */
+  async _domainReviewOpenCount(mailbox) {
+    const { ok, body } = await listDomainReviewItems(mailbox.mailbox_id);
+    return ok && body ? body.count : 0;
   },
 
   /** A minimal, NON-classifying recent-mail summary line (architect

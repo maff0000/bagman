@@ -43,3 +43,37 @@ const NEEDS_YOU_STATUS_KIND = { OPEN: "warn", RESOLVED: "ok", DISMISSED: "neutra
 export function needsYouStatusChip(status) {
   return chip(status || "OPEN", NEEDS_YOU_STATUS_KIND[status] || "neutral");
 }
+
+//: services.xero.supplier_correlation's own closed
+//: `xero_correlation_class` vocabulary -> chip kind (CD-6
+//: GUI-operations-foundation WO). STRONG gets its own distinct colour
+//: (the operator's real "safe to batch-approve" signal); the shared-
+//: domain class is deliberately `warn` (never `ok` — the architect's
+//: own explicit "the domain cannot safely represent one supplier" rule,
+//: see services/xero/supplier_correlation.py's own module docstring)
+//: even though it also has real purchase history; CONTACT_ONLY/NONE
+//: both read as ordinary/uncertain, not alarming.
+const XERO_CORRELATION_CLASS_KIND = {
+  STRONG: "ok",
+  CONTACT_ONLY: "progress",
+  SHARED_DOMAIN_REQUIRES_MANUAL_REVIEW: "warn",
+  NONE: "neutral",
+};
+
+const XERO_CORRELATION_CLASS_LABEL = {
+  STRONG: "Strong match",
+  CONTACT_ONLY: "Contact only",
+  SHARED_DOMAIN_REQUIRES_MANUAL_REVIEW: "Shared domain — review",
+  NONE: "No match",
+};
+
+/** `correlationClass`: one of `xero_correlation_class`'s closed values,
+ * or `undefined`/`null` when a domain-review item has never been
+ * through a correlation run yet (no `xero_*` metadata at all) — that
+ * "not yet correlated" state renders as its own honest neutral chip,
+ * never silently as `NONE` (which means something different: a real
+ * correlation run happened and found nothing). */
+export function xeroCorrelationClassChip(correlationClass) {
+  if (!correlationClass) return chip("Not yet correlated", "neutral");
+  return chip(XERO_CORRELATION_CLASS_LABEL[correlationClass] || correlationClass, XERO_CORRELATION_CLASS_KIND[correlationClass] || "neutral");
+}

@@ -39,6 +39,7 @@ from services.xero.sync import (
     REFERENCE_DATA_STALE_THRESHOLD_SECONDS,
     SyncFailureReason,
     is_reference_data_stale,
+    resolve_fresh_access_token,
     run_sync,
 )
 from services.xero.tenant_selection import (
@@ -587,6 +588,109 @@ def test_run_sync_missing_tokens_fails_as_config_error():
     )
     assert run.status == "FAILED"
     assert run.error_code == SyncFailureReason.CONFIG_ERROR.value
+
+
+# ---------------------------------------------------------------------
+# resolve_fresh_access_token — CD-6 GUI-operations-foundation WO's
+# extraction of run_sync's own token-read/pre-emptive-refresh sequence
+# into a small reusable helper (see services/xero/sync.py's own module
+# docstring for why). Direct, focused coverage of the helper itself,
+# in addition to the run_sync tests above already exercising it
+# indirectly (those tests all still pass unmodified — proof the
+# extraction changed no run_sync-observable behaviour).
+# ---------------------------------------------------------------------
+
+
+def test_resolve_fresh_access_token_returns_ok_without_refresh_when_token_is_fresh():
+    entity_id, conn_repo, acct_repo, run_repo, token_store, oauth_client, acct_client = _connected_fixture()
+    connection = conn_repo.get_by_entity(entity_id)
+
+    outcome = resolve_fresh_access_token(
+        entity_id=entity_id,
+        connection=connection,
+        connection_repository=conn_repo,
+        token_store=token_store,
+        oauth_client=oauth_client,
+    )
+    assert outcome.ok
+    assert outcome.access_token == "tok"
+    assert oauth_client.token_calls == []  # no refresh needed — token was already fresh
+
+
+def test_resolve_fresh_access_token_refreshes_a_near_expiry_token_exactly_once():
+    entity_id, conn_repo, acct_repo, run_repo, token_store, oauth_client, acct_client = _connected_fixture()
+    connection = conn_repo.get_by_entity(entity_id)
+    token_store.write(
+        entity_id, access_token="stale", refresh_token="ref",
+        expires_at=datetime.now(timezone.utc) - timedelta(seconds=5),
+    )
+    oauth_client.queue_refresh_result(
+        XeroTokenResult(status=XeroOutcomeStatus.OK, tokens=fake_token_bundle(access_token="fresh-token"))
+    )
+
+    outcome = resolve_fresh_access_token(
+        entity_id=entity_id,
+        connection=connection,
+        connection_repository=conn_repo,
+        token_store=token_store,
+        oauth_client=oauth_client,
+    )
+    assert outcome.ok
+    assert outcome.access_token == "fresh-token"
+    refresh_calls = [c for c in oauth_client.token_calls if c.kind == "refresh"]
+    assert len(refresh_calls) == 1
+    # The refreshed token was also persisted back to the store, not just
+    # returned — a later, independent caller re-reading the store sees it.
+    assert token_store.read(entity_id).access_token == "fresh-token"
+
+
+def test_resolve_fresh_access_token_reports_refresh_failure_without_raising():
+    """A refresh failure is a non-ok outcome, never a raised exception —
+    `run_sync`'s own long-established contract (this is an EXTRACTION,
+    not a behaviour change) requires the caller to decide what to do
+    with it (a `FAILED` sync run for `run_sync`; a raised `ConflictError`
+    for the new xero-correlate HTTP endpoint — see that endpoint's own
+    test coverage in tests/app_api/test_mailbox_microsoft_endpoints.py)."""
+    entity_id, conn_repo, acct_repo, run_repo, token_store, oauth_client, acct_client = _connected_fixture()
+    connection = conn_repo.get_by_entity(entity_id)
+    token_store.write(
+        entity_id, access_token="stale", refresh_token="ref",
+        expires_at=datetime.now(timezone.utc) - timedelta(seconds=5),
+    )
+    oauth_client.queue_refresh_result(XeroTokenResult(status=XeroOutcomeStatus.AUTH_ERROR, error_detail="invalid_grant"))
+
+    outcome = resolve_fresh_access_token(
+        entity_id=entity_id,
+        connection=connection,
+        connection_repository=conn_repo,
+        token_store=token_store,
+        oauth_client=oauth_client,
+    )
+    assert not outcome.ok
+    assert outcome.failure_reason == SyncFailureReason.TOKEN_REFRESH_FAILED.value
+    # The same connection-level side effect run_sync's own reactive/
+    # pre-emptive refresh failure paths already apply — the shared
+    # helper calls the SAME `connection_repository.fail_refresh`.
+    assert conn_repo.get_by_entity(entity_id).status == "ERROR"
+
+
+def test_resolve_fresh_access_token_reports_missing_tokens_without_raising():
+    conn_repo = InMemoryXeroConnectionRepository()
+    entity_id = _eid()
+    conn = conn_repo.begin_connect(entity_id=entity_id)
+    connection = conn_repo.complete_connect(
+        conn.xero_connection_id, tenant_id="t1", tenant_name="Acme", token_expires_at=None
+    )
+
+    outcome = resolve_fresh_access_token(
+        entity_id=entity_id,
+        connection=connection,
+        connection_repository=conn_repo,
+        token_store=InMemoryTokenStore(),  # nothing written
+        oauth_client=FakeXeroOAuthClient(),
+    )
+    assert not outcome.ok
+    assert outcome.failure_reason == SyncFailureReason.CONFIG_ERROR.value
 
 
 # ---------------------------------------------------------------------

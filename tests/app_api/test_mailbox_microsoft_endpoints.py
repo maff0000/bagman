@@ -9,7 +9,7 @@ lightweight `TestClient`-only style — no Docker required.
 from __future__ import annotations
 
 import urllib.parse
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from fastapi.testclient import TestClient
@@ -29,6 +29,17 @@ from services.mailbox.microsoft.graph_client import (
     MicrosoftIdentityResult,
     MicrosoftTokenResult,
 )
+from services.xero.client import (
+    RawXeroContact,
+    RawXeroPurchaseInvoice,
+    XeroConnectionInfo,
+    XeroConnectionsResult,
+    XeroContactsResult,
+    XeroInvoicesResult,
+    XeroOutcomeStatus,
+    XeroTokenResult,
+)
+from services.xero.fake_client import fake_token_bundle as fake_xero_token_bundle
 
 ACTOR_ID = "bagman-mailbox-microsoft-endpoint-tests"
 
@@ -743,3 +754,270 @@ def test_batch_resolve_requires_at_least_one_item(dev_client):
         json={"actor_type": "USER", "actor_id": ACTOR_ID, "items": []},
     )
     assert r.status_code == 422
+
+
+# ---------------------------------------------------------------------
+# GET domain-review — CD-6 GUI-operations-foundation WO (the new
+# per-mailbox list endpoint feeding the domain-review batch-triage GUI
+# page).
+# ---------------------------------------------------------------------
+
+
+def test_list_domain_review_scopes_to_the_requested_mailbox_only(dev_client):
+    mailbox_id, comp, _entity = _connected_mailbox_with_entity_seeded(dev_client)
+    _sweep_unknown_domain(dev_client, mailbox_id, domain="scope-test-one.example")
+
+    other_mailbox_id = _create_mailbox(dev_client, email="ops-scope@infosecurs.com")
+    _connect_and_complete(dev_client, other_mailbox_id, email="ops-scope@infosecurs.com")
+    other_comp = get_composition()
+    other_comp.api.register_entity(
+        entity_type="COMPANY", canonical_name="TEST_DOMAIN_REVIEW_SCOPE_LTD", display_name="Test Scope Ltd",
+        status="ACTIVE", actor_type="SYSTEM", actor_id=ACTOR_ID,
+        fiscal_year_start_month_day="01-01", historical_floor_override_at=datetime(2025, 1, 1, tzinfo=timezone.utc),
+    )
+    _sweep_unknown_domain(dev_client, other_mailbox_id, domain="scope-test-two.example")
+
+    r = dev_client.get(f"/internal/mailboxes/{mailbox_id}/microsoft/domain-review")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["mailbox_id"] == mailbox_id
+    assert body["count"] == 1
+    assert body["items"][0]["metadata"]["sender_domain"] == "scope-test-one.example"
+    # The second mailbox's own item never appears in THIS mailbox's list.
+    assert all(i["metadata"]["mailbox_id"] == mailbox_id for i in body["items"])
+
+
+def test_list_domain_review_defaults_to_open_and_status_override_works(dev_client):
+    mailbox_id, comp, _entity = _connected_mailbox_with_entity_seeded(dev_client)
+    _sweep_unknown_domain(dev_client, mailbox_id, domain="default-status-test.example")
+    item = _open_domain_review_item_for_domain(comp, mailbox_id, "default-status-test.example")
+    dev_client.post(
+        f"/internal/mailboxes/{mailbox_id}/microsoft/domain-review/{item.item_id}/resolve",
+        json={"actor_type": "USER", "actor_id": ACTOR_ID, "decision": "IGNORE"},
+    )
+
+    # Default (no `status` query param at all): OPEN only — the one
+    # item raised above is now RESOLVED, so the default listing is empty.
+    default_r = dev_client.get(f"/internal/mailboxes/{mailbox_id}/microsoft/domain-review")
+    assert default_r.status_code == 200, default_r.text
+    assert default_r.json()["count"] == 0
+
+    # An explicit `status` override reaches the now-RESOLVED item.
+    explicit_r = dev_client.get(
+        f"/internal/mailboxes/{mailbox_id}/microsoft/domain-review", params={"status": "RESOLVED"}
+    )
+    assert explicit_r.status_code == 200, explicit_r.text
+    assert explicit_r.json()["count"] == 1
+    assert explicit_r.json()["items"][0]["item_id"] == item.item_id
+
+
+def test_domain_review_endpoints_reject_a_non_microsoft_mailbox(dev_client):
+    mailbox_id = _create_mailbox(dev_client, provider_kind="IMAP", email="ops-domain-review@noustai.com")
+    r_get = dev_client.get(f"/internal/mailboxes/{mailbox_id}/microsoft/domain-review")
+    assert r_get.status_code == 422
+    r_post = dev_client.post(
+        f"/internal/mailboxes/{mailbox_id}/microsoft/domain-review/xero-correlate",
+        json={"entity_id": "whatever", "actor_type": "USER", "actor_id": ACTOR_ID},
+    )
+    assert r_post.status_code == 422
+
+
+# ---------------------------------------------------------------------
+# POST domain-review/xero-correlate — CD-6 GUI-operations-foundation WO
+# (the new endpoint that calls
+# services.xero.supplier_correlation.correlate_xero_suppliers_for_open_domain_review_items
+# via a real, resolved-and-refreshed Xero access token).
+# ---------------------------------------------------------------------
+
+_XERO_CORRELATE_CONTACTS = (
+    RawXeroContact(
+        contact_id="ct-strong",
+        name="Strong Supplier Ltd",
+        email_address="billing@correlate-strong.example",
+        is_customer=False,
+        is_supplier=True,
+        contact_status="ACTIVE",
+    ),
+)
+_XERO_CORRELATE_INVOICES = (
+    RawXeroPurchaseInvoice(
+        invoice_id="inv-1",
+        contact_id="ct-strong",
+        invoice_type="ACCPAY",
+        invoice_date=datetime(2026, 3, 1, tzinfo=timezone.utc),
+        status="AUTHORISED",
+    ),
+)
+
+
+def _connect_xero_entity(client, entity_id: str, *, tenant_id="tenant-xero-correlate", tenant_name="Infosecurs Limited") -> None:
+    """Connect `entity_id`'s `XeroConnection` via the real HTTP OAuth
+    flow (mirrors tests/app_api/test_xero_endpoints.py
+    ::_connect_and_complete exactly — that helper is file-local there,
+    not importable, so it is reproduced here rather than reached into
+    across test files), then writes a FRESH (not near-expiry) token
+    into the token store — the ordinary "already connected, tokens
+    fresh" starting state most of this file's own xero-correlate tests
+    want."""
+    comp = get_composition()
+    r = client.post("/internal/xero/connect", json={"entity_id": entity_id, "actor_type": "USER", "actor_id": ACTOR_ID})
+    assert r.status_code == 201, r.text
+    state = urllib.parse.parse_qs(urllib.parse.urlparse(r.json()["authorize_url"]).query)["state"][0]
+
+    comp.xero_oauth_client.queue_exchange_result(XeroTokenResult(status=XeroOutcomeStatus.OK, tokens=fake_xero_token_bundle()))
+    comp.xero_oauth_client.queue_connections_result(
+        XeroConnectionsResult(
+            status=XeroOutcomeStatus.OK,
+            connections=(XeroConnectionInfo(connection_id="c1", tenant_id=tenant_id, tenant_name=tenant_name, tenant_type="ORGANISATION"),),
+        )
+    )
+    r = client.get("/internal/xero/oauth/callback", params={"code": "abc123", "state": state})
+    assert r.status_code == 200, r.text
+    comp.xero_token_store.write(
+        entity_id, access_token="tok", refresh_token="ref", expires_at=fake_xero_token_bundle().expires_at
+    )
+
+
+def _queue_xero_correlation_success(comp) -> None:
+    comp.xero_accounting_client.queue_contacts_result(
+        XeroContactsResult(status=XeroOutcomeStatus.OK, contacts=_XERO_CORRELATE_CONTACTS)
+    )
+    comp.xero_accounting_client.queue_invoices_result(
+        XeroInvoicesResult(status=XeroOutcomeStatus.OK, invoices=_XERO_CORRELATE_INVOICES)
+    )
+
+
+def test_xero_correlate_success_enriches_open_items_and_returns_summary(dev_client):
+    """(a) a successful correlation run returns ok:true and a correct
+    summary, and the items' metadata is genuinely enriched."""
+    mailbox_id, comp, entity = _connected_mailbox_with_entity_seeded(dev_client)
+    _sweep_unknown_domain(dev_client, mailbox_id, domain="correlate-strong.example")
+    item = _open_domain_review_item_for_domain(comp, mailbox_id, "correlate-strong.example")
+
+    _connect_xero_entity(dev_client, entity.entity_id)
+    _queue_xero_correlation_success(comp)
+
+    r = dev_client.post(
+        f"/internal/mailboxes/{mailbox_id}/microsoft/domain-review/xero-correlate",
+        json={"entity_id": entity.entity_id, "actor_type": "USER", "actor_id": ACTOR_ID},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["ok"] is True
+    assert body["contacts_read"] == 1
+    assert body["purchase_invoices_examined"] == 1
+    assert body["domain_review_items_updated"] == 1
+    assert body["strong_correlation_count"] == 1
+
+    updated = comp.needs_you_repository.get_needs_you_item(item.item_id)
+    assert updated.metadata["xero_correlation_class"] == "STRONG"
+    assert updated.metadata["xero_contact_match"] is True
+    assert updated.metadata["xero_purchase_invoice_count"] == 1
+    assert updated.metadata["xero_correlated_at"] is not None
+    assert updated.status == "OPEN"  # correlation never resolves anything itself
+
+
+def test_xero_correlate_failure_never_touches_any_item_metadata(dev_client):
+    """(b) a fake Xero client returning AUTH_ERROR (simulating the
+    CURRENT real scope-insufficient Infosecurs state) returns ok:false
+    with a clear error, and — critically — does NOT touch any item's
+    metadata at all."""
+    mailbox_id, comp, entity = _connected_mailbox_with_entity_seeded(dev_client)
+    _sweep_unknown_domain(dev_client, mailbox_id, domain="correlate-fail.example")
+    item = _open_domain_review_item_for_domain(comp, mailbox_id, "correlate-fail.example")
+
+    _connect_xero_entity(dev_client, entity.entity_id)
+    comp.xero_accounting_client.queue_contacts_result(
+        XeroContactsResult(
+            status=XeroOutcomeStatus.AUTH_ERROR,
+            error_detail="insufficient scope — accounting.contacts.read not granted",
+        )
+    )
+
+    r = dev_client.post(
+        f"/internal/mailboxes/{mailbox_id}/microsoft/domain-review/xero-correlate",
+        json={"entity_id": entity.entity_id, "actor_type": "USER", "actor_id": ACTOR_ID},
+    )
+    assert r.status_code == 200, r.text  # a correlation failure is DATA, never an HTTP-level failure
+    body = r.json()
+    assert body["ok"] is False
+    assert body["error_type"] == "XeroSupplierCorrelationFailedError"
+    assert body["error"]  # a real, non-empty message
+
+    untouched = comp.needs_you_repository.get_needs_you_item(item.item_id)
+    assert "xero_correlation_class" not in untouched.metadata
+    assert untouched.status == "OPEN"
+
+
+def test_xero_correlate_refreshes_a_near_expiry_token_exactly_once(dev_client):
+    """(c) a token close to expires_at triggers exactly one refresh
+    before the real Xero call, mirroring run_sync's own already-tested
+    refresh behaviour (same FakeXeroOAuthClient fixture)."""
+    mailbox_id, comp, entity = _connected_mailbox_with_entity_seeded(dev_client)
+    _sweep_unknown_domain(dev_client, mailbox_id, domain="correlate-refresh.example")
+
+    _connect_xero_entity(dev_client, entity.entity_id)
+    # Force the pre-emptive refresh path (mirrors
+    # tests/integration/test_xero_domain.py's own
+    # "already-expired token" technique).
+    comp.xero_token_store.write(
+        entity.entity_id, access_token="stale", refresh_token="ref",
+        expires_at=datetime.now(timezone.utc) - timedelta(seconds=5),
+    )
+    comp.xero_oauth_client.queue_refresh_result(
+        XeroTokenResult(status=XeroOutcomeStatus.OK, tokens=fake_xero_token_bundle())
+    )
+    _queue_xero_correlation_success(comp)
+
+    r = dev_client.post(
+        f"/internal/mailboxes/{mailbox_id}/microsoft/domain-review/xero-correlate",
+        json={"entity_id": entity.entity_id, "actor_type": "USER", "actor_id": ACTOR_ID},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["ok"] is True
+
+    refresh_calls = [c for c in comp.xero_oauth_client.token_calls if c.kind == "refresh"]
+    assert len(refresh_calls) == 1
+    # The refreshed access token — not the stale one — was actually used
+    # for the real Contacts/Invoices calls.
+    assert comp.xero_accounting_client.contact_calls[-1][1] == "fake-access-token"
+    assert comp.xero_accounting_client.invoice_calls[-1][1] == "fake-access-token"
+
+
+def test_xero_correlate_entity_with_no_xero_connection_at_all_is_409(dev_client):
+    """(d) entity_id with no XeroConnection at all raises/maps to the
+    same 409 this router's other Xero-touching code paths already
+    produce for that case."""
+    mailbox_id, _comp, entity = _connected_mailbox_with_entity_seeded(dev_client)
+    r = dev_client.post(
+        f"/internal/mailboxes/{mailbox_id}/microsoft/domain-review/xero-correlate",
+        json={"entity_id": entity.entity_id, "actor_type": "USER", "actor_id": ACTOR_ID},
+    )
+    assert r.status_code == 409, r.text
+
+
+def test_xero_correlate_entity_with_non_connected_xero_connection_is_409(dev_client):
+    """(d) a non-CONNECTED XeroConnection (here: PENDING — the OAuth
+    flow was begun but never completed) is the same genuine
+    precondition failure as "no connection at all", not a different
+    error shape."""
+    mailbox_id, _comp, entity = _connected_mailbox_with_entity_seeded(dev_client)
+    r = dev_client.post(
+        "/internal/xero/connect", json={"entity_id": entity.entity_id, "actor_type": "USER", "actor_id": ACTOR_ID}
+    )
+    assert r.status_code == 201, r.text  # PENDING — never completed
+
+    r2 = dev_client.post(
+        f"/internal/mailboxes/{mailbox_id}/microsoft/domain-review/xero-correlate",
+        json={"entity_id": entity.entity_id, "actor_type": "USER", "actor_id": ACTOR_ID},
+    )
+    assert r2.status_code == 409, r2.text
+
+
+def test_xero_correlate_unknown_entity_id_is_404(dev_client):
+    mailbox_id, _comp, _entity = _connected_mailbox_with_entity_seeded(dev_client)
+    r = dev_client.post(
+        f"/internal/mailboxes/{mailbox_id}/microsoft/domain-review/xero-correlate",
+        json={"entity_id": "not-a-real-entity", "actor_type": "USER", "actor_id": ACTOR_ID},
+    )
+    assert r.status_code == 404, r.text
