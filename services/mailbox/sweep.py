@@ -40,17 +40,39 @@ ingested. For each message in a delta round:
    SPF/DKIM/DMARC signals — all from the SAME delta request Graph
    already returns (see ``services/mailbox/microsoft/graph_client.py``'s
    own ``$select``/``$expand`` additions) — never a body/`$value` fetch.
-2. Stage B (the domain gate) — the sender's domain is looked up in this
-   mailbox's own ``services.mailbox.domain_rule.MailboxDomainRuleRepository``:
+2. Stage B (the domain/sender gate) — CD-6 GUI-operations-foundation
+   follow-on WO: a THREE-state operator-learning policy model (was a
+   two-state ``ALLOWED``/``IGNORED`` model) — the sender is looked up in
+   this mailbox's own
+   ``services.mailbox.domain_rule.MailboxDomainRuleRepository`` (most-
+   specific-rule-wins across an ``EXACT_ADDRESS``/``EXACT``/
+   ``INCLUDE_SUBDOMAINS`` match — see that module's own docstring):
 
-   * ``ALLOWED`` — proceeds with the existing Slice 4A full-MIME-fetch-
-     and-evidence-ingest path, attaching the rule's
-     ``destination_entity_id``/``destination_mode``/``processor_hint``
-     to the resulting ``MailboxMessage.metadata["routing"]`` as
-     NON-AUTHORITATIVE routing metadata (never accounting truth).
-   * ``IGNORED`` — marked ``CHECKED_NOT_CANDIDATE``; no MIME fetch;
-     the rule's ``last_seen_at`` is touched; never a Needs You item.
-   * no rule yet — ``services.mailbox.discovery_signals
+   * ``MUST_READ`` (was ``ALLOWED``) — this specific MESSAGE's own
+     authentication signals are checked FIRST (see "Authentication
+     escalation" below); on a genuine PASS, proceeds with the existing
+     Slice 4A full-MIME-fetch-and-evidence-ingest path, attaching the
+     rule's ``destination_entity_id``/``destination_mode``/
+     ``processor_hint`` to the resulting
+     ``MailboxMessage.metadata["routing"]`` as NON-AUTHORITATIVE routing
+     metadata (never accounting truth) — and, when
+     ``destination_mode == "FIXED"``, the resulting ``EvidenceItem`` now
+     gets a REAL ``entity_id`` at registration time (the CD-6
+     GUI-operations-foundation follow-on WO's own fix for a confirmed
+     pre-existing gap — see ``services/mailbox/microsoft/evidence_ingest.py``).
+     A later, ordinary message from this SAME confirmed source NEVER
+     re-raises a ``MAILBOX_DOMAIN_REVIEW`` item merely because it
+     arrived — the whole point of this durable-memory model (architect,
+     verbatim: "Once Matt has explicitly confirmed a sender/source as
+     financially relevant, BAGMAN must remember that decision durably").
+   * ``GRAYLIST`` (new) — behaves IDENTICALLY to "no rule yet" below
+     (Matt looked at this domain once and deliberately left it under
+     review; a real row exists purely for GUI display) — never a MIME
+     fetch, same aggregated ``MAILBOX_DOMAIN_REVIEW`` item reuse.
+   * ``BLACKLIST`` (was ``IGNORED``) — marked ``CHECKED_NOT_CANDIDATE``;
+     no MIME fetch; the rule's ``last_seen_at`` is touched; never a
+     Needs You item.
+   * no rule yet (or ``GRAYLIST``) — ``services.mailbox.discovery_signals
      .evaluate_discovery_candidate`` runs (Stage-A metadata only). A
      credible candidate raises (or reuses) exactly one
      ``services.needs_you.needs_you.ITEM_TYPE_MAILBOX_DOMAIN_REVIEW``
@@ -61,6 +83,76 @@ ingested. For each message in a delta round:
      triggering message, gets its MIME fetched immediately once an
      operator approves). A non-candidate is marked
      ``CHECKED_NOT_CANDIDATE`` and nothing further happens.
+
+Authentication escalation — a new, per-message security gate on top of
+a MUST_READ source (CD-6 GUI-operations-foundation follow-on WO)
+------------------------------------------------------------------------
+Trusting a SOURCE (a ``MUST_READ`` rule) is not the same as trusting
+every individual MESSAGE claiming to be from it — a compromised/spoofed
+sender is a real, different risk `MailboxMessage.auth_signals` already
+captured honestly but, until this WO, never acted on. See
+:func:`evaluate_message_authentication` for the exact bounded,
+deterministic (never AI/ML) PASS/FAIL threshold this WO adopts:
+
+* Any of ``spf``/``dkim``/``dmarc`` explicitly reporting ``"fail"`` is a
+  hard FAIL.
+* All three being ``None``/absent (zero authentication signal captured
+  at all for this message) is ALSO treated as suspicious/FAIL — a
+  documented judgment call: a real provider ordinarily reports
+  SOMETHING for at least one mechanism, so total silence is itself worth
+  surfacing rather than silently trusting.
+* Anything else (a real ``"pass"``, a `"softfail"`/`"none"` mixed with at
+  least one populated signal, ...) is a PASS — proceeds normally.
+
+On a FAIL, the message is marked ``services.mailbox.message
+.INGESTION_STATUS_SECURITY_REVIEW`` — a distinct, honest outcome (this
+IS a real candidate that failed a security check, never merely "not a
+candidate") — and exactly one
+``services.needs_you.needs_you.ITEM_TYPE_MAILBOX_AUTHENTICATION_ESCALATION``
+item is raised, deduped on ``(item_type, source_object_reference)`` with
+``source_object_reference`` set to this message's own canonical
+``mailbox_message_id`` (the generic dedupe mechanism
+``services.needs_you.needs_you.NeedsYouRepository.create_needs_you_item``
+already provides — equivalent to per-``(mailbox_id,
+immutable_provider_message_id)`` deduplication, since
+``record_observation`` itself already resolves that tuple to one stable
+``mailbox_message_id``). This is architecturally a DIFFERENT question
+from ``MAILBOX_DOMAIN_REVIEW`` — never the same item type, never the
+same dedupe scope — architect, verbatim: "this is not BAGMAN re-asking
+Matt's relevance decision — it is a new security event". The governing
+``MailboxDomainRule`` itself is never touched by this — it stays
+``MUST_READ``; only this ONE message's own outcome is affected. A
+``SECURITY_REVIEW`` message is never MIME-fetched/evidence-created via
+the normal trusted path, and is deliberately EXCLUDED from
+``MailboxMessageRepository.list_candidate_messages_for_domain``'s own
+eligibility filter (that filter already requires
+``ingestion_status == CHECKED_NOT_CANDIDATE``, which ``SECURITY_REVIEW``
+never is) — a security-escalated message must never be silently swept
+into a later domain-approval back-process.
+
+Document-level destination review for MUST_READ + REVIEW_REQUIRED (CD-6
+GUI-operations-foundation follow-on WO)
+------------------------------------------------------------------------
+A ``MUST_READ``-policy, ``REVIEW_REQUIRED``-destination message that
+passes its authentication check gets fully, deeply ingested exactly like
+today (``entity_id`` stays ``None`` — domain alone never determines a
+destination, architect §3) — but now ALSO raises (idempotently, keyed on
+``(item_type, source_object_reference=evidence_id)``, reusing
+``app/api/routers/intake.py``'s own established
+``COMPANY_REQUIRED``/``COMPANY_WHAT_WHY`` vocabulary verbatim, so the
+EXISTING Needs You review-drawer form renders it with zero GUI change)
+one document-scoped Needs You item per evidence item created this way —
+see :func:`_raise_document_destination_review_item`. This is the real
+per-document resolution mechanism a domain-level ``REVIEW_REQUIRED``
+rule defers to: resolving ONE such item never mutates the governing
+``MailboxDomainRule`` itself (that item is resolved through the EXISTING
+generic ``POST /internal/needs-you/{id}/resolve`` endpoint, scoped
+purely to its own ``evidence_id`` — see that router's own docstring,
+untouched by this WO), so a second, different ambiguous message from the
+SAME domain always raises its OWN separate item, still
+``REVIEW_REQUIRED`` at the rule level (architect's own explicit
+acceptance test: one ambiguous document's destination choice never
+silently converts every future document from that source).
 
 A message already in any of ``services.mailbox.message
 .FINAL_INGESTION_STATUSES`` (which now includes
@@ -104,7 +196,7 @@ bootstraps from a boundary DERIVED specifically for THAT mailbox:
 
 1. Determine the mailbox's in-scope destination entities — the union
    of its own optional ``default_entity_id`` hint (when set) and every
-   ``destination_entity_id`` named by one of its own ``ALLOWED``
+   ``destination_entity_id`` named by one of its own ``MUST_READ``
    ``services.mailbox.domain_rule.MailboxDomainRule`` rows.
 2. For each in-scope entity, derive its own real historical-bootstrap
    requirement via
@@ -262,6 +354,7 @@ treating folder identity/equality uses ``folder_id``.
 from __future__ import annotations
 
 import time
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Mapping, Optional, Protocol, Sequence
 
@@ -273,8 +366,10 @@ from services.mailbox.bootstrap_policy import compute_entity_historical_bootstra
 from services.mailbox.cursor import MailboxFolderCursorRepository
 from services.mailbox.discovery_signals import evaluate_discovery_candidate
 from services.mailbox.domain_rule import (
-    POLICY_ALLOWED,
-    POLICY_IGNORED,
+    DESTINATION_MODE_FIXED,
+    DESTINATION_MODE_REVIEW_REQUIRED,
+    POLICY_BLACKLIST,
+    POLICY_MUST_READ,
     MailboxDomainRule,
     MailboxDomainRuleRepository,
 )
@@ -290,6 +385,7 @@ from services.mailbox.message import (
     INGESTION_STATUS_FAILED,
     INGESTION_STATUS_INGESTED,
     INGESTION_STATUS_QUARANTINED,
+    INGESTION_STATUS_SECURITY_REVIEW,
     INGESTION_STATUS_VANISHED,
     MailboxMessage,
     MailboxMessageRepository,
@@ -304,7 +400,11 @@ from services.mailbox.microsoft.evidence_ingest import (
 from services.mailbox.microsoft.graph_client import GraphOutcomeStatus
 from services.mailbox.sweep_run import MailboxSweepRunRepository, SweepFailureReason
 from services.needs_you.needs_you import (
+    ALLOWED_ACTION_COMPANY_WHAT_WHY,
+    ALLOWED_ACTION_MAILBOX_AUTHENTICATION_ESCALATION,
     ALLOWED_ACTION_MAILBOX_DOMAIN_REVIEW,
+    ITEM_TYPE_COMPANY_REQUIRED,
+    ITEM_TYPE_MAILBOX_AUTHENTICATION_ESCALATION,
     ITEM_TYPE_MAILBOX_DOMAIN_REVIEW,
     NeedsYouRepository,
 )
@@ -324,7 +424,7 @@ def compute_bootstrap_floor(
     1. Resolve ``mailbox``'s in-scope destination entity ids: the union
        of its own optional ``default_entity_id`` hint (if set) and
        every ``destination_entity_id`` named by one of its own
-       ``ALLOWED`` ``MailboxDomainRule`` rows.
+       ``MUST_READ`` ``MailboxDomainRule`` rows.
     2. If that set is EMPTY (the real, current ``matt@infosecurs.com``
        state — a genuine bootstrapping case, not a placeholder), fall
        back to EVERY governed entity currently seeded (the previous,
@@ -353,7 +453,7 @@ def compute_bootstrap_floor(
     if mailbox.default_entity_id is not None:
         in_scope_entity_ids.add(mailbox.default_entity_id)
     for rule in domain_rule_repository.list_rules(mailbox_id=mailbox.mailbox_id):
-        if rule.policy == POLICY_ALLOWED and rule.destination_entity_id is not None:
+        if rule.policy == POLICY_MUST_READ and rule.destination_entity_id is not None:
             in_scope_entity_ids.add(rule.destination_entity_id)
 
     if in_scope_entity_ids:
@@ -400,7 +500,7 @@ def _attachment_metadata_dicts(attachment_metadata: Sequence[Mapping[str, Any]])
 
 
 def _routing_metadata(rule: MailboxDomainRule) -> dict:
-    """Non-authoritative ROUTING metadata attached to an ALLOWED-rule
+    """Non-authoritative ROUTING metadata attached to a MUST_READ-rule
     message's own ``MailboxMessage.metadata["routing"]`` — architect
     spec §5: "never as accounting truth". Deliberately folded into the
     existing free-form ``metadata`` field rather than three new typed
@@ -414,6 +514,122 @@ def _routing_metadata(rule: MailboxDomainRule) -> dict:
             "mailbox_domain_rule_id": rule.rule_id,
         }
     }
+
+
+@dataclass(frozen=True)
+class _AuthCheckResult:
+    """The bounded, deterministic outcome of
+    :func:`evaluate_message_authentication` — never a confidence score,
+    never anything an AI/ML call produced."""
+
+    escalate: bool
+    reason: str
+
+
+def evaluate_message_authentication(auth_signals: Mapping[str, Optional[str]]) -> _AuthCheckResult:
+    """CD-6 GUI-operations-foundation follow-on WO — the bounded,
+    deterministic (never AI/ML) per-message authentication threshold a
+    ``MUST_READ`` rule's own trusted-source status is checked against
+    before this SPECIFIC message is allowed down the normal MIME-fetch-
+    and-evidence path. See module docstring's own "Authentication
+    escalation" section for the full reasoning; this function is
+    exactly that threshold, isolated for direct unit testing:
+
+    * Any of ``spf``/``dkim``/``dmarc`` explicitly reporting the literal
+      string ``"fail"`` -> escalate (a hard, unambiguous authentication
+      failure).
+    * All three of ``spf``/``dkim``/``dmarc`` being ``None``/absent (no
+      authentication signal captured at all for this message) ->
+      escalate (documented judgment call: a real provider ordinarily
+      reports something for at least one mechanism; total silence is
+      itself worth surfacing rather than silently trusted).
+    * Anything else (a real ``"pass"``, or a ``"softfail"``/``"none"``
+      value that still means AT LEAST ONE mechanism reported something)
+      -> proceed normally.
+
+    Never raises; never returns anything other than this one bounded
+    ``_AuthCheckResult``.
+    """
+    spf = auth_signals.get("spf")
+    dkim = auth_signals.get("dkim")
+    dmarc = auth_signals.get("dmarc")
+
+    hard_failures = [name for name, value in (("spf", spf), ("dkim", dkim), ("dmarc", dmarc)) if value == "fail"]
+    if hard_failures:
+        return _AuthCheckResult(
+            escalate=True, reason=f"authentication FAIL reported for: {', '.join(hard_failures)}"
+        )
+
+    if spf is None and dkim is None and dmarc is None:
+        return _AuthCheckResult(
+            escalate=True,
+            reason="no spf/dkim/dmarc authentication signal was captured for this message at all",
+        )
+
+    return _AuthCheckResult(escalate=False, reason="authentication check passed")
+
+
+def _raise_authentication_escalation_item(
+    needs_you_repository: NeedsYouRepository, *, mailbox: MailboxSource, message: MailboxMessage, reason: str
+):
+    """Raise (or, on a benign replay, resolve to the EXISTING) one
+    ``ITEM_TYPE_MAILBOX_AUTHENTICATION_ESCALATION`` item for this ONE
+    message — see module docstring's "Authentication escalation"
+    section for why this is deduped per-message (via the generic
+    ``(item_type, source_object_reference=mailbox_message_id)``
+    mechanism ``create_needs_you_item`` already provides), never per-
+    domain, and never conflated with ``MAILBOX_DOMAIN_REVIEW``."""
+    return needs_you_repository.create_needs_you_item(
+        item_type=ITEM_TYPE_MAILBOX_AUTHENTICATION_ESCALATION,
+        domain="MAILBOX",
+        source_object_reference=message.mailbox_message_id,
+        question=(
+            f"A message from a trusted (MUST_READ) source failed its authentication check — "
+            f"{mailbox.display_name} ({mailbox.email_address}), sender '{message.sender_address or 'unknown'}'"
+        ),
+        allowed_action_type=ALLOWED_ACTION_MAILBOX_AUTHENTICATION_ESCALATION,
+        priority="HIGH",
+        metadata={
+            "mailbox_id": mailbox.mailbox_id,
+            "email_address": mailbox.email_address,
+            "sender_address": message.sender_address,
+            "sender_domain": message.sender_domain,
+            "mailbox_message_id": message.mailbox_message_id,
+            "subject": message.subject,
+            "reason": reason,
+        },
+    )
+
+
+def _raise_document_destination_review_item(
+    needs_you_repository: NeedsYouRepository, *, mailbox: MailboxSource, message: MailboxMessage, evidence
+):
+    """CD-6 GUI-operations-foundation follow-on WO — see module
+    docstring's own "Document-level destination review" section. Reuses
+    ``app/api/routers/intake.py::_create_needs_you_item_for_accepted_evidence``'s
+    exact ``COMPANY_REQUIRED``/``COMPANY_WHAT_WHY`` vocabulary verbatim
+    (never a new item type) so the EXISTING Needs You review-drawer form
+    renders this with zero GUI change, deduped idempotently via the
+    generic ``(item_type, source_object_reference=evidence_id)``
+    mechanism — one item per evidence item, never per domain."""
+    original_label = message.subject or evidence.evidence_id
+    return needs_you_repository.create_needs_you_item(
+        item_type=ITEM_TYPE_COMPANY_REQUIRED,
+        domain="MAILBOX",
+        source_object_reference=evidence.evidence_id,
+        question=f"Which company is this document for, and what/why? ({original_label})",
+        allowed_action_type=ALLOWED_ACTION_COMPANY_WHAT_WHY,
+        metadata={
+            "evidence_id": evidence.evidence_id,
+            "mailbox_id": mailbox.mailbox_id,
+            "email_address": mailbox.email_address,
+            "mailbox_message_id": message.mailbox_message_id,
+            "sender_address": message.sender_address,
+            "sender_domain": message.sender_domain,
+            "subject": message.subject,
+        },
+    )
+
 
 #: Bounded worst-case backoff for one rate-limited delta page — mirrors
 #: `services.xero.sync._MAX_RATE_LIMIT_BACKOFF_SECONDS`'s own reasoning.
@@ -915,22 +1131,29 @@ def run_sweep(
                             return message
 
                         rule = (
-                            domain_rule_repository.find_for_sender(mailbox_id=mailbox.mailbox_id, sender_domain=sender_domain)
+                            domain_rule_repository.find_for_sender(
+                                mailbox_id=mailbox.mailbox_id,
+                                sender_domain=sender_domain,
+                                sender_address=msg.sender_address,
+                            )
                             if sender_domain
                             else None
                         )
 
-                        if rule is not None and rule.policy == POLICY_IGNORED:
+                        if rule is not None and rule.policy == POLICY_BLACKLIST:
                             ignored_domain_messages += 1
                             domain_rule_repository.touch_last_seen(
-                                mailbox_id=mailbox.mailbox_id, sender_domain=rule.sender_domain, seen_at=resolved_now
+                                mailbox_id=mailbox.mailbox_id,
+                                sender_domain=rule.sender_domain,
+                                seen_at=resolved_now,
+                                sender_address=msg.sender_address,
                             )
                             messages_new += 1
                             folder_entry["new_discovery_records"] += 1
                             # `discovery_candidate`/`discovery_reason`
                             # stay `None` — the domain gate short-
                             # circuits BEFORE `evaluate_discovery_candidate`
-                            # is ever called for an IGNORED-domain
+                            # is ever called for a BLACKLIST-policy
                             # message (see module docstring). Only
                             # `discovery_checked_at` is honestly set —
                             # this message WAS checked, just not by the
@@ -940,8 +1163,9 @@ def run_sweep(
                             )
                             continue
 
-                        if rule is None or rule.policy != POLICY_ALLOWED:
-                            # Unknown domain — the bounded, non-AI
+                        if rule is None or rule.policy != POLICY_MUST_READ:
+                            # No rule, or GRAYLIST — both behave
+                            # identically here: the bounded, non-AI
                             # discovery-candidate heuristic (architect
                             # spec §4). Never a MIME fetch either way.
                             unknown_domain_messages += 1
@@ -968,13 +1192,30 @@ def run_sweep(
                                 )
                             continue
 
-                        # rule.policy == POLICY_ALLOWED — the existing
-                        # Slice 4A full-MIME-fetch-and-evidence-ingest
-                        # path, now gated behind an approved rule.
+                        # rule.policy == POLICY_MUST_READ — a confirmed,
+                        # durably-trusted source. This specific MESSAGE's
+                        # own authentication signals are checked FIRST
+                        # (see module docstring's "Authentication
+                        # escalation" section) before any MIME fetch.
                         allowed_domain_messages += 1
                         domain_rule_repository.touch_last_seen(
-                            mailbox_id=mailbox.mailbox_id, sender_domain=rule.sender_domain, seen_at=resolved_now
+                            mailbox_id=mailbox.mailbox_id,
+                            sender_domain=rule.sender_domain,
+                            seen_at=resolved_now,
+                            sender_address=msg.sender_address,
                         )
+
+                        auth_check = evaluate_message_authentication(auth_signals)
+                        if auth_check.escalate:
+                            messages_new += 1
+                            folder_entry["new_discovery_records"] += 1
+                            escalated_message = _record_discovery_only(
+                                INGESTION_STATUS_SECURITY_REVIEW, discovery_checked_at=resolved_now
+                            )
+                            _raise_authentication_escalation_item(
+                                needs_you_repository, mailbox=mailbox, message=escalated_message, reason=auth_check.reason
+                            )
+                            continue
 
                         content_result = adapter.fetch_message_content(
                             mailbox_id=mailbox.mailbox_id, immutable_message_id=msg.immutable_id
@@ -1013,10 +1254,24 @@ def run_sweep(
                         # pipeline (`ingest_email_evidence` below) was
                         # attempted this run for this message, whatever
                         # its eventual outcome (ingested/quarantined/
-                        # governed-oversize-failed) — the ALLOWED-domain
-                        # path's own real cost centre (see the schema's
-                        # own field description).
+                        # governed-oversize-failed) — the MUST_READ-
+                        # domain path's own real cost centre (see the
+                        # schema's own field description).
                         folder_entry["deep_processing_count"] += 1
+                        # CD-6 GUI-operations-foundation follow-on WO —
+                        # the real entity-assignment fix: a FIXED
+                        # destination now threads its real
+                        # destination_entity_id straight through to
+                        # `EvidenceRepository.register_evidence` at
+                        # registration time (never `assign_entity` — see
+                        # this delivery's own final report for why that
+                        # method remains unwired). A REVIEW_REQUIRED
+                        # destination stays unresolved (`entity_id=None`)
+                        # exactly as before — domain alone never
+                        # determines a destination (architect §3).
+                        entity_id_for_evidence = (
+                            rule.destination_entity_id if rule.destination_mode == DESTINATION_MODE_FIXED else None
+                        )
                         outcome = ingest_email_evidence(
                             raw_mime_bytes=content_result.content or b"",
                             mailbox_id=mailbox.mailbox_id,
@@ -1032,6 +1287,7 @@ def run_sweep(
                             actor_type=actor_type,
                             actor_id=actor_id,
                             correlation_id=run.sweep_run_id,
+                            entity_id=entity_id_for_evidence,
                         )
 
                         routing_metadata = _routing_metadata(rule)
@@ -1086,6 +1342,18 @@ def run_sweep(
                                         "sweep_run_id": run.sweep_run_id,
                                     },
                                 )
+                                # CD-6 GUI-operations-foundation follow-on
+                                # WO — REVIEW_REQUIRED-destination
+                                # evidence raises its OWN document-scoped
+                                # COMPANY_REQUIRED item (see module
+                                # docstring's own "Document-level
+                                # destination review" section); a FIXED
+                                # destination already has a real
+                                # entity_id (above) and never needs one.
+                                if rule.destination_mode == DESTINATION_MODE_REVIEW_REQUIRED:
+                                    _raise_document_destination_review_item(
+                                        needs_you_repository, mailbox=mailbox, message=message, evidence=outcome.evidence
+                                    )
                         elif outcome.status == INGEST_STATUS_QUARANTINED:
                             quarantined += 1
                             quarantined_message, _ = message_repository.record_observation(
@@ -1257,6 +1525,7 @@ def _reprocess_one_message(
     rule: MailboxDomainRule,
     adapter: _AdapterProtocol,
     message_repository: MailboxMessageRepository,
+    needs_you_repository: NeedsYouRepository,
     api: _EvidenceAPIProtocol,
     object_store: _ObjectStoreProtocol,
     scanner: EvidenceSafetyScanner,
@@ -1296,6 +1565,20 @@ def _reprocess_one_message(
     `connection_state` — the caller (`reprocess_all_historical_candidates_for_domain`)
     owns that precondition once, up front, rather than repeating a
     per-message check across a bounded sequential loop.
+
+    CD-6 GUI-operations-foundation follow-on WO — this helper's own core
+    logic is UNCHANGED (per that WO's own explicit instruction): it
+    still never runs `evaluate_message_authentication` (a per-message
+    authentication check belongs to an ORDINARY sweep observing a
+    message live, not to this bounded, operator-triggered historical
+    back-process of messages already durably recorded) — the only two
+    additions are threading `rule.destination_entity_id` through to
+    `ingest_email_evidence` when `destination_mode == "FIXED"` (the same
+    entity-assignment fix `run_sweep` itself now applies), and raising a
+    document-scoped `COMPANY_REQUIRED` item when `destination_mode ==
+    "REVIEW_REQUIRED"` and ingestion succeeds (mirrors `run_sweep`'s own
+    identical new call — see that function's own module docstring,
+    "Document-level destination review" section).
     """
     current = message_repository.get_message(message_id)
     if current.ingestion_status in FINAL_INGESTION_STATUSES - {INGESTION_STATUS_CHECKED_NOT_CANDIDATE}:
@@ -1335,6 +1618,7 @@ def _reprocess_one_message(
             f"reprocessing: {content_result.status.value} — {content_result.error_detail or ''}"
         )
 
+    entity_id_for_evidence = rule.destination_entity_id if rule.destination_mode == DESTINATION_MODE_FIXED else None
     outcome = ingest_email_evidence(
         raw_mime_bytes=content_result.content or b"",
         mailbox_id=mailbox.mailbox_id,
@@ -1350,6 +1634,7 @@ def _reprocess_one_message(
         actor_type=actor_type,
         actor_id=actor_id,
         correlation_id=correlation_id,
+        entity_id=entity_id_for_evidence,
     )
 
     if outcome.status == INGEST_STATUS_INGESTED:
@@ -1396,6 +1681,10 @@ def _reprocess_one_message(
                     "reprocessed_after_domain_rule_approval": True,
                 },
             )
+            if rule.destination_mode == DESTINATION_MODE_REVIEW_REQUIRED:
+                _raise_document_destination_review_item(
+                    needs_you_repository, mailbox=mailbox, message=message, evidence=outcome.evidence
+                )
         return message
 
     if outcome.status == INGEST_STATUS_QUARANTINED:
@@ -1459,6 +1748,7 @@ def reprocess_all_historical_candidates_for_domain(
     rule: MailboxDomainRule,
     adapter: _AdapterProtocol,
     message_repository: MailboxMessageRepository,
+    needs_you_repository: NeedsYouRepository,
     api: _EvidenceAPIProtocol,
     object_store: _ObjectStoreProtocol,
     scanner: EvidenceSafetyScanner,
@@ -1538,6 +1828,7 @@ def reprocess_all_historical_candidates_for_domain(
                 rule=rule,
                 adapter=adapter,
                 message_repository=message_repository,
+                needs_you_repository=needs_you_repository,
                 api=api,
                 object_store=object_store,
                 scanner=scanner,

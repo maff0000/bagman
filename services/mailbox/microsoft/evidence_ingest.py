@@ -128,6 +128,7 @@ def ingest_email_evidence(
     correlation_id: Optional[str] = None,
     causation_id: Optional[str] = None,
     max_size_bytes: int = DEFAULT_MAX_MESSAGE_SIZE_BYTES,
+    entity_id: Optional[str] = None,
 ) -> EmailIngestOutcome:
     """Ingest one email's raw MIME bytes as canonical evidence.
 
@@ -170,7 +171,17 @@ def ingest_email_evidence(
             storage_reference = object_store.put(immutable_provider_message_id, content_hash, data)
 
             evidence = api.register_evidence(
-                entity_id=None,  # a mailbox is never asserted ownership of an entity — see services/mailbox/mailbox.py
+                # CD-6 GUI-operations-foundation follow-on WO: `entity_id`
+                # is now threaded through from the caller (never derived
+                # here) — the ONLY legitimate source is an explicit,
+                # operator-approved `MailboxDomainRule.destination_entity_id`
+                # under `destination_mode == "FIXED"` (see
+                # `services/mailbox/sweep.py`'s own call sites). A mailbox
+                # is still never itself asserted ownership of an entity —
+                # see services/mailbox/mailbox.py — and the default
+                # (`entity_id=None`) preserves that for every other case
+                # (REVIEW_REQUIRED, or no rule at all).
+                entity_id=entity_id,
                 evidence_type="EMAIL",
                 source_id=mailbox_source_id,
                 observed_at=observed_at,

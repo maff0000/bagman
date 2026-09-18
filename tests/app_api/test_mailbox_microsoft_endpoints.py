@@ -274,7 +274,7 @@ def test_sweep_after_connect_ingests_a_message_and_lists_it(dev_client):
         mailbox_id=mailbox_id,
         sender_domain="example.com",
         match_mode="EXACT",
-        policy="ALLOWED",
+        policy="MUST_READ",
         destination_entity_id=None,
         destination_mode="REVIEW_REQUIRED",
         source="OPERATOR",
@@ -284,6 +284,12 @@ def test_sweep_after_connect_ingests_a_message_and_lists_it(dev_client):
     msg = GraphMessageSummary(
         immutable_id="AAMk-1", internet_message_id="<a@b>", subject="Invoice", sender_address="v@example.com",
         sender_display_name="Vendor", received_at=now, has_attachments=False,
+        # CD-6 GUI-operations-foundation follow-on WO — a MUST_READ-
+        # policy message's own authentication signals are now checked
+        # before MIME fetch; a real passing signal set proves the
+        # ORDINARY path here (the dedicated authentication-escalation
+        # tests below exercise a failing/missing signal set instead).
+        auth_signals={"spf": "pass", "dkim": "pass", "dmarc": "pass"},
     )
     _queue_folder_discovery(comp)
     comp.microsoft_graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(msg,), delta_link="d1"))
@@ -387,7 +393,7 @@ def test_resolve_domain_review_allow_fixed_creates_rule_and_reprocesses_message(
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["needs_you_item"]["status"] == "RESOLVED"
-    assert body["mailbox_domain_rule"]["policy"] == "ALLOWED"
+    assert body["mailbox_domain_rule"]["policy"] == "MUST_READ"
     assert body["mailbox_domain_rule"]["destination_entity_id"] == entity.entity_id
     assert len(body["reprocessed_messages"]) == 1
     assert body["reprocessed_messages"][0]["ingestion_status"] == "INGESTED"
@@ -435,7 +441,7 @@ def test_resolve_domain_review_ignore_creates_ignored_rule_no_reprocess(dev_clie
     )
     assert r.status_code == 200, r.text
     body = r.json()
-    assert body["mailbox_domain_rule"]["policy"] == "IGNORED"
+    assert body["mailbox_domain_rule"]["policy"] == "BLACKLIST"
     assert body["reprocessed_messages"] == []
     # No content fetch happened for an IGNORE decision.
     assert comp.microsoft_graph_client.content_calls == []
@@ -649,7 +655,7 @@ def test_batch_resolve_three_domains_matches_three_individual_calls_end_state(de
     for result in body["results"]:
         assert result["ok"] is True
         assert result["needs_you_item"]["status"] == "RESOLVED"
-        assert result["mailbox_domain_rule"]["policy"] == "ALLOWED"
+        assert result["mailbox_domain_rule"]["policy"] == "MUST_READ"
         assert len(result["reprocessed_messages"]) == 1
         assert result["reprocessed_messages"][0]["ingestion_status"] == "INGESTED"
         assert result["error"] is None
@@ -662,7 +668,7 @@ def test_batch_resolve_three_domains_matches_three_individual_calls_end_state(de
     assert {r["sender_domain"] for r in rules["items"]} == set(domains)
     for item in items:
         assert comp.needs_you_repository.get_needs_you_item(item.item_id).status == "RESOLVED"
-    audit_events = comp.api.audit_repository.list_recent(limit=50, event_type_prefix="MAILBOX_DOMAIN_RULE_ALLOWED")
+    audit_events = comp.api.audit_repository.list_recent(limit=50, event_type_prefix="MAILBOX_DOMAIN_RULE_MUST_READ")
     assert len(audit_events) == 3
 
 
@@ -1236,3 +1242,195 @@ def test_xero_correlate_unknown_entity_id_is_404(dev_client):
         json={"entity_id": "not-a-real-entity", "actor_type": "USER", "actor_id": ACTOR_ID},
     )
     assert r.status_code == 404, r.text
+
+
+# =======================================================================
+# CD-6 GUI-operations-foundation follow-on WO — three-state policy model
+# at the HTTP layer: KEEP_GRAY, the document-level COMPANY_REQUIRED
+# scoping proof (WO required test #6), and the audit-trail before/after
+# proof (WO required test #10).
+# =======================================================================
+
+_PASSING_AUTH_SIGNALS = {"spf": "pass", "dkim": "pass", "dmarc": "pass"}
+
+
+def _sweep_must_read_review_required_message(client, mailbox_id, *, msg_id, domain="review-required.example"):
+    """Sweeps ONE message from `domain` under a MUST_READ +
+    REVIEW_REQUIRED rule for it — real end-to-end evidence-creation +
+    COMPANY_REQUIRED-raise path (never the discovery/candidate path)."""
+    comp = get_composition()
+    comp.mailbox_domain_rule_repository.upsert_rule(
+        mailbox_id=mailbox_id, sender_domain=domain, match_mode="EXACT", policy="MUST_READ",
+        destination_entity_id=None, destination_mode="REVIEW_REQUIRED", source="OPERATOR",
+    )
+    now = datetime.now(timezone.utc)
+    msg = GraphMessageSummary(
+        immutable_id=msg_id, internet_message_id=f"<{msg_id}@b>", subject="Invoice",
+        sender_address=f"billing@{domain}", sender_display_name="Supplier", received_at=now,
+        has_attachments=False, auth_signals=_PASSING_AUTH_SIGNALS,
+    )
+    _queue_folder_discovery(comp)
+    comp.microsoft_graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(msg,), delta_link=f"d-{msg_id}"))
+    comp.microsoft_graph_client.queue_content_result(
+        GraphMessageContentResult(status=GraphOutcomeStatus.OK, content=f"From: billing@{domain}\r\nSubject: Invoice\r\n\r\nBody".encode())
+    )
+    comp.microsoft_graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link=f"d-{msg_id}-junk"))
+    r = client.post(f"/internal/mailboxes/{mailbox_id}/microsoft/sweep", json={"actor_type": "USER", "actor_id": ACTOR_ID})
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+def test_resolving_one_company_required_item_never_touches_the_domain_rule(dev_client):
+    """WO required test #6, verbatim: resolving ONE COMPANY_REQUIRED
+    item (via the EXISTING, untouched generic resolve endpoint) does
+    NOT change the MailboxDomainRule's own destination_mode/
+    destination_entity_id — a second, different ambiguous message from
+    the same domain still creates its OWN separate COMPANY_REQUIRED
+    item, still REVIEW_REQUIRED at the rule level."""
+    mailbox_id, comp, entity = _connected_mailbox_with_entity_seeded(dev_client)
+    _sweep_must_read_review_required_message(dev_client, mailbox_id, msg_id="doc-1")
+    _sweep_must_read_review_required_message(dev_client, mailbox_id, msg_id="doc-2")
+
+    company_items = [
+        i for i in comp.needs_you_repository.list_needs_you_items(item_type="COMPANY_REQUIRED")
+        if i.metadata.get("mailbox_id") == mailbox_id
+    ]
+    assert len(company_items) == 2
+    first, second = company_items[0], company_items[1]
+    assert first.source_object_reference != second.source_object_reference
+
+    rule_before = comp.mailbox_domain_rule_repository.find_for_sender(
+        mailbox_id=mailbox_id, sender_domain="review-required.example"
+    )
+    assert rule_before.destination_mode == "REVIEW_REQUIRED"
+    assert rule_before.destination_entity_id is None
+
+    r = dev_client.post(
+        f"/internal/needs-you/{first.item_id}/resolve",
+        json={
+            "actor_type": "USER", "actor_id": ACTOR_ID,
+            "resolution": {"entity_id": entity.entity_id, "what": "Invoice", "why": "Ops"},
+        },
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["status"] == "RESOLVED"
+
+    # The rule itself — never touched by resolving one document's
+    # own destination question.
+    rule_after = comp.mailbox_domain_rule_repository.find_for_sender(
+        mailbox_id=mailbox_id, sender_domain="review-required.example"
+    )
+    assert rule_after.destination_mode == "REVIEW_REQUIRED"
+    assert rule_after.destination_entity_id is None
+    assert rule_after.rule_id == rule_before.rule_id
+    assert rule_after.updated_at == rule_before.updated_at
+
+    # The SECOND item is still open, completely unaffected.
+    still_open = comp.needs_you_repository.get_needs_you_item(second.item_id)
+    assert still_open.status == "OPEN"
+
+
+def test_policy_change_audit_event_carries_before_after_and_is_live_on_next_sweep(dev_client):
+    """WO required test #10: a policy change (GRAYLIST -> MUST_READ)
+    produces a real audit event carrying the before/after policy and
+    destination values, and immediately affects the NEXT sweep's
+    handling of that domain (not merely recorded, but functionally
+    live)."""
+    mailbox_id, comp, entity = _connected_mailbox_with_entity_seeded(dev_client)
+    _sweep_unknown_domain_message(dev_client, mailbox_id)  # domain: new-supplier.example
+    item = [
+        i for i in comp.needs_you_repository.list_needs_you_items(item_type="MAILBOX_DOMAIN_REVIEW")
+        if i.metadata.get("mailbox_id") == mailbox_id
+    ][0]
+
+    # Step 1: KEEP_GRAY — a real GRAYLIST rule, item stays OPEN.
+    r_gray = dev_client.post(
+        f"/internal/mailboxes/{mailbox_id}/microsoft/domain-review/{item.item_id}/resolve",
+        json={"actor_type": "USER", "actor_id": ACTOR_ID, "decision": "KEEP_GRAY"},
+    )
+    assert r_gray.status_code == 200, r_gray.text
+    assert r_gray.json()["mailbox_domain_rule"]["policy"] == "GRAYLIST"
+    assert comp.needs_you_repository.get_needs_you_item(item.item_id).status == "OPEN"
+
+    gray_events = comp.api.audit_repository.list_recent(limit=50, event_type_prefix="MAILBOX_DOMAIN_RULE_GRAYLIST")
+    matching_gray = [e for e in gray_events if e.payload.get("needs_you_item_id") == item.item_id]
+    assert len(matching_gray) == 1
+    assert matching_gray[0].payload["previous_policy"] is None  # no rule existed before
+    assert matching_gray[0].payload["new_policy"] == "GRAYLIST"
+
+    # Step 2: ALLOW (MUST_READ + FIXED) — the real transition under test.
+    comp.microsoft_graph_client.queue_content_result(
+        GraphMessageContentResult(status=GraphOutcomeStatus.OK, content=b"From: billing@new-supplier.example\r\nSubject: Invoice\r\n\r\nBody")
+    )
+    r_allow = dev_client.post(
+        f"/internal/mailboxes/{mailbox_id}/microsoft/domain-review/{item.item_id}/resolve",
+        json={
+            "actor_type": "USER", "actor_id": ACTOR_ID, "decision": "ALLOW",
+            "destination_entity_id": entity.entity_id, "destination_mode": "FIXED",
+        },
+    )
+    assert r_allow.status_code == 200, r_allow.text
+
+    must_read_events = comp.api.audit_repository.list_recent(limit=50, event_type_prefix="MAILBOX_DOMAIN_RULE_MUST_READ")
+    matching_allow = [e for e in must_read_events if e.payload.get("needs_you_item_id") == item.item_id]
+    assert len(matching_allow) == 1
+    payload = matching_allow[0].payload
+    assert payload["previous_policy"] == "GRAYLIST"
+    assert payload["new_policy"] == "MUST_READ"
+    assert payload["previous_destination_entity_id"] is None
+    assert payload["new_destination_entity_id"] == entity.entity_id
+    assert payload["previous_destination_mode"] is None
+    assert payload["new_destination_mode"] == "FIXED"
+
+    # Functionally live, not merely recorded: a NEW message from the
+    # SAME domain, on the NEXT sweep, is now deep-processed under the
+    # new MUST_READ+FIXED rule — no further Needs You item, real entity_id.
+    now = datetime.now(timezone.utc)
+    msg2 = GraphMessageSummary(
+        immutable_id="AAMk-unknown-2", internet_message_id="<u2@b>", subject="Invoice attached",
+        sender_address="billing@new-supplier.example", sender_display_name="New Supplier", received_at=now,
+        has_attachments=False, auth_signals=_PASSING_AUTH_SIGNALS,
+    )
+    _queue_folder_discovery(comp)
+    comp.microsoft_graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(msg2,), delta_link="d-next"))
+    comp.microsoft_graph_client.queue_content_result(
+        GraphMessageContentResult(status=GraphOutcomeStatus.OK, content=b"From: billing@new-supplier.example\r\nSubject: Invoice\r\n\r\nBody")
+    )
+    comp.microsoft_graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link="d-next-junk"))
+    r_sweep = dev_client.post(f"/internal/mailboxes/{mailbox_id}/microsoft/sweep", json={"actor_type": "USER", "actor_id": ACTOR_ID})
+    assert r_sweep.status_code == 200, r_sweep.text
+    assert r_sweep.json()["evidence_created"] == 1
+
+    message2 = comp.mailbox_message_repository.find_by_provider_id(mailbox_id, "AAMk-unknown-2")
+    assert message2.ingestion_status == "INGESTED"
+    evidence2 = comp.api.get_evidence(message2.evidence_id)
+    assert evidence2.entity_id == entity.entity_id
+
+    # Still exactly the ONE original MAILBOX_DOMAIN_REVIEW item for this
+    # domain — the new message never raised a second one.
+    domain_review_items = [
+        i for i in comp.needs_you_repository.list_needs_you_items(item_type="MAILBOX_DOMAIN_REVIEW")
+        if i.metadata.get("mailbox_id") == mailbox_id and i.metadata.get("sender_domain") == "new-supplier.example"
+    ]
+    assert len(domain_review_items) == 1
+
+
+def test_get_domain_rules_reflects_current_policy_after_keep_gray(dev_client):
+    mailbox_id, comp, _entity = _connected_mailbox_with_entity_seeded(dev_client)
+    _sweep_unknown_domain_message(dev_client, mailbox_id)
+    item = [
+        i for i in comp.needs_you_repository.list_needs_you_items(item_type="MAILBOX_DOMAIN_REVIEW")
+        if i.metadata.get("mailbox_id") == mailbox_id
+    ][0]
+    r = dev_client.post(
+        f"/internal/mailboxes/{mailbox_id}/microsoft/domain-review/{item.item_id}/resolve",
+        json={"actor_type": "USER", "actor_id": ACTOR_ID, "decision": "KEEP_GRAY"},
+    )
+    assert r.status_code == 200, r.text
+    # KEEP_GRAY never resolves the item — it stays OPEN for a later look.
+    assert dev_client.get(f"/internal/mailboxes/{mailbox_id}/microsoft/domain-review").json()["count"] == 1
+
+    rules = dev_client.get(f"/internal/mailboxes/{mailbox_id}/microsoft/domain-rules").json()
+    assert rules["count"] == 1
+    assert rules["items"][0]["policy"] == "GRAYLIST"
+    assert rules["items"][0]["sender_address"] is None

@@ -1,8 +1,10 @@
 """PostgreSQL-backed implementation of
 ``services.mailbox.domain_rule.MailboxDomainRuleRepository`` (CD-6
-architect amendment). Mirrors ``persistence/postgres/mailbox_repository.py``'s
-own "stateless, fresh Session per call, with_for_update row-locking,
-never let a raw SQLAlchemy exception escape" discipline.
+architect amendment; extended by the CD-6 GUI-operations-foundation
+follow-on WO — three-state policy model + EXACT_ADDRESS match mode).
+Mirrors ``persistence/postgres/mailbox_repository.py``'s own "stateless,
+fresh Session per call, with_for_update row-locking, never let a raw
+SQLAlchemy exception escape" discipline.
 """
 from __future__ import annotations
 
@@ -18,11 +20,14 @@ from core.timestamps import utc_now
 from persistence.postgres.mailbox_domain_rule_models import MailboxDomainRuleRow
 from persistence.postgres.session import get_engine, session_scope
 from services.mailbox.domain_rule import (
+    MATCH_MODE_EXACT_ADDRESS,
     MATCH_MODE_INCLUDE_SUBDOMAINS,
-    MATCH_MODES,
     MailboxDomainRule,
     MailboxDomainRuleRepository,
+    domain_from_address,
+    normalize_address,
     normalize_domain,
+    validate_match_fields_or_raise,
     validate_policy_fields_or_raise,
 )
 
@@ -34,6 +39,7 @@ def _row_to_domain(row: MailboxDomainRuleRow) -> MailboxDomainRule:
         rule_id=row.rule_id,
         mailbox_id=row.mailbox_id,
         sender_domain=row.sender_domain,
+        sender_address=row.sender_address,
         match_mode=row.match_mode,
         policy=row.policy,
         destination_entity_id=row.destination_entity_id,
@@ -63,28 +69,48 @@ class PostgresMailboxDomainRuleRepository(MailboxDomainRuleRepository):
         source: str,
         processor_hint: Optional[str] = None,
         approved_at=None,
+        sender_address: Optional[str] = None,
     ) -> MailboxDomainRule:
-        if match_mode not in MATCH_MODES:
-            raise ValidationError(f"'{match_mode}' is not a governed match_mode — must be one of {sorted(MATCH_MODES)}")
+        validate_match_fields_or_raise(match_mode=match_mode, sender_address=sender_address)
         validate_policy_fields_or_raise(
             policy=policy, destination_entity_id=destination_entity_id, destination_mode=destination_mode
         )
-        normalized_domain = normalize_domain(sender_domain)
+
+        is_address_rule = match_mode == MATCH_MODE_EXACT_ADDRESS
+        if is_address_rule:
+            normalized_address = normalize_address(sender_address)
+            derived_domain = domain_from_address(normalized_address)
+            if sender_domain and normalize_domain(sender_domain) != derived_domain:
+                raise ValidationError(
+                    f"sender_domain '{sender_domain}' does not match the domain of sender_address "
+                    f"'{sender_address}' ('{derived_domain}')"
+                )
+            normalized_domain = derived_domain
+        else:
+            normalized_address = None
+            normalized_domain = normalize_domain(sender_domain)
+
         now = utc_now()
 
         try:
             with session_scope(self._engine) as session:
-                row = (
-                    session.query(MailboxDomainRuleRow)
-                    .filter_by(mailbox_id=mailbox_id, sender_domain=normalized_domain)
-                    .with_for_update()
-                    .one_or_none()
-                )
+                query = session.query(MailboxDomainRuleRow).filter_by(mailbox_id=mailbox_id)
+                if is_address_rule:
+                    row = query.filter_by(sender_address=normalized_address).with_for_update().one_or_none()
+                else:
+                    row = (
+                        query.filter_by(sender_domain=normalized_domain)
+                        .filter(MailboxDomainRuleRow.match_mode != MATCH_MODE_EXACT_ADDRESS)
+                        .with_for_update()
+                        .one_or_none()
+                    )
+
                 if row is None:
                     candidate = MailboxDomainRule(
                         rule_id=identity.generate_id(),
                         mailbox_id=mailbox_id,
                         sender_domain=normalized_domain,
+                        sender_address=normalized_address,
                         match_mode=match_mode,
                         policy=policy,
                         destination_entity_id=destination_entity_id,
@@ -102,6 +128,7 @@ class PostgresMailboxDomainRuleRepository(MailboxDomainRuleRepository):
                             rule_id=candidate.rule_id,
                             mailbox_id=candidate.mailbox_id,
                             sender_domain=candidate.sender_domain,
+                            sender_address=candidate.sender_address,
                             match_mode=candidate.match_mode,
                             policy=candidate.policy,
                             destination_entity_id=candidate.destination_entity_id,
@@ -120,7 +147,8 @@ class PostgresMailboxDomainRuleRepository(MailboxDomainRuleRepository):
                 updated = MailboxDomainRule(
                     rule_id=current.rule_id,
                     mailbox_id=current.mailbox_id,
-                    sender_domain=current.sender_domain,
+                    sender_domain=normalized_domain,
+                    sender_address=normalized_address,
                     match_mode=match_mode,
                     policy=policy,
                     destination_entity_id=destination_entity_id,
@@ -133,6 +161,8 @@ class PostgresMailboxDomainRuleRepository(MailboxDomainRuleRepository):
                     last_seen_at=current.last_seen_at,
                 )
                 validate_against_contract(updated.to_dict(), _SCHEMA)
+                row.sender_domain = updated.sender_domain
+                row.sender_address = updated.sender_address
                 row.match_mode = updated.match_mode
                 row.policy = updated.policy
                 row.destination_entity_id = updated.destination_entity_id
@@ -161,13 +191,30 @@ class PostgresMailboxDomainRuleRepository(MailboxDomainRuleRepository):
         except SQLAlchemyError as exc:
             raise PersistenceError(f"could not read MailboxDomainRule: {exc}") from exc
 
-    def find_for_sender(self, *, mailbox_id: str, sender_domain: str) -> Optional[MailboxDomainRule]:
+    def find_for_sender(
+        self, *, mailbox_id: str, sender_domain: str, sender_address: Optional[str] = None
+    ) -> Optional[MailboxDomainRule]:
         normalized_domain = normalize_domain(sender_domain)
         try:
             with session_scope(self._engine) as session:
+                if sender_address:
+                    normalized_address = normalize_address(sender_address)
+                    address_row = (
+                        session.query(MailboxDomainRuleRow)
+                        .filter_by(
+                            mailbox_id=mailbox_id,
+                            sender_address=normalized_address,
+                            match_mode=MATCH_MODE_EXACT_ADDRESS,
+                        )
+                        .one_or_none()
+                    )
+                    if address_row is not None:
+                        return _row_to_domain(address_row)
+
                 row = (
                     session.query(MailboxDomainRuleRow)
                     .filter_by(mailbox_id=mailbox_id, sender_domain=normalized_domain)
+                    .filter(MailboxDomainRuleRow.match_mode != MATCH_MODE_EXACT_ADDRESS)
                     .one_or_none()
                 )
                 if row is not None:
@@ -185,8 +232,10 @@ class PostgresMailboxDomainRuleRepository(MailboxDomainRuleRepository):
         except SQLAlchemyError as exc:
             raise PersistenceError(f"could not look up MailboxDomainRule: {exc}") from exc
 
-    def touch_last_seen(self, *, mailbox_id: str, sender_domain: str, seen_at) -> MailboxDomainRule:
-        rule = self.find_for_sender(mailbox_id=mailbox_id, sender_domain=sender_domain)
+    def touch_last_seen(
+        self, *, mailbox_id: str, sender_domain: str, seen_at, sender_address: Optional[str] = None
+    ) -> MailboxDomainRule:
+        rule = self.find_for_sender(mailbox_id=mailbox_id, sender_domain=sender_domain, sender_address=sender_address)
         if rule is None:
             raise NotFoundError(
                 f"no MailboxDomainRule governs mailbox_id={mailbox_id!r} sender_domain={sender_domain!r}"

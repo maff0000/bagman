@@ -21,8 +21,8 @@ from services.mailbox.domain_rule import (
     DESTINATION_MODE_REVIEW_REQUIRED,
     MATCH_MODE_EXACT,
     MATCH_MODE_INCLUDE_SUBDOMAINS,
-    POLICY_ALLOWED,
-    POLICY_IGNORED,
+    POLICY_MUST_READ,
+    POLICY_BLACKLIST,
     SOURCE_OPERATOR,
 )
 from services.mailbox.mailbox import PROVIDER_MICROSOFT_GRAPH
@@ -46,14 +46,14 @@ def test_rule_persists_and_is_retrievable_via_a_fresh_repository_instance(fresh_
     repo = PostgresMailboxDomainRuleRepository()
     mailbox_id = _mailbox_id()
     created = repo.upsert_rule(
-        mailbox_id=mailbox_id, sender_domain="Vendor.COM", match_mode=MATCH_MODE_EXACT, policy=POLICY_IGNORED,
+        mailbox_id=mailbox_id, sender_domain="Vendor.COM", match_mode=MATCH_MODE_EXACT, policy=POLICY_BLACKLIST,
         destination_entity_id=None, destination_mode=None, source=SOURCE_OPERATOR,
     )
     assert created.sender_domain == "vendor.com"  # normalised lowercase
 
     fresh_repo = PostgresMailboxDomainRuleRepository(engine=fresh_engine)
     fetched = fresh_repo.get_rule(created.rule_id)
-    assert fetched.policy == POLICY_IGNORED
+    assert fetched.policy == POLICY_BLACKLIST
     assert fetched.mailbox_id == mailbox_id
 
 
@@ -72,15 +72,15 @@ def test_upsert_for_an_existing_domain_updates_the_same_row_never_a_second_one()
     repo = PostgresMailboxDomainRuleRepository()
     mailbox_id = _mailbox_id()
     first = repo.upsert_rule(
-        mailbox_id=mailbox_id, sender_domain="vendor.com", match_mode=MATCH_MODE_EXACT, policy=POLICY_IGNORED,
+        mailbox_id=mailbox_id, sender_domain="vendor.com", match_mode=MATCH_MODE_EXACT, policy=POLICY_BLACKLIST,
         destination_entity_id=None, destination_mode=None, source=SOURCE_OPERATOR,
     )
     second = repo.upsert_rule(
-        mailbox_id=mailbox_id, sender_domain="vendor.com", match_mode=MATCH_MODE_EXACT, policy=POLICY_ALLOWED,
+        mailbox_id=mailbox_id, sender_domain="vendor.com", match_mode=MATCH_MODE_EXACT, policy=POLICY_MUST_READ,
         destination_entity_id=None, destination_mode=DESTINATION_MODE_REVIEW_REQUIRED, source=SOURCE_OPERATOR,
     )
     assert second.rule_id == first.rule_id
-    assert second.policy == POLICY_ALLOWED
+    assert second.policy == POLICY_MUST_READ
 
     with session_scope(get_engine()) as session:
         count = (
@@ -97,16 +97,16 @@ def test_same_domain_in_two_different_mailboxes_are_independent_rows():
     mailbox_a = _mailbox_id()
     mailbox_b = _mailbox_id()
     rule_a = repo.upsert_rule(
-        mailbox_id=mailbox_a, sender_domain="vendor.com", match_mode=MATCH_MODE_EXACT, policy=POLICY_ALLOWED,
+        mailbox_id=mailbox_a, sender_domain="vendor.com", match_mode=MATCH_MODE_EXACT, policy=POLICY_MUST_READ,
         destination_entity_id=None, destination_mode=DESTINATION_MODE_REVIEW_REQUIRED, source=SOURCE_OPERATOR,
     )
     rule_b = repo.upsert_rule(
-        mailbox_id=mailbox_b, sender_domain="vendor.com", match_mode=MATCH_MODE_EXACT, policy=POLICY_IGNORED,
+        mailbox_id=mailbox_b, sender_domain="vendor.com", match_mode=MATCH_MODE_EXACT, policy=POLICY_BLACKLIST,
         destination_entity_id=None, destination_mode=None, source=SOURCE_OPERATOR,
     )
     assert rule_a.rule_id != rule_b.rule_id
-    assert repo.find_for_sender(mailbox_id=mailbox_a, sender_domain="vendor.com").policy == POLICY_ALLOWED
-    assert repo.find_for_sender(mailbox_id=mailbox_b, sender_domain="vendor.com").policy == POLICY_IGNORED
+    assert repo.find_for_sender(mailbox_id=mailbox_a, sender_domain="vendor.com").policy == POLICY_MUST_READ
+    assert repo.find_for_sender(mailbox_id=mailbox_b, sender_domain="vendor.com").policy == POLICY_BLACKLIST
 
 
 def test_database_level_unique_constraint_exists():
@@ -120,7 +120,7 @@ def test_database_level_unique_constraint_exists():
             session.add(
                 MailboxDomainRuleRow(
                     rule_id=identity.generate_id(), mailbox_id=mailbox_id, sender_domain="dupe.com",
-                    match_mode=MATCH_MODE_EXACT, policy=POLICY_IGNORED, destination_entity_id=None,
+                    match_mode=MATCH_MODE_EXACT, policy=POLICY_BLACKLIST, destination_entity_id=None,
                     destination_mode=None, source=SOURCE_OPERATOR, processor_hint=None, approved_at=None,
                     created_at=now, updated_at=now, last_seen_at=now,
                 )
@@ -129,7 +129,7 @@ def test_database_level_unique_constraint_exists():
             session.add(
                 MailboxDomainRuleRow(
                     rule_id=identity.generate_id(), mailbox_id=mailbox_id, sender_domain="dupe.com",
-                    match_mode=MATCH_MODE_EXACT, policy=POLICY_ALLOWED, destination_entity_id=None,
+                    match_mode=MATCH_MODE_EXACT, policy=POLICY_MUST_READ, destination_entity_id=None,
                     destination_mode=DESTINATION_MODE_REVIEW_REQUIRED, source=SOURCE_OPERATOR, processor_hint=None,
                     approved_at=None, created_at=now, updated_at=now, last_seen_at=now,
                 )
@@ -146,7 +146,7 @@ def test_exact_match_mode_does_not_match_a_subdomain():
     repo = PostgresMailboxDomainRuleRepository()
     mailbox_id = _mailbox_id()
     repo.upsert_rule(
-        mailbox_id=mailbox_id, sender_domain="vendor.com", match_mode=MATCH_MODE_EXACT, policy=POLICY_IGNORED,
+        mailbox_id=mailbox_id, sender_domain="vendor.com", match_mode=MATCH_MODE_EXACT, policy=POLICY_BLACKLIST,
         destination_entity_id=None, destination_mode=None, source=SOURCE_OPERATOR,
     )
     assert repo.find_for_sender(mailbox_id=mailbox_id, sender_domain="mail.vendor.com") is None
@@ -157,7 +157,7 @@ def test_include_subdomains_match_mode_matches_a_subdomain():
     mailbox_id = _mailbox_id()
     repo.upsert_rule(
         mailbox_id=mailbox_id, sender_domain="vendor.com", match_mode=MATCH_MODE_INCLUDE_SUBDOMAINS,
-        policy=POLICY_IGNORED, destination_entity_id=None, destination_mode=None, source=SOURCE_OPERATOR,
+        policy=POLICY_BLACKLIST, destination_entity_id=None, destination_mode=None, source=SOURCE_OPERATOR,
     )
     found = repo.find_for_sender(mailbox_id=mailbox_id, sender_domain="mail.vendor.com")
     assert found is not None
@@ -180,7 +180,7 @@ def test_allowed_with_fixed_destination_requires_a_real_entity_id():
     mailbox_id = _mailbox_id()
     with pytest.raises(ValidationError):
         repo.upsert_rule(
-            mailbox_id=mailbox_id, sender_domain="vendor.com", match_mode=MATCH_MODE_EXACT, policy=POLICY_ALLOWED,
+            mailbox_id=mailbox_id, sender_domain="vendor.com", match_mode=MATCH_MODE_EXACT, policy=POLICY_MUST_READ,
             destination_entity_id=None, destination_mode=DESTINATION_MODE_FIXED, source=SOURCE_OPERATOR,
         )
 
@@ -190,7 +190,7 @@ def test_ignored_rule_must_never_carry_a_destination():
     mailbox_id = _mailbox_id()
     with pytest.raises(ValidationError):
         repo.upsert_rule(
-            mailbox_id=mailbox_id, sender_domain="vendor.com", match_mode=MATCH_MODE_EXACT, policy=POLICY_IGNORED,
+            mailbox_id=mailbox_id, sender_domain="vendor.com", match_mode=MATCH_MODE_EXACT, policy=POLICY_BLACKLIST,
             destination_entity_id=identity.generate_id(), destination_mode=DESTINATION_MODE_FIXED,
             source=SOURCE_OPERATOR,
         )
@@ -205,20 +205,20 @@ def test_ignored_domain_can_be_changed_back_to_allowed():
     repo = PostgresMailboxDomainRuleRepository()
     mailbox_id = _mailbox_id()
     repo.upsert_rule(
-        mailbox_id=mailbox_id, sender_domain="vendor.com", match_mode=MATCH_MODE_EXACT, policy=POLICY_IGNORED,
+        mailbox_id=mailbox_id, sender_domain="vendor.com", match_mode=MATCH_MODE_EXACT, policy=POLICY_BLACKLIST,
         destination_entity_id=None, destination_mode=None, source=SOURCE_OPERATOR,
     )
     updated = repo.upsert_rule(
-        mailbox_id=mailbox_id, sender_domain="vendor.com", match_mode=MATCH_MODE_EXACT, policy=POLICY_ALLOWED,
+        mailbox_id=mailbox_id, sender_domain="vendor.com", match_mode=MATCH_MODE_EXACT, policy=POLICY_MUST_READ,
         destination_entity_id=None, destination_mode=DESTINATION_MODE_REVIEW_REQUIRED, source=SOURCE_OPERATOR,
     )
-    assert updated.policy == POLICY_ALLOWED
+    assert updated.policy == POLICY_MUST_READ
 
     reverted = repo.upsert_rule(
-        mailbox_id=mailbox_id, sender_domain="vendor.com", match_mode=MATCH_MODE_EXACT, policy=POLICY_IGNORED,
+        mailbox_id=mailbox_id, sender_domain="vendor.com", match_mode=MATCH_MODE_EXACT, policy=POLICY_BLACKLIST,
         destination_entity_id=None, destination_mode=None, source=SOURCE_OPERATOR,
     )
-    assert reverted.policy == POLICY_IGNORED
+    assert reverted.policy == POLICY_BLACKLIST
     assert reverted.rule_id == updated.rule_id
 
 
@@ -231,7 +231,7 @@ def test_touch_last_seen_updates_the_matched_rule():
     repo = PostgresMailboxDomainRuleRepository()
     mailbox_id = _mailbox_id()
     created = repo.upsert_rule(
-        mailbox_id=mailbox_id, sender_domain="vendor.com", match_mode=MATCH_MODE_EXACT, policy=POLICY_IGNORED,
+        mailbox_id=mailbox_id, sender_domain="vendor.com", match_mode=MATCH_MODE_EXACT, policy=POLICY_BLACKLIST,
         destination_entity_id=None, destination_mode=None, source=SOURCE_OPERATOR,
     )
     later = utc_now()
@@ -252,15 +252,15 @@ def test_list_rules_scoped_to_one_mailbox():
     mailbox_a = _mailbox_id()
     mailbox_b = _mailbox_id()
     repo.upsert_rule(
-        mailbox_id=mailbox_a, sender_domain="one.com", match_mode=MATCH_MODE_EXACT, policy=POLICY_IGNORED,
+        mailbox_id=mailbox_a, sender_domain="one.com", match_mode=MATCH_MODE_EXACT, policy=POLICY_BLACKLIST,
         destination_entity_id=None, destination_mode=None, source=SOURCE_OPERATOR,
     )
     repo.upsert_rule(
-        mailbox_id=mailbox_a, sender_domain="two.com", match_mode=MATCH_MODE_EXACT, policy=POLICY_IGNORED,
+        mailbox_id=mailbox_a, sender_domain="two.com", match_mode=MATCH_MODE_EXACT, policy=POLICY_BLACKLIST,
         destination_entity_id=None, destination_mode=None, source=SOURCE_OPERATOR,
     )
     repo.upsert_rule(
-        mailbox_id=mailbox_b, sender_domain="three.com", match_mode=MATCH_MODE_EXACT, policy=POLICY_IGNORED,
+        mailbox_id=mailbox_b, sender_domain="three.com", match_mode=MATCH_MODE_EXACT, policy=POLICY_BLACKLIST,
         destination_entity_id=None, destination_mode=None, source=SOURCE_OPERATOR,
     )
     rules = repo.list_rules(mailbox_id=mailbox_a)

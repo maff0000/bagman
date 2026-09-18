@@ -92,8 +92,11 @@ Endpoints
   ``xero_correlate_mailbox_domain_review``'s own docstring.
 * ``POST /internal/mailboxes/{mailbox_id}/microsoft/domain-review/{item_id}/resolve``
   — resolve one ``ITEM_TYPE_MAILBOX_DOMAIN_REVIEW`` Needs You item
-  (architect spec §4's operator decision: Allow -> a real canonical
-  entity / Allow -> destination review required / Ignore domain — "Review
+  (architect spec §4's operator decision, extended to three by the CD-6
+  GUI-operations-foundation follow-on WO's own three-state
+  MUST_READ/GRAYLIST/BLACKLIST policy model: Allow -> a real canonical
+  entity / Allow -> destination review required / Keep checking with me
+  (GRAYLIST — does NOT resolve the item) / Ignore this source — "Review
   candidate"/defer needs no call at all, the item simply stays OPEN).
   Creates/updates the real ``MailboxDomainRule`` and, on ALLOW,
   immediately back-processes EVERY historical candidate BAGMAN has
@@ -155,8 +158,9 @@ from services.mailbox.domain_rule import (
     DESTINATION_MODE_REVIEW_REQUIRED,
     MATCH_MODE_EXACT,
     MATCH_MODE_INCLUDE_SUBDOMAINS,
-    POLICY_ALLOWED,
-    POLICY_IGNORED,
+    POLICY_BLACKLIST,
+    POLICY_GRAYLIST,
+    POLICY_MUST_READ,
     SOURCE_OPERATOR,
 )
 from services.mailbox.lock import MailboxSweepLockError
@@ -799,27 +803,41 @@ async def xero_correlate_mailbox_domain_review(
 class ResolveMailboxDomainReviewRequest(BaseModel):
     """Request body for
     ``POST /internal/mailboxes/{mailbox_id}/microsoft/domain-review/{item_id}/resolve``
-    — CD-6 architect amendment §4's own operator action set, collapsed
-    to two `decision` values (`DEFER`/"Review candidate" needs no
-    endpoint call at all — an item simply stays `OPEN` until an
-    operator acts; see this router's own module docstring addendum
-    below):
+    — CD-6 architect amendment §4's own operator action set, now THREE
+    `decision` values (CD-6 GUI-operations-foundation follow-on WO adds
+    ``KEEP_GRAY``; ``DEFER``/"Review candidate" still needs no endpoint
+    call at all — an item simply stays `OPEN` until an operator acts;
+    see this router's own module docstring addendum below). The
+    `decision` wire values themselves are UNCHANGED (`ALLOW`/`IGNORE`)
+    — only the PERSISTED `MailboxDomainRule.policy` they each produce
+    was renamed (see `services.mailbox.domain_rule`'s own module
+    docstring for the full three-state `MUST_READ`/`GRAYLIST`/
+    `BLACKLIST` reasoning):
 
     * ``decision="ALLOW"`` + ``destination_mode="FIXED"`` +
       ``destination_entity_id=<Infosecurs|NoustAI|Matthew Scott
-      Personal's real entity_id>`` — "Allow -> <company>".
+      Personal's real entity_id>`` -> `policy="MUST_READ"` — "Always
+      Read -> <company>".
     * ``decision="ALLOW"`` + ``destination_mode="REVIEW_REQUIRED"`` (no
-      ``destination_entity_id``) — "Allow -> destination review
-      required".
-    * ``decision="IGNORE"`` — "Ignore domain".
+      ``destination_entity_id``) -> `policy="MUST_READ"` — "Always Read
+      -> Ask destination".
+    * ``decision="IGNORE"`` -> `policy="BLACKLIST"` — "Ignore this
+      source".
+    * ``decision="KEEP_GRAY"`` (new) -> `policy="GRAYLIST"` — "Keep
+      checking with me": Matt has looked at this domain and deliberately
+      left it under review. Unlike `ALLOW`/`IGNORE`, this decision does
+      NOT resolve the triggering Needs You item (it stays `OPEN` — see
+      `_resolve_mailbox_domain_review_core`'s own docstring for why);
+      `destination_entity_id`/`destination_mode` are ignored for this
+      decision.
     """
 
     actor_type: str
     actor_id: str
-    decision: str  # "ALLOW" | "IGNORE"
+    decision: str  # "ALLOW" | "IGNORE" | "KEEP_GRAY"
     destination_entity_id: Optional[str] = None
     destination_mode: Optional[str] = None  # "FIXED" | "REVIEW_REQUIRED" — required when decision == "ALLOW"
-    match_mode: str = MATCH_MODE_EXACT  # "EXACT" | "INCLUDE_SUBDOMAINS"
+    match_mode: str = MATCH_MODE_EXACT  # "EXACT" | "INCLUDE_SUBDOMAINS" | "EXACT_ADDRESS"
     processor_hint: Optional[str] = None
 
 
@@ -838,6 +856,20 @@ def _resolve_mailbox_domain_review_core(
     full behavioural description — unchanged by this extraction, this
     is a pure "move the body into a function, call it from two places"
     refactor with no logic change.
+
+    ``decision="KEEP_GRAY"`` (CD-6 GUI-operations-foundation follow-on
+    WO — "Keep checking with me") is a deliberately DIFFERENT shape from
+    ``ALLOW``/``IGNORE``: it upserts a real ``GRAYLIST``
+    ``MailboxDomainRule`` for this ``(mailbox_id, sender_domain)`` but
+    does NOT resolve the triggering item — it stays ``OPEN``. This is a
+    documented, intentional choice: "Matt looked at this and
+    deliberately left it under review" is a real, useful, distinct state
+    from "never looked at at all", but no final relevance/destination
+    call has been made yet, so the item legitimately stays open for a
+    later look (mirrors the architect's own "GRAYLIST behaves like no
+    rule at Stage B" doctrine — the Needs You side of that same
+    doctrine: nothing about this domain's OPEN question has actually
+    been answered).
     """
     item = composition.needs_you_repository.get_needs_you_item(item_id)
 
@@ -846,8 +878,8 @@ def _resolve_mailbox_domain_review_core(
     if item.metadata.get("mailbox_id") != mailbox_id:
         raise ValidationError(f"NeedsYouItem '{item_id}' does not belong to mailbox '{mailbox_id}'")
 
-    if payload.decision not in ("ALLOW", "IGNORE"):
-        raise ValidationError(f"decision must be 'ALLOW' or 'IGNORE' (got {payload.decision!r})")
+    if payload.decision not in ("ALLOW", "IGNORE", "KEEP_GRAY"):
+        raise ValidationError(f"decision must be 'ALLOW', 'IGNORE' or 'KEEP_GRAY' (got {payload.decision!r})")
     if payload.match_mode not in (MATCH_MODE_EXACT, MATCH_MODE_INCLUDE_SUBDOMAINS):
         raise ValidationError(f"match_mode must be 'EXACT' or 'INCLUDE_SUBDOMAINS' (got {payload.match_mode!r})")
 
@@ -859,6 +891,55 @@ def _resolve_mailbox_domain_review_core(
         "match_mode": payload.match_mode,
     }
 
+    # Audit trail (WO §6) — snapshot whatever governs this domain BEFORE
+    # this action, so the audit event below can carry a real
+    # previous_policy/previous_destination_* alongside the new values.
+    # `find_for_sender` (never a raw domain-only dict lookup) is reused
+    # deliberately — this IS the exact resolution a real message from
+    # this domain would hit right now.
+    previous_rule = composition.mailbox_domain_rule_repository.find_for_sender(
+        mailbox_id=mailbox_id, sender_domain=sender_domain
+    )
+    previous_policy = previous_rule.policy if previous_rule is not None else None
+    previous_destination_entity_id = previous_rule.destination_entity_id if previous_rule is not None else None
+    previous_destination_mode = previous_rule.destination_mode if previous_rule is not None else None
+
+    if payload.decision == "KEEP_GRAY":
+        # A real rule row, but never a resolution of the item itself —
+        # see this function's own docstring above.
+        rule = composition.mailbox_domain_rule_repository.upsert_rule(
+            mailbox_id=mailbox_id,
+            sender_domain=sender_domain,
+            match_mode=payload.match_mode,
+            policy=POLICY_GRAYLIST,
+            destination_entity_id=None,
+            destination_mode=None,
+            source=SOURCE_OPERATOR,
+            processor_hint=payload.processor_hint,
+            approved_at=utc_now(),
+        )
+        composition.api.record_audit_event(
+            event_type="MAILBOX_DOMAIN_RULE_GRAYLIST",
+            actor_type=payload.actor_type,
+            actor_id=payload.actor_id,
+            subject_type="MailboxDomainRule",
+            subject_id=rule.rule_id,
+            correlation_id=item.correlation_id,
+            causation_id=None,
+            payload={
+                "mailbox_id": mailbox_id,
+                "sender_domain": sender_domain,
+                "needs_you_item_id": item_id,
+                "previous_policy": previous_policy,
+                "new_policy": POLICY_GRAYLIST,
+                "previous_destination_entity_id": previous_destination_entity_id,
+                "new_destination_entity_id": None,
+                "previous_destination_mode": previous_destination_mode,
+                "new_destination_mode": None,
+            },
+        )
+        return {"needs_you_item": item.to_dict(), "mailbox_domain_rule": rule.to_dict(), "reprocessed_messages": []}
+
     if item.status != "OPEN":
         if item.status == "RESOLVED" and (item.resolution or {}) == resolution:
             return {"needs_you_item": item.to_dict(), "mailbox_domain_rule": None, "reprocessed_messages": []}
@@ -869,7 +950,7 @@ def _resolve_mailbox_domain_review_core(
         )
 
     if payload.decision == "ALLOW":
-        policy = POLICY_ALLOWED
+        policy = POLICY_MUST_READ
         if payload.destination_mode not in (DESTINATION_MODE_FIXED, DESTINATION_MODE_REVIEW_REQUIRED):
             raise ValidationError(
                 "destination_mode must be 'FIXED' or 'REVIEW_REQUIRED' when decision is 'ALLOW'"
@@ -882,15 +963,15 @@ def _resolve_mailbox_domain_review_core(
             # caller-supplied entity_id without proving it real).
             composition.api.entity_repository.get_entity(payload.destination_entity_id)
     else:
-        policy = POLICY_IGNORED
+        policy = POLICY_BLACKLIST
 
     rule = composition.mailbox_domain_rule_repository.upsert_rule(
         mailbox_id=mailbox_id,
         sender_domain=sender_domain,
         match_mode=payload.match_mode,
         policy=policy,
-        destination_entity_id=payload.destination_entity_id if policy == POLICY_ALLOWED else None,
-        destination_mode=payload.destination_mode if policy == POLICY_ALLOWED else None,
+        destination_entity_id=payload.destination_entity_id if policy == POLICY_MUST_READ else None,
+        destination_mode=payload.destination_mode if policy == POLICY_MUST_READ else None,
         source=SOURCE_OPERATOR,
         processor_hint=payload.processor_hint,
         approved_at=utc_now(),
@@ -900,14 +981,24 @@ def _resolve_mailbox_domain_review_core(
         item_id, new_status="RESOLVED", resolution=resolution, actor_type=payload.actor_type, actor_id=payload.actor_id
     )
     composition.api.record_audit_event(
-        event_type="MAILBOX_DOMAIN_RULE_ALLOWED" if policy == POLICY_ALLOWED else "MAILBOX_DOMAIN_RULE_IGNORED",
+        event_type="MAILBOX_DOMAIN_RULE_MUST_READ" if policy == POLICY_MUST_READ else "MAILBOX_DOMAIN_RULE_BLACKLIST",
         actor_type=payload.actor_type,
         actor_id=payload.actor_id,
         subject_type="MailboxDomainRule",
         subject_id=rule.rule_id,
         correlation_id=updated_item.correlation_id,
         causation_id=None,
-        payload={"mailbox_id": mailbox_id, "sender_domain": sender_domain, "needs_you_item_id": item_id},
+        payload={
+            "mailbox_id": mailbox_id,
+            "sender_domain": sender_domain,
+            "needs_you_item_id": item_id,
+            "previous_policy": previous_policy,
+            "new_policy": policy,
+            "previous_destination_entity_id": previous_destination_entity_id,
+            "new_destination_entity_id": rule.destination_entity_id,
+            "previous_destination_mode": previous_destination_mode,
+            "new_destination_mode": rule.destination_mode,
+        },
     )
 
     # Operational addendum (ahead of the first real large historical
@@ -918,7 +1009,7 @@ def _resolve_mailbox_domain_review_core(
     # `_create_or_reuse_domain_review_item`); the guard below is
     # defensive, never expected to be exercised for a well-formed item.
     reprocessed: list = []
-    if policy == POLICY_ALLOWED and sender_domain:
+    if policy == POLICY_MUST_READ and sender_domain:
         mailbox_source_id = get_mailbox_source_id(composition, mailbox)
         reprocessed = reprocess_all_historical_candidates_for_domain(
             mailbox=mailbox,
@@ -927,6 +1018,7 @@ def _resolve_mailbox_domain_review_core(
             rule=rule,
             adapter=composition.microsoft_mailbox_adapter,
             message_repository=composition.mailbox_message_repository,
+            needs_you_repository=composition.needs_you_repository,
             api=composition.api,
             object_store=composition.object_store,
             scanner=composition.scanner,
@@ -991,7 +1083,7 @@ class BatchResolveMailboxDomainReviewItem(BaseModel):
     docstring)."""
 
     item_id: str
-    decision: str  # "ALLOW" | "IGNORE"
+    decision: str  # "ALLOW" | "IGNORE" | "KEEP_GRAY"
     destination_entity_id: Optional[str] = None
     destination_mode: Optional[str] = None  # "FIXED" | "REVIEW_REQUIRED" — required when decision == "ALLOW"
     match_mode: str = MATCH_MODE_EXACT  # "EXACT" | "INCLUDE_SUBDOMAINS"

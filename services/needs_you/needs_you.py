@@ -180,6 +180,21 @@ ALLOWED_ACTION_CONNECT_MICROSOFT_MAILBOX = "CONNECT_MICROSOFT_MAILBOX"
 ITEM_TYPE_MAILBOX_DOMAIN_REVIEW = "MAILBOX_DOMAIN_REVIEW"
 ALLOWED_ACTION_MAILBOX_DOMAIN_REVIEW = "MAILBOX_DOMAIN_REVIEW"
 
+#: CD-6 GUI-operations-foundation follow-on WO — a genuinely DIFFERENT
+#: question from `ITEM_TYPE_MAILBOX_DOMAIN_REVIEW` (architect, verbatim:
+#: "this is not BAGMAN re-asking Matt's relevance decision — it is a new
+#: security event"): a `MUST_READ`-policy message (a source Matt has
+#: ALREADY confirmed as relevant) whose OWN SPF/DKIM/DMARC signals
+#: failed a bounded, deterministic check this specific message. Raised
+#: by `services/mailbox/sweep.py`, deduped via the GENERIC
+#: `(item_type, source_object_reference)` mechanism keyed on the
+#: message's own `mailbox_message_id` — see that module's own docstring,
+#: "Authentication escalation" section, for the full reasoning (per-
+#: message, not per-domain, since each failing message is its own real
+#: security event; never conflated with the relevance question).
+ITEM_TYPE_MAILBOX_AUTHENTICATION_ESCALATION = "MAILBOX_AUTHENTICATION_ESCALATION"
+ALLOWED_ACTION_MAILBOX_AUTHENTICATION_ESCALATION = "MAILBOX_AUTHENTICATION_ESCALATION"
+
 #: Slice 1's own single real allowed_action_type (see module docstring
 #: "Slice 1's one real trigger"). Also open (not contract-enforced).
 ALLOWED_ACTION_COMPANY_WHAT_WHY = "COMPANY_WHAT_WHY"

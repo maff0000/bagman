@@ -32,6 +32,11 @@ export const MAILBOX_API = {
   //: `/internal/needs-you/{id}/resolve` endpoint (that one has no idea
   //: what a `MailboxDomainRule` is).
   microsoftDomainReview: (mailboxId) => `/internal/mailboxes/${encodeURIComponent(mailboxId)}/microsoft/domain-review`,
+  //: CD-6 GUI-operations-foundation follow-on WO (three-state
+  //: MUST_READ/GRAYLIST/BLACKLIST operator-learning model) — the
+  //: mailbox's own governed MailboxDomainRule list, used to show each
+  //: domain-review row's CURRENT policy prominently (architect §7).
+  microsoftDomainRules: (mailboxId) => `/internal/mailboxes/${encodeURIComponent(mailboxId)}/microsoft/domain-rules`,
   microsoftDomainReviewXeroCorrelate: (mailboxId) =>
     `/internal/mailboxes/${encodeURIComponent(mailboxId)}/microsoft/domain-review/xero-correlate`,
   microsoftDomainReviewResolveOne: (mailboxId, itemId) =>
@@ -119,6 +124,14 @@ export function listMicrosoftMessages(mailboxId) {
 export function listDomainReviewItems(mailboxId, status) {
   const suffix = status ? `?status=${encodeURIComponent(status)}` : "";
   return apiGet(`${MAILBOX_API.microsoftDomainReview(mailboxId)}${suffix}`);
+}
+
+/** This mailbox's own governed `MailboxDomainRule` list — used purely
+ * to show each domain's CURRENT policy (MUST_READ/GRAYLIST/BLACKLIST,
+ * or "not yet reviewed" when no rule exists) alongside the domain-
+ * review table (architect §7). */
+export function listMicrosoftDomainRules(mailboxId) {
+  return apiGet(MAILBOX_API.microsoftDomainRules(mailboxId));
 }
 
 /** Triggers one bounded Xero-assisted supplier-domain correlation run

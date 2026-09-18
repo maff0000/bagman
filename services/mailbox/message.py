@@ -63,10 +63,25 @@ INGESTION_STATUS_QUARANTINED = "QUARANTINED"
 INGESTION_STATUS_FAILED = "FAILED"
 INGESTION_STATUS_VANISHED = "VANISHED"
 #: CD-6 architect amendment (two-stage mail processing) — "seen,
-#: checked, no meaningful signal (or an IGNORED domain rule matched),
+#: checked, no meaningful signal (or a BLACKLIST rule matched),
 #: nothing further happens". See services/mailbox/sweep.py's own
 #: module docstring for exactly which Stage-B outcomes produce this.
 INGESTION_STATUS_CHECKED_NOT_CANDIDATE = "CHECKED_NOT_CANDIDATE"
+#: CD-6 GUI-operations-foundation follow-on WO — a MUST_READ-policy
+#: message whose OWN authentication signals (spf/dkim/dmarc) failed the
+#: bounded, deterministic check (see
+#: services/mailbox/sweep.py::evaluate_message_authentication) never
+#: proceeds down the normal MIME-fetch-and-evidence path; this is the
+#: honest terminal outcome for that specific message — a genuine
+#: candidate that failed a SECURITY check, never merely "not a
+#: candidate" (CHECKED_NOT_CANDIDATE would be a dishonest label here).
+#: See services/mailbox/sweep.py's own module docstring, "Authentication
+#: escalation" section, for the full reasoning this is a NEW, distinct
+#: outcome rather than reusing an existing one, and why it is
+#: deliberately EXCLUDED from `list_candidate_messages_for_domain`'s own
+#: eligibility filter (a security-escalated message must never be
+#: silently swept into a later domain-approval back-process).
+INGESTION_STATUS_SECURITY_REVIEW = "SECURITY_REVIEW"
 INGESTION_STATUSES = frozenset(
     {
         INGESTION_STATUS_INGESTED,
@@ -74,6 +89,7 @@ INGESTION_STATUSES = frozenset(
         INGESTION_STATUS_FAILED,
         INGESTION_STATUS_VANISHED,
         INGESTION_STATUS_CHECKED_NOT_CANDIDATE,
+        INGESTION_STATUS_SECURITY_REVIEW,
     }
 )
 
@@ -90,6 +106,7 @@ FINAL_INGESTION_STATUSES = frozenset(
         INGESTION_STATUS_FAILED,
         INGESTION_STATUS_VANISHED,
         INGESTION_STATUS_CHECKED_NOT_CANDIDATE,
+        INGESTION_STATUS_SECURITY_REVIEW,
     }
 )
 
@@ -155,9 +172,9 @@ class MailboxMessage:
     #: actually ran for this message AND judged it a credible financial-
     #: document candidate. `False` when the heuristic ran and judged it
     #: NOT credible. `None` when the heuristic never ran at all — the
-    #: honest state for an `IGNORED`-domain message (the domain gate
+    #: honest state for an `BLACKLIST`-policy message (the domain gate
     #: short-circuits before Stage-A candidate evaluation ever executes)
-    #: and for any `ALLOWED`-domain message (never sits in a discovery-
+    #: and for any `MUST_READ`-policy message (never sits in a discovery-
     #: only state at all). See `services/mailbox/sweep.py`'s own
     #: `_record_discovery_only` call sites for exactly which branch sets
     #: which value.
@@ -166,14 +183,14 @@ class MailboxMessage:
     #: "subject contains keyword 'invoice'") — set ONLY when
     #: `discovery_candidate is True`. `None` for the `is_candidate ==
     #: False` case (no reason is required there) and for the
-    #: `IGNORED`-domain case (heuristic never ran).
+    #: `BLACKLIST`-policy case (heuristic never ran).
     discovery_reason: Optional[str] = None
     #: UTC timestamp Stage-A/B discovery processing actually happened
     #: for this message — set whenever `_record_discovery_only` is
-    #: called (both the `IGNORED`-domain branch AND the UNKNOWN-domain
+    #: called (both the `BLACKLIST`-policy branch AND the UNKNOWN-domain
     #: branch), regardless of `discovery_candidate`. `None` for any
     #: message that never went through discovery-only handling at all
-    #: (an `ALLOWED`-domain message, or a message from a sweep run that
+    #: (an `MUST_READ`-policy message, or a message from a sweep run that
     #: predates this addendum entirely — e.g. the real 128 already-
     #: ingested Infosecurs messages).
     discovery_checked_at: Optional[datetime] = None
@@ -321,7 +338,7 @@ class MailboxMessageRepository(abc.ABC):
 
         The ``discovery_candidate is True`` gate is what makes this
         method safe for the real operator-approval flow: an
-        ``IGNORED``-domain message and an ordinary (non-keyword-
+        ``BLACKLIST``-policy message and an ordinary (non-keyword-
         matching) UNKNOWN-domain message both land on
         ``CHECKED_NOT_CANDIDATE`` too, but neither ever has
         ``discovery_candidate is True`` (the former never even ran the
@@ -352,6 +369,7 @@ def _terminal_rank(status: str) -> int:
         INGESTION_STATUS_INGESTED: 4,
         INGESTION_STATUS_QUARANTINED: 3,
         INGESTION_STATUS_VANISHED: 2,
+        INGESTION_STATUS_SECURITY_REVIEW: 1,
         INGESTION_STATUS_FAILED: 1,
         INGESTION_STATUS_CHECKED_NOT_CANDIDATE: 0,
     }.get(status, 0)

@@ -18,11 +18,12 @@ from core.errors import ConflictError
 from persistence.objects.memory_store import InMemoryObjectStore
 from services.evidence.intake.scanner import EvidenceSafetyScanner, ScanResult, ScanVerdict
 from services.mailbox.cursor import InMemoryMailboxFolderCursorRepository
-from services.mailbox.domain_rule import InMemoryMailboxDomainRuleRepository
+from services.mailbox.domain_rule import DESTINATION_MODE_FIXED, InMemoryMailboxDomainRuleRepository
 from services.mailbox.lock import InMemoryMailboxSweepLock, MailboxSweepLockError
 from services.mailbox.mailbox import PROVIDER_MICROSOFT_GRAPH, InMemoryMailboxSourceRepository
 from services.mailbox.message import (
     INGESTION_STATUS_CHECKED_NOT_CANDIDATE,
+    INGESTION_STATUS_SECURITY_REVIEW,
     INGESTION_STATUS_VANISHED,
     InMemoryMailboxMessageRepository,
 )
@@ -42,7 +43,12 @@ from services.mailbox.microsoft.graph_client import (
 from services.mailbox.microsoft.secrets import InMemoryMicrosoftTokenStore
 from services.mailbox.sweep import run_sweep
 from services.mailbox.sweep_run import InMemoryMailboxSweepRunRepository, SweepFailureReason, TRIGGER_MANUAL
-from services.needs_you.needs_you import ITEM_TYPE_MAILBOX_DOMAIN_REVIEW, InMemoryNeedsYouRepository
+from services.needs_you.needs_you import (
+    ITEM_TYPE_COMPANY_REQUIRED,
+    ITEM_TYPE_MAILBOX_AUTHENTICATION_ESCALATION,
+    ITEM_TYPE_MAILBOX_DOMAIN_REVIEW,
+    InMemoryNeedsYouRepository,
+)
 
 
 class AlwaysCleanScanner(EvidenceSafetyScanner):
@@ -61,8 +67,27 @@ class AlwaysMaliciousScanner(EvidenceSafetyScanner):
         return True
 
 
+#: CD-6 GUI-operations-foundation follow-on WO — the new per-message
+#: authentication check (`services.mailbox.sweep.evaluate_message_authentication`)
+#: escalates a message with NO captured auth signal at all (the OLD
+#: default here — an empty `{}` — now reads as "suspicious"). Every
+#: EXISTING test in this file that exercises the ordinary MUST_READ
+#: MIME-fetch-and-evidence path is proving something else entirely (the
+#: sweep engine's own idempotency/cursor/quarantine machinery) and must
+#: keep passing exactly as before, so `_msg()` now defaults to a
+#: PASSING signal set; dedicated new tests further down override this
+#: explicitly to exercise the escalation path itself.
+_PASSING_AUTH_SIGNALS = {"spf": "pass", "dkim": "pass", "dmarc": "pass"}
+
+
 def _msg(
-    msg_id: str, *, received_at=None, subject="Invoice", sender_address="billing@vendor.com", attachment_metadata=()
+    msg_id: str,
+    *,
+    received_at=None,
+    subject="Invoice",
+    sender_address="billing@vendor.com",
+    attachment_metadata=(),
+    auth_signals=None,
 ) -> GraphMessageSummary:
     return GraphMessageSummary(
         immutable_id=msg_id,
@@ -73,6 +98,7 @@ def _msg(
         received_at=received_at or datetime.now(timezone.utc),
         has_attachments=bool(attachment_metadata),
         attachment_metadata=tuple(attachment_metadata),
+        auth_signals=dict(auth_signals) if auth_signals is not None else dict(_PASSING_AUTH_SIGNALS),
     )
 
 
@@ -161,7 +187,7 @@ class Harness:
         if allow_default_domain:
             self.domain_rule_repo.upsert_rule(
                 mailbox_id=self.mailbox.mailbox_id, sender_domain=_DEFAULT_ALLOWED_DOMAIN, match_mode="EXACT",
-                policy="ALLOWED", destination_entity_id=None, destination_mode="REVIEW_REQUIRED", source="OPERATOR",
+                policy="MUST_READ", destination_entity_id=None, destination_mode="REVIEW_REQUIRED", source="OPERATOR",
             )
 
     def refresh_mailbox(self):
@@ -537,7 +563,7 @@ def test_allowed_domain_proceeds_to_full_ingest():
 def test_ignored_domain_is_checked_not_candidate_no_mime_fetch_no_needs_you():
     h = Harness(allow_default_domain=False)
     h.domain_rule_repo.upsert_rule(
-        mailbox_id=h.mailbox.mailbox_id, sender_domain="vendor.com", match_mode="EXACT", policy="IGNORED",
+        mailbox_id=h.mailbox.mailbox_id, sender_domain="vendor.com", match_mode="EXACT", policy="BLACKLIST",
         destination_entity_id=None, destination_mode=None, source="OPERATOR",
     )
     h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(_msg("m1"),), delta_link="d1"))
@@ -621,7 +647,7 @@ def test_a_message_already_checked_not_candidate_is_never_re_decided_by_a_later_
 
     # Operator now approves the domain going forward...
     h.domain_rule_repo.upsert_rule(
-        mailbox_id=h.mailbox.mailbox_id, sender_domain="vendor.com", match_mode="EXACT", policy="ALLOWED",
+        mailbox_id=h.mailbox.mailbox_id, sender_domain="vendor.com", match_mode="EXACT", policy="MUST_READ",
         destination_entity_id=None, destination_mode="REVIEW_REQUIRED", source="OPERATOR",
     )
     # ...but a later, ordinary sweep re-observing the SAME message must
@@ -652,13 +678,13 @@ def test_reprocess_all_historical_candidates_ingests_the_triggering_message_imme
     assert triggering_message.ingestion_status == INGESTION_STATUS_CHECKED_NOT_CANDIDATE
 
     rule = h.domain_rule_repo.upsert_rule(
-        mailbox_id=h.mailbox.mailbox_id, sender_domain="vendor.com", match_mode="EXACT", policy="ALLOWED",
+        mailbox_id=h.mailbox.mailbox_id, sender_domain="vendor.com", match_mode="EXACT", policy="MUST_READ",
         destination_entity_id=None, destination_mode="REVIEW_REQUIRED", source="OPERATOR",
     )
     h.graph_client.queue_content_result(_content())
     reprocessed = reprocess_all_historical_candidates_for_domain(
         mailbox=h.mailbox, mailbox_source_id=h.source_id, sender_domain="vendor.com",
-        rule=rule, adapter=h.adapter, message_repository=h.message_repo, api=h.api, object_store=h.object_store,
+        rule=rule, adapter=h.adapter, message_repository=h.message_repo, needs_you_repository=h.needs_you_repo, api=h.api, object_store=h.object_store,
         scanner=h.scanner, actor_type="SYSTEM", actor_id="test",
     )
     assert len(reprocessed) == 1
@@ -677,13 +703,13 @@ def test_reprocess_all_historical_candidates_is_idempotent_on_a_double_submit_of
     h.sweep()
 
     rule = h.domain_rule_repo.upsert_rule(
-        mailbox_id=h.mailbox.mailbox_id, sender_domain="vendor.com", match_mode="EXACT", policy="ALLOWED",
+        mailbox_id=h.mailbox.mailbox_id, sender_domain="vendor.com", match_mode="EXACT", policy="MUST_READ",
         destination_entity_id=None, destination_mode="REVIEW_REQUIRED", source="OPERATOR",
     )
     h.graph_client.queue_content_result(_content())
     first = reprocess_all_historical_candidates_for_domain(
         mailbox=h.mailbox, mailbox_source_id=h.source_id, sender_domain="vendor.com",
-        rule=rule, adapter=h.adapter, message_repository=h.message_repo, api=h.api, object_store=h.object_store,
+        rule=rule, adapter=h.adapter, message_repository=h.message_repo, needs_you_repository=h.needs_you_repo, api=h.api, object_store=h.object_store,
         scanner=h.scanner, actor_type="SYSTEM", actor_id="test",
     )
     assert len(first) == 1
@@ -695,7 +721,7 @@ def test_reprocess_all_historical_candidates_is_idempotent_on_a_double_submit_of
     # second time round.
     second = reprocess_all_historical_candidates_for_domain(
         mailbox=h.mailbox, mailbox_source_id=h.source_id, sender_domain="vendor.com",
-        rule=rule, adapter=h.adapter, message_repository=h.message_repo, api=h.api, object_store=h.object_store,
+        rule=rule, adapter=h.adapter, message_repository=h.message_repo, needs_you_repository=h.needs_you_repo, api=h.api, object_store=h.object_store,
         scanner=h.scanner, actor_type="SYSTEM", actor_id="test",
     )
     assert second == []
@@ -737,7 +763,7 @@ def test_reprocess_all_historical_candidates_back_processes_every_historical_can
     assert items[0].metadata["candidate_message_count"] == 3
 
     rule = h.domain_rule_repo.upsert_rule(
-        mailbox_id=h.mailbox.mailbox_id, sender_domain="vendor.com", match_mode="EXACT", policy="ALLOWED",
+        mailbox_id=h.mailbox.mailbox_id, sender_domain="vendor.com", match_mode="EXACT", policy="MUST_READ",
         destination_entity_id=None, destination_mode="REVIEW_REQUIRED", source="OPERATOR",
     )
     # Content is fetched once per message, sequentially — queue THREE.
@@ -747,7 +773,7 @@ def test_reprocess_all_historical_candidates_back_processes_every_historical_can
 
     reprocessed = reprocess_all_historical_candidates_for_domain(
         mailbox=h.mailbox, mailbox_source_id=h.source_id, sender_domain="vendor.com",
-        rule=rule, adapter=h.adapter, message_repository=h.message_repo, api=h.api, object_store=h.object_store,
+        rule=rule, adapter=h.adapter, message_repository=h.message_repo, needs_you_repository=h.needs_you_repo, api=h.api, object_store=h.object_store,
         scanner=h.scanner, actor_type="SYSTEM", actor_id="test",
     )
     assert len(reprocessed) == 3
@@ -817,7 +843,7 @@ def test_reprocess_mixed_domain_only_back_processes_actual_candidates_never_ever
     assert items[0].metadata["candidate_message_count"] == 3
 
     rule = h.domain_rule_repo.upsert_rule(
-        mailbox_id=h.mailbox.mailbox_id, sender_domain="vendor.com", match_mode="EXACT", policy="ALLOWED",
+        mailbox_id=h.mailbox.mailbox_id, sender_domain="vendor.com", match_mode="EXACT", policy="MUST_READ",
         destination_entity_id=None, destination_mode="REVIEW_REQUIRED", source="OPERATOR",
     )
     h.graph_client.queue_content_result(_content())
@@ -826,7 +852,7 @@ def test_reprocess_mixed_domain_only_back_processes_actual_candidates_never_ever
 
     reprocessed = reprocess_all_historical_candidates_for_domain(
         mailbox=h.mailbox, mailbox_source_id=h.source_id, sender_domain="vendor.com",
-        rule=rule, adapter=h.adapter, message_repository=h.message_repo, api=h.api, object_store=h.object_store,
+        rule=rule, adapter=h.adapter, message_repository=h.message_repo, needs_you_repository=h.needs_you_repo, api=h.api, object_store=h.object_store,
         scanner=h.scanner, actor_type="SYSTEM", actor_id="test",
     )
     # Exactly 3 messages returned/reprocessed — NEVER 7.
@@ -848,7 +874,7 @@ def test_reprocess_mixed_domain_only_back_processes_actual_candidates_never_ever
     # candidates were never eligible and still aren't.
     second_call = reprocess_all_historical_candidates_for_domain(
         mailbox=h.mailbox, mailbox_source_id=h.source_id, sender_domain="vendor.com",
-        rule=rule, adapter=h.adapter, message_repository=h.message_repo, api=h.api, object_store=h.object_store,
+        rule=rule, adapter=h.adapter, message_repository=h.message_repo, needs_you_repository=h.needs_you_repo, api=h.api, object_store=h.object_store,
         scanner=h.scanner, actor_type="SYSTEM", actor_id="test",
     )
     assert second_call == []
@@ -866,7 +892,7 @@ def test_ignored_domain_message_is_never_swept_in_even_after_the_domain_is_later
     and the ingestion_status happens to match."""
     h = Harness(allow_default_domain=False)
     h.domain_rule_repo.upsert_rule(
-        mailbox_id=h.mailbox.mailbox_id, sender_domain="vendor.com", match_mode="EXACT", policy="IGNORED",
+        mailbox_id=h.mailbox.mailbox_id, sender_domain="vendor.com", match_mode="EXACT", policy="BLACKLIST",
         destination_entity_id=None, destination_mode=None, source="OPERATOR",
     )
     h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(_msg("ignored-1"),), delta_link="d1"))
@@ -885,7 +911,7 @@ def test_ignored_domain_message_is_never_swept_in_even_after_the_domain_is_later
     # Realistic scenario: the domain, originally IGNORED, is later
     # reconsidered and approved by an operator.
     h.domain_rule_repo.upsert_rule(
-        mailbox_id=h.mailbox.mailbox_id, sender_domain="vendor.com", match_mode="EXACT", policy="ALLOWED",
+        mailbox_id=h.mailbox.mailbox_id, sender_domain="vendor.com", match_mode="EXACT", policy="MUST_READ",
         destination_entity_id=None, destination_mode="REVIEW_REQUIRED", source="OPERATOR",
     )
     # The old IGNORED-era message must still NOT be swept in — only
@@ -1141,7 +1167,7 @@ def test_mailbox_scoped_via_an_allowed_domain_rule_destination_also_participates
     domain_rule_repo = InMemoryMailboxDomainRuleRepository()
     domain_rule_repo.upsert_rule(
         mailbox_id=mailbox.mailbox_id, sender_domain="noustai-supplier.example", match_mode="EXACT",
-        policy="ALLOWED", destination_entity_id=entities["NOUSTAI_LIMITED"].entity_id,
+        policy="MUST_READ", destination_entity_id=entities["NOUSTAI_LIMITED"].entity_id,
         destination_mode="FIXED", source="OPERATOR",
     )
 
@@ -1171,11 +1197,11 @@ def test_mailbox_scoping_ignores_an_ignored_rules_destination_and_a_review_requi
     domain_rule_repo = InMemoryMailboxDomainRuleRepository()
     domain_rule_repo.upsert_rule(
         mailbox_id=mailbox.mailbox_id, sender_domain="spam.example", match_mode="EXACT",
-        policy="IGNORED", destination_entity_id=None, destination_mode=None, source="OPERATOR",
+        policy="BLACKLIST", destination_entity_id=None, destination_mode=None, source="OPERATOR",
     )
     domain_rule_repo.upsert_rule(
         mailbox_id=mailbox.mailbox_id, sender_domain="unsure.example", match_mode="EXACT",
-        policy="ALLOWED", destination_entity_id=None, destination_mode="REVIEW_REQUIRED", source="OPERATOR",
+        policy="MUST_READ", destination_entity_id=None, destination_mode="REVIEW_REQUIRED", source="OPERATOR",
     )
 
     floor = compute_bootstrap_floor(
@@ -1292,7 +1318,7 @@ def test_no_mime_fetch_for_a_non_candidate_message_in_deleted_items():
     metadata processing only — never a MIME fetch."""
     h = Harness(allow_default_domain=False)
     h.domain_rule_repo.upsert_rule(
-        mailbox_id=h.mailbox.mailbox_id, sender_domain="vendor.com", match_mode="EXACT", policy="IGNORED",
+        mailbox_id=h.mailbox.mailbox_id, sender_domain="vendor.com", match_mode="EXACT", policy="BLACKLIST",
         destination_entity_id=None, destination_mode=None, source="OPERATOR",
     )
     h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link="d-inbox"))
@@ -1434,7 +1460,7 @@ def test_sweep_run_aggregate_reporting_fields_across_mixed_messages_and_rate_lim
     aggregate field this addendum adds."""
     h = Harness()  # allow_default_domain=True -> vendor.com is ALLOWED
     h.domain_rule_repo.upsert_rule(
-        mailbox_id=h.mailbox.mailbox_id, sender_domain="ignored.example", match_mode="EXACT", policy="IGNORED",
+        mailbox_id=h.mailbox.mailbox_id, sender_domain="ignored.example", match_mode="EXACT", policy="BLACKLIST",
         destination_entity_id=None, destination_mode=None, source="OPERATOR",
     )
     allowed_msg = _msg(
@@ -1576,3 +1602,191 @@ def test_domain_review_item_accumulates_aggregate_stats_across_repeat_candidates
     assert item.metadata["candidate_message_count"] == 3
     assert item.metadata["first_seen_at"] == first_seen  # STILL unchanged
     assert item.metadata["attachment_bearing_count"] == 2
+
+
+# =======================================================================
+# CD-6 GUI-operations-foundation follow-on WO — three-state operator-
+# learning policy model (MUST_READ/GRAYLIST/BLACKLIST), the real
+# entity-assignment fix, authentication escalation, and document-level
+# destination review. Tests below are numbered against the architect's
+# own required-tests list (see the WO itself) where a direct mapping
+# exists.
+# =======================================================================
+
+
+def test_must_read_fixed_destination_assigns_real_entity_id_to_evidence(h):
+    """WO required test #2: Matt confirms MUST_READ + FIXED destination
+    — the resulting evidence really gets entity_id == that fixed
+    entity, not None (the real fix, see
+    services/mailbox/microsoft/evidence_ingest.py)."""
+    h.domain_rule_repo.upsert_rule(
+        mailbox_id=h.mailbox.mailbox_id, sender_domain=_DEFAULT_ALLOWED_DOMAIN, match_mode="EXACT",
+        policy="MUST_READ", destination_entity_id=h.entity.entity_id, destination_mode="FIXED", source="OPERATOR",
+    )
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(_msg("m1"),), delta_link="d1"))
+    h.graph_client.queue_content_result(_content())
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link="d-junk"))
+    run = h.sweep()
+    assert run.evidence_created == 1
+
+    message = h.message_repo.find_by_provider_id(h.mailbox.mailbox_id, "m1")
+    assert message.evidence_id is not None
+    evidence = h.api.get_evidence(message.evidence_id)
+    assert evidence.entity_id == h.entity.entity_id
+
+
+def test_confirmed_must_read_source_never_reraises_domain_review_across_multiple_messages(h):
+    """WO required tests #3 and #4: after Matt confirms a source
+    MUST_READ, a SECOND, THIRD and FOURTH message from the SAME
+    authenticated source are all deep-processed with ZERO new
+    MAILBOX_DOMAIN_REVIEW items — the core durable-memory invariant,
+    proven across real, repeated sweep rounds (never just 'the second
+    one')."""
+    for i, msg_id in enumerate(["m1", "m2", "m3", "m4"], start=1):
+        h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(_msg(msg_id),), delta_link=f"d{i}"))
+        h.graph_client.queue_content_result(_content())
+        h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link=f"d-junk-{i}"))
+        run = h.sweep()
+        assert run.status == "SUCCEEDED"
+        assert run.evidence_created == 1
+        assert h.needs_you_repo.list_needs_you_items(item_type=ITEM_TYPE_MAILBOX_DOMAIN_REVIEW) == []
+
+    assert len(h.message_repo.list_messages(mailbox_id=h.mailbox.mailbox_id)) == 4
+
+
+def test_must_read_review_required_raises_company_required_per_evidence_not_domain_review(h):
+    """WO required test #5: MUST_READ + REVIEW_REQUIRED never raises a
+    second source-relevance (MAILBOX_DOMAIN_REVIEW) item for later
+    messages, but DOES raise a COMPANY_REQUIRED item scoped to each new
+    evidence item it creates (the Harness's own default rule already
+    uses destination_mode=REVIEW_REQUIRED)."""
+    for i, msg_id in enumerate(["m1", "m2"], start=1):
+        h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(_msg(msg_id),), delta_link=f"d{i}"))
+        h.graph_client.queue_content_result(_content())
+        h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link=f"d-junk-{i}"))
+        h.sweep()
+
+    assert h.needs_you_repo.list_needs_you_items(item_type=ITEM_TYPE_MAILBOX_DOMAIN_REVIEW) == []
+    company_items = h.needs_you_repo.list_needs_you_items(item_type=ITEM_TYPE_COMPANY_REQUIRED)
+    assert len(company_items) == 2
+    evidence_ids = {i.source_object_reference for i in company_items}
+    assert len(evidence_ids) == 2  # one distinct item per evidence item, never shared
+    for item in company_items:
+        assert item.allowed_action_type == "COMPANY_WHAT_WHY"
+        assert item.status == "OPEN"
+
+
+def test_blacklist_suppresses_future_domain_review_noise():
+    """WO required test #7: BLACKLIST suppresses future
+    MAILBOX_DOMAIN_REVIEW noise for that domain — mirrors test #3's
+    proof but for BLACKLIST (no new item on a later credible-looking
+    message)."""
+    h = Harness(allow_default_domain=False)
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(_msg("m1"),), delta_link="d1"))
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link="d-junk"))
+    h.sweep()
+    assert len(h.needs_you_repo.list_needs_you_items(item_type=ITEM_TYPE_MAILBOX_DOMAIN_REVIEW)) == 1
+
+    h.domain_rule_repo.upsert_rule(
+        mailbox_id=h.mailbox.mailbox_id, sender_domain="vendor.com", match_mode="EXACT", policy="BLACKLIST",
+        destination_entity_id=None, destination_mode=None, source="OPERATOR",
+    )
+    for i, msg_id in enumerate(["m2", "m3"], start=2):
+        h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(_msg(msg_id),), delta_link=f"d{i}"))
+        h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link=f"d-junk-{i}"))
+        h.sweep()
+
+    # Still just the ONE original item — later credible-looking mail
+    # from the now-BLACKLISTed domain raises nothing further.
+    items = h.needs_you_repo.list_needs_you_items(item_type=ITEM_TYPE_MAILBOX_DOMAIN_REVIEW)
+    assert len(items) == 1
+
+
+def test_must_read_message_with_hard_auth_failure_escalates_never_ingests(h):
+    """WO required test #8: a MUST_READ-policy message with a genuine
+    authentication FAIL escalates to the new security-review outcome/
+    item type — WITHOUT touching the MailboxDomainRule's own policy —
+    and does NOT get MIME-fetched/evidence-created via the normal
+    trusted path."""
+    failing_msg = _msg("m1", auth_signals={"spf": "fail", "dkim": "pass", "dmarc": "pass"})
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(failing_msg,), delta_link="d1"))
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link="d-junk"))
+    run = h.sweep()
+
+    assert run.evidence_created == 0
+    assert h.graph_client.content_calls == []  # never MIME-fetched
+
+    message = h.message_repo.find_by_provider_id(h.mailbox.mailbox_id, "m1")
+    assert message.ingestion_status == INGESTION_STATUS_SECURITY_REVIEW
+    assert message.evidence_id is None
+
+    escalation_items = h.needs_you_repo.list_needs_you_items(item_type=ITEM_TYPE_MAILBOX_AUTHENTICATION_ESCALATION)
+    assert len(escalation_items) == 1
+    assert escalation_items[0].source_object_reference == message.mailbox_message_id
+    # Never conflated with the domain-relevance question.
+    assert h.needs_you_repo.list_needs_you_items(item_type=ITEM_TYPE_MAILBOX_DOMAIN_REVIEW) == []
+
+    rule = h.domain_rule_repo.find_for_sender(mailbox_id=h.mailbox.mailbox_id, sender_domain=_DEFAULT_ALLOWED_DOMAIN)
+    assert rule.policy == "MUST_READ"  # the rule itself is untouched — a per-message event, not a re-ask
+
+
+def test_must_read_message_with_no_auth_signal_at_all_also_escalates(h):
+    """The documented threshold's second branch: total silence (no
+    spf/dkim/dmarc captured at all) is ALSO treated as suspicious."""
+    silent_msg = _msg("m1", auth_signals={})
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(silent_msg,), delta_link="d1"))
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link="d-junk"))
+    h.sweep()
+
+    message = h.message_repo.find_by_provider_id(h.mailbox.mailbox_id, "m1")
+    assert message.ingestion_status == INGESTION_STATUS_SECURITY_REVIEW
+
+
+def test_must_read_message_with_softfail_but_a_real_signal_still_passes(h):
+    """A `softfail`/`none` value still counts as SOME captured signal —
+    only a hard `fail` or total silence escalates."""
+    passing_msg = _msg("m1", auth_signals={"spf": "softfail", "dkim": "pass", "dmarc": "none"})
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(passing_msg,), delta_link="d1"))
+    h.graph_client.queue_content_result(_content())
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link="d-junk"))
+    run = h.sweep()
+
+    assert run.evidence_created == 1
+    message = h.message_repo.find_by_provider_id(h.mailbox.mailbox_id, "m1")
+    assert message.ingestion_status == "INGESTED"
+
+
+def test_fixed_destination_never_inferred_from_mailbox_default_entity_id(h):
+    """WO required test #12: no mailbox's own identity/default_entity_id
+    ever implies a destination — every FIXED-destination assignment
+    comes from an explicit rule, never inferred from which mailbox the
+    message arrived through. Proven by giving the mailbox a DIFFERENT
+    default_entity_id hint than the rule's own destination_entity_id,
+    then proving the evidence gets the RULE's entity, never the
+    mailbox's hint."""
+    hint_entity = h.api.register_entity(
+        entity_type="COMPANY", canonical_name="HINT_ONLY_ENTITY", display_name="Hint Only", status="ACTIVE",
+        actor_type="SYSTEM", actor_id="test", fiscal_year_start_month_day="01-01",
+    )
+    h.mailbox_repo.update_mailbox(
+        h.mailbox.mailbox_id,
+        display_name=h.mailbox.display_name,
+        email_address=h.mailbox.email_address,
+        provider_kind=h.mailbox.provider_kind,
+        default_entity_id=hint_entity.entity_id,
+    )
+    h.refresh_mailbox()
+
+    h.domain_rule_repo.upsert_rule(
+        mailbox_id=h.mailbox.mailbox_id, sender_domain=_DEFAULT_ALLOWED_DOMAIN, match_mode="EXACT",
+        policy="MUST_READ", destination_entity_id=h.entity.entity_id, destination_mode="FIXED", source="OPERATOR",
+    )
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(_msg("m1"),), delta_link="d1"))
+    h.graph_client.queue_content_result(_content())
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link="d-junk"))
+    h.sweep()
+
+    message = h.message_repo.find_by_provider_id(h.mailbox.mailbox_id, "m1")
+    evidence = h.api.get_evidence(message.evidence_id)
+    assert evidence.entity_id == h.entity.entity_id
+    assert evidence.entity_id != hint_entity.entity_id

@@ -40,10 +40,37 @@ import * as drawer from "../../shell/drawer.js";
 import { listEntities } from "../../shell/entities.js";
 import {
   listDomainReviewItems,
+  listMicrosoftDomainRules,
   runXeroCorrelation,
   resolveMailboxDomainReviewItem,
   batchResolveMailboxDomainReview,
 } from "./mailbox-api.js";
+
+//: CD-6 GUI-operations-foundation follow-on WO — the three real,
+//: persisted `MailboxDomainRule.policy` values a row can carry, plus
+//: the "no rule at all yet" pseudo-state this page renders as "Not yet
+//: reviewed" (never a real value on the wire — see
+//: `_currentPolicyLabel` below). Mirrors
+//: `services.mailbox.domain_rule`'s own module docstring exactly.
+const POLICY_KIND = { MUST_READ: "ok", GRAYLIST: "progress", BLACKLIST: "neutral" };
+
+/** The operator-facing "current policy" label for one domain (architect
+ * §7 — "show the current policy prominently"). `rule` is `undefined`
+ * when no `MailboxDomainRule` exists yet for this sender_domain;
+ * `entities` resolves a `MUST_READ`+`FIXED` rule's own
+ * `destination_entity_id` to a real display name (never hardcoded —
+ * repo-wide guardrail, `test_no_hardcoded_company_truth_anywhere_in_static_ui`). */
+function _currentPolicyLabel(rule, entities) {
+  if (!rule) return "Not yet reviewed";
+  if (rule.policy === "GRAYLIST") return "GRAYLIST";
+  if (rule.policy === "BLACKLIST") return "BLACKLIST";
+  // MUST_READ
+  if (rule.destination_mode === "FIXED" && rule.destination_entity_id) {
+    const entity = entities.find((e) => e.entity_id === rule.destination_entity_id);
+    return `MUST_READ → ${entity ? entity.display_name : "unknown company"}`;
+  }
+  return "MUST_READ → Ask destination";
+}
 
 //: Sort options for the table — a plain, small closed set (no generic
 //: click-any-column-header sort framework; this is a 90-ish-row
@@ -373,12 +400,20 @@ export const DomainReview = {
     clear(tableHost);
     tableHost.appendChild(loadingState("Loading domain-review items…"));
 
-    const { ok, status, body } = await listDomainReviewItems(mailbox.mailbox_id); // default status=OPEN
+    const [{ ok, status, body }, rulesResult] = await Promise.all([
+      listDomainReviewItems(mailbox.mailbox_id), // default status=OPEN
+      listMicrosoftDomainRules(mailbox.mailbox_id),
+    ]);
     clear(tableHost);
     if (!ok || !body) {
       tableHost.appendChild(errorState(status, body, "Could not load domain-review items"));
       return;
     }
+    // Current-policy lookup (architect §7) — a plain, best-effort read;
+    // a failure here never blocks the table itself from rendering (every
+    // row simply falls back to "Not yet reviewed").
+    const rules = rulesResult && rulesResult.ok && rulesResult.body ? rulesResult.body.items : [];
+    this._ruleByDomain = new Map(rules.map((r) => [r.sender_domain, r]));
     if (body.items.length === 0) {
       tableHost.appendChild(
         emptyState("No open domain-review items.", "Every candidate-bearing sender domain has already been decided.")
@@ -436,9 +471,11 @@ export const DomainReview = {
     const countLabel = el("span", { class: "small muted", text: "0 selected" });
     this._selectionCountLabel = countLabel;
 
-    const allowBtn = el("button", { class: "btn btn--primary btn--sm", text: "Allow selected", attrs: { type: "button", disabled: "true" } });
-    const ignoreBtn = el("button", { class: "btn btn--ghost btn--sm", text: "Ignore selected", attrs: { type: "button", disabled: "true" } });
+    const allowBtn = el("button", { class: "btn btn--primary btn--sm", text: "Always Read selected", attrs: { type: "button", disabled: "true" } });
+    const grayBtn = el("button", { class: "btn btn--ghost btn--sm", text: "Keep checking with me", attrs: { type: "button", disabled: "true" } });
+    const ignoreBtn = el("button", { class: "btn btn--ghost btn--sm", text: "Ignore this source (selected)", attrs: { type: "button", disabled: "true" } });
     this._allowBtn = allowBtn;
+    this._grayBtn = grayBtn;
     this._ignoreBtn = ignoreBtn;
     this._updateAllowButtonLabel();
     // The entity `<select>` node is created once in `_correlationSection`
@@ -455,15 +492,16 @@ export const DomainReview = {
     }
 
     allowBtn.addEventListener("click", () => this._batchDecide(mailbox, "ALLOW"));
+    grayBtn.addEventListener("click", () => this._batchDecide(mailbox, "KEEP_GRAY"));
     ignoreBtn.addEventListener("click", () => this._batchDecide(mailbox, "IGNORE"));
 
     // `.list-panel__toolbar` (style.css) is a `justify-content:
     // space-between` flex row built for exactly two groups (a label on
     // one side, controls on the other — Documents' own toolbar uses it
-    // the same way) — group both buttons into ONE second child so this
-    // reuse gets that same "label left, actions right" layout instead
-    // of three items spread evenly across the row.
-    const actionsGroup = el("div", { class: "field--inline" }, [allowBtn, ignoreBtn]);
+    // the same way) — group all three buttons into ONE second child so
+    // this reuse gets that same "label left, actions right" layout
+    // instead of items spread evenly across the row.
+    const actionsGroup = el("div", { class: "field--inline" }, [allowBtn, grayBtn, ignoreBtn]);
     toolbar.appendChild(countLabel);
     toolbar.appendChild(actionsGroup);
     return toolbar;
@@ -473,13 +511,14 @@ export const DomainReview = {
     if (!this._allowBtn) return;
     const selectedOption = this._entitySelect && this._entitySelect.selectedOptions && this._entitySelect.selectedOptions[0];
     const label = selectedOption ? selectedOption.textContent : "company";
-    this._allowBtn.textContent = `Allow selected → ${label}`;
+    this._allowBtn.textContent = `Always Read selected → ${label}`;
   },
 
   _updateSelectionUI() {
     const n = this._selected.size;
     if (this._selectionCountLabel) this._selectionCountLabel.textContent = `${n} selected`;
     if (this._allowBtn) this._allowBtn.disabled = n === 0 || !this._entitySelect || !this._entitySelect.value;
+    if (this._grayBtn) this._grayBtn.disabled = n === 0;
     if (this._ignoreBtn) this._ignoreBtn.disabled = n === 0;
   },
 
@@ -503,6 +542,7 @@ export const DomainReview = {
       el("tr", {}, [
         el("th", { text: "" }),
         el("th", { text: "Priority" }),
+        el("th", { text: "Current policy" }),
         el("th", { text: "Sender domain" }),
         el("th", { text: "Candidates" }),
         el("th", { text: "With attachment" }),
@@ -540,9 +580,14 @@ export const DomainReview = {
     const detailsBtn = el("button", { class: "btn btn--ghost btn--sm", text: "Details", attrs: { type: "button" } });
     detailsBtn.addEventListener("click", () => this._openDetails(item, mailbox, entities));
 
+    const rule = this._ruleByDomain ? this._ruleByDomain.get(m.sender_domain) : undefined;
+    const policyLabel = _currentPolicyLabel(rule, entities);
+    const policyKind = rule ? POLICY_KIND[rule.policy] || "neutral" : "neutral";
+
     return el("tr", {}, [
       el("td", {}, [checkbox]),
       el("td", {}, [chip(item.review_priority || "LOW", REVIEW_PRIORITY_KIND[item.review_priority] || "neutral")]),
+      el("td", {}, [chip(policyLabel, policyKind)]),
       el("td", { text: m.sender_domain || "—" }),
       el("td", { text: m.candidate_message_count != null ? String(m.candidate_message_count) : "—" }),
       el("td", { text: m.attachment_bearing_count != null ? String(m.attachment_bearing_count) : "—" }),
@@ -562,11 +607,12 @@ export const DomainReview = {
     if (this._selected.size === 0) return;
     const entityId = this._entitySelect ? this._entitySelect.value : null;
     if (decision === "ALLOW" && !entityId) {
-      notify.error("Select a company before allowing selected domains.");
+      notify.error("Select a company before choosing Always Read for selected domains.");
       return;
     }
 
     this._allowBtn.disabled = true;
+    if (this._grayBtn) this._grayBtn.disabled = true;
     this._ignoreBtn.disabled = true;
 
     const items = Array.from(this._selected).map((itemId) => ({
@@ -582,7 +628,7 @@ export const DomainReview = {
     });
 
     if (!ok || !body) {
-      notify.error(`Batch ${decision.toLowerCase()} failed: ${errorMessage(status, body)}`);
+      notify.error(`Batch action failed: ${errorMessage(status, body)}`);
       this._updateSelectionUI();
       return;
     }
@@ -594,15 +640,26 @@ export const DomainReview = {
     // operator, so this renders the actual per-item outcome list.
     clear(this._resultsHost);
     const domainByItemId = new Map(this._items.map((i) => [i.item_id, i.metadata.sender_domain]));
+    const pastTense = { ALLOW: "will always be read", IGNORE: "ignored", KEEP_GRAY: "kept under review" };
     for (const result of body.results) {
       const domain = domainByItemId.get(result.item_id) || result.item_id;
       const line = el("div", { class: `small domain-review__result domain-review__result--${result.ok ? "ok" : "bad"}` });
       line.textContent = result.ok
-        ? `✓ ${domain} — ${decision === "ALLOW" ? "allowed" : "ignored"}.`
+        ? `✓ ${domain} — ${pastTense[decision] || "updated"}.`
         : `✗ ${domain} — ${result.error_type || "error"}: ${result.error || "unknown error"}`;
       this._resultsHost.appendChild(line);
     }
-    notify.ok(`${body.succeeded_count}/${body.count} domain(s) ${decision === "ALLOW" ? "allowed" : "ignored"}.`);
+    // Explicit learning feedback (architect §7 — "make the UI feedback
+    // explicit that BAGMAN has learned this and will not ask again for
+    // ordinary future messages", extended here to the batch flow) — a
+    // clear status-line sentence, not just a generic success toast.
+    const learnedSuffix =
+      decision === "ALLOW"
+        ? " BAGMAN will remember this and will not ask again for ordinary future messages from these sources."
+        : decision === "KEEP_GRAY"
+          ? " These domains stay under review — BAGMAN will keep asking about them."
+          : " BAGMAN will not raise these domains again.";
+    notify.ok(`${body.succeeded_count}/${body.count} domain(s) updated.${learnedSuffix}`);
 
     this._selected = new Set();
     document.dispatchEvent(new CustomEvent("bagman:needs-you-changed"));
@@ -716,22 +773,23 @@ export const DomainReview = {
         entities.map((entity) => el("option", { attrs: { value: entity.entity_id }, text: entity.display_name }))
       )
     );
-    section.appendChild(el("label", { class: "field", text: "Allow → company" }, [entitySelect]));
+    section.appendChild(el("label", { class: "field", text: "Always Read → company" }, [entitySelect]));
 
     const statusEl = el("div", { class: "upload-status", attrs: { "aria-live": "polite" } });
-    const allowBtn = el("button", { class: "btn btn--primary btn--sm", text: "Allow", attrs: { type: "button" } });
-    const ignoreBtn = el("button", { class: "btn btn--ghost btn--sm", text: "Ignore", attrs: { type: "button" } });
-    section.appendChild(el("div", { class: "review-drawer__actions" }, [allowBtn, ignoreBtn]));
+    const allowBtn = el("button", { class: "btn btn--primary btn--sm", text: "Always Read", attrs: { type: "button" } });
+    const grayBtn = el("button", { class: "btn btn--ghost btn--sm", text: "Keep checking with me", attrs: { type: "button" } });
+    const ignoreBtn = el("button", { class: "btn btn--ghost btn--sm", text: "Ignore this source", attrs: { type: "button" } });
+    section.appendChild(el("div", { class: "review-drawer__actions" }, [allowBtn, grayBtn, ignoreBtn]));
     section.appendChild(statusEl);
 
+    const allButtons = [allowBtn, grayBtn, ignoreBtn];
     const decide = async (decision) => {
       if (decision === "ALLOW" && !entitySelect.value) {
         statusEl.dataset.kind = "bad";
-        statusEl.textContent = "Select a company before allowing this domain.";
+        statusEl.textContent = "Select a company before choosing Always Read for this domain.";
         return;
       }
-      allowBtn.disabled = true;
-      ignoreBtn.disabled = true;
+      allButtons.forEach((btn) => (btn.disabled = true));
       statusEl.dataset.kind = "progress";
       statusEl.textContent = "Saving…";
 
@@ -745,17 +803,25 @@ export const DomainReview = {
       if (!ok || !result) {
         statusEl.dataset.kind = "bad";
         statusEl.textContent = `Could not save: ${errorMessage(status, result)}`;
-        allowBtn.disabled = false;
-        ignoreBtn.disabled = false;
+        allButtons.forEach((btn) => (btn.disabled = false));
         return;
       }
 
-      notify.ok(decision === "ALLOW" ? "Domain allowed." : "Domain ignored.");
+      // Explicit learning feedback (architect §7) — a clear sentence,
+      // not just a generic success toast, especially for "Always Read"
+      // (the whole point of the durable-memory model).
+      const message = {
+        ALLOW: "BAGMAN will always read this source and will not ask again for ordinary future messages from it.",
+        KEEP_GRAY: "This domain stays under review — BAGMAN will keep asking about it.",
+        IGNORE: "BAGMAN will not raise this domain again.",
+      }[decision];
+      notify.ok(message || "Saved.");
       document.dispatchEvent(new CustomEvent("bagman:needs-you-changed"));
       this.open(mailbox); // back to the (now-refreshed) table
     };
 
     allowBtn.addEventListener("click", () => decide("ALLOW"));
+    grayBtn.addEventListener("click", () => decide("KEEP_GRAY"));
     ignoreBtn.addEventListener("click", () => decide("IGNORE"));
 
     return section;
