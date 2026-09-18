@@ -1,6 +1,7 @@
 """``assess_microsoft_authentication`` — the real Microsoft-specific
 trust-boundary selector (CD-6 GUI-operations-foundation follow-on WO,
-item B). Consumes the RAW header list Microsoft Graph returns
+item B; corrected by a second architect review, Finding 2). Consumes
+the RAW header list Microsoft Graph returns
 (``internetMessageHeaders``: ``[{"name": ..., "value": ...}, ...]``) and
 produces a provider-neutral
 :class:`services.mailbox.authentication_assessment.AuthenticationAssessment`.
@@ -22,8 +23,8 @@ inbound messages) captured in this WO's own PID, not assumptions:
   originating domain and a relay/ESP) — the confirmed real bug: the old
   parser's ``setdefault`` silently kept only the FIRST token, even
   within one legitimate header. This module fixes that bug class
-  generally (see :func:`_merge_tokens`), not merely for the
-  cross-header case.
+  generally (see :func:`_parse_tokens`), not merely for the
+  single-header case.
 
 The trust model — why ``compauth`` is the strongest available signal
 ------------------------------------------------------------------------
@@ -51,30 +52,65 @@ ARC-verifying provider could revisit this; nothing here assumes ARC
 tokens are worthless, only that THIS selector does not trust them
 unverified.
 
-Same-mechanism-disagreement tie-break — the worst verdict wins
+ONLY the selected final-hop header gates — corrected cross-header
+merge model (Finding 2, second architect review)
 ------------------------------------------------------------------------
-Both WITHIN one header's own value (the real, confirmed multi-``dkim=``
-case above) and ACROSS every plain ``Authentication-Results`` header
-this message carries (the adversarial "duplicate/forged header" case —
-see below), this selector never blindly takes "the first token/header
-seen". It merges every trusted candidate header's own tokens with a
-conservative, documented rank (:data:`_VERDICT_RANK`): a FAIL-shaped
-verdict always outranks (wins over) a PASS-shaped one for the SAME
-mechanism. This is a deliberate, conservative choice — "a mixed result
-is not an unambiguous pass" — and it is exactly what makes the
-adversarial forged-header case safe: an attacker who manages to inject
-a SECOND, forged ``Authentication-Results`` header claiming
-``compauth=pass`` can never override a genuine header's own real
-``compauth=fail`` merely by choosing where in the header array their
-forgery lands — the merge is order-independent for conflicting
-verdicts. (Ordering still matters for which header's *other*, non-
-conflicting supporting facts are surfaced as "the" trusted evidence
-when every trusted header agrees — Microsoft's own real edge-stamped
-header is, by ordinary RFC 5322 header-stacking, the FIRST such header
-Graph returns, since a new hop's own header is always prepended ahead
-of any earlier hop's; that reasoning is captured in the ``evidence``
-this function returns but never overridden by mere position when a
-genuine conflict exists.)
+**This is a deliberate correction of this module's own FIRST cut, which
+was a real, confirmed security bypass.** The original implementation
+merged tokens across EVERY plain ``Authentication-Results`` header a
+message carried, with a worst-verdict-wins tie-break — but that
+tie-break only ever applies when TWO headers report the SAME mechanism.
+When the genuine (first/topmost) header was SILENT on a mechanism (e.g.
+it carried only ``dmarc=fail``, no ``compauth=`` token at all) and a
+LATER, forged/untrusted header supplied ``compauth=pass``, there was
+nothing for that value to "compete" against — it merged in unopposed
+and won, because the top-level gating logic checked ``compauth ==
+"pass"`` before ever looking at the genuine header's own real
+``dmarc=fail``. Reproduced directly::
+
+    headers = [
+        {"name": "Authentication-Results", "value": "spf=fail; dkim=fail; dmarc=fail action=quarantine"},
+        {"name": "Authentication-Results", "value": "compauth=pass reason=100"},
+    ]
+    assess_microsoft_authentication(headers).verdict  # was "PASS" -- WRONG. Now "FAIL".
+
+The fix is simpler than the old cross-header-merge logic, not more
+complex: Microsoft Graph preserves message-header ordering (a new hop's
+own header is prepended ahead of any earlier hop's — the FIRST plain
+``Authentication-Results`` header Graph returns is the final-hop,
+most-recent, genuinely-Microsoft-stamped one for THIS delivery). This
+selector now:
+
+1. Locates the FIRST (topmost) plain ``Authentication-Results`` header
+   in the raw, ordered header list — the "selected header". This ONE
+   header is the sole trust boundary for gating.
+2. Parses ALL mechanism tokens WITHIN the selected header's own value
+   ONLY (see :func:`_parse_tokens`) — never looking at any other
+   ``Authentication-Results`` header's tokens for gating purposes. The
+   real, confirmed duplicate-``dkim=``-WITHIN-ONE-header case (see
+   above) remains real and is still handled deterministically: the
+   EXISTING conservative worst-verdict-wins tie-break
+   (:data:`_VERDICT_RANK`/:func:`_verdict_rank`) still applies, but only
+   for two tokens of the SAME mechanism found inside that ONE selected
+   header's own value — this is an entirely intra-header concern,
+   unaffected by the cross-header correction.
+3. Gates on ONLY the selected header's own (possibly intra-header
+   tie-broken) tokens: ``compauth`` -> ``dmarc`` waterfall (see "Never a
+   bare SPF/DKIM pass alone" below).
+4. EVERY OTHER plain ``Authentication-Results`` header (2nd, 3rd, ...)
+   and EVERY ``ARC-Authentication-Results`` header are preserved as
+   supporting/diagnostic evidence ONLY — their own tokens NEVER
+   influence the gating verdict in any way. ARC was already never
+   trusted for gating before this correction; what changes here is that
+   SUBSEQUENT plain ``Authentication-Results`` headers are now ALSO
+   excluded from gating, closing the exact bypass reproduced above.
+
+``evidence`` distinguishes these three sources explicitly rather than
+collapsing them into one ambiguous blob: ``selected_header_tokens`` (the
+one header actually gated on), ``additional_authentication_results_header_count``
+/ ``additional_authentication_results_header_tokens`` (every OTHER plain
+header seen — untrusted, count + tokens kept only for a human/auditor),
+and ``arc_header_count`` / ``arc_tokens`` (unchanged from before).
 
 Never a bare SPF/DKIM pass alone
 ------------------------------------------------------------------------
@@ -114,8 +150,8 @@ _ARC_AUTHENTICATION_RESULTS_HEADER_NAME = "arc-authentication-results"
 _TOKEN_PATTERN = re.compile(r"\b(spf|dkim|dmarc|compauth)\s*=\s*([a-zA-Z]+)")
 
 #: Conservative same-mechanism tie-break rank — LOWER rank wins (is kept)
-#: when the same mechanism appears more than once, whether within one
-#: header value or across multiple trusted candidate headers. A
+#: when the same mechanism appears more than once WITHIN ONE header
+#: value (the real, confirmed multi-`dkim=`-in-one-header case). A
 #: fail-shaped verdict is always more severe (lower rank, wins) than a
 #: pass-shaped one; an ambiguous/non-committal verdict sits in between.
 #: An unrecognised token value is treated as non-committal (never allowed
@@ -140,7 +176,13 @@ def _verdict_rank(value: str) -> int:
 
 
 def _parse_tokens(value: str) -> dict[str, str]:
-    """Parse every ``mechanism=verdict`` token in ONE header value."""
+    """Parse every ``mechanism=verdict`` token in ONE header value,
+    applying the conservative worst-verdict-wins tie-break
+    (:data:`_VERDICT_RANK`) when the SAME mechanism appears more than
+    once WITHIN this one value (the real, confirmed duplicate-``dkim=``
+    case). This is a purely intra-header concern — see module docstring
+    — callers never merge this across multiple header values for gating
+    purposes."""
     parsed: dict[str, str] = {}
     for mechanism, verdict in _TOKEN_PATTERN.findall(value):
         mechanism = mechanism.lower()
@@ -150,12 +192,15 @@ def _parse_tokens(value: str) -> dict[str, str]:
     return parsed
 
 
-def _merge_tokens(values: Sequence[str]) -> dict[str, str]:
+def _merge_tokens_for_evidence_only(values: Sequence[str]) -> dict[str, str]:
     """Merge every value's own :func:`_parse_tokens` result across
-    MULTIPLE header values, applying the SAME conservative worst-wins
-    rank — see module docstring's own "Same-mechanism-disagreement
-    tie-break" section. This is what makes the adversarial
-    forged-duplicate-header case safe."""
+    MULTIPLE header values — used ONLY to build supporting/diagnostic
+    ``evidence`` for untrusted headers (every plain
+    ``Authentication-Results`` header after the selected one, and every
+    ``ARC-Authentication-Results`` header). NEVER used for gating — see
+    module docstring's "ONLY the selected final-hop header gates"
+    section for exactly why a cross-header merge must never feed the
+    verdict."""
     merged: dict[str, str] = {}
     for value in values:
         for mechanism, verdict in _parse_tokens(value).items():
@@ -187,7 +232,7 @@ def assess_microsoft_authentication(
 
     # Supporting-evidence-only facts from ARC headers — captured, never
     # allowed to influence the verdict (see module docstring).
-    arc_tokens = _merge_tokens(arc_values) if arc_values else {}
+    arc_tokens = _merge_tokens_for_evidence_only(arc_values) if arc_values else {}
 
     if not trusted_values:
         return AuthenticationAssessment(
@@ -200,47 +245,59 @@ def assess_microsoft_authentication(
                 else "no Authentication-Results (or ARC-Authentication-Results) header was present on this message at all"
             ),
             evidence={
-                "trusted_header_count": 0,
+                "authentication_results_header_count": 0,
                 "arc_header_count": len(arc_values),
                 "arc_tokens": arc_tokens,
             },
         )
 
-    merged = _merge_tokens(trusted_values)
-    compauth = merged.get("compauth")
+    # The FIRST plain Authentication-Results header is the sole trust
+    # boundary for gating (Graph prepends each new hop's own header
+    # ahead of earlier ones, so this is the genuine final-hop verdict
+    # for THIS delivery — see module docstring). Every OTHER plain
+    # header is untrusted, supporting evidence only.
+    selected_value = trusted_values[0]
+    untrusted_values = trusted_values[1:]
+
+    selected_tokens = _parse_tokens(selected_value)
+    untrusted_tokens = _merge_tokens_for_evidence_only(untrusted_values) if untrusted_values else {}
+
+    compauth = selected_tokens.get("compauth")
 
     evidence: dict[str, Any] = {
-        "trusted_header_count": len(trusted_values),
+        "authentication_results_header_count": len(trusted_values),
+        "selected_header_tokens": dict(selected_tokens),
+        "additional_authentication_results_header_count": len(untrusted_values),
+        "additional_authentication_results_header_tokens": untrusted_tokens,
         "arc_header_count": len(arc_values),
-        "merged_tokens": dict(merged),
         "arc_tokens": arc_tokens,
-        "conflict": len(trusted_values) > 1,
     }
 
     if compauth == "pass":
         return AuthenticationAssessment(
             verdict=AUTH_ASSESSMENT_PASS,
-            reason="trusted Microsoft composite-authentication verdict compauth=pass",
+            reason="trusted Microsoft composite-authentication verdict compauth=pass (selected header)",
             evidence=evidence,
         )
     if compauth == "fail":
         return AuthenticationAssessment(
             verdict=AUTH_ASSESSMENT_FAIL,
-            reason="trusted Microsoft composite-authentication verdict compauth=fail",
+            reason="trusted Microsoft composite-authentication verdict compauth=fail (selected header)",
             evidence=evidence,
         )
 
     # No decisive compauth (missing, softpass, none, or any other
-    # non-pass/fail token) — fall through to the DMARC tier, using the
-    # SAME trusted, merged token set. spf/dkim are deliberately never
-    # consulted here — see module docstring's "Never a bare SPF/DKIM
-    # pass alone" section.
-    dmarc = merged.get("dmarc")
+    # non-pass/fail token) on the SELECTED header — fall through to the
+    # DMARC tier, using ONLY the selected header's own tokens. spf/dkim
+    # are deliberately never consulted here — see module docstring's
+    # "Never a bare SPF/DKIM pass alone" section.
+    dmarc = selected_tokens.get("dmarc")
     if dmarc == "pass":
         return AuthenticationAssessment(
             verdict=AUTH_ASSESSMENT_PASS,
             reason=(
-                f"no decisive compauth verdict ({compauth!r}); the trusted header's own dmarc=pass is used instead"
+                f"no decisive compauth verdict ({compauth!r}) on the selected header; "
+                "its own dmarc=pass is used instead"
             ),
             evidence=evidence,
         )
@@ -248,7 +305,8 @@ def assess_microsoft_authentication(
         return AuthenticationAssessment(
             verdict=AUTH_ASSESSMENT_FAIL,
             reason=(
-                f"no decisive compauth verdict ({compauth!r}); the trusted header's own dmarc=fail is used instead"
+                f"no decisive compauth verdict ({compauth!r}) on the selected header; "
+                "its own dmarc=fail is used instead"
             ),
             evidence=evidence,
         )
@@ -256,8 +314,8 @@ def assess_microsoft_authentication(
     return AuthenticationAssessment(
         verdict=AUTH_ASSESSMENT_UNKNOWN,
         reason=(
-            f"neither a decisive compauth ({compauth!r}) nor dmarc ({dmarc!r}) verdict was found on a "
-            "trusted Authentication-Results header"
+            f"neither a decisive compauth ({compauth!r}) nor dmarc ({dmarc!r}) verdict was found on the "
+            "selected (final-hop) Authentication-Results header"
         ),
         evidence=evidence,
     )

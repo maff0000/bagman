@@ -1369,6 +1369,62 @@ def test_resolving_one_company_required_item_never_touches_the_domain_rule(dev_c
     assert still_open.status == "OPEN"
 
 
+def test_resolving_mailbox_origin_company_required_with_missing_entity_id_fails_validation(dev_client):
+    """CD-6 second architect review — Finding 1: applies identically to
+    the mailbox-origin `COMPANY_REQUIRED` producer, not just the manual-
+    upload one — the generic resolve endpoint's validation is shared by
+    both producers."""
+    mailbox_id, comp, _entity = _connected_mailbox_with_entity_seeded(dev_client)
+    _sweep_must_read_review_required_message(dev_client, mailbox_id, msg_id="finding1-doc-1")
+
+    company_items = [
+        i for i in comp.needs_you_repository.list_needs_you_items(item_type="COMPANY_REQUIRED")
+        if i.metadata.get("mailbox_id") == mailbox_id
+    ]
+    item = company_items[0]
+
+    response = dev_client.post(
+        f"/internal/needs-you/{item.item_id}/resolve",
+        json={
+            "new_status": "RESOLVED",
+            "resolution": {"entity_id": None, "what": "Invoice", "why": "Ops"},
+            "actor_type": "USER", "actor_id": ACTOR_ID,
+        },
+    )
+    assert response.status_code == 422, response.text
+
+    still_open = comp.needs_you_repository.get_needs_you_item(item.item_id)
+    assert still_open.status == "OPEN"
+    evidence_after = comp.api.get_evidence(item.source_object_reference)
+    assert evidence_after.entity_id is None
+
+
+def test_resolving_mailbox_origin_company_required_with_unknown_entity_id_fails(dev_client):
+    mailbox_id, comp, _entity = _connected_mailbox_with_entity_seeded(dev_client)
+    _sweep_must_read_review_required_message(dev_client, mailbox_id, msg_id="finding1-doc-2")
+
+    company_items = [
+        i for i in comp.needs_you_repository.list_needs_you_items(item_type="COMPANY_REQUIRED")
+        if i.metadata.get("mailbox_id") == mailbox_id
+    ]
+    item = company_items[0]
+
+    response = dev_client.post(
+        f"/internal/needs-you/{item.item_id}/resolve",
+        json={
+            "new_status": "RESOLVED",
+            "resolution": {"entity_id": "018f5b3e-0000-7a4e-8b2d-000000000003", "what": "Invoice", "why": "Ops"},
+            "actor_type": "USER", "actor_id": ACTOR_ID,
+        },
+    )
+    assert response.status_code == 404, response.text
+
+    still_open = comp.needs_you_repository.get_needs_you_item(item.item_id)
+    assert still_open.status == "OPEN"
+    evidence_after = comp.api.get_evidence(item.source_object_reference)
+    assert evidence_after.entity_id is None
+
+
 def test_policy_change_audit_event_carries_before_after_and_is_live_on_next_sweep(dev_client):
     """WO required test #10: a policy change (GRAYLIST -> MUST_READ)
     produces a real audit event carrying the before/after policy and

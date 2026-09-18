@@ -157,12 +157,18 @@ def test_resolving_a_needs_you_item_answers_company_what_why(client):
 def test_double_submitting_the_same_resolution_is_idempotent_not_an_error(client):
     upload = _post_intake(client)
     evidence_id = upload.json()["evidence"]["evidence_id"]
+    entities = client.get("/internal/entities").json()["items"]
+    infosecurs = next(e for e in entities if e["canonical_name"] == "INFOSECURS_LIMITED")
     listing = client.get("/internal/needs-you", params={"status": "OPEN"}).json()
     item = next(i for i in listing["items"] if i["source_object_reference"] == evidence_id)
 
+    # Finding 1 fix — a COMPANY_REQUIRED item's RESOLVED path now
+    # requires a real entity_id (see the dedicated validation tests
+    # below); the double-submit proof therefore uses a real one, same
+    # as every other RESOLVED-path fixture in this file.
     body = {
         "new_status": "RESOLVED",
-        "resolution": {"entity_id": None, "what": "Office supplies", "why": "General expense"},
+        "resolution": {"entity_id": infosecurs["entity_id"], "what": "Office supplies", "why": "General expense"},
         "actor_type": "USER",
         "actor_id": "matt",
     }
@@ -178,6 +184,8 @@ def test_double_submitting_the_same_resolution_is_idempotent_not_an_error(client
 def test_resolving_an_already_resolved_item_with_a_different_outcome_conflicts(client):
     upload = _post_intake(client)
     evidence_id = upload.json()["evidence"]["evidence_id"]
+    entities = client.get("/internal/entities").json()["items"]
+    infosecurs = next(e for e in entities if e["canonical_name"] == "INFOSECURS_LIMITED")
     listing = client.get("/internal/needs-you", params={"status": "OPEN"}).json()
     item = next(i for i in listing["items"] if i["source_object_reference"] == evidence_id)
 
@@ -185,7 +193,7 @@ def test_resolving_an_already_resolved_item_with_a_different_outcome_conflicts(c
         f"/internal/needs-you/{item['item_id']}/resolve",
         json={
             "new_status": "RESOLVED",
-            "resolution": {"entity_id": None, "what": "A", "why": "A"},
+            "resolution": {"entity_id": infosecurs["entity_id"], "what": "A", "why": "A"},
             "actor_type": "USER",
             "actor_id": "matt",
         },
@@ -196,7 +204,7 @@ def test_resolving_an_already_resolved_item_with_a_different_outcome_conflicts(c
         f"/internal/needs-you/{item['item_id']}/resolve",
         json={
             "new_status": "RESOLVED",
-            "resolution": {"entity_id": None, "what": "B", "why": "B"},
+            "resolution": {"entity_id": infosecurs["entity_id"], "what": "B", "why": "B"},
             "actor_type": "USER",
             "actor_id": "matt",
         },
@@ -226,10 +234,13 @@ def test_resolution_survives_a_fresh_composition_against_the_same_database(clien
 
     upload = _post_intake(client)
     evidence_id = upload.json()["evidence"]["evidence_id"]
+    entities = client.get("/internal/entities").json()["items"]
+    infosecurs = next(e for e in entities if e["canonical_name"] == "INFOSECURS_LIMITED")
     listing = client.get("/internal/needs-you", params={"status": "OPEN"}).json()
     item = next(i for i in listing["items"] if i["source_object_reference"] == evidence_id)
 
-    resolution = {"entity_id": None, "what": "GPU hardware", "why": "local inference R&D"}
+    # Finding 1 fix — RESOLVED now requires a real entity_id.
+    resolution = {"entity_id": infosecurs["entity_id"], "what": "GPU hardware", "why": "local inference R&D"}
     client.post(
         f"/internal/needs-you/{item['item_id']}/resolve",
         json={"new_status": "RESOLVED", "resolution": resolution, "actor_type": "USER", "actor_id": "matt"},
@@ -379,3 +390,136 @@ def test_dismissing_a_company_required_item_never_assigns_an_entity(client):
 
     evidence_after = client.get(f"/internal/evidence/{evidence_id}").json()
     assert evidence_after["entity_id"] is None
+
+
+# ---------------------------------------------------------------------
+# CD-6 second architect review — Finding 1: a COMPANY_REQUIRED item must
+# not be RESOLVED without a real entity assignment actually taking
+# effect. Every check below must fail BEFORE any mutation — the item
+# stays OPEN and the evidence stays unchanged.
+# ---------------------------------------------------------------------
+
+
+def test_resolving_company_required_with_missing_entity_id_fails_validation_and_stays_open(client):
+    upload = _post_intake(client)
+    evidence_id = upload.json()["evidence"]["evidence_id"]
+    listing = client.get("/internal/needs-you", params={"status": "OPEN"}).json()
+    item = next(i for i in listing["items"] if i["source_object_reference"] == evidence_id)
+
+    response = client.post(
+        f"/internal/needs-you/{item['item_id']}/resolve",
+        json={
+            "new_status": "RESOLVED",
+            "resolution": {"entity_id": None, "what": "Office supplies", "why": "General expense"},
+            "actor_type": "USER", "actor_id": "matt",
+        },
+    )
+    assert response.status_code == 422, response.text
+
+    still_open = client.get(f"/internal/needs-you/{item['item_id']}").json()
+    assert still_open["status"] == "OPEN"
+    evidence_after = client.get(f"/internal/evidence/{evidence_id}").json()
+    assert evidence_after["entity_id"] is None
+
+
+def test_resolving_company_required_with_no_resolution_at_all_fails_validation_and_stays_open(client):
+    upload = _post_intake(client)
+    evidence_id = upload.json()["evidence"]["evidence_id"]
+    listing = client.get("/internal/needs-you", params={"status": "OPEN"}).json()
+    item = next(i for i in listing["items"] if i["source_object_reference"] == evidence_id)
+
+    response = client.post(
+        f"/internal/needs-you/{item['item_id']}/resolve",
+        json={"new_status": "RESOLVED", "actor_type": "USER", "actor_id": "matt"},
+    )
+    assert response.status_code == 422, response.text
+
+    still_open = client.get(f"/internal/needs-you/{item['item_id']}").json()
+    assert still_open["status"] == "OPEN"
+    evidence_after = client.get(f"/internal/evidence/{evidence_id}").json()
+    assert evidence_after["entity_id"] is None
+
+
+def test_resolving_company_required_with_unknown_entity_id_fails_and_stays_open(client):
+    upload = _post_intake(client)
+    evidence_id = upload.json()["evidence"]["evidence_id"]
+    listing = client.get("/internal/needs-you", params={"status": "OPEN"}).json()
+    item = next(i for i in listing["items"] if i["source_object_reference"] == evidence_id)
+
+    response = client.post(
+        f"/internal/needs-you/{item['item_id']}/resolve",
+        json={
+            "new_status": "RESOLVED",
+            "resolution": {"entity_id": "018f5b3e-0000-7a4e-8b2d-000000000001", "what": "A", "why": "A"},
+            "actor_type": "USER", "actor_id": "matt",
+        },
+    )
+    assert response.status_code == 404, response.text
+
+    still_open = client.get(f"/internal/needs-you/{item['item_id']}").json()
+    assert still_open["status"] == "OPEN"
+    evidence_after = client.get(f"/internal/evidence/{evidence_id}").json()
+    assert evidence_after["entity_id"] is None
+
+
+def test_resolving_company_required_with_no_source_object_reference_fails_validation(client):
+    """A caller-constructed COMPANY_REQUIRED item with no evidence anchor
+    at all cannot be meaningfully resolved to RESOLVED — mirrors
+    `tests/app_api/test_xero_endpoints.py`'s own style of constructing a
+    NeedsYouItem straight through the repository, without a real
+    intake."""
+    from app.api.composition import get_composition
+
+    composition = get_composition()
+    item = composition.needs_you_repository.create_needs_you_item(
+        item_type="COMPANY_REQUIRED",
+        domain="EVIDENCE_INTAKE",
+        question="Which company is this for?",
+        allowed_action_type="COMPANY_WHAT_WHY",
+    )
+    entities = client.get("/internal/entities").json()["items"]
+    infosecurs = next(e for e in entities if e["canonical_name"] == "INFOSECURS_LIMITED")
+
+    response = client.post(
+        f"/internal/needs-you/{item.item_id}/resolve",
+        json={
+            "new_status": "RESOLVED",
+            "resolution": {"entity_id": infosecurs["entity_id"], "what": "A", "why": "A"},
+            "actor_type": "USER", "actor_id": "matt",
+        },
+    )
+    assert response.status_code == 422, response.text
+
+    still_open = client.get(f"/internal/needs-you/{item.item_id}").json()
+    assert still_open["status"] == "OPEN"
+
+
+def test_resolving_company_required_with_bogus_source_object_reference_fails(client):
+    """A `source_object_reference` present but not resolving to a REAL
+    EvidenceItem must fail honestly (404 via `NotFoundError`), never
+    silently resolve the item nor surface a confusing error."""
+    from app.api.composition import get_composition
+
+    composition = get_composition()
+    item = composition.needs_you_repository.create_needs_you_item(
+        item_type="COMPANY_REQUIRED",
+        domain="EVIDENCE_INTAKE",
+        question="Which company is this for?",
+        allowed_action_type="COMPANY_WHAT_WHY",
+        source_object_reference="018f5b3e-0000-7a4e-8b2d-000000000002",
+    )
+    entities = client.get("/internal/entities").json()["items"]
+    infosecurs = next(e for e in entities if e["canonical_name"] == "INFOSECURS_LIMITED")
+
+    response = client.post(
+        f"/internal/needs-you/{item.item_id}/resolve",
+        json={
+            "new_status": "RESOLVED",
+            "resolution": {"entity_id": infosecurs["entity_id"], "what": "A", "why": "A"},
+            "actor_type": "USER", "actor_id": "matt",
+        },
+    )
+    assert response.status_code == 404, response.text
+
+    still_open = client.get(f"/internal/needs-you/{item.item_id}").json()
+    assert still_open["status"] == "OPEN"

@@ -67,7 +67,10 @@ def test_real_diagnostic_shape_duplicate_dkim_token_within_one_header_is_handled
     the FIRST token; this selector must not merely fail to crash on it —
     it must resolve it via the documented worst-wins rule and still
     reach the correct overall verdict (real compauth=pass here, so PASS
-    regardless of which dkim token 'wins')."""
+    regardless of which dkim token 'wins'). This is entirely an
+    intra-header concern (both `dkim=` tokens are inside the ONE
+    selected header), unaffected by the Finding 2 cross-header
+    correction — see `result.evidence["selected_header_tokens"]`."""
     headers = [
         _header(
             "spf=pass (sender IP is 40.107.20.51) smtp.mailfrom=REDACTED.example.com;"
@@ -79,7 +82,7 @@ def test_real_diagnostic_shape_duplicate_dkim_token_within_one_header_is_handled
     ]
     result = assess_microsoft_authentication(headers)
     assert result.verdict == AUTH_ASSESSMENT_PASS
-    assert result.evidence["merged_tokens"]["dkim"] == "pass"
+    assert result.evidence["selected_header_tokens"]["dkim"] == "pass"
 
 
 def test_real_diagnostic_shape_duplicate_dkim_token_worst_wins_when_they_disagree():
@@ -88,10 +91,10 @@ def test_real_diagnostic_shape_duplicate_dkim_token_worst_wins_when_they_disagre
     — a mixed result is not an unambiguous pass. Here the SAME header
     still carries a real compauth=pass (an entirely independent
     Microsoft-stamped verdict, unaffected by the dkim disagreement), so
-    the overall verdict is still PASS — but the underlying merged
-    evidence must honestly reflect the WORSE dkim verdict, never the
-    better one, so an auditor never sees a falsely-rosier picture of the
-    raw facts."""
+    the overall verdict is still PASS — but the underlying selected-
+    header evidence must honestly reflect the WORSE dkim verdict, never
+    the better one, so an auditor never sees a falsely-rosier picture of
+    the raw facts."""
     headers = [
         _header(
             "dkim=pass header.d=REDACTED.example.com;"
@@ -102,7 +105,7 @@ def test_real_diagnostic_shape_duplicate_dkim_token_worst_wins_when_they_disagre
     ]
     result = assess_microsoft_authentication(headers)
     assert result.verdict == AUTH_ASSESSMENT_PASS  # compauth=pass gates the verdict, spf/dkim never do
-    assert result.evidence["merged_tokens"]["dkim"] == "fail"  # worst-wins evidence, honestly recorded
+    assert result.evidence["selected_header_tokens"]["dkim"] == "fail"  # worst-wins evidence, honestly recorded
 
 
 # ---------------------------------------------------------------------
@@ -186,48 +189,104 @@ def test_spf_pass_alone_without_dmarc_or_compauth_is_never_treated_as_proof():
 
 
 # ---------------------------------------------------------------------
-# The required adversarial forged/duplicate-header proof
+# CD-6 second architect review — Finding 2: the OLD cross-header-merge
+# model was a real, confirmed security bypass (see
+# `services.mailbox.microsoft.authentication` module docstring's
+# "ONLY the selected final-hop header gates" section for the full
+# reproduction and reasoning). The corrected model trusts ONLY the
+# FIRST/topmost plain `Authentication-Results` header for gating —
+# Microsoft Graph prepends each new hop's own header ahead of earlier
+# ones, so that first header genuinely IS the final-hop, Microsoft-
+# stamped verdict for THIS delivery. Every one of the four required
+# adversarial cases below is the architect's own exact case, verbatim.
 # ---------------------------------------------------------------------
 
 
-def test_forged_header_claiming_pass_cannot_override_a_genuine_fail_when_forged_is_first():
-    """A forged SECOND `Authentication-Results` header claiming
-    `compauth=pass`, positioned FIRST (the position a naive 'first match
-    wins' parser would trust), alongside a genuine header reporting
-    `compauth=fail` SECOND. The real trust-boundary logic must still
-    pick the correct (FAIL) outcome — position alone must never be
-    exploitable."""
+def test_genuine_first_header_compauth_fail_beats_forged_later_compauth_pass():
+    """Required case 1: genuine (first/selected) header compauth=fail +
+    forged LATER header compauth=pass -> FAIL. The forged header is
+    excluded from gating entirely (untrusted, evidence-only)."""
     headers = [
-        _header("spf=pass; dkim=pass; dmarc=pass action=none; compauth=pass reason=100"),  # forged, first
-        _header("spf=fail; dkim=fail; dmarc=fail action=quarantine; compauth=fail reason=001"),  # genuine, second
+        _header("spf=fail; dkim=fail; dmarc=fail action=quarantine; compauth=fail reason=001"),  # genuine, selected
+        _header("spf=pass; dkim=pass; dmarc=pass action=none; compauth=pass reason=100"),  # forged, untrusted
     ]
     result = assess_microsoft_authentication(headers)
     assert result.verdict == AUTH_ASSESSMENT_FAIL
+    assert result.evidence["selected_header_tokens"]["compauth"] == "fail"
+    assert result.evidence["additional_authentication_results_header_count"] == 1
 
 
-def test_forged_header_claiming_pass_cannot_override_a_genuine_fail_when_forged_is_second():
-    """The same proof with the forged header positioned SECOND (the more
-    realistic real-world RFC 5322 stacking scenario — an attacker's own
-    header, injected earlier in the delivery chain, ends up LOWER in the
-    list Graph returns, since Microsoft's own genuine final-hop header is
-    prepended ahead of it) — the outcome must be identical either way:
-    order-independent for a genuine conflict."""
+def test_genuine_first_header_dmarc_fail_no_compauth_beats_forged_later_compauth_pass():
+    """Required case 2 — THE key regression test: genuine (first/
+    selected) header carries dmarc=fail with NO decisive compauth token
+    at all, and a forged LATER header supplies compauth=pass -> FAIL.
+    This is the exact bypass the OLD cross-header merge did NOT protect
+    against (see module docstring's exact reproduction): with nothing
+    on the genuine header for the forged compauth=pass to "compete"
+    against under the old worst-wins-per-mechanism rule, it used to
+    merge in unopposed and win. Under the corrected selected-header-only
+    model, the forged header's compauth token is never even looked at
+    for gating, so the genuine header's own real dmarc=fail is what
+    decides the verdict."""
     headers = [
-        _header("spf=fail; dkim=fail; dmarc=fail action=quarantine; compauth=fail reason=001"),  # genuine, first
-        _header("spf=pass; dkim=pass; dmarc=pass action=none; compauth=pass reason=100"),  # forged, second
+        _header("spf=fail; dkim=fail; dmarc=fail action=quarantine"),  # genuine, selected — no compauth at all
+        _header("compauth=pass reason=100"),  # forged, untrusted
+    ]
+    result = assess_microsoft_authentication(headers)
+    assert result.verdict == AUTH_ASSESSMENT_FAIL
+    assert "compauth" not in result.evidence["selected_header_tokens"]
+    assert result.evidence["selected_header_tokens"]["dmarc"] == "fail"
+    assert result.evidence["additional_authentication_results_header_tokens"]["compauth"] == "pass"
+
+
+def test_genuine_first_header_compauth_and_dmarc_none_with_forged_later_compauth_pass_is_unknown():
+    """Required case 3: genuine (first/selected) header compauth=none;
+    dmarc=none + forged LATER header compauth=pass -> UNKNOWN. Neither
+    the non-committal genuine verdict nor the untrusted forged one can
+    produce an affirmative PASS."""
+    headers = [
+        _header("compauth=none; dmarc=none"),  # genuine, selected — non-committal
+        _header("compauth=pass reason=100"),  # forged, untrusted
+    ]
+    result = assess_microsoft_authentication(headers)
+    assert result.verdict == AUTH_ASSESSMENT_UNKNOWN
+
+
+def test_genuine_first_header_compauth_pass_is_not_downgraded_by_forged_later_compauth_fail():
+    """Required case 4 — the mirror image: genuine (first/selected)
+    header compauth=pass + forged LATER header compauth=fail -> PASS.
+    The later untrusted header must not be able to force either a
+    bypass OR a false security escalation — a forged FAIL appended after
+    a genuine PASS must not trigger an unnecessary security review."""
+    headers = [
+        _header("spf=pass; dkim=pass; dmarc=pass action=none; compauth=pass reason=100"),  # genuine, selected
+        _header("compauth=fail reason=001"),  # forged, untrusted
+    ]
+    result = assess_microsoft_authentication(headers)
+    assert result.verdict == AUTH_ASSESSMENT_PASS
+    assert result.evidence["additional_authentication_results_header_tokens"]["compauth"] == "fail"
+
+
+def test_pl_exact_reproduction_snippet_from_wo_background_now_returns_fail():
+    """Required case 7 — a dedicated regression test reproducing the PL's
+    own exact reproduction snippet from this WO's background section,
+    verbatim, proving the old cross-header-merge bypass is closed: this
+    used to return PASS (wrong); it must now return FAIL."""
+    headers = [
+        {"name": "Authentication-Results", "value": "spf=fail; dkim=fail; dmarc=fail action=quarantine"},
+        {"name": "Authentication-Results", "value": "compauth=pass reason=100"},
     ]
     result = assess_microsoft_authentication(headers)
     assert result.verdict == AUTH_ASSESSMENT_FAIL
 
 
 def test_forged_header_alone_with_no_genuine_header_is_trusted_as_is():
-    """Sanity check on the adversarial proofs above: a SINGLE header
-    (whether genuine or "forged" is not something this selector can ever
-    know without a real signing verification step it does not perform)
-    claiming compauth=pass is trusted at face value — the adversarial
-    proof's whole point is that a genuine FAIL, when present, can never
-    be overridden by an added forgery, not that a lone header is
-    distrusted."""
+    """Sanity check: a SINGLE header (whether genuine or "forged" is not
+    something this selector can ever know without a real signing
+    verification step it does not perform) claiming compauth=pass is
+    trusted at face value — the adversarial proofs above are about a
+    genuine header's own real verdict never being overridden by a LATER,
+    untrusted one, not about a lone header being distrusted."""
     headers = [_header("compauth=pass reason=100")]
     result = assess_microsoft_authentication(headers)
     assert result.verdict == AUTH_ASSESSMENT_PASS

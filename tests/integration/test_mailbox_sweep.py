@@ -2086,25 +2086,30 @@ def test_dmarc_alignment_sensitive_case_spf_fail_under_dmarc_pass_never_escalate
 
 def test_forged_duplicate_header_cannot_manufacture_pass_over_a_genuine_fail(h):
     """WO's own required adversarial proof, exercised end to end through
-    `run_sweep`: a forged SECOND `Authentication-Results` header claiming
-    `compauth=pass` can never override a genuine header's own real
-    `compauth=fail` — the selector's worst-wins merge (see
-    `services.mailbox.microsoft.authentication`'s own module docstring)
-    is order-independent. The forged header is placed FIRST here
-    (the position a naive 'first match wins' parser would trust) to
-    prove position alone cannot be exploited."""
+    `run_sweep` (CD-6 second architect review, Finding 2 — corrected
+    selected-header-only model): a forged, LATER `Authentication-Results`
+    header claiming `compauth=pass` can never override the GENUINE,
+    FIRST/selected header's own real `compauth=fail` — see
+    `services.mailbox.microsoft.authentication`'s own module docstring
+    ("ONLY the selected final-hop header gates") for the full
+    reproduction this closes. The genuine header is placed FIRST
+    (exactly as Microsoft Graph's own real header ordering guarantees —
+    a new hop's own header is always prepended ahead of an earlier
+    one), with the forged header appended SECOND — the realistic shape
+    of this attack, and the one this selector is now specifically
+    designed to defeat."""
     msg = _msg(
         "m1",
         raw_headers=(
             {
                 "name": "Authentication-Results",
-                "value": "spf=pass smtp.mailfrom=vendor.com; dkim=pass header.d=vendor.com; "
-                "dmarc=pass action=none header.from=vendor.com; compauth=pass reason=100",
+                "value": "spf=fail smtp.mailfrom=vendor.com; dkim=fail header.d=vendor.com; "
+                "dmarc=fail action=quarantine header.from=vendor.com; compauth=fail reason=001",
             },
             {
                 "name": "Authentication-Results",
-                "value": "spf=fail smtp.mailfrom=vendor.com; dkim=fail header.d=vendor.com; "
-                "dmarc=fail action=quarantine header.from=vendor.com; compauth=fail reason=001",
+                "value": "spf=pass smtp.mailfrom=vendor.com; dkim=pass header.d=vendor.com; "
+                "dmarc=pass action=none header.from=vendor.com; compauth=pass reason=100",
             },
         ),
     )

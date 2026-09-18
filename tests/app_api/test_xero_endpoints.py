@@ -10,6 +10,7 @@ exists yet, PID §102.1's own stated constraint). Mirrors
 """
 from __future__ import annotations
 
+import hashlib
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -38,6 +39,41 @@ def dev_client(monkeypatch):
     with TestClient(app) as test_client:
         yield test_client
     reset_composition_for_tests()
+
+
+def _register_text_evidence(composition, content: bytes = b"Synthetic Xero-endpoint test evidence.") -> str:
+    """Register a real, minimal `EvidenceItem` (mirrors
+    `tests/app_api/test_ai_endpoints.py::_register_text_evidence`) — a
+    COMPANY_REQUIRED item's RESOLVED path (Finding 1 fix) now requires a
+    real `source_object_reference` anchoring a real EvidenceItem, so
+    this file's own directly-constructed NeedsYouItem fixture needs one
+    too."""
+    from core import identity
+
+    content_hash = {"algorithm": "SHA-256", "value": hashlib.sha256(content).hexdigest()}
+    source = composition.api.register_source(
+        source_type="MANUAL_UPLOAD",
+        provider="bagman-xero-endpoint-tests",
+        status="ACTIVE",
+        actor_type="USER",
+        actor_id=ACTOR_ID,
+    )
+    storage_reference = composition.object_store.put(identity.generate_id(), content_hash, content)
+    evidence = composition.api.register_evidence(
+        entity_id=None,
+        evidence_type="INVOICE",
+        source_id=source.source_id,
+        observed_at=datetime.now(timezone.utc),
+        received_at=datetime.now(timezone.utc),
+        content_hash=content_hash,
+        mime_type="text/plain",
+        size_bytes=len(content),
+        actor_type="USER",
+        actor_id=ACTOR_ID,
+        storage_reference=storage_reference,
+        status="OBSERVED",
+    )
+    return evidence.evidence_id
 
 
 def _first_entity_id(client) -> str:
@@ -417,12 +453,16 @@ def test_needs_you_resolution_stores_the_real_account_id_not_a_display_string(de
 
     # The item this delivery does not itself need to create via a real
     # intake — created directly, exactly as app/api/routers/intake.py's
-    # own COMPANY_REQUIRED hook would.
+    # own COMPANY_REQUIRED hook would. Anchored to a real EvidenceItem
+    # (Finding 1 fix requires a real `source_object_reference` to
+    # resolve a COMPANY_REQUIRED item to RESOLVED).
+    evidence_id = _register_text_evidence(comp)
     item = comp.needs_you_repository.create_needs_you_item(
         item_type="COMPANY_REQUIRED",
         domain="EVIDENCE_INTAKE",
         question="Which company is this for?",
         allowed_action_type="COMPANY_WHAT_WHY",
+        source_object_reference=evidence_id,
     )
 
     r = dev_client.post(
