@@ -4,7 +4,7 @@
 # contracts/manifest/bagman.component_manifest.v1.schema.json.
 
 id: BAGMAN.XERO
-version: 1
+version: 2
 
 responsibility: >
   Own the durable Company<->Xero-organisation mapping (XeroConnection,
@@ -24,7 +24,17 @@ responsibility: >
   integration: the only "write" direction to Xero is the OAuth token
   lifecycle itself (authorize/refresh/revoke) — no Xero write endpoint
   (invoice/bill/journal/payment/contact creation, bank reconciliation,
-  tax filing) is implemented anywhere in this component.
+  tax filing) is implemented anywhere in this component. As of this
+  version, also owns the read-only Contacts/Purchase-Invoices client
+  methods (`XeroAccountingClient.list_contacts`/`list_purchase_invoices`,
+  transient/never-persisted — see `services/xero/client.py`'s own
+  module docstring) and the bounded, on-demand, non-AI Xero-assisted
+  supplier-domain correlation capability
+  (`services/xero/supplier_correlation.py`) that enriches still-OPEN
+  `MAILBOX_DOMAIN_REVIEW` Needs You items' own metadata as a review aid
+  — this component's first real cross-component orchestration function
+  (see that module's own "why this lives in services/xero/" docstring
+  section), never auto-approving anything.
 
 owns:
   - XeroConnection
@@ -38,9 +48,18 @@ owns:
 # ValidationError), and contract_validation (validate_against_contract).
 # services/xero/client.py additionally depends on
 # services.xero.account.RawXeroAccount (same package, not a boundary
-# crossing).
+# crossing). services/xero/supplier_correlation.py additionally depends
+# on services.mailbox.domain_rule.normalize_domain (BAGMAN.MAILBOX) and
+# services.needs_you.needs_you.NeedsYouRepository/
+# ITEM_TYPE_MAILBOX_DOMAIN_REVIEW (BAGMAN.NEEDS_YOU) — a real, narrow
+# cross-component read/enrich dependency, the mirror image of
+# services/mailbox/sweep.py's own existing BAGMAN.NEEDS_YOU dependency
+# (see supplier_correlation.py's own module docstring for why this
+# capability lives here rather than in either of those two components).
 consumes:
   - BAGMAN.CORE
+  - BAGMAN.MAILBOX
+  - BAGMAN.NEEDS_YOU
 
 # This component does not itself emit AuditEvents — every
 # XERO_CONNECTION_*/XERO_SYNC_* audit event is minted by the HTTP

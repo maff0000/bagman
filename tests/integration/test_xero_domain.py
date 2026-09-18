@@ -644,11 +644,16 @@ def test_reference_data_synced_long_ago_is_stale():
 
 def test_xero_accounting_client_exposes_no_write_capability_at_all():
     """`XeroAccountingClient` (the one class that ever calls Xero's
-    Accounting API) has exactly ONE public, non-dunder callable —
-    `list_accounts`, a `GET`. No `create_*`/`update_*`/`post_*`/`put_*`/
-    `delete_*` method exists, so there is no code path in this slice
-    that could ever write/post to Xero (architect spec §18: 'explicitly
-    NO posting to Xero in this slice')."""
+    Accounting API) has exactly THREE public, non-dunder callables —
+    `list_accounts`/`list_contacts`/`list_purchase_invoices`, all
+    `GET`s (the latter two are the CD-6 bounded Xero-assisted supplier-
+    domain-correlation addition — see `services/xero/client.py`'s own
+    module docstring's "Scope extension" section). No
+    `create_*`/`update_*`/`post_*`/`put_*`/`delete_*` method exists, so
+    there is no code path in this slice that could ever write/post to
+    Xero (architect spec §18: 'explicitly NO posting to Xero in this
+    slice' — a constraint this WO's own read-only Contacts/Invoices
+    addition was explicitly bound by too)."""
     from services.xero.client import XeroAccountingClient
 
     public_methods = {
@@ -656,16 +661,19 @@ def test_xero_accounting_client_exposes_no_write_capability_at_all():
         for name in dir(XeroAccountingClient)
         if not name.startswith("_") and callable(getattr(XeroAccountingClient, name))
     }
-    assert public_methods == {"list_accounts"}
+    assert public_methods == {"list_accounts", "list_contacts", "list_purchase_invoices"}
+    # Belt-and-braces: no method name itself looks like a write verb.
+    _write_verb_prefixes = ("create_", "update_", "post_", "put_", "delete_", "write_")
+    assert not any(name.startswith(_write_verb_prefixes) for name in public_methods)
 
 
 def test_xero_accounting_client_never_issues_a_non_get_http_request(monkeypatch):
     """Belt-and-braces on the same guarantee, proven at the transport
     boundary: patch `urllib.request.Request` itself and assert every
-    call `XeroAccountingClient.list_accounts` makes uses `method="GET"`
-    — even if a future edit added a write-shaped method, THIS call
-    (the only one this class makes today) can never silently become a
-    write."""
+    call any of `XeroAccountingClient`'s three real methods makes uses
+    `method="GET"` — even if a future edit added a write-shaped method,
+    none of THESE calls (the only ones this class makes today) can ever
+    silently become a write."""
     import urllib.error
     import urllib.request
 
@@ -684,10 +692,18 @@ def test_xero_accounting_client_never_issues_a_non_get_http_request(monkeypatch)
         client.list_accounts(tenant_id="some-tenant", access_token="fake-token")
     except Exception:
         pass  # the spy deliberately breaks the call after recording it — the method used is what matters here
+    try:
+        client.list_contacts(tenant_id="some-tenant", access_token="fake-token")
+    except Exception:
+        pass
+    try:
+        client.list_purchase_invoices(tenant_id="some-tenant", access_token="fake-token")
+    except Exception:
+        pass
     finally:
         monkeypatch.setattr(urllib.request, "Request", real_request)
 
-    assert seen_methods == ["GET"]
+    assert seen_methods == ["GET", "GET", "GET"]
 
 
 # ---------------------------------------------------------------------

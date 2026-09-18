@@ -124,7 +124,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel
 
 from app.api.composition import ensure_seed_entities, get_composition, get_mailbox_source_id
-from core.errors import ConflictError, NotFoundError, OAuthStateError, ValidationError
+from core.errors import BagmanError, ConflictError, NotFoundError, OAuthStateError, ValidationError
 from core.timestamps import utc_now
 from services.mailbox.domain_rule import (
     DESTINATION_MODE_FIXED,
@@ -543,35 +543,22 @@ class ResolveMailboxDomainReviewRequest(BaseModel):
     processor_hint: Optional[str] = None
 
 
-@router.post("/{mailbox_id}/microsoft/domain-review/{item_id}/resolve")
-async def resolve_mailbox_domain_review(
-    mailbox_id: str, item_id: str, payload: ResolveMailboxDomainReviewRequest
+def _resolve_mailbox_domain_review_core(
+    composition, *, mailbox_id: str, mailbox, item_id: str, payload: ResolveMailboxDomainReviewRequest
 ) -> dict[str, Any]:
-    """Resolve one ``ITEM_TYPE_MAILBOX_DOMAIN_REVIEW`` Needs You item —
-    the architect spec §4 operator-decision endpoint. On ``ALLOW``/
-    ``IGNORE``, creates or updates the real
-    ``services.mailbox.domain_rule.MailboxDomainRule`` for this
-    ``(mailbox_id, sender_domain)`` (``source="OPERATOR"``,
-    ``approved_at=now``) — never auto-adds a domain to any allowlist
-    outside this explicit operator action (architect spec §4). On
-    ``ALLOW``, EVERY historical candidate message BAGMAN has already
-    discovered for this ``(mailbox_id, sender_domain)`` — the item's own
-    triggering ``source_object_reference`` message INCLUDED, since it is
-    also ``CHECKED_NOT_CANDIDATE`` and therefore always covered by the
-    same query — is reprocessed IMMEDIATELY: fetched and ingested now,
-    not deferred to the next sweep (architect spec's own explicit
-    requirement, corrected/broadened by the operational addendum ahead
-    of the first real large historical sweep — "the domain-learning
-    mechanism is not useful if it only affects future mail"; see
-    `services.mailbox.sweep.reprocess_all_historical_candidates_for_domain`).
-
-    Idempotent-safe against a genuine double-submit of the exact same
-    decision (mirrors `app/api/routers/needs_you.py::resolve_needs_you_item`'s
-    own doctrine) — a real attempt to change an already-decided item to
-    a DIFFERENT outcome raises `ConflictError` -> HTTP 409.
+    """The real business logic behind
+    ``POST /{mailbox_id}/microsoft/domain-review/{item_id}/resolve`` —
+    extracted so ``resolve_mailbox_domain_review`` (single-item) and
+    ``batch_resolve_mailbox_domain_review`` (below) call the EXACT SAME
+    governed path, never a parallel/cheaper "bulk mode" (the WO's own
+    explicit instruction: every batch-approved item must go through the
+    identical back-processing-only-of-`discovery_candidate=True`
+    behaviour and the identical audit-event emission a single approval
+    gets). See ``resolve_mailbox_domain_review``'s own docstring for the
+    full behavioural description — unchanged by this extraction, this
+    is a pure "move the body into a function, call it from two places"
+    refactor with no logic change.
     """
-    composition = get_composition()
-    mailbox = _require_microsoft_mailbox(composition, mailbox_id)
     item = composition.needs_you_repository.get_needs_you_item(item_id)
 
     if item.item_type != ITEM_TYPE_MAILBOX_DOMAIN_REVIEW:
@@ -672,4 +659,166 @@ async def resolve_mailbox_domain_review(
         "needs_you_item": updated_item.to_dict(),
         "mailbox_domain_rule": rule.to_dict(),
         "reprocessed_messages": [m.to_dict() for m in reprocessed],
+    }
+
+
+@router.post("/{mailbox_id}/microsoft/domain-review/{item_id}/resolve")
+async def resolve_mailbox_domain_review(
+    mailbox_id: str, item_id: str, payload: ResolveMailboxDomainReviewRequest
+) -> dict[str, Any]:
+    """Resolve one ``ITEM_TYPE_MAILBOX_DOMAIN_REVIEW`` Needs You item —
+    the architect spec §4 operator-decision endpoint. On ``ALLOW``/
+    ``IGNORE``, creates or updates the real
+    ``services.mailbox.domain_rule.MailboxDomainRule`` for this
+    ``(mailbox_id, sender_domain)`` (``source="OPERATOR"``,
+    ``approved_at=now``) — never auto-adds a domain to any allowlist
+    outside this explicit operator action (architect spec §4). On
+    ``ALLOW``, EVERY historical candidate message BAGMAN has already
+    discovered for this ``(mailbox_id, sender_domain)`` — the item's own
+    triggering ``source_object_reference`` message INCLUDED, since it is
+    also ``CHECKED_NOT_CANDIDATE`` and therefore always covered by the
+    same query — is reprocessed IMMEDIATELY: fetched and ingested now,
+    not deferred to the next sweep (architect spec's own explicit
+    requirement, corrected/broadened by the operational addendum ahead
+    of the first real large historical sweep — "the domain-learning
+    mechanism is not useful if it only affects future mail"; see
+    `services.mailbox.sweep.reprocess_all_historical_candidates_for_domain`).
+
+    Idempotent-safe against a genuine double-submit of the exact same
+    decision (mirrors `app/api/routers/needs_you.py::resolve_needs_you_item`'s
+    own doctrine) — a real attempt to change an already-decided item to
+    a DIFFERENT outcome raises `ConflictError` -> HTTP 409.
+
+    Business logic lives in `_resolve_mailbox_domain_review_core` — this
+    handler only resolves the mailbox and re-raises whatever that
+    function raises (unchanged HTTP behaviour from before this WO's
+    extraction).
+    """
+    composition = get_composition()
+    mailbox = _require_microsoft_mailbox(composition, mailbox_id)
+    return _resolve_mailbox_domain_review_core(
+        composition, mailbox_id=mailbox_id, mailbox=mailbox, item_id=item_id, payload=payload
+    )
+
+
+class BatchResolveMailboxDomainReviewItem(BaseModel):
+    """One entry of a
+    ``POST /{mailbox_id}/microsoft/domain-review/batch-resolve`` request
+    — the exact same per-item fields
+    ``ResolveMailboxDomainReviewRequest`` accepts (see that model's own
+    docstring for what each means), minus ``actor_type``/``actor_id``
+    (shared once across the whole batch — see the batch request's own
+    docstring)."""
+
+    item_id: str
+    decision: str  # "ALLOW" | "IGNORE"
+    destination_entity_id: Optional[str] = None
+    destination_mode: Optional[str] = None  # "FIXED" | "REVIEW_REQUIRED" — required when decision == "ALLOW"
+    match_mode: str = MATCH_MODE_EXACT  # "EXACT" | "INCLUDE_SUBDOMAINS"
+    processor_hint: Optional[str] = None
+
+
+class BatchResolveMailboxDomainReviewRequest(BaseModel):
+    """Request body for
+    ``POST /internal/mailboxes/{mailbox_id}/microsoft/domain-review/batch-resolve``
+    — CD-6 bounded Xero-assisted supplier-domain-correlation addendum
+    (architect's own framing: "Operator should be able to: select
+    several strong Xero-correlated domains; Allow selected -> Infosecurs
+    Limited; Ignore selected..."). A real operator action, explicit PER
+    ITEM (each entry carries its own `decision`/`destination_*`), batched
+    only for UI convenience — never a single blanket decision silently
+    applied to every item. `actor_type`/`actor_id` are shared once
+    across the whole batch (the same human operator performed every
+    decision in one batch submission)."""
+
+    actor_type: str
+    actor_id: str
+    items: list[BatchResolveMailboxDomainReviewItem]
+
+
+@router.post("/{mailbox_id}/microsoft/domain-review/batch-resolve")
+async def batch_resolve_mailbox_domain_review(mailbox_id: str, payload: BatchResolveMailboxDomainReviewRequest) -> dict[str, Any]:
+    """Resolve several ``ITEM_TYPE_MAILBOX_DOMAIN_REVIEW`` Needs You
+    items in one call — built to help an operator work through the 90
+    domains a real Phase A historical mailbox discovery sweep produced
+    more efficiently, once Xero-assisted correlation has enriched each
+    item's own metadata (see ``services.xero.supplier_correlation``).
+
+    Every item in `payload.items` goes through the EXACT SAME governed
+    path as `resolve_mailbox_domain_review` (single-item) —
+    `_resolve_mailbox_domain_review_core`, shared by both endpoints —
+    including the same `MailboxDomainRule` creation/update, the same
+    immediate historical back-processing on ALLOW
+    (`reprocess_all_historical_candidates_for_domain`), and the same
+    audit-event emission. There is no cheaper "bulk mode" that skips any
+    of that.
+
+    Partial batch success is normal and expected — a documented judgment
+    call (this WO's own explicit instruction): a single bad item (a
+    non-existent `item_id`, an `item_id` belonging to a DIFFERENT
+    mailbox, an already-DISMISSED item, an invalid `decision`, ...) must
+    never silently lose or corrupt the other items in the same batch.
+    Each entry is processed INDEPENDENTLY, in list order; a
+    `core.errors.BagmanError` raised by one entry's own
+    `_resolve_mailbox_domain_review_core` call is caught and recorded as
+    that entry's own `error`/`error_type` in the response — never
+    allowed to abort the loop or roll back any entry already applied.
+    This mirrors the ordinary single-item endpoint's own error contract
+    per entry (the same exception types, the same messages) — a caller
+    that wants "was THIS item ok" reads `results[i]["ok"]`, never the
+    overall HTTP status alone (this endpoint always returns 200 as long
+    as the request body itself parses — a per-item failure is DATA, not
+    a request-level failure).
+    """
+    composition = get_composition()
+    mailbox = _require_microsoft_mailbox(composition, mailbox_id)
+    if not payload.items:
+        raise ValidationError("batch-resolve requires at least one item in `items`")
+
+    results: list[dict[str, Any]] = []
+    for entry in payload.items:
+        try:
+            single_payload = ResolveMailboxDomainReviewRequest(
+                actor_type=payload.actor_type,
+                actor_id=payload.actor_id,
+                decision=entry.decision,
+                destination_entity_id=entry.destination_entity_id,
+                destination_mode=entry.destination_mode,
+                match_mode=entry.match_mode,
+                processor_hint=entry.processor_hint,
+            )
+            outcome = _resolve_mailbox_domain_review_core(
+                composition, mailbox_id=mailbox_id, mailbox=mailbox, item_id=entry.item_id, payload=single_payload
+            )
+            results.append(
+                {
+                    "item_id": entry.item_id,
+                    "ok": True,
+                    "needs_you_item": outcome["needs_you_item"],
+                    "mailbox_domain_rule": outcome["mailbox_domain_rule"],
+                    "reprocessed_messages": outcome["reprocessed_messages"],
+                    "error": None,
+                    "error_type": None,
+                }
+            )
+        except BagmanError as exc:
+            results.append(
+                {
+                    "item_id": entry.item_id,
+                    "ok": False,
+                    "needs_you_item": None,
+                    "mailbox_domain_rule": None,
+                    "reprocessed_messages": None,
+                    "error": str(exc),
+                    "error_type": type(exc).__name__,
+                }
+            )
+
+    succeeded_count = sum(1 for r in results if r["ok"])
+    return {
+        "mailbox_id": mailbox_id,
+        "results": results,
+        "count": len(results),
+        "succeeded_count": succeeded_count,
+        "failed_count": len(results) - succeeded_count,
     }

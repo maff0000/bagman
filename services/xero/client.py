@@ -26,9 +26,53 @@ extended beyond `GET /Accounts`)
   (architect spec §3's explicit anti-tenant-substitution instruction;
   ``app/api/routers/xero.py`` never accepts a `tenant_id` as a request
   parameter for this reason).
+* Contacts: ``GET https://api.xero.com/api.xro/2.0/Contacts`` — CD-6
+  supplier-domain-correlation addition (see below).
+* Purchase (bill-side, ``ACCPAY``) Invoices:
+  ``GET https://api.xero.com/api.xro/2.0/Invoices?where=Type%3D%3D%22ACCPAY%22``
+  — same addition; the server-side ``where`` filter is how this method
+  itself enforces "never treat a sales-side (``ACCREC``) customer
+  invoice as purchase history" (see :meth:`XeroAccountingClient
+  .list_purchase_invoices`'s own docstring).
 * Scopes: ``openid profile email offline_access accounting.settings.read``
   (PID §102.1 — confirmed current/non-deprecated for a read-only Chart-
   of-Accounts sync; see that section for the devblog citation).
+
+Scope extension (architect-authorized, bounded Xero-assisted supplier-
+domain correlation ahead of any bulk mailbox-domain approval)
+------------------------------------------------------------------------
+:data:`OAUTH_SCOPES` gained two further READ-ONLY scopes,
+``accounting.contacts.read`` and ``accounting.invoices.read`` — the
+minimum necessary additional read scopes for
+:mod:`services.xero.supplier_correlation` to read Contacts/Invoices and
+correlate them against still-OPEN ``MAILBOX_DOMAIN_REVIEW`` Needs You
+items. No write-capable scope (no ``.write`` token of any kind) was
+added, and no broader accounting-transaction write authority was
+requested — this component remains READ/REFERENCE-ONLY (see this
+module's own docstring and ``services/xero/component.yaml``'s
+``prohibited: xero_write_endpoints``). Changing this constant only
+changes what scope string gets REQUESTED the next time an operator
+goes through the existing connect/reconnect OAuth flow (real,
+operator-driven, browser-based, explicitly deferred) — it does not
+retroactively grant anything against the currently-connected Infosecurs
+tenant (which today only actually holds ``accounting.settings.read``),
+and it never itself triggers or simulates any OAuth call.
+
+No new persisted canonical domain model for Contacts/Invoices
+------------------------------------------------------------------------
+Unlike :class:`RawXeroAccount`/:class:`XeroAccount` (`services.xero
+.account`), the new :class:`RawXeroContact`/:class:`RawXeroPurchaseInvoice`
+below have no canonical, persisted, ``entity_id``-scoped counterpart —
+Xero remains the system of record for its own Contacts/Invoices; BAGMAN
+reads them transiently, correlates, and discards them (see
+``services.xero.supplier_correlation``'s own module docstring). This
+codebase's own established precedent (``contracts/xero/`` carries a
+schema for the CANONICAL, persisted ``XeroAccount`` only — never for
+the transient ``RawXeroAccount`` the client layer returns) is followed
+here deliberately: no ``contracts/xero/bagman.xero_contact.v1.schema.json``
+or ``bagman.xero_purchase_invoice.v1.schema.json`` exists, since nothing
+here crosses a persisted/API-boundary contract — a documented judgment
+call, not an oversight.
 
 No client_id/client_secret exist yet (PID §102.1's own stated
 constraint for this dispatch) — this module's constructors accept them
@@ -58,12 +102,29 @@ AUTHORIZE_URL = "https://login.xero.com/identity/connect/authorize"
 TOKEN_URL = "https://identity.xero.com/connect/token"
 CONNECTIONS_URL = "https://api.xero.com/connections"
 ACCOUNTS_URL = "https://api.xero.com/api.xro/2.0/Accounts"
+CONTACTS_URL = "https://api.xero.com/api.xro/2.0/Contacts"
+INVOICES_URL = "https://api.xero.com/api.xro/2.0/Invoices"
+
+#: Xero's own server-side `where` filter, applied ONLY to
+#: `list_purchase_invoices` — restricts the returned set to bill-side
+#: (`ACCPAY`) invoices, never sales-side (`ACCREC`) customer invoices
+#: (architect's own explicit instruction: "Do not treat customers... as
+#: suppliers merely because they exist in Xero" — enforced here, at the
+#: query itself, not left for a later caller to remember).
+_ACCPAY_ONLY_QUERY = urllib.parse.urlencode({"where": 'Type=="ACCPAY"'})
 
 #: PID §102.1 — the exact, confirmed-current scope set for this slice's
-#: read-only Chart-of-Accounts sync. `offline_access` is what makes a
-#: `refresh_token` exist at all (never re-prompting an operator for
-#: ordinary token refresh, architect spec §3).
-OAUTH_SCOPES = "openid profile email offline_access accounting.settings.read"
+#: read-only Chart-of-Accounts sync, EXTENDED (architect-authorized —
+#: see module docstring's "Scope extension" section) with two further
+#: READ-ONLY scopes for the bounded Xero-assisted supplier-domain
+#: correlation capability: `accounting.contacts.read` and
+#: `accounting.invoices.read`. No write-capable scope. `offline_access`
+#: is what makes a `refresh_token` exist at all (never re-prompting an
+#: operator for ordinary token refresh, architect spec §3).
+OAUTH_SCOPES = (
+    "openid profile email offline_access accounting.settings.read "
+    "accounting.contacts.read accounting.invoices.read"
+)
 
 DEFAULT_TIMEOUT_SECONDS = 15.0
 
@@ -142,6 +203,59 @@ class XeroAccountsResult:
     error_detail: Optional[str] = None
 
 
+@dataclass(frozen=True)
+class RawXeroContact:
+    """The plain, provider-shaped fields one `GET /Contacts` entry
+    yields — transient, never persisted (see module docstring's "No new
+    persisted canonical domain model" section). `is_customer`/
+    `is_supplier` are Xero's OWN self-reported flags, captured verbatim
+    but NEVER conflated with "has real purchase-invoice history" (the
+    stronger signal `services.xero.supplier_correlation` actually
+    weights — see that module's own docstring)."""
+
+    contact_id: str
+    name: str
+    email_address: Optional[str]
+    is_customer: bool
+    is_supplier: bool
+    contact_status: Optional[str]
+
+
+@dataclass(frozen=True)
+class XeroContactsResult:
+    status: XeroOutcomeStatus
+    contacts: tuple[RawXeroContact, ...] = ()
+    retry_after_seconds: Optional[float] = None
+    error_detail: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class RawXeroPurchaseInvoice:
+    """The plain, provider-shaped fields one `GET /Invoices` entry
+    (server-side filtered to `Type=="ACCPAY"`) yields — transient,
+    never persisted. `invoice_type` is captured and defensively
+    re-validated (see `_parse_raw_purchase_invoice`) rather than
+    silently trusting the server-side filter alone worked. `status`
+    (`AUTHORISED`/`PAID`/`VOIDED`/`DRAFT`/...) is captured verbatim —
+    this client layer never decides which statuses count as "real"
+    purchase history; that weighting judgment belongs to
+    `services.xero.supplier_correlation` alone."""
+
+    invoice_id: str
+    contact_id: Optional[str]
+    invoice_type: str
+    invoice_date: Optional[datetime]
+    status: Optional[str]
+
+
+@dataclass(frozen=True)
+class XeroInvoicesResult:
+    status: XeroOutcomeStatus
+    invoices: tuple[RawXeroPurchaseInvoice, ...] = ()
+    retry_after_seconds: Optional[float] = None
+    error_detail: Optional[str] = None
+
+
 class XeroOAuthClientProtocol(Protocol):
     def is_configured(self) -> bool: ...
 
@@ -156,6 +270,10 @@ class XeroOAuthClientProtocol(Protocol):
 
 class XeroAccountingClientProtocol(Protocol):
     def list_accounts(self, *, tenant_id: str, access_token: str) -> XeroAccountsResult: ...
+
+    def list_contacts(self, *, tenant_id: str, access_token: str) -> XeroContactsResult: ...
+
+    def list_purchase_invoices(self, *, tenant_id: str, access_token: str) -> XeroInvoicesResult: ...
 
 
 def _read_body(exc: urllib.error.HTTPError) -> str:
@@ -336,21 +454,30 @@ def _basic_auth_header(client_id: str, client_secret: str) -> str:
     return f"Basic {token}"
 
 
+def _parse_xero_wire_datetime(value: Any) -> Optional[datetime]:
+    """The ONE place every caller in this module parses a Xero-supplied
+    date/timestamp string — shared by `_parse_raw_account`'s own
+    `UpdatedDateUTC` parsing and `_parse_raw_purchase_invoice`'s `Date`
+    parsing (the WO's own explicit instruction: reuse this exact same
+    helper, do not reinvent it for invoices).
+
+    Xero's own wire format is "/Date(1700000000000+0000)/" for some
+    endpoints, but the modern JSON Accounting API returns plain
+    ISO-8601 for both `UpdatedDateUTC` and `Date` — handled generically
+    here rather than special-cased, since either form parses via
+    `fromisoformat` once normalised, and a value this module cannot
+    parse is simply left `None` (never fabricated) rather than crashing
+    the whole call over one cosmetic field."""
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
 def _parse_raw_account(item: Mapping[str, Any]) -> RawXeroAccount:
-    updated = item.get("UpdatedDateUTC")
-    parsed_updated: Optional[datetime] = None
-    if isinstance(updated, str) and updated:
-        # Xero's own wire format: "/Date(1700000000000+0000)/" for some
-        # endpoints, but the modern JSON Accounting API returns plain
-        # ISO-8601 for UpdatedDateUTC — handled generically here rather
-        # than special-cased, since either form parses via fromisoformat
-        # once normalised, and a value this module cannot parse is
-        # simply left `None` (never fabricated) rather than crashing
-        # the whole sync over one cosmetic field.
-        try:
-            parsed_updated = datetime.fromisoformat(updated.replace("Z", "+00:00"))
-        except ValueError:
-            parsed_updated = None
+    parsed_updated = _parse_xero_wire_datetime(item.get("UpdatedDateUTC"))
 
     return RawXeroAccount(
         account_id=item["AccountID"],
@@ -364,6 +491,42 @@ def _parse_raw_account(item: Mapping[str, Any]) -> RawXeroAccount:
         reporting_code=item.get("ReportingCode"),
         reporting_code_name=item.get("ReportingCodeName"),
         updated_date_utc=parsed_updated,
+    )
+
+
+def _parse_raw_contact(item: Mapping[str, Any]) -> RawXeroContact:
+    email = item.get("EmailAddress")
+    return RawXeroContact(
+        contact_id=item["ContactID"],
+        name=item["Name"],
+        email_address=email if isinstance(email, str) and email.strip() else None,
+        is_customer=bool(item.get("IsCustomer", False)),
+        is_supplier=bool(item.get("IsSupplier", False)),
+        contact_status=item.get("ContactStatus"),
+    )
+
+
+def _parse_raw_purchase_invoice(item: Mapping[str, Any]) -> RawXeroPurchaseInvoice:
+    invoice_type = item["Type"]
+    if invoice_type != "ACCPAY":
+        # Defensive re-validation (WO's own explicit instruction) — the
+        # server-side `where=Type=="ACCPAY"` filter is trusted, but
+        # never BLINDLY trusted: a response that somehow contains a
+        # non-ACCPAY row is treated as a malformed/unexpected response
+        # shape (caught by list_purchase_invoices's own
+        # ValueError-inclusive except clause), never silently accepted
+        # as if it were a legitimate purchase invoice.
+        raise ValueError(
+            f"expected every /Invoices row to be Type=='ACCPAY' (the where-filter's own contract), "
+            f"got {invoice_type!r} for InvoiceID={item.get('InvoiceID')!r}"
+        )
+    contact = item.get("Contact") or {}
+    return RawXeroPurchaseInvoice(
+        invoice_id=item["InvoiceID"],
+        contact_id=contact.get("ContactID"),
+        invoice_type=invoice_type,
+        invoice_date=_parse_xero_wire_datetime(item.get("Date")),
+        status=item.get("Status"),
     )
 
 
@@ -420,3 +583,110 @@ class XeroAccountingClient:
                 error_detail=f"could not parse Xero /Accounts response shape: {exc}",
             )
         return XeroAccountsResult(status=XeroOutcomeStatus.OK, accounts=accounts)
+
+    def list_contacts(self, *, tenant_id: str, access_token: str) -> XeroContactsResult:
+        """`GET /Contacts` (CD-6 supplier-domain-correlation addition —
+        see module docstring). Same GET-only/never-raises-for-transport-
+        failure/`Xero-Tenant-Id` discipline as :meth:`list_accounts`
+        exactly."""
+        if not tenant_id:
+            raise ValidationError(
+                "list_contacts requires a real, server-resolved tenant_id — never call this "
+                "with an empty/browser-supplied value (architect spec §3)"
+            )
+
+        request = urllib.request.Request(
+            CONTACTS_URL,
+            method="GET",
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "Xero-Tenant-Id": tenant_id,
+                "Accept": "application/json",
+            },
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=self._timeout_seconds) as response:
+                raw = response.read()
+        except urllib.error.HTTPError as exc:
+            if exc.code in (401, 403):
+                return XeroContactsResult(
+                    status=XeroOutcomeStatus.AUTH_ERROR, error_detail=f"HTTP {exc.code}: {_read_body(exc)}"
+                )
+            if exc.code == 429:
+                return XeroContactsResult(
+                    status=XeroOutcomeStatus.RATE_LIMITED,
+                    retry_after_seconds=_retry_after_seconds(exc),
+                    error_detail=f"HTTP 429: {_read_body(exc)}",
+                )
+            return XeroContactsResult(
+                status=XeroOutcomeStatus.PROVIDER_ERROR, error_detail=f"HTTP {exc.code}: {_read_body(exc)}"
+            )
+        except Exception as exc:  # noqa: BLE001
+            is_timeout = isinstance(exc, TimeoutError) or "timed out" in str(exc).lower()
+            status = XeroOutcomeStatus.TIMEOUT if is_timeout else XeroOutcomeStatus.TRANSPORT_ERROR
+            return XeroContactsResult(status=status, error_detail=str(exc)[:500])
+
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+            contacts = tuple(_parse_raw_contact(item) for item in payload["Contacts"])
+        except (json.JSONDecodeError, KeyError, TypeError) as exc:
+            return XeroContactsResult(
+                status=XeroOutcomeStatus.MALFORMED_RESPONSE,
+                error_detail=f"could not parse Xero /Contacts response shape: {exc}",
+            )
+        return XeroContactsResult(status=XeroOutcomeStatus.OK, contacts=contacts)
+
+    def list_purchase_invoices(self, *, tenant_id: str, access_token: str) -> XeroInvoicesResult:
+        """`GET /Invoices?where=Type%3D%3D%22ACCPAY%22` — bill-side
+        (purchase) invoices ONLY, server-side filtered (see module
+        docstring's endpoint list, and `_ACCPAY_ONLY_QUERY`'s own
+        comment for why this is enforced at the query itself, not left
+        to a later caller). Same GET-only/never-raises-for-transport-
+        failure/`Xero-Tenant-Id` discipline as :meth:`list_accounts`
+        exactly."""
+        if not tenant_id:
+            raise ValidationError(
+                "list_purchase_invoices requires a real, server-resolved tenant_id — never call this "
+                "with an empty/browser-supplied value (architect spec §3)"
+            )
+
+        request = urllib.request.Request(
+            f"{INVOICES_URL}?{_ACCPAY_ONLY_QUERY}",
+            method="GET",
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "Xero-Tenant-Id": tenant_id,
+                "Accept": "application/json",
+            },
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=self._timeout_seconds) as response:
+                raw = response.read()
+        except urllib.error.HTTPError as exc:
+            if exc.code in (401, 403):
+                return XeroInvoicesResult(
+                    status=XeroOutcomeStatus.AUTH_ERROR, error_detail=f"HTTP {exc.code}: {_read_body(exc)}"
+                )
+            if exc.code == 429:
+                return XeroInvoicesResult(
+                    status=XeroOutcomeStatus.RATE_LIMITED,
+                    retry_after_seconds=_retry_after_seconds(exc),
+                    error_detail=f"HTTP 429: {_read_body(exc)}",
+                )
+            return XeroInvoicesResult(
+                status=XeroOutcomeStatus.PROVIDER_ERROR, error_detail=f"HTTP {exc.code}: {_read_body(exc)}"
+            )
+        except Exception as exc:  # noqa: BLE001
+            is_timeout = isinstance(exc, TimeoutError) or "timed out" in str(exc).lower()
+            status = XeroOutcomeStatus.TIMEOUT if is_timeout else XeroOutcomeStatus.TRANSPORT_ERROR
+            return XeroInvoicesResult(status=status, error_detail=str(exc)[:500])
+
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+            invoices = tuple(_parse_raw_purchase_invoice(item) for item in payload["Invoices"])
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+            return XeroInvoicesResult(
+                status=XeroOutcomeStatus.MALFORMED_RESPONSE,
+                error_detail=f"could not parse Xero /Invoices response shape: {exc}",
+            )
+        return XeroInvoicesResult(status=XeroOutcomeStatus.OK, invoices=invoices)

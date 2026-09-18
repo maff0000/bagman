@@ -555,3 +555,191 @@ def test_noustai_imap_mailbox_never_reaches_the_microsoft_router(dev_client):
     assert r.status_code == 422
     mailbox = dev_client.get(f"/internal/mailboxes/{mailbox_id}").json()
     assert mailbox["connection_state"] == "NOT_CONFIGURED"
+
+
+# ---------------------------------------------------------------------
+# batch domain-review resolution — CD-6 bounded Xero-assisted supplier-
+# domain-correlation addendum (backend-only; efficient review of the 90
+# real OPEN MAILBOX_DOMAIN_REVIEW items a Phase A historical sweep
+# produced, before any bulk domain approval).
+# ---------------------------------------------------------------------
+
+
+def _sweep_unknown_domain(client, mailbox_id, *, domain: str, local_part: str = "billing"):
+    """Generalises `_sweep_unknown_domain_message` (fixed to
+    `new-supplier.example`) to an arbitrary sender domain, so a batch
+    test can raise several DISTINCT `MAILBOX_DOMAIN_REVIEW` items in one
+    mailbox."""
+    comp = get_composition()
+    now = datetime.now(timezone.utc)
+    msg = GraphMessageSummary(
+        immutable_id=f"AAMk-{domain}-1",
+        internet_message_id=f"<{domain}-1@b>",
+        subject="Invoice attached",
+        sender_address=f"{local_part}@{domain}",
+        sender_display_name="Supplier",
+        received_at=now,
+        has_attachments=False,
+    )
+    _queue_folder_discovery(comp)
+    comp.microsoft_graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(msg,), delta_link=f"d-{domain}-1"))
+    comp.microsoft_graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link=f"d-{domain}-junk"))
+    r = client.post(f"/internal/mailboxes/{mailbox_id}/microsoft/sweep", json={"actor_type": "USER", "actor_id": ACTOR_ID})
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+def _open_domain_review_item_for_domain(comp, mailbox_id, domain):
+    items = [
+        i
+        for i in comp.needs_you_repository.list_needs_you_items(item_type="MAILBOX_DOMAIN_REVIEW", status="OPEN")
+        if i.metadata.get("mailbox_id") == mailbox_id and i.metadata.get("sender_domain") == domain
+    ]
+    assert len(items) == 1, f"expected exactly one OPEN item for domain {domain!r}, got {len(items)}"
+    return items[0]
+
+
+def test_batch_resolve_three_domains_matches_three_individual_calls_end_state(dev_client):
+    mailbox_id, comp, entity = _connected_mailbox_with_entity_seeded(dev_client)
+    domains = ["batch-supplier-one.example", "batch-supplier-two.example", "batch-supplier-three.example"]
+    for domain in domains:
+        _sweep_unknown_domain(dev_client, mailbox_id, domain=domain)
+
+    items = [_open_domain_review_item_for_domain(comp, mailbox_id, d) for d in domains]
+
+    for _ in domains:
+        comp.microsoft_graph_client.queue_content_result(
+            GraphMessageContentResult(status=GraphOutcomeStatus.OK, content=b"From: x\r\nSubject: Invoice\r\n\r\nBody")
+        )
+
+    r = dev_client.post(
+        f"/internal/mailboxes/{mailbox_id}/microsoft/domain-review/batch-resolve",
+        json={
+            "actor_type": "USER",
+            "actor_id": ACTOR_ID,
+            "items": [
+                {
+                    "item_id": item.item_id,
+                    "decision": "ALLOW",
+                    "destination_entity_id": entity.entity_id,
+                    "destination_mode": "FIXED",
+                }
+                for item in items
+            ],
+        },
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["count"] == 3
+    assert body["succeeded_count"] == 3
+    assert body["failed_count"] == 0
+    for result in body["results"]:
+        assert result["ok"] is True
+        assert result["needs_you_item"]["status"] == "RESOLVED"
+        assert result["mailbox_domain_rule"]["policy"] == "ALLOWED"
+        assert len(result["reprocessed_messages"]) == 1
+        assert result["reprocessed_messages"][0]["ingestion_status"] == "INGESTED"
+        assert result["error"] is None
+
+    # Same end-state three individual calls would produce: three real
+    # MailboxDomainRule rows, three RESOLVED items, three ALLOWED audit
+    # events.
+    rules = dev_client.get(f"/internal/mailboxes/{mailbox_id}/microsoft/domain-rules").json()
+    assert rules["count"] == 3
+    assert {r["sender_domain"] for r in rules["items"]} == set(domains)
+    for item in items:
+        assert comp.needs_you_repository.get_needs_you_item(item.item_id).status == "RESOLVED"
+    audit_events = comp.api.audit_repository.list_recent(limit=50, event_type_prefix="MAILBOX_DOMAIN_RULE_ALLOWED")
+    assert len(audit_events) == 3
+
+
+def test_batch_resolve_one_bad_item_never_blocks_the_others(dev_client):
+    mailbox_id, comp, entity = _connected_mailbox_with_entity_seeded(dev_client)
+    domains = ["batch-good-one.example", "batch-good-two.example"]
+    for domain in domains:
+        _sweep_unknown_domain(dev_client, mailbox_id, domain=domain)
+    items = [_open_domain_review_item_for_domain(comp, mailbox_id, d) for d in domains]
+
+    # A second mailbox (distinct email — mailbox email uniqueness is
+    # global), with its own OPEN item — used to prove an item_id
+    # belonging to a DIFFERENT mailbox is reported as a clean per-item
+    # failure, not silently accepted.
+    other_mailbox_id = _create_mailbox(dev_client, email="ops-other@infosecurs.com")
+    _connect_and_complete(dev_client, other_mailbox_id, email="ops-other@infosecurs.com")
+    other_comp = get_composition()
+    other_comp.api.register_entity(
+        entity_type="COMPANY",
+        canonical_name="TEST_DOMAIN_REVIEW_OTHER_LTD",
+        display_name="Test Other Ltd",
+        status="ACTIVE",
+        actor_type="SYSTEM",
+        actor_id=ACTOR_ID,
+        fiscal_year_start_month_day="01-01",
+        historical_floor_override_at=datetime(2025, 1, 1, tzinfo=timezone.utc),
+    )
+    _sweep_unknown_domain(dev_client, other_mailbox_id, domain="other-mailbox-domain.example")
+    foreign_item = _open_domain_review_item_for_domain(other_comp, other_mailbox_id, "other-mailbox-domain.example")
+
+    for _ in domains:
+        comp.microsoft_graph_client.queue_content_result(
+            GraphMessageContentResult(status=GraphOutcomeStatus.OK, content=b"From: x\r\nSubject: Invoice\r\n\r\nBody")
+        )
+
+    r = dev_client.post(
+        f"/internal/mailboxes/{mailbox_id}/microsoft/domain-review/batch-resolve",
+        json={
+            "actor_type": "USER",
+            "actor_id": ACTOR_ID,
+            "items": [
+                {
+                    "item_id": items[0].item_id,
+                    "decision": "ALLOW",
+                    "destination_entity_id": entity.entity_id,
+                    "destination_mode": "FIXED",
+                },
+                # A genuinely non-existent item_id.
+                {"item_id": "does-not-exist", "decision": "IGNORE"},
+                {
+                    "item_id": items[1].item_id,
+                    "decision": "ALLOW",
+                    "destination_entity_id": entity.entity_id,
+                    "destination_mode": "FIXED",
+                },
+                # An item_id that is real, but belongs to a DIFFERENT
+                # mailbox than the one this batch call is scoped to.
+                {"item_id": foreign_item.item_id, "decision": "IGNORE"},
+            ],
+        },
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["count"] == 4
+    assert body["succeeded_count"] == 2
+    assert body["failed_count"] == 2
+
+    results_by_item_id = {res["item_id"]: res for res in body["results"]}
+    assert results_by_item_id[items[0].item_id]["ok"] is True
+    assert results_by_item_id[items[1].item_id]["ok"] is True
+    assert results_by_item_id["does-not-exist"]["ok"] is False
+    assert results_by_item_id["does-not-exist"]["error_type"] == "NotFoundError"
+    assert results_by_item_id[foreign_item.item_id]["ok"] is False
+    assert results_by_item_id[foreign_item.item_id]["error_type"] == "ValidationError"
+
+    # Both VALID items in the same batch fully succeeded despite the two
+    # bad entries — never lost, never corrupted.
+    assert comp.needs_you_repository.get_needs_you_item(items[0].item_id).status == "RESOLVED"
+    assert comp.needs_you_repository.get_needs_you_item(items[1].item_id).status == "RESOLVED"
+    rules = dev_client.get(f"/internal/mailboxes/{mailbox_id}/microsoft/domain-rules").json()
+    assert rules["count"] == 2
+
+    # The foreign mailbox's own item was never touched by this batch.
+    assert other_comp.needs_you_repository.get_needs_you_item(foreign_item.item_id).status == "OPEN"
+
+
+def test_batch_resolve_requires_at_least_one_item(dev_client):
+    mailbox_id, _comp, _entity = _connected_mailbox_with_entity_seeded(dev_client)
+    r = dev_client.post(
+        f"/internal/mailboxes/{mailbox_id}/microsoft/domain-review/batch-resolve",
+        json={"actor_type": "USER", "actor_id": ACTOR_ID, "items": []},
+    )
+    assert r.status_code == 422

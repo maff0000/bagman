@@ -21,6 +21,8 @@ from services.xero.client import (
     XeroAccountsResult,
     XeroConnectionInfo,
     XeroConnectionsResult,
+    XeroContactsResult,
+    XeroInvoicesResult,
     XeroOutcomeStatus,
     XeroTokenBundle,
     XeroTokenResult,
@@ -93,22 +95,47 @@ class FakeXeroOAuthClient:
 
 class FakeXeroAccountingClient:
     """Deterministic `XeroAccountingClientProtocol` implementation.
-    Script outcomes with `queue_accounts_result`; each `list_accounts()`
-    call pops the next queued outcome, or raises `AssertionError` if
-    nothing was queued."""
+    Script outcomes with `queue_accounts_result`/`queue_contacts_result`/
+    `queue_invoices_result`; each corresponding `list_*()` call pops the
+    next queued outcome for THAT method, or raises `AssertionError` if
+    nothing was queued for it (an unscripted call is a test/dev-
+    composition bug, never a silently fabricated success — same
+    discipline every other `Fake*` in this codebase documents)."""
 
     def __init__(self) -> None:
         self._queue: Deque[XeroAccountsResult] = deque()
+        self._contacts_queue: Deque[XeroContactsResult] = deque()
+        self._invoices_queue: Deque[XeroInvoicesResult] = deque()
         self.calls: list[tuple[str, str]] = []  # (tenant_id, access_token)
+        self.contact_calls: list[tuple[str, str]] = []
+        self.invoice_calls: list[tuple[str, str]] = []
 
     def queue_accounts_result(self, result: XeroAccountsResult) -> None:
         self._queue.append(result)
+
+    def queue_contacts_result(self, result: XeroContactsResult) -> None:
+        self._contacts_queue.append(result)
+
+    def queue_invoices_result(self, result: XeroInvoicesResult) -> None:
+        self._invoices_queue.append(result)
 
     def list_accounts(self, *, tenant_id: str, access_token: str) -> XeroAccountsResult:
         self.calls.append((tenant_id, access_token))
         if not self._queue:
             raise AssertionError("FakeXeroAccountingClient.list_accounts() called with nothing queued")
         return self._queue.popleft()
+
+    def list_contacts(self, *, tenant_id: str, access_token: str) -> XeroContactsResult:
+        self.contact_calls.append((tenant_id, access_token))
+        if not self._contacts_queue:
+            raise AssertionError("FakeXeroAccountingClient.list_contacts() called with nothing queued")
+        return self._contacts_queue.popleft()
+
+    def list_purchase_invoices(self, *, tenant_id: str, access_token: str) -> XeroInvoicesResult:
+        self.invoice_calls.append((tenant_id, access_token))
+        if not self._invoices_queue:
+            raise AssertionError("FakeXeroAccountingClient.list_purchase_invoices() called with nothing queued")
+        return self._invoices_queue.popleft()
 
 
 def fake_token_bundle(*, access_token: str = "fake-access-token", expires_in_seconds: float = 1800.0) -> XeroTokenBundle:
