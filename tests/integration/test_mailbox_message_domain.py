@@ -284,3 +284,25 @@ def test_list_candidate_messages_ordered_oldest_received_first(repo, mailbox_id)
 
     results = repo.list_candidate_messages_for_domain(mailbox_id=mailbox_id, sender_domain="vendor.com")
     assert [m.immutable_provider_message_id for m in results] == ["m-older", "m-newer"]
+
+
+# ---------------------------------------------------------------------
+# CD-6 GUI-operations-foundation follow-on WO (item A) —
+# `sender_address_observed`.
+# ---------------------------------------------------------------------
+
+
+def test_sender_address_observed_true_for_a_real_observed_address(repo, mailbox_id):
+    _observe(repo, mailbox_id=mailbox_id)
+    assert repo.sender_address_observed(mailbox_id, "s@x.com") is True
+    assert repo.sender_address_observed(mailbox_id, "S@X.COM") is True  # case-insensitive
+
+
+def test_sender_address_observed_false_for_an_unobserved_address(repo, mailbox_id):
+    _observe(repo, mailbox_id=mailbox_id)
+    assert repo.sender_address_observed(mailbox_id, "never-seen@x.com") is False
+
+
+def test_sender_address_observed_scoped_to_mailbox(repo, mailbox_id, other_mailbox_id):
+    _observe(repo, mailbox_id=mailbox_id)
+    assert repo.sender_address_observed(other_mailbox_id, "s@x.com") is False

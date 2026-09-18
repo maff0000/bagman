@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from typing import Any, Mapping, Optional
 
+from sqlalchemy import exists, func
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
@@ -215,6 +216,19 @@ class PostgresMailboxMessageRepository(MailboxMessageRepository):
                 return _row_to_domain(row) if row is not None else None
         except SQLAlchemyError as exc:
             raise PersistenceError(f"could not look up MailboxMessage: {exc}") from exc
+
+    def sender_address_observed(self, mailbox_id: str, sender_address: str) -> bool:
+        normalized = sender_address.strip().lower()
+        try:
+            with session_scope(self._engine) as session:
+                return session.query(
+                    exists().where(
+                        MailboxMessageRow.mailbox_id == mailbox_id,
+                        func.lower(MailboxMessageRow.sender_address) == normalized,
+                    )
+                ).scalar()
+        except SQLAlchemyError as exc:
+            raise PersistenceError(f"could not check sender_address_observed for MailboxMessage: {exc}") from exc
 
     def list_messages(self, *, mailbox_id: str, limit: Optional[int] = None, offset: int = 0):
         try:

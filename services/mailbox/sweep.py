@@ -85,26 +85,28 @@ ingested. For each message in a delta round:
      ``CHECKED_NOT_CANDIDATE`` and nothing further happens.
 
 Authentication escalation — a new, per-message security gate on top of
-a MUST_READ source (CD-6 GUI-operations-foundation follow-on WO)
+a MUST_READ source (CD-6 GUI-operations-foundation follow-on WO, later
+hardened by that WO's own follow-on "five confirmed integration gaps"
+fix — see items B/C of that fix's own PID for the full history)
 ------------------------------------------------------------------------
 Trusting a SOURCE (a ``MUST_READ`` rule) is not the same as trusting
 every individual MESSAGE claiming to be from it — a compromised/spoofed
-sender is a real, different risk `MailboxMessage.auth_signals` already
-captured honestly but, until this WO, never acted on. See
-:func:`evaluate_message_authentication` for the exact bounded,
-deterministic (never AI/ML) PASS/FAIL threshold this WO adopts:
+sender is a real, different risk. :func:`evaluate_message_authentication`
+now delegates to a real, bounded, deterministic (never AI/ML)
+provider-neutral + Microsoft-selector pipeline
+(``services.mailbox.authentication_assessment``/
+``services.mailbox.microsoft.authentication`` — see those modules' own
+docstrings for the complete PASS/FAIL/UNKNOWN trust-boundary reasoning,
+built against real, live, redacted diagnostic header data) driven by the
+message's own RAW headers, never the old flat, best-effort
+``auth_signals`` dict alone (a confirmed real bug: that dict's own
+parser silently kept only the FIRST token for a mechanism, even within
+one legitimate header, and the old gate could not distinguish a
+genuinely Microsoft-trusted header from an attacker-forgeable one at
+all). Only a genuine PASS proceeds; both FAIL and UNKNOWN escalate —
+an inconclusive verdict is never silently treated as trusted.
 
-* Any of ``spf``/``dkim``/``dmarc`` explicitly reporting ``"fail"`` is a
-  hard FAIL.
-* All three being ``None``/absent (zero authentication signal captured
-  at all for this message) is ALSO treated as suspicious/FAIL — a
-  documented judgment call: a real provider ordinarily reports
-  SOMETHING for at least one mechanism, so total silence is itself worth
-  surfacing rather than silently trusting.
-* Anything else (a real ``"pass"``, a `"softfail"`/`"none"` mixed with at
-  least one populated signal, ...) is a PASS — proceeds normally.
-
-On a FAIL, the message is marked ``services.mailbox.message
+On a FAIL/UNKNOWN, the message is marked ``services.mailbox.message
 .INGESTION_STATUS_SECURITY_REVIEW`` — a distinct, honest outcome (this
 IS a real candidate that failed a security check, never merely "not a
 candidate") — and exactly one
@@ -354,7 +356,6 @@ treating folder identity/equality uses ``folder_id``.
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Mapping, Optional, Protocol, Sequence
 
@@ -362,6 +363,7 @@ from core.entity import EntityRepository
 from core.errors import ConflictError
 from core.timestamps import to_contract_string, utc_now
 from services.evidence.intake.scanner import EvidenceSafetyScanner
+from services.mailbox.authentication_assessment import AUTH_ASSESSMENT_PASS, AuthenticationAssessment
 from services.mailbox.bootstrap_policy import compute_entity_historical_bootstrap
 from services.mailbox.cursor import MailboxFolderCursorRepository
 from services.mailbox.discovery_signals import evaluate_discovery_candidate
@@ -391,6 +393,7 @@ from services.mailbox.message import (
     MailboxMessageRepository,
 )
 from services.mailbox.microsoft.adapter import FolderDiscoveryResult
+from services.mailbox.microsoft.authentication import assess_microsoft_authentication
 from services.mailbox.microsoft.evidence_ingest import (
     INGEST_STATUS_FAILED,
     INGEST_STATUS_INGESTED,
@@ -516,57 +519,50 @@ def _routing_metadata(rule: MailboxDomainRule) -> dict:
     }
 
 
-@dataclass(frozen=True)
-class _AuthCheckResult:
-    """The bounded, deterministic outcome of
-    :func:`evaluate_message_authentication` — never a confidence score,
-    never anything an AI/ML call produced."""
-
-    escalate: bool
-    reason: str
-
-
-def evaluate_message_authentication(auth_signals: Mapping[str, Optional[str]]) -> _AuthCheckResult:
+def evaluate_message_authentication(
+    raw_headers: Optional[Sequence[Mapping[str, Optional[str]]]],
+) -> AuthenticationAssessment:
     """CD-6 GUI-operations-foundation follow-on WO — the bounded,
-    deterministic (never AI/ML) per-message authentication threshold a
+    deterministic (never AI/ML) per-message authentication check a
     ``MUST_READ`` rule's own trusted-source status is checked against
     before this SPECIFIC message is allowed down the normal MIME-fetch-
     and-evidence path. See module docstring's own "Authentication
-    escalation" section for the full reasoning; this function is
-    exactly that threshold, isolated for direct unit testing:
+    escalation" section for the full reasoning.
 
-    * Any of ``spf``/``dkim``/``dmarc`` explicitly reporting the literal
-      string ``"fail"`` -> escalate (a hard, unambiguous authentication
-      failure).
-    * All three of ``spf``/``dkim``/``dmarc`` being ``None``/absent (no
-      authentication signal captured at all for this message) ->
-      escalate (documented judgment call: a real provider ordinarily
-      reports something for at least one mechanism; total silence is
-      itself worth surfacing rather than silently trusted).
-    * Anything else (a real ``"pass"``, or a ``"softfail"``/``"none"``
-      value that still means AT LEAST ONE mechanism reported something)
-      -> proceed normally.
+    **Superseded design note**: this function used to gate directly on
+    the flat, best-effort ``auth_signals`` dict (a bare ``spf``/``dkim``/
+    ``dmarc`` == ``"fail"`` check) — a confirmed, real defect the
+    architect found on direct code inspection: that flat dict came from
+    ``services.mailbox.microsoft.graph_client._parse_auth_signals``'s own
+    ``setdefault``-based parser, which silently kept only the FIRST
+    token for a mechanism even within one legitimate trusted header (two
+    real, live Infosecurs samples carried two separate ``dkim=`` tokens
+    in a single header), and never distinguished a genuinely trusted
+    Microsoft-stamped header from an attacker-forgeable one at all. This
+    function now delegates entirely to the real provider-neutral +
+    Microsoft-selector pipeline
+    (:func:`services.mailbox.microsoft.authentication.assess_microsoft_authentication`),
+    driven by the message's own RAW headers rather than that flat dict —
+    see that function's own module docstring for the complete trust-
+    boundary reasoning (built against the real, live, redacted
+    diagnostic header shape recorded there).
 
-    Never raises; never returns anything other than this one bounded
-    ``_AuthCheckResult``.
+    Never raises; never returns anything other than a bounded
+    :class:`~services.mailbox.authentication_assessment.AuthenticationAssessment`.
     """
-    spf = auth_signals.get("spf")
-    dkim = auth_signals.get("dkim")
-    dmarc = auth_signals.get("dmarc")
+    return assess_microsoft_authentication(raw_headers)
 
-    hard_failures = [name for name, value in (("spf", spf), ("dkim", dkim), ("dmarc", dmarc)) if value == "fail"]
-    if hard_failures:
-        return _AuthCheckResult(
-            escalate=True, reason=f"authentication FAIL reported for: {', '.join(hard_failures)}"
-        )
 
-    if spf is None and dkim is None and dmarc is None:
-        return _AuthCheckResult(
-            escalate=True,
-            reason="no spf/dkim/dmarc authentication signal was captured for this message at all",
-        )
-
-    return _AuthCheckResult(escalate=False, reason="authentication check passed")
+def _auth_assessment_metadata(assessment: AuthenticationAssessment) -> dict:
+    """CD-6 GUI-operations-foundation follow-on WO (item C) — the
+    ``MailboxMessage.metadata`` shape a persisted authentication
+    assessment is stored under, so a later operator/reader can see WHY a
+    message passed or was held (never just the bare terminal status).
+    Folded into the existing, already-established open ``metadata``
+    field — a documented, no-migration judgment call (see
+    ``services.mailbox.authentication_assessment.AuthenticationAssessment
+    .to_metadata``'s own docstring)."""
+    return {"auth_assessment": assessment.to_metadata()}
 
 
 def _raise_authentication_escalation_item(
@@ -781,6 +777,8 @@ class _AdapterProtocol(Protocol):
     ): ...
 
     def fetch_message_content(self, *, mailbox_id: str, immutable_message_id: str): ...
+
+    def fetch_message_headers(self, *, mailbox_id: str, immutable_message_id: str): ...
 
     def report_connection_error(self, mailbox_id: str, *, error_code: str, error_detail: str) -> None: ...
 
@@ -1098,6 +1096,7 @@ def run_sweep(
                             discovery_candidate: Optional[bool] = None,
                             discovery_reason: Optional[str] = None,
                             discovery_checked_at: Optional[datetime] = None,
+                            metadata: Optional[Mapping[str, Any]] = None,
                         ) -> MailboxMessage:
                             """Second CD-6 architect amendment (persisted
                             discovery decision) — the three new optional
@@ -1127,6 +1126,7 @@ def run_sweep(
                                 discovery_candidate=discovery_candidate,
                                 discovery_reason=discovery_reason,
                                 discovery_checked_at=discovery_checked_at,
+                                metadata=metadata,
                             )
                             return message
 
@@ -1205,15 +1205,17 @@ def run_sweep(
                             sender_address=msg.sender_address,
                         )
 
-                        auth_check = evaluate_message_authentication(auth_signals)
-                        if auth_check.escalate:
+                        assessment = evaluate_message_authentication(msg.raw_headers)
+                        if assessment.verdict != AUTH_ASSESSMENT_PASS:
                             messages_new += 1
                             folder_entry["new_discovery_records"] += 1
                             escalated_message = _record_discovery_only(
-                                INGESTION_STATUS_SECURITY_REVIEW, discovery_checked_at=resolved_now
+                                INGESTION_STATUS_SECURITY_REVIEW,
+                                discovery_checked_at=resolved_now,
+                                metadata=_auth_assessment_metadata(assessment),
                             )
                             _raise_authentication_escalation_item(
-                                needs_you_repository, mailbox=mailbox, message=escalated_message, reason=auth_check.reason
+                                needs_you_repository, mailbox=mailbox, message=escalated_message, reason=assessment.reason
                             )
                             continue
 
@@ -1290,7 +1292,12 @@ def run_sweep(
                             entity_id=entity_id_for_evidence,
                         )
 
-                        routing_metadata = _routing_metadata(rule)
+                        # CD-6 GUI-operations-foundation follow-on WO
+                        # (item C) — persist the PASSING assessment too
+                        # (never only the FAIL/UNKNOWN case above), so a
+                        # later operator/reader can see WHY a message
+                        # passed, not only why one was held.
+                        routing_metadata = {**_routing_metadata(rule), **_auth_assessment_metadata(assessment)}
 
                         if outcome.status == INGEST_STATUS_INGESTED:
                             evidence_created += 1
@@ -1566,25 +1573,100 @@ def _reprocess_one_message(
     owns that precondition once, up front, rather than repeating a
     per-message check across a bounded sequential loop.
 
-    CD-6 GUI-operations-foundation follow-on WO — this helper's own core
-    logic is UNCHANGED (per that WO's own explicit instruction): it
-    still never runs `evaluate_message_authentication` (a per-message
-    authentication check belongs to an ORDINARY sweep observing a
-    message live, not to this bounded, operator-triggered historical
-    back-process of messages already durably recorded) — the only two
-    additions are threading `rule.destination_entity_id` through to
-    `ingest_email_evidence` when `destination_mode == "FIXED"` (the same
-    entity-assignment fix `run_sweep` itself now applies), and raising a
-    document-scoped `COMPANY_REQUIRED` item when `destination_mode ==
-    "REVIEW_REQUIRED"` and ingestion succeeds (mirrors `run_sweep`'s own
-    identical new call — see that function's own module docstring,
-    "Document-level destination review" section).
+    CD-6 GUI-operations-foundation follow-on WO (item C) — this helper
+    now ALSO runs the real authentication gate, via a fresh, bounded,
+    METADATA-ONLY headers refresh (`adapter.fetch_message_headers`),
+    before ever fetching full MIME — see this function's own inline
+    comment, above the `fetch_message_headers` call, for the full
+    reasoning (this supersedes this docstring's own former "never runs
+    evaluate_message_authentication" description, which was itself a
+    confirmed, real, blocking integration gap the architect found on
+    direct code inspection). The other two additions from the earlier
+    revision of this WO remain: threading `rule.destination_entity_id`
+    through to `ingest_email_evidence` when `destination_mode == "FIXED"`
+    (the same entity-assignment fix `run_sweep` itself applies), and
+    raising a document-scoped `COMPANY_REQUIRED` item when
+    `destination_mode == "REVIEW_REQUIRED"` and ingestion succeeds
+    (mirrors `run_sweep`'s own identical call — see that function's own
+    module docstring, "Document-level destination review" section).
     """
     current = message_repository.get_message(message_id)
     if current.ingestion_status in FINAL_INGESTION_STATUSES - {INGESTION_STATUS_CHECKED_NOT_CANDIDATE}:
         # Already fully, durably decided by something else (e.g. a
         # genuine double-submit of this same approval) — a safe no-op.
         return current
+
+    # CD-6 GUI-operations-foundation follow-on WO (item C) — historical
+    # back-processing must now pass the SAME security gate an ordinary
+    # live sweep applies (this helper's own docstring USED TO admit it
+    # "never runs evaluate_message_authentication" — a confirmed,
+    # blocking integration gap the architect found; fixed here). The 959
+    # real historical candidate `MailboxMessage` rows only carry the OLD,
+    # buggy parser's flat `auth_signals` — never trusted for this new
+    # assessment. A bounded, METADATA-ONLY headers refresh (never a full
+    # MIME fetch merely to perform this check) is fetched fresh, by this
+    # message's own immutable provider id, and assessed via the SAME
+    # provider-neutral + Microsoft-selector pipeline the live-sweep path
+    # uses. PASS -> proceed to the existing MIME-fetch/evidence path
+    # exactly as before. FAIL/UNKNOWN -> mark SECURITY_REVIEW and raise
+    # the SAME escalation item type the live-sweep path raises — never
+    # silently skip/drop the message, never silently proceed as if it
+    # passed.
+    headers_result = adapter.fetch_message_headers(
+        mailbox_id=mailbox.mailbox_id, immutable_message_id=current.immutable_provider_message_id
+    )
+
+    if headers_result.status == GraphOutcomeStatus.NOT_FOUND:
+        message, _ = message_repository.record_observation(
+            mailbox_id=mailbox.mailbox_id,
+            provider_kind=mailbox.provider_kind,
+            immutable_provider_message_id=current.immutable_provider_message_id,
+            internet_message_id=current.internet_message_id,
+            observed_folder=current.observed_folder,
+            observed_folder_display_name=current.observed_folder_display_name,
+            subject=current.subject,
+            sender_address=current.sender_address,
+            sender_display_name=current.sender_display_name,
+            received_at=current.received_at,
+            has_attachments=current.has_attachments,
+            ingestion_status=INGESTION_STATUS_VANISHED,
+            sender_domain=current.sender_domain,
+            attachment_metadata=current.attachment_metadata,
+            auth_signals=current.auth_signals,
+        )
+        return message
+
+    if headers_result.status != GraphOutcomeStatus.OK:
+        raise ConflictError(
+            f"could not fetch headers for message '{message_id}' during domain-rule-approval "
+            f"reprocessing (required before the authentication gate can run): "
+            f"{headers_result.status.value} — {headers_result.error_detail or ''}"
+        )
+
+    assessment = evaluate_message_authentication(headers_result.raw_headers)
+    if assessment.verdict != AUTH_ASSESSMENT_PASS:
+        message, _ = message_repository.record_observation(
+            mailbox_id=mailbox.mailbox_id,
+            provider_kind=mailbox.provider_kind,
+            immutable_provider_message_id=current.immutable_provider_message_id,
+            internet_message_id=current.internet_message_id,
+            observed_folder=current.observed_folder,
+            observed_folder_display_name=current.observed_folder_display_name,
+            subject=current.subject,
+            sender_address=current.sender_address,
+            sender_display_name=current.sender_display_name,
+            received_at=current.received_at,
+            has_attachments=current.has_attachments,
+            ingestion_status=INGESTION_STATUS_SECURITY_REVIEW,
+            sender_domain=current.sender_domain,
+            attachment_metadata=current.attachment_metadata,
+            auth_signals=current.auth_signals,
+            metadata=_auth_assessment_metadata(assessment),
+        )
+        _raise_authentication_escalation_item(
+            needs_you_repository, mailbox=mailbox, message=message, reason=assessment.reason
+        )
+        return message
 
     content_result = adapter.fetch_message_content(
         mailbox_id=mailbox.mailbox_id, immutable_message_id=current.immutable_provider_message_id
@@ -1839,3 +1921,238 @@ def reprocess_all_historical_candidates_for_domain(
             )
         )
     return results
+
+
+def process_security_reviewed_message_once(
+    *,
+    mailbox: MailboxSource,
+    mailbox_source_id: str,
+    message_id: str,
+    rule: MailboxDomainRule,
+    adapter: _AdapterProtocol,
+    message_repository: MailboxMessageRepository,
+    needs_you_repository: NeedsYouRepository,
+    api: _EvidenceAPIProtocol,
+    object_store: _ObjectStoreProtocol,
+    scanner: EvidenceSafetyScanner,
+    actor_type: str,
+    actor_id: str,
+    correlation_id: Optional[str] = None,
+) -> MailboxMessage:
+    """CD-6 GUI-operations-foundation follow-on WO (item D) — the real
+    resolution workflow for a ``SECURITY_REVIEW``-held message: an
+    operator's explicit ``PROCESS_THIS_MESSAGE_ONCE`` decision (see
+    ``app/api/routers/mailboxes_microsoft.py``'s own dedicated
+    ``POST .../security-review/{item_id}/resolve`` endpoint).
+
+    Deliberately does NOT run :func:`evaluate_message_authentication`
+    again — the whole point of this one-message override is that an
+    operator has already looked at WHY this message failed/was
+    inconclusive and decided, for THIS one message only, to proceed
+    anyway; re-running the identical check would just fail it again for
+    the identical reason. The governing ``MailboxDomainRule`` (``rule``)
+    is never modified by this call — it stays exactly ``MUST_READ`` (a
+    one-message override, never a relevance/policy re-decision).
+
+    Otherwise mirrors :func:`_reprocess_one_message`'s own MIME-fetch +
+    ``ingest_email_evidence`` + FIXED/REVIEW_REQUIRED destination
+    handling exactly (including the identical NOT_FOUND -> VANISHED and
+    other-non-OK -> raised ``ConflictError`` outcomes).
+
+    Idempotent-safe: a message no longer ``SECURITY_REVIEW`` (already
+    processed by an earlier call — a genuine double-submit of the same
+    ``PROCESS_THIS_MESSAGE_ONCE`` decision) is returned UNCHANGED — never
+    re-fetched, never re-ingested, never a second evidence item.
+    """
+    current = message_repository.get_message(message_id)
+    if current.ingestion_status != INGESTION_STATUS_SECURITY_REVIEW:
+        return current
+
+    content_result = adapter.fetch_message_content(
+        mailbox_id=mailbox.mailbox_id, immutable_message_id=current.immutable_provider_message_id
+    )
+    routing_metadata = _routing_metadata(rule)
+
+    if content_result.status == GraphOutcomeStatus.NOT_FOUND:
+        message, _ = message_repository.record_observation(
+            mailbox_id=mailbox.mailbox_id,
+            provider_kind=mailbox.provider_kind,
+            immutable_provider_message_id=current.immutable_provider_message_id,
+            internet_message_id=current.internet_message_id,
+            observed_folder=current.observed_folder,
+            observed_folder_display_name=current.observed_folder_display_name,
+            subject=current.subject,
+            sender_address=current.sender_address,
+            sender_display_name=current.sender_display_name,
+            received_at=current.received_at,
+            has_attachments=current.has_attachments,
+            ingestion_status=INGESTION_STATUS_VANISHED,
+            sender_domain=current.sender_domain,
+            attachment_metadata=current.attachment_metadata,
+            auth_signals=current.auth_signals,
+        )
+        return message
+
+    if content_result.status != GraphOutcomeStatus.OK:
+        raise ConflictError(
+            f"could not fetch content for message '{message_id}' during security-review "
+            f"PROCESS_THIS_MESSAGE_ONCE: {content_result.status.value} — {content_result.error_detail or ''}"
+        )
+
+    entity_id_for_evidence = rule.destination_entity_id if rule.destination_mode == DESTINATION_MODE_FIXED else None
+    outcome = ingest_email_evidence(
+        raw_mime_bytes=content_result.content or b"",
+        mailbox_id=mailbox.mailbox_id,
+        mailbox_source_id=mailbox_source_id,
+        immutable_provider_message_id=current.immutable_provider_message_id,
+        observed_at=current.received_at,
+        received_at=current.received_at,
+        sender_address=current.sender_address,
+        subject=current.subject,
+        api=api,
+        object_store=object_store,
+        scanner=scanner,
+        actor_type=actor_type,
+        actor_id=actor_id,
+        correlation_id=correlation_id,
+        entity_id=entity_id_for_evidence,
+    )
+
+    if outcome.status == INGEST_STATUS_INGESTED:
+        message, _ = message_repository.record_observation(
+            mailbox_id=mailbox.mailbox_id,
+            provider_kind=mailbox.provider_kind,
+            immutable_provider_message_id=current.immutable_provider_message_id,
+            internet_message_id=current.internet_message_id,
+            observed_folder=current.observed_folder,
+            observed_folder_display_name=current.observed_folder_display_name,
+            subject=current.subject,
+            sender_address=current.sender_address,
+            sender_display_name=current.sender_display_name,
+            received_at=current.received_at,
+            has_attachments=current.has_attachments,
+            ingestion_status=INGESTION_STATUS_INGESTED,
+            evidence_id=outcome.evidence.evidence_id if outcome.evidence is not None else None,
+            sender_domain=current.sender_domain,
+            attachment_metadata=current.attachment_metadata,
+            auth_signals=current.auth_signals,
+            metadata=routing_metadata,
+        )
+        if outcome.evidence is not None:
+            api.record_provenance(
+                subject_type="MailboxMessage",
+                subject_id=message.mailbox_message_id,
+                evidence_id=outcome.evidence.evidence_id,
+                relationship="OBSERVED_FROM",
+                actor_type=actor_type,
+                actor_id=actor_id,
+                correlation_id=correlation_id,
+            )
+            api.record_audit_event(
+                event_type="EMAIL_EVIDENCE_INGESTED",
+                actor_type=actor_type,
+                actor_id=actor_id,
+                subject_type="EvidenceItem",
+                subject_id=outcome.evidence.evidence_id,
+                correlation_id=correlation_id,
+                causation_id=None,
+                payload={
+                    "mailbox_id": mailbox.mailbox_id,
+                    "mailbox_message_id": message.mailbox_message_id,
+                    "processed_after_security_review_override": True,
+                },
+            )
+            if rule.destination_mode == DESTINATION_MODE_REVIEW_REQUIRED:
+                _raise_document_destination_review_item(
+                    needs_you_repository, mailbox=mailbox, message=message, evidence=outcome.evidence
+                )
+        return message
+
+    if outcome.status == INGEST_STATUS_QUARANTINED:
+        message, _ = message_repository.record_observation(
+            mailbox_id=mailbox.mailbox_id,
+            provider_kind=mailbox.provider_kind,
+            immutable_provider_message_id=current.immutable_provider_message_id,
+            internet_message_id=current.internet_message_id,
+            observed_folder=current.observed_folder,
+            observed_folder_display_name=current.observed_folder_display_name,
+            subject=current.subject,
+            sender_address=current.sender_address,
+            sender_display_name=current.sender_display_name,
+            received_at=current.received_at,
+            has_attachments=current.has_attachments,
+            ingestion_status=INGESTION_STATUS_QUARANTINED,
+            sender_domain=current.sender_domain,
+            attachment_metadata=current.attachment_metadata,
+            auth_signals=current.auth_signals,
+            metadata=routing_metadata,
+        )
+        api.record_audit_event(
+            event_type="EMAIL_EVIDENCE_QUARANTINED",
+            actor_type=actor_type,
+            actor_id=actor_id,
+            subject_type="MailboxMessage",
+            subject_id=message.mailbox_message_id,
+            correlation_id=correlation_id,
+            causation_id=None,
+            payload={"mailbox_id": mailbox.mailbox_id, "processed_after_security_review_override": True},
+        )
+        return message
+
+    # INGEST_STATUS_FAILED — oversized message, a governed terminal outcome.
+    message, _ = message_repository.record_observation(
+        mailbox_id=mailbox.mailbox_id,
+        provider_kind=mailbox.provider_kind,
+        immutable_provider_message_id=current.immutable_provider_message_id,
+        internet_message_id=current.internet_message_id,
+        observed_folder=current.observed_folder,
+        observed_folder_display_name=current.observed_folder_display_name,
+        subject=current.subject,
+        sender_address=current.sender_address,
+        sender_display_name=current.sender_display_name,
+        received_at=current.received_at,
+        has_attachments=current.has_attachments,
+        ingestion_status=INGESTION_STATUS_FAILED,
+        sender_domain=current.sender_domain,
+        attachment_metadata=current.attachment_metadata,
+        auth_signals=current.auth_signals,
+        metadata=routing_metadata,
+    )
+    return message
+
+
+def decline_security_reviewed_message(
+    *, message_repository: MailboxMessageRepository, message_id: str
+) -> MailboxMessage:
+    """CD-6 GUI-operations-foundation follow-on WO (item D) — an
+    operator's explicit ``DO_NOT_PROCESS_THIS_MESSAGE`` decision: records
+    the decision (as an honest metadata marker), performs NO MIME fetch/
+    evidence ingestion, and leaves ``ingestion_status`` at the real,
+    honest terminal value ``SECURITY_REVIEW`` — never silently reused as
+    ``CHECKED_NOT_CANDIDATE`` (that would be dishonest here: this message
+    WAS a real candidate that WAS security-reviewed, not one Stage-A
+    heuristic quietly decided was irrelevant). Never touches the
+    governing ``MailboxDomainRule`` — this is a per-message security
+    decision, never a relevance decision; the source/domain is never
+    blacklisted by this call. Idempotent by construction — a repeated
+    call simply re-records the same metadata marker."""
+    current = message_repository.get_message(message_id)
+    message, _ = message_repository.record_observation(
+        mailbox_id=current.mailbox_id,
+        provider_kind=current.provider_kind,
+        immutable_provider_message_id=current.immutable_provider_message_id,
+        internet_message_id=current.internet_message_id,
+        observed_folder=current.observed_folder,
+        observed_folder_display_name=current.observed_folder_display_name,
+        subject=current.subject,
+        sender_address=current.sender_address,
+        sender_display_name=current.sender_display_name,
+        received_at=current.received_at,
+        has_attachments=current.has_attachments,
+        ingestion_status=INGESTION_STATUS_SECURITY_REVIEW,
+        sender_domain=current.sender_domain,
+        attachment_metadata=current.attachment_metadata,
+        auth_signals=current.auth_signals,
+        metadata={"security_review_decision": "DO_NOT_PROCESS_THIS_MESSAGE"},
+    )
+    return message

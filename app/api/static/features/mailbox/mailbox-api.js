@@ -43,6 +43,12 @@ export const MAILBOX_API = {
     `/internal/mailboxes/${encodeURIComponent(mailboxId)}/microsoft/domain-review/${encodeURIComponent(itemId)}/resolve`,
   microsoftDomainReviewBatchResolve: (mailboxId) =>
     `/internal/mailboxes/${encodeURIComponent(mailboxId)}/microsoft/domain-review/batch-resolve`,
+  //: CD-6 GUI-operations-foundation follow-on WO (item D) — the
+  //: SECURITY_REVIEW resolution surface, its own dedicated endpoint
+  //: mirroring the domain-review resolve endpoint's own shape.
+  microsoftSecurityReview: (mailboxId) => `/internal/mailboxes/${encodeURIComponent(mailboxId)}/microsoft/security-review`,
+  microsoftSecurityReviewResolveOne: (mailboxId, itemId) =>
+    `/internal/mailboxes/${encodeURIComponent(mailboxId)}/microsoft/security-review/${encodeURIComponent(itemId)}/resolve`,
 };
 
 export function listMailboxes() {
@@ -155,11 +161,17 @@ export function runXeroCorrelation(mailboxId, { entityId, actorId }) {
  * `MailboxDomainRule` and, on ALLOW, immediately back-processes every
  * historical candidate for that domain — see the endpoint's own
  * docstring). `destinationMode`/`destinationEntityId` are required when
- * `decision === "ALLOW"`; omitted entirely for `"IGNORE"`. */
+ * `decision === "ALLOW"`; omitted entirely for `"IGNORE"`.
+ *
+ * `senderAddress` (CD-6 GUI-operations-foundation follow-on WO, item A)
+ * — required, and ONLY sent, when `matchMode === "EXACT_ADDRESS"`: scope
+ * this rule to one specific, OBSERVED sender address rather than the
+ * whole domain. The server independently re-validates it was actually
+ * observed for this mailbox — this wrapper never second-guesses that. */
 export function resolveMailboxDomainReviewItem(
   mailboxId,
   itemId,
-  { decision, destinationEntityId, destinationMode, matchMode, processorHint, actorId }
+  { decision, destinationEntityId, destinationMode, matchMode, processorHint, senderAddress, actorId }
 ) {
   return apiPost(MAILBOX_API.microsoftDomainReviewResolveOne(mailboxId, itemId), {
     actor_type: "USER",
@@ -169,16 +181,17 @@ export function resolveMailboxDomainReviewItem(
     destination_mode: destinationMode || null,
     match_mode: matchMode || "EXACT",
     processor_hint: processorHint || null,
+    sender_address: senderAddress || null,
   });
 }
 
 /** Batched version of `resolveMailboxDomainReviewItem` — `items` is an
  * array of `{itemId, decision, destinationEntityId, destinationMode,
- * matchMode, processorHint}` (camelCase in, snake_case on the wire).
- * Partial batch success is normal (see the endpoint's own docstring) —
- * this wrapper does no interpretation of `body.results` itself; the
- * caller (`features/mailbox/domain-review.js`) renders per-item
- * outcomes. */
+ * matchMode, processorHint, senderAddress}` (camelCase in, snake_case on
+ * the wire). Partial batch success is normal (see the endpoint's own
+ * docstring) — this wrapper does no interpretation of `body.results`
+ * itself; the caller (`features/mailbox/domain-review.js`) renders
+ * per-item outcomes. */
 export function batchResolveMailboxDomainReview(mailboxId, { actorId, items }) {
   return apiPost(MAILBOX_API.microsoftDomainReviewBatchResolve(mailboxId), {
     actor_type: "USER",
@@ -190,7 +203,29 @@ export function batchResolveMailboxDomainReview(mailboxId, { actorId, items }) {
       destination_mode: item.destinationMode || null,
       match_mode: item.matchMode || "EXACT",
       processor_hint: item.processorHint || null,
+      sender_address: item.senderAddress || null,
     })),
+  });
+}
+
+//: CD-6 GUI-operations-foundation follow-on WO (item D) —
+//: SECURITY_REVIEW resolution.
+
+/** `status` defaults server-side to `"OPEN"` (mirrors
+ * `listDomainReviewItems`'s own convention). */
+export function listSecurityReviewItems(mailboxId, status) {
+  const suffix = status ? `?status=${encodeURIComponent(status)}` : "";
+  return apiGet(`${MAILBOX_API.microsoftSecurityReview(mailboxId)}${suffix}`);
+}
+
+/** `decision` is exactly `"PROCESS_THIS_MESSAGE_ONCE"` or
+ * `"DO_NOT_PROCESS_THIS_MESSAGE"` — see the endpoint's own docstring for
+ * exactly what each does. Never touches the governing `MailboxDomainRule`. */
+export function resolveSecurityReviewItem(mailboxId, itemId, { decision, actorId }) {
+  return apiPost(MAILBOX_API.microsoftSecurityReviewResolveOne(mailboxId, itemId), {
+    actor_type: "USER",
+    actor_id: actorId,
+    decision,
   });
 }
 

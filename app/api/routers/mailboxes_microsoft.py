@@ -103,7 +103,14 @@ Endpoints
   already discovered for that domain (operational addendum, ahead of
   the first real large historical sweep — not merely the one triggering
   message) — see ``ResolveMailboxDomainReviewRequest``'s own docstring
-  below.
+  below, including its ``sender_address``/``EXACT_ADDRESS`` scope (CD-6
+  GUI-operations-foundation follow-on WO fix — "five confirmed
+  integration gaps", item A).
+* ``GET /internal/mailboxes/{mailbox_id}/microsoft/security-review`` /
+  ``POST /internal/mailboxes/{mailbox_id}/microsoft/security-review/{item_id}/resolve``
+  — the real resolution workflow for a ``SECURITY_REVIEW``-held message
+  (CD-6 GUI-operations-foundation follow-on WO fix, item D) — see
+  ``resolve_microsoft_security_review``'s own docstring below.
 
 Needs You integration (architect spec)
 ------------------------------------------
@@ -157,11 +164,15 @@ from services.mailbox.domain_rule import (
     DESTINATION_MODE_FIXED,
     DESTINATION_MODE_REVIEW_REQUIRED,
     MATCH_MODE_EXACT,
+    MATCH_MODE_EXACT_ADDRESS,
     MATCH_MODE_INCLUDE_SUBDOMAINS,
     POLICY_BLACKLIST,
     POLICY_GRAYLIST,
     POLICY_MUST_READ,
     SOURCE_OPERATOR,
+    domain_from_address,
+    normalize_address,
+    normalize_domain,
 )
 from services.mailbox.lock import MailboxSweepLockError
 from services.mailbox.mailbox import (
@@ -170,10 +181,16 @@ from services.mailbox.mailbox import (
 )
 from services.mailbox.domain_review_priority import aggregate_discovery_reasons, compute_review_priority
 from services.mailbox.microsoft.oauth_state import consume_state
-from services.mailbox.sweep import reprocess_all_historical_candidates_for_domain, run_sweep
+from services.mailbox.sweep import (
+    decline_security_reviewed_message,
+    process_security_reviewed_message_once,
+    reprocess_all_historical_candidates_for_domain,
+    run_sweep,
+)
 from services.mailbox.sweep_run import TRIGGER_MANUAL
 from services.needs_you.needs_you import (
     ALLOWED_ACTION_CONNECT_MICROSOFT_MAILBOX,
+    ITEM_TYPE_MAILBOX_AUTHENTICATION_ESCALATION,
     ITEM_TYPE_MAILBOX_AUTH_REQUIRED,
     ITEM_TYPE_MAILBOX_DOMAIN_REVIEW,
 )
@@ -839,6 +856,63 @@ class ResolveMailboxDomainReviewRequest(BaseModel):
     destination_mode: Optional[str] = None  # "FIXED" | "REVIEW_REQUIRED" — required when decision == "ALLOW"
     match_mode: str = MATCH_MODE_EXACT  # "EXACT" | "INCLUDE_SUBDOMAINS" | "EXACT_ADDRESS"
     processor_hint: Optional[str] = None
+    #: CD-6 GUI-operations-foundation follow-on WO (item A — the
+    #: confirmed root defect fix) — required, and ONLY accepted, when
+    #: `match_mode == MATCH_MODE_EXACT_ADDRESS`. See
+    #: `_validate_and_normalize_sender_address`'s own docstring below for
+    #: the full real-observation/domain-match validation this goes
+    #: through before a rule is ever created for it.
+    sender_address: Optional[str] = None
+
+
+def _validate_and_normalize_sender_address(
+    composition, *, mailbox_id: str, sender_domain: str, match_mode: str, sender_address: Optional[str]
+) -> Optional[str]:
+    """CD-6 GUI-operations-foundation follow-on WO (item A) — the real
+    validation an ``EXACT_ADDRESS`` resolve/batch-resolve request must
+    pass before ``upsert_rule`` is ever called (the architect's own
+    confirmed root defect: this endpoint used to reject
+    ``MATCH_MODE_EXACT_ADDRESS`` outright, since it was never imported
+    here at all):
+
+    * ``match_mode != MATCH_MODE_EXACT_ADDRESS`` -> ``sender_address``
+      must be absent/empty (a domain-level mode must never silently
+      accept a stray address).
+    * ``match_mode == MATCH_MODE_EXACT_ADDRESS`` -> ``sender_address``
+      is REQUIRED, non-empty, normalised, its own domain must equal this
+      domain-review item's own ``sender_domain`` (an operator must never
+      create a rule for an address whose domain doesn't even match the
+      item they're resolving), AND it must have been ACTUALLY OBSERVED
+      for this mailbox (``MailboxMessageRepository
+      .sender_address_observed``) — an operator must never be able to
+      pre-authorize an address BAGMAN has never actually seen mail from.
+
+    Returns the normalised address (``None`` for a domain-level rule).
+    """
+    if match_mode != MATCH_MODE_EXACT_ADDRESS:
+        if sender_address:
+            raise ValidationError(
+                f"sender_address must not be supplied when match_mode is '{match_mode}' — only "
+                f"'{MATCH_MODE_EXACT_ADDRESS}' rules are scoped to one specific address"
+            )
+        return None
+
+    if not sender_address:
+        raise ValidationError(f"sender_address is required when match_mode is '{MATCH_MODE_EXACT_ADDRESS}'")
+
+    normalized_address = normalize_address(sender_address)
+    address_domain = domain_from_address(normalized_address)
+    if address_domain != normalize_domain(sender_domain):
+        raise ValidationError(
+            f"sender_address '{sender_address}' does not belong to this domain-review item's own "
+            f"sender_domain '{sender_domain}' ('{address_domain}' != '{normalize_domain(sender_domain)}')"
+        )
+    if not composition.mailbox_message_repository.sender_address_observed(mailbox_id, normalized_address):
+        raise ValidationError(
+            f"sender_address '{normalized_address}' has never actually been observed for mailbox "
+            f"'{mailbox_id}' — refusing to pre-authorize an address BAGMAN has never seen mail from"
+        )
+    return normalized_address
 
 
 def _resolve_mailbox_domain_review_core(
@@ -880,15 +954,35 @@ def _resolve_mailbox_domain_review_core(
 
     if payload.decision not in ("ALLOW", "IGNORE", "KEEP_GRAY"):
         raise ValidationError(f"decision must be 'ALLOW', 'IGNORE' or 'KEEP_GRAY' (got {payload.decision!r})")
-    if payload.match_mode not in (MATCH_MODE_EXACT, MATCH_MODE_INCLUDE_SUBDOMAINS):
-        raise ValidationError(f"match_mode must be 'EXACT' or 'INCLUDE_SUBDOMAINS' (got {payload.match_mode!r})")
+    if payload.match_mode not in (MATCH_MODE_EXACT, MATCH_MODE_INCLUDE_SUBDOMAINS, MATCH_MODE_EXACT_ADDRESS):
+        raise ValidationError(
+            f"match_mode must be 'EXACT', 'INCLUDE_SUBDOMAINS' or 'EXACT_ADDRESS' (got {payload.match_mode!r})"
+        )
+    if payload.decision == "KEEP_GRAY" and payload.match_mode == MATCH_MODE_EXACT_ADDRESS:
+        # Documented, deliberate out-of-scope judgment call (WO item A) —
+        # graylisting is inherently domain-level triage ("Matt looked at
+        # this domain once and deliberately left it under review"); an
+        # address-scoped graylist has no real operator use case this
+        # delivery builds for. Use 'EXACT'/'INCLUDE_SUBDOMAINS' instead.
+        raise ValidationError(
+            "match_mode 'EXACT_ADDRESS' is not supported for decision 'KEEP_GRAY' — graylisting is "
+            "inherently domain-level triage; use 'EXACT' or 'INCLUDE_SUBDOMAINS' instead"
+        )
 
     sender_domain = item.metadata.get("sender_domain")
+    normalized_sender_address = _validate_and_normalize_sender_address(
+        composition,
+        mailbox_id=mailbox_id,
+        sender_domain=sender_domain,
+        match_mode=payload.match_mode,
+        sender_address=payload.sender_address,
+    )
     resolution = {
         "decision": payload.decision,
         "destination_entity_id": payload.destination_entity_id,
         "destination_mode": payload.destination_mode,
         "match_mode": payload.match_mode,
+        "sender_address": normalized_sender_address,
     }
 
     # Audit trail (WO §6) — snapshot whatever governs this domain BEFORE
@@ -896,9 +990,14 @@ def _resolve_mailbox_domain_review_core(
     # previous_policy/previous_destination_* alongside the new values.
     # `find_for_sender` (never a raw domain-only dict lookup) is reused
     # deliberately — this IS the exact resolution a real message from
-    # this domain would hit right now.
+    # this domain would hit right now. CD-6 GUI-operations-foundation
+    # follow-on WO (item A fix) — now ALSO passes `sender_address` when
+    # creating/updating an `EXACT_ADDRESS` rule, so this lookup correctly
+    # resolves the PRIOR state of THAT specific address-level rule, never
+    # a broader domain-level rule that happens to also govern the same
+    # domain.
     previous_rule = composition.mailbox_domain_rule_repository.find_for_sender(
-        mailbox_id=mailbox_id, sender_domain=sender_domain
+        mailbox_id=mailbox_id, sender_domain=sender_domain, sender_address=normalized_sender_address
     )
     previous_policy = previous_rule.policy if previous_rule is not None else None
     previous_destination_entity_id = previous_rule.destination_entity_id if previous_rule is not None else None
@@ -975,6 +1074,7 @@ def _resolve_mailbox_domain_review_core(
         source=SOURCE_OPERATOR,
         processor_hint=payload.processor_hint,
         approved_at=utc_now(),
+        sender_address=normalized_sender_address,
     )
 
     updated_item = composition.needs_you_repository.resolve_needs_you_item(
@@ -1086,8 +1186,14 @@ class BatchResolveMailboxDomainReviewItem(BaseModel):
     decision: str  # "ALLOW" | "IGNORE" | "KEEP_GRAY"
     destination_entity_id: Optional[str] = None
     destination_mode: Optional[str] = None  # "FIXED" | "REVIEW_REQUIRED" — required when decision == "ALLOW"
-    match_mode: str = MATCH_MODE_EXACT  # "EXACT" | "INCLUDE_SUBDOMAINS"
+    match_mode: str = MATCH_MODE_EXACT  # "EXACT" | "INCLUDE_SUBDOMAINS" | "EXACT_ADDRESS"
     processor_hint: Optional[str] = None
+    #: CD-6 GUI-operations-foundation follow-on WO (item A) — see
+    #: `ResolveMailboxDomainReviewRequest.sender_address`'s own
+    #: docstring; supported in the batch shape too (each entry is
+    #: resolved through the identical `_resolve_mailbox_domain_review_core`
+    #: governed path — no cheaper "bulk mode").
+    sender_address: Optional[str] = None
 
 
 class BatchResolveMailboxDomainReviewRequest(BaseModel):
@@ -1158,6 +1264,7 @@ async def batch_resolve_mailbox_domain_review(mailbox_id: str, payload: BatchRes
                 destination_mode=entry.destination_mode,
                 match_mode=entry.match_mode,
                 processor_hint=entry.processor_hint,
+                sender_address=entry.sender_address,
             )
             outcome = _resolve_mailbox_domain_review_core(
                 composition, mailbox_id=mailbox_id, mailbox=mailbox, item_id=entry.item_id, payload=single_payload
@@ -1194,3 +1301,192 @@ async def batch_resolve_mailbox_domain_review(mailbox_id: str, payload: BatchRes
         "succeeded_count": succeeded_count,
         "failed_count": len(results) - succeeded_count,
     }
+
+
+# ---------------------------------------------------------------------
+# CD-6 GUI-operations-foundation follow-on WO, item D — the real
+# resolution workflow for a SECURITY_REVIEW-held message. Before this
+# endpoint existed, a MAILBOX_AUTHENTICATION_ESCALATION item could be
+# marked resolved via the generic Needs You endpoint, but nothing
+# actually reprocessed the underlying message — it was permanently
+# stuck. Mirrors this router's own established precedent (domain-review
+# having its own dedicated resolve endpoint, distinct from the generic
+# one) — never reuses `POST /internal/needs-you/{id}/resolve` for this.
+# ---------------------------------------------------------------------
+
+
+@router.get("/{mailbox_id}/microsoft/security-review")
+async def list_microsoft_security_review_items(mailbox_id: str, status: str = "OPEN") -> dict[str, Any]:
+    """List this mailbox's own ``MAILBOX_AUTHENTICATION_ESCALATION``
+    Needs You items — a plain read, no side effects. Mirrors
+    ``list_microsoft_domain_review_items``'s own filter/default-status
+    convention exactly, deliberately without that endpoint's review-
+    priority/Xero-correlation enrichment — a security-review item's own
+    triage need is much simpler (why did THIS one message fail, and does
+    the operator want to override it just this once), so this stays
+    proportionate rather than growing the full batch-triage treatment."""
+    composition = get_composition()
+    _require_microsoft_mailbox(composition, mailbox_id)
+    items = [
+        item
+        for item in composition.needs_you_repository.list_needs_you_items(
+            item_type=ITEM_TYPE_MAILBOX_AUTHENTICATION_ESCALATION, domain="MAILBOX", status=status
+        )
+        if item.metadata.get("mailbox_id") == mailbox_id
+    ]
+    return {"mailbox_id": mailbox_id, "items": [i.to_dict() for i in items], "count": len(items)}
+
+
+class ResolveSecurityReviewRequest(BaseModel):
+    """Request body for
+    ``POST /internal/mailboxes/{mailbox_id}/microsoft/security-review/{item_id}/resolve``.
+    ``decision`` is exactly one of two values — see
+    ``services.mailbox.sweep.process_security_reviewed_message_once``/
+    ``.decline_security_reviewed_message``'s own docstrings for exactly
+    what each does. There is deliberately NO "always trust this address
+    even on auth failure" exception mechanism here — the architect
+    explicitly said not to build that now; a genuinely trusted address
+    is instead handled through the ordinary `EXACT_ADDRESS`
+    `MailboxDomainRule` path (item A), which still runs the SAME
+    authentication gate per-message — this endpoint is purely a
+    one-message override.
+    """
+
+    actor_type: str
+    actor_id: str
+    decision: str  # "PROCESS_THIS_MESSAGE_ONCE" | "DO_NOT_PROCESS_THIS_MESSAGE"
+
+
+_SECURITY_REVIEW_DECISIONS = ("PROCESS_THIS_MESSAGE_ONCE", "DO_NOT_PROCESS_THIS_MESSAGE")
+
+
+@router.post("/{mailbox_id}/microsoft/security-review/{item_id}/resolve")
+async def resolve_microsoft_security_review(
+    mailbox_id: str, item_id: str, payload: ResolveSecurityReviewRequest
+) -> dict[str, Any]:
+    """Resolve one ``ITEM_TYPE_MAILBOX_AUTHENTICATION_ESCALATION`` Needs
+    You item — the real, previously-missing way back into processing for
+    a ``SECURITY_REVIEW``-held message.
+
+    * ``decision="PROCESS_THIS_MESSAGE_ONCE"`` — fetches this ONE
+      message's raw MIME and applies the GOVERNING ``MailboxDomainRule``'s
+      own destination semantics exactly as the normal MUST_READ path
+      would (FIXED -> real entity_id at registration; REVIEW_REQUIRED ->
+      an unresolved evidence item + a document-level ``COMPANY_REQUIRED``
+      item). Does NOT modify the governing rule's own policy at all — a
+      one-message override, never a relevance re-decision. Idempotent
+      under a double-submit — a second call on the same already-processed
+      message never creates a second evidence item.
+    * ``decision="DO_NOT_PROCESS_THIS_MESSAGE"`` — records the explicit
+      decision (audited), performs no MIME fetch/evidence ingestion, and
+      does NOT blacklist the underlying source/domain — the governing
+      ``MailboxDomainRule`` stays untouched (this is a per-message
+      security decision, never a relevance decision).
+
+    Both decisions resolve the triggering ``MAILBOX_AUTHENTICATION_ESCALATION``
+    item as part of the same call. Idempotent-safe against a genuine
+    double-submit of the exact same decision (mirrors
+    ``resolve_mailbox_domain_review``'s own doctrine) — a real attempt to
+    change an already-decided item to a DIFFERENT outcome raises
+    ``ConflictError`` -> HTTP 409.
+    """
+    composition = get_composition()
+    mailbox = _require_microsoft_mailbox(composition, mailbox_id)
+
+    item = composition.needs_you_repository.get_needs_you_item(item_id)
+    if item.item_type != ITEM_TYPE_MAILBOX_AUTHENTICATION_ESCALATION:
+        raise ValidationError(
+            f"NeedsYouItem '{item_id}' is not a {ITEM_TYPE_MAILBOX_AUTHENTICATION_ESCALATION} item"
+        )
+    if item.metadata.get("mailbox_id") != mailbox_id:
+        raise ValidationError(f"NeedsYouItem '{item_id}' does not belong to mailbox '{mailbox_id}'")
+    if payload.decision not in _SECURITY_REVIEW_DECISIONS:
+        raise ValidationError(f"decision must be one of {_SECURITY_REVIEW_DECISIONS} (got {payload.decision!r})")
+
+    resolution = {"decision": payload.decision}
+    message_id = item.metadata.get("mailbox_message_id")
+
+    if item.status != "OPEN":
+        if item.status == "RESOLVED" and (item.resolution or {}) == resolution:
+            message = composition.mailbox_message_repository.get_message(message_id)
+            return {"needs_you_item": item.to_dict(), "mailbox_message": message.to_dict()}
+        raise ConflictError(
+            f"NeedsYouItem '{item_id}' is already '{item.status}' with a different resolution — "
+            "refusing to silently change an already-decided item; this is a genuine conflict, not "
+            "an idempotent retry"
+        )
+
+    if payload.decision == "DO_NOT_PROCESS_THIS_MESSAGE":
+        updated_message = decline_security_reviewed_message(
+            message_repository=composition.mailbox_message_repository, message_id=message_id
+        )
+        updated_item = composition.needs_you_repository.resolve_needs_you_item(
+            item_id,
+            new_status="RESOLVED",
+            resolution=resolution,
+            actor_type=payload.actor_type,
+            actor_id=payload.actor_id,
+        )
+        composition.api.record_audit_event(
+            event_type="MAILBOX_SECURITY_REVIEW_DECLINED",
+            actor_type=payload.actor_type,
+            actor_id=payload.actor_id,
+            subject_type="MailboxMessage",
+            subject_id=updated_message.mailbox_message_id,
+            correlation_id=updated_item.correlation_id,
+            causation_id=None,
+            payload={"mailbox_id": mailbox_id, "needs_you_item_id": item_id},
+        )
+        return {"needs_you_item": updated_item.to_dict(), "mailbox_message": updated_message.to_dict()}
+
+    # PROCESS_THIS_MESSAGE_ONCE
+    message = composition.mailbox_message_repository.get_message(message_id)
+    rule = composition.mailbox_domain_rule_repository.find_for_sender(
+        mailbox_id=mailbox_id, sender_domain=message.sender_domain, sender_address=message.sender_address
+    )
+    if rule is None or rule.policy != POLICY_MUST_READ:
+        raise ConflictError(
+            f"no governing MUST_READ MailboxDomainRule found for message '{message_id}' — cannot "
+            "process it (this should never happen for a genuine MAILBOX_AUTHENTICATION_ESCALATION "
+            "item, which is only ever raised for a MUST_READ source)"
+        )
+
+    mailbox_source_id = get_mailbox_source_id(composition, mailbox)
+    updated_message = process_security_reviewed_message_once(
+        mailbox=mailbox,
+        mailbox_source_id=mailbox_source_id,
+        message_id=message_id,
+        rule=rule,
+        adapter=composition.microsoft_mailbox_adapter,
+        message_repository=composition.mailbox_message_repository,
+        needs_you_repository=composition.needs_you_repository,
+        api=composition.api,
+        object_store=composition.object_store,
+        scanner=composition.scanner,
+        actor_type=payload.actor_type,
+        actor_id=payload.actor_id,
+        correlation_id=item.correlation_id,
+    )
+    updated_item = composition.needs_you_repository.resolve_needs_you_item(
+        item_id,
+        new_status="RESOLVED",
+        resolution=resolution,
+        actor_type=payload.actor_type,
+        actor_id=payload.actor_id,
+    )
+    composition.api.record_audit_event(
+        event_type="MAILBOX_SECURITY_REVIEW_PROCESSED_ONCE",
+        actor_type=payload.actor_type,
+        actor_id=payload.actor_id,
+        subject_type="MailboxMessage",
+        subject_id=updated_message.mailbox_message_id,
+        correlation_id=updated_item.correlation_id,
+        causation_id=None,
+        payload={
+            "mailbox_id": mailbox_id,
+            "needs_you_item_id": item_id,
+            "ingestion_status": updated_message.ingestion_status,
+            "evidence_id": updated_message.evidence_id,
+        },
+    )
+    return {"needs_you_item": updated_item.to_dict(), "mailbox_message": updated_message.to_dict()}

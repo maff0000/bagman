@@ -217,3 +217,59 @@ def test_list_candidate_messages_for_domain_requires_discovery_candidate_true_at
     fresh_repo = PostgresMailboxMessageRepository(engine=fresh_engine)
     results = fresh_repo.list_candidate_messages_for_domain(mailbox_id=mailbox_id, sender_domain="vendor.com")
     assert {m.immutable_provider_message_id for m in results} == {"real-candidate"}
+
+
+# ---------------------------------------------------------------------
+# CD-6 GUI-operations-foundation follow-on WO (item A) —
+# `sender_address_observed` (the real backstop behind an `EXACT_ADDRESS`
+# `MailboxDomainRule`: an operator must never be able to pre-authorize
+# an address BAGMAN has never actually seen mail from).
+# ---------------------------------------------------------------------
+
+
+def test_sender_address_observed_is_true_for_a_real_observed_address(fresh_engine):
+    repo = PostgresMailboxMessageRepository()
+    mailbox_id = _mailbox_id()
+    repo.record_observation(
+        mailbox_id=mailbox_id, provider_kind="MICROSOFT_GRAPH", immutable_provider_message_id="msg-1",
+        internet_message_id="<a@b>", observed_folder=FOLDER_INBOX, subject="Hi",
+        sender_address="Billing@Vendor.com", sender_display_name="Vendor",
+        received_at=datetime.now(timezone.utc), has_attachments=False,
+        ingestion_status=INGESTION_STATUS_INGESTED,
+    )
+
+    fresh_repo = PostgresMailboxMessageRepository(engine=fresh_engine)
+    # Case-insensitive — the real, stored address was "Billing@Vendor.com".
+    assert fresh_repo.sender_address_observed(mailbox_id, "billing@vendor.com") is True
+    assert fresh_repo.sender_address_observed(mailbox_id, "BILLING@VENDOR.COM") is True
+
+
+def test_sender_address_observed_is_false_for_an_unobserved_address(fresh_engine):
+    repo = PostgresMailboxMessageRepository()
+    mailbox_id = _mailbox_id()
+    repo.record_observation(
+        mailbox_id=mailbox_id, provider_kind="MICROSOFT_GRAPH", immutable_provider_message_id="msg-1",
+        internet_message_id="<a@b>", observed_folder=FOLDER_INBOX, subject="Hi",
+        sender_address="billing@vendor.com", sender_display_name="Vendor",
+        received_at=datetime.now(timezone.utc), has_attachments=False,
+        ingestion_status=INGESTION_STATUS_INGESTED,
+    )
+
+    fresh_repo = PostgresMailboxMessageRepository(engine=fresh_engine)
+    assert fresh_repo.sender_address_observed(mailbox_id, "someone-else@vendor.com") is False
+
+
+def test_sender_address_observed_is_scoped_to_the_mailbox(fresh_engine):
+    repo = PostgresMailboxMessageRepository()
+    mailbox_id = _mailbox_id()
+    other_mailbox_id = _mailbox_id()
+    repo.record_observation(
+        mailbox_id=mailbox_id, provider_kind="MICROSOFT_GRAPH", immutable_provider_message_id="msg-1",
+        internet_message_id="<a@b>", observed_folder=FOLDER_INBOX, subject="Hi",
+        sender_address="billing@vendor.com", sender_display_name="Vendor",
+        received_at=datetime.now(timezone.utc), has_attachments=False,
+        ingestion_status=INGESTION_STATUS_INGESTED,
+    )
+
+    fresh_repo = PostgresMailboxMessageRepository(engine=fresh_engine)
+    assert fresh_repo.sender_address_observed(other_mailbox_id, "billing@vendor.com") is False

@@ -89,6 +89,7 @@ from services.mailbox.microsoft.graph_client import (
     WELL_KNOWN_FOLDER_NAMES_TO_RESOLVE,
     GraphDeltaPageResult,
     GraphMessageContentResult,
+    GraphMessageHeadersResult,
     GraphOutcomeStatus,
     MicrosoftGraphClientProtocol,
     MicrosoftOAuthClientProtocol,
@@ -260,6 +261,30 @@ class MicrosoftGraphMailboxAdapter:
         if retried_token is None:
             return GraphMessageContentResult(status=GraphOutcomeStatus.AUTH_ERROR, error_detail=retry_error)
         return self._graph_client.fetch_message_content(
+            access_token=retried_token, immutable_message_id=immutable_message_id
+        )
+
+    def fetch_message_headers(self, *, mailbox_id: str, immutable_message_id: str) -> GraphMessageHeadersResult:
+        """CD-6 GUI-operations-foundation follow-on WO (item C) — the
+        bounded, METADATA-ONLY headers refresh
+        ``services.mailbox.sweep._reprocess_one_message`` uses to run the
+        real authentication gate against FRESH headers before back-
+        processing a historical candidate. Same pre-emptive/reactive
+        token-refresh discipline as :meth:`fetch_message_content`."""
+        access_token, error_detail = self._ensure_fresh_access_token(mailbox_id)
+        if access_token is None:
+            return GraphMessageHeadersResult(status=GraphOutcomeStatus.AUTH_ERROR, error_detail=error_detail)
+
+        result = self._graph_client.fetch_message_headers(
+            access_token=access_token, immutable_message_id=immutable_message_id
+        )
+        if result.status != GraphOutcomeStatus.AUTH_ERROR:
+            return result
+
+        retried_token, retry_error = self._reactive_refresh(mailbox_id)
+        if retried_token is None:
+            return GraphMessageHeadersResult(status=GraphOutcomeStatus.AUTH_ERROR, error_detail=retry_error)
+        return self._graph_client.fetch_message_headers(
             access_token=retried_token, immutable_message_id=immutable_message_id
         )
 

@@ -106,6 +106,13 @@ TOKEN_URL_TEMPLATE = "https://login.microsoftonline.com/{tenant}/oauth2/v2.0/tok
 GRAPH_ME_URL = "https://graph.microsoft.com/v1.0/me"
 GRAPH_DELTA_URL_TEMPLATE = "https://graph.microsoft.com/v1.0/me/mailFolders/{folder}/messages/delta"
 GRAPH_MESSAGE_CONTENT_URL_TEMPLATE = "https://graph.microsoft.com/v1.0/me/messages/{message_id}/$value"
+#: CD-6 GUI-operations-foundation follow-on WO (item C — historical
+#: back-processing must pass the same security gate) — a bounded,
+#: METADATA-ONLY read distinct from `GRAPH_MESSAGE_CONTENT_URL_TEMPLATE`
+#: above: refreshes ONLY `internetMessageHeaders` for one already-known
+#: message id, never the full MIME body. See
+#: `MicrosoftGraphClient.fetch_message_headers` below.
+GRAPH_MESSAGE_HEADERS_URL_TEMPLATE = "https://graph.microsoft.com/v1.0/me/messages/{message_id}?$select=internetMessageHeaders"
 GRAPH_MAIL_FOLDERS_URL = "https://graph.microsoft.com/v1.0/me/mailFolders"
 GRAPH_CHILD_FOLDERS_URL_TEMPLATE = "https://graph.microsoft.com/v1.0/me/mailFolders/{folder_id}/childFolders"
 GRAPH_WELL_KNOWN_FOLDER_URL_TEMPLATE = "https://graph.microsoft.com/v1.0/me/mailFolders/{well_known_name}"
@@ -297,6 +304,36 @@ class GraphMessageSummary:
     #: mechanism — this module never invents a verdict Graph did not
     #: supply.
     auth_signals: Mapping[str, Optional[str]] = field(default_factory=dict)
+    #: CD-6 GUI-operations-foundation follow-on WO (item B) — the RAW,
+    #: unparsed `internetMessageHeaders` list Graph returned for this
+    #: delta item (`[{"name": ..., "value": ...}, ...]`, order
+    #: preserved exactly as Graph returned it). This is what
+    #: `services.mailbox.microsoft.authentication.assess_microsoft_authentication`
+    #: consumes directly — `auth_signals` above remains a separate,
+    #: simpler best-effort projection kept for backward-compatible
+    #: display/persistence on `MailboxMessage.auth_signals`; the new,
+    #: real per-message security GATE (see `services/mailbox/sweep.py`)
+    #: is driven by these raw headers, never by the flat dict alone.
+    #: Empty when the provider did not return `internetMessageHeaders`
+    #: for this item (e.g. the historical-reprocessing headers-only
+    #: fetch below always populates it; an old delta round from before
+    #: this field existed would not have).
+    raw_headers: Sequence[Mapping[str, Optional[str]]] = field(default_factory=tuple)
+
+
+@dataclass(frozen=True)
+class GraphMessageHeadersResult:
+    """CD-6 GUI-operations-foundation follow-on WO (item C) — the result
+    of a bounded, METADATA-ONLY headers refresh for one already-known
+    message id (see `MicrosoftGraphClient.fetch_message_headers`)."""
+
+    status: GraphOutcomeStatus
+    #: The raw `internetMessageHeaders` list, present only when `status
+    #: == GraphOutcomeStatus.OK` — the SAME shape `GraphMessageSummary
+    #: .raw_headers` carries.
+    raw_headers: Sequence[Mapping[str, Optional[str]]] = field(default_factory=tuple)
+    retry_after_seconds: Optional[float] = None
+    error_detail: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -471,6 +508,8 @@ class MicrosoftGraphClientProtocol(Protocol):
 
     def fetch_message_content(self, *, access_token: str, immutable_message_id: str) -> GraphMessageContentResult: ...
 
+    def fetch_message_headers(self, *, access_token: str, immutable_message_id: str) -> "GraphMessageHeadersResult": ...
+
     def list_mail_folders(self, *, access_token: str) -> GraphFolderListResult: ...
 
     def resolve_well_known_folders(
@@ -620,25 +659,85 @@ class MicrosoftOAuthClient:
         return MicrosoftIdentityResult(status=GraphOutcomeStatus.OK, identity=identity)
 
 
+#: Best-effort, non-exhaustive same-mechanism tie-break for the simple,
+#: DISPLAY-ONLY `_parse_auth_signals` projection below — mirrors
+#: `services.mailbox.microsoft.authentication._VERDICT_RANK`'s own
+#: conservative "worst verdict wins" reasoning (a real, confirmed bug:
+#: the OLD `setdefault`-based parser silently kept only the FIRST token
+#: for a mechanism, even when TWO real, live diagnostic samples carried
+#: two separate `dkim=` tokens within the SAME single header — see that
+#: module's own docstring for the full live-diagnostic writeup). This
+#: dict is intentionally the SAME rank table, kept local rather than
+#: imported, so this low-level wire-parsing module never depends on
+#: `services.mailbox.microsoft.authentication` (the real SECURITY GATE
+#: now lives there, driven by `GraphMessageSummary.raw_headers`
+#: directly — this function remains only a simpler, best-effort,
+#: backward-compatible projection for `MailboxMessage.auth_signals`
+#: display/persistence, never the gate itself).
+_AUTH_SIGNAL_VERDICT_RANK: Mapping[str, int] = {
+    "fail": 0, "reject": 0, "hardfail": 0,
+    "softfail": 1, "neutral": 1,
+    "none": 2, "temperror": 2, "permerror": 2, "bestguesspass": 2,
+    "pass": 3,
+}
+
+
+def _auth_signal_rank(value: str) -> int:
+    return _AUTH_SIGNAL_VERDICT_RANK.get(value.lower(), 1)
+
+
 def _parse_auth_signals(headers: Optional[Sequence[Mapping]]) -> Mapping[str, Optional[str]]:
     """Best-effort SPF/DKIM/DMARC verdict extraction from a Graph
     `internetMessageHeaders` list (`[{"name": ..., "value": ...}, ...]`)
     — see `_AUTH_RESULT_TOKEN_PATTERN`'s own docstring for the bounded,
     non-exhaustive parsing this performs. Returns `{}` (never a dict of
     `None`s) when no relevant header was present at all — this module
-    never fabricates a verdict Graph did not supply."""
+    never fabricates a verdict Graph did not supply.
+
+    Iterates EVERY matching header (never only the first), and — the
+    real, confirmed bug fix — resolves a mechanism reported more than
+    once (whether within one header's own value or across several
+    headers) via a conservative worst-verdict-wins rank rather than
+    `dict.setdefault`'s old "first token seen, full stop" behaviour.
+    This remains a simple, best-effort, DISPLAY-ONLY projection — the
+    real per-message security gate is
+    `services.mailbox.microsoft.authentication.assess_microsoft_authentication`,
+    driven by the raw header list directly (see that module's own
+    docstring for the full trust-boundary reasoning this function does
+    NOT attempt to replicate)."""
     signals: dict[str, Optional[str]] = {}
+
+    def _consider(mechanism: str, verdict: str) -> None:
+        mechanism = mechanism.lower()
+        verdict = verdict.lower()
+        if mechanism not in signals or _auth_signal_rank(verdict) < _auth_signal_rank(signals[mechanism]):
+            signals[mechanism] = verdict
+
     for header in headers or ():
         name = str(header.get("name") or "").strip().lower()
         value = str(header.get("value") or "")
         if name in _AUTH_RESULTS_HEADER_NAMES:
             for mechanism, verdict in _AUTH_RESULT_TOKEN_PATTERN.findall(value):
-                signals.setdefault(mechanism.lower(), verdict.lower())
+                _consider(mechanism, verdict)
         elif name == _RECEIVED_SPF_HEADER_NAME:
             first_token = value.strip().split(" ", 1)[0].lower() if value.strip() else None
             if first_token:
-                signals.setdefault("spf", first_token)
+                _consider("spf", first_token)
     return signals
+
+
+def _parse_raw_headers(headers: Optional[Sequence[Mapping]]) -> tuple:
+    """CD-6 GUI-operations-foundation follow-on WO (item B) — normalise
+    Graph's own `internetMessageHeaders` list into the plain
+    `{"name": ..., "value": ...}` tuple shape
+    `GraphMessageSummary.raw_headers`/`GraphMessageHeadersResult
+    .raw_headers` both carry, preserving Graph's own return order
+    exactly (order is load-bearing — see
+    `services.mailbox.microsoft.authentication`'s own module
+    docstring)."""
+    return tuple(
+        {"name": h.get("name"), "value": h.get("value")} for h in (headers or ()) if isinstance(h, Mapping)
+    )
 
 
 def _parse_attachment_metadata(item: Mapping) -> Sequence[Mapping[str, Optional[object]]]:
@@ -695,6 +794,7 @@ def _parse_message_summary(item: Mapping) -> Optional[GraphMessageSummary]:
         removed=False,
         attachment_metadata=_parse_attachment_metadata(item),
         auth_signals=_parse_auth_signals(item.get("internetMessageHeaders")),
+        raw_headers=_parse_raw_headers(item.get("internetMessageHeaders")),
     )
 
 
@@ -822,6 +922,61 @@ class MicrosoftGraphClient:
             return GraphMessageContentResult(status=status, error_detail=str(exc)[:500])
 
         return GraphMessageContentResult(status=GraphOutcomeStatus.OK, content=raw)
+
+    def fetch_message_headers(self, *, access_token: str, immutable_message_id: str) -> GraphMessageHeadersResult:
+        """CD-6 GUI-operations-foundation follow-on WO (item C) — a
+        bounded, METADATA-ONLY read (`$select=internetMessageHeaders`),
+        deliberately distinct from :meth:`fetch_message_content` above:
+        historical back-processing must refresh a candidate's headers to
+        run the real authentication gate BEFORE ever fetching full MIME,
+        never as a side effect of a MIME fetch, and never by trusting the
+        959 real historical candidates' own STALE, old-parser-produced
+        `auth_signals`. Mirrors every other GET method in this module's
+        own error-handling shape exactly."""
+        url = GRAPH_MESSAGE_HEADERS_URL_TEMPLATE.format(message_id=immutable_message_id)
+        request = urllib.request.Request(
+            url,
+            method="GET",
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "Accept": "application/json",
+                "Prefer": IMMUTABLE_ID_PREFER_HEADER,
+            },
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=self._timeout_seconds) as response:
+                raw = response.read()
+        except urllib.error.HTTPError as exc:
+            if exc.code == 401:
+                return GraphMessageHeadersResult(status=GraphOutcomeStatus.AUTH_ERROR, error_detail=f"HTTP 401: {_read_body(exc)}")
+            if exc.code == 403:
+                return GraphMessageHeadersResult(
+                    status=GraphOutcomeStatus.PERMISSION_ERROR, error_detail=f"HTTP 403: {_read_body(exc)}"
+                )
+            if exc.code == 404:
+                return GraphMessageHeadersResult(status=GraphOutcomeStatus.NOT_FOUND, error_detail=f"HTTP 404: {_read_body(exc)}")
+            if exc.code == 429:
+                return GraphMessageHeadersResult(
+                    status=GraphOutcomeStatus.RATE_LIMITED,
+                    retry_after_seconds=_retry_after_seconds(exc),
+                    error_detail=f"HTTP 429: {_read_body(exc)}",
+                )
+            return GraphMessageHeadersResult(
+                status=GraphOutcomeStatus.PROVIDER_ERROR, error_detail=f"HTTP {exc.code}: {_read_body(exc)}"
+            )
+        except Exception as exc:  # noqa: BLE001
+            is_timeout = isinstance(exc, TimeoutError) or "timed out" in str(exc).lower()
+            status = GraphOutcomeStatus.TIMEOUT if is_timeout else GraphOutcomeStatus.TRANSPORT_ERROR
+            return GraphMessageHeadersResult(status=status, error_detail=str(exc)[:500])
+
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+            raw_headers = _parse_raw_headers(payload.get("internetMessageHeaders"))
+        except (json.JSONDecodeError, TypeError) as exc:
+            return GraphMessageHeadersResult(
+                status=GraphOutcomeStatus.MALFORMED_RESPONSE, error_detail=f"could not parse message headers response: {exc}"
+            )
+        return GraphMessageHeadersResult(status=GraphOutcomeStatus.OK, raw_headers=raw_headers)
 
     # -- folder discovery (CD-6 architect amendment) ---------------------
 

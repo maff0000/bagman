@@ -299,6 +299,21 @@ class MailboxMessageRepository(abc.ABC):
         raise NotImplementedError
 
     @abc.abstractmethod
+    def sender_address_observed(self, mailbox_id: str, sender_address: str) -> bool:
+        """CD-6 GUI-operations-foundation follow-on WO (item A —
+        `EXACT_ADDRESS` match mode) — a plain existence check: has this
+        mailbox EVER actually seen a message from this exact sender
+        address (any `MailboxMessage` row for `mailbox_id` whose own
+        `sender_address`, compared case-insensitively, equals
+        ``sender_address``)? This is the real backstop that makes an
+        `EXACT_ADDRESS` `MailboxDomainRule` trustworthy: an operator must
+        never be able to pre-authorize an address BAGMAN has never
+        actually observed mail from. Deliberately a narrow, cheap
+        existence check — never a heavy query, never paginated, never
+        returning the matching row(s) themselves."""
+        raise NotImplementedError
+
+    @abc.abstractmethod
     def list_messages(
         self, *, mailbox_id: str, limit: Optional[int] = None, offset: int = 0
     ) -> list[MailboxMessage]:
@@ -505,6 +520,13 @@ class InMemoryMailboxMessageRepository(MailboxMessageRepository):
     def find_by_provider_id(self, mailbox_id: str, immutable_provider_message_id: str) -> Optional[MailboxMessage]:
         existing_id = self._id_by_tuple.get((mailbox_id, immutable_provider_message_id))
         return self._by_id[existing_id] if existing_id is not None else None
+
+    def sender_address_observed(self, mailbox_id: str, sender_address: str) -> bool:
+        normalized = sender_address.strip().lower()
+        return any(
+            m.mailbox_id == mailbox_id and (m.sender_address or "").strip().lower() == normalized
+            for m in self._by_id.values()
+        )
 
     def list_messages(
         self, *, mailbox_id: str, limit: Optional[int] = None, offset: int = 0

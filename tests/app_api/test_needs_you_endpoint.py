@@ -244,3 +244,138 @@ def test_resolution_survives_a_fresh_composition_against_the_same_database(clien
         refetched = fresh_client.get(f"/internal/needs-you/{item['item_id']}").json()
         assert refetched["status"] == "RESOLVED"
         assert refetched["resolution"] == resolution
+
+
+# ---------------------------------------------------------------------
+# CD-6 GUI-operations-foundation follow-on WO (item E) —
+# `COMPANY_REQUIRED` resolution must actually assign the `EvidenceItem`
+# entity, through the canonical layer (`core.api.BagmanCanonicalAPI
+# .assign_evidence_entity`, previously implemented with zero real
+# callers anywhere).
+# ---------------------------------------------------------------------
+
+
+def test_resolving_company_required_to_resolved_assigns_the_evidence_entity(client):
+    upload = _post_intake(client)
+    evidence_id = upload.json()["evidence"]["evidence_id"]
+    entities = client.get("/internal/entities").json()["items"]
+    infosecurs = next(e for e in entities if e["canonical_name"] == "INFOSECURS_LIMITED")
+
+    listing = client.get("/internal/needs-you", params={"status": "OPEN"}).json()
+    item = next(i for i in listing["items"] if i["source_object_reference"] == evidence_id)
+
+    resolve_response = client.post(
+        f"/internal/needs-you/{item['item_id']}/resolve",
+        json={
+            "new_status": "RESOLVED",
+            "resolution": {"entity_id": infosecurs["entity_id"], "what": "Software subscription", "why": "R&D tooling"},
+            "actor_type": "USER", "actor_id": "matt",
+        },
+    )
+    assert resolve_response.status_code == 200, resolve_response.text
+
+    evidence_after = client.get(f"/internal/evidence/{evidence_id}").json()
+    assert evidence_after["entity_id"] == infosecurs["entity_id"]
+
+
+def test_resolving_company_required_with_same_entity_twice_is_idempotent(client):
+    upload = _post_intake(client)
+    evidence_id = upload.json()["evidence"]["evidence_id"]
+    entities = client.get("/internal/entities").json()["items"]
+    infosecurs = next(e for e in entities if e["canonical_name"] == "INFOSECURS_LIMITED")
+
+    listing = client.get("/internal/needs-you", params={"status": "OPEN"}).json()
+    item = next(i for i in listing["items"] if i["source_object_reference"] == evidence_id)
+
+    body = {
+        "new_status": "RESOLVED",
+        "resolution": {"entity_id": infosecurs["entity_id"], "what": "Software subscription", "why": "R&D tooling"},
+        "actor_type": "USER", "actor_id": "matt",
+    }
+    first = client.post(f"/internal/needs-you/{item['item_id']}/resolve", json=body)
+    assert first.status_code == 200, first.text
+
+    # A genuine retry of the SAME resolve call (mirrors the double-submit
+    # doctrine already proven above for the non-entity case) — the
+    # entity is already correctly assigned; `assign_evidence_entity`'s
+    # own idempotent same-entity no-op lets this complete cleanly.
+    second = client.post(f"/internal/needs-you/{item['item_id']}/resolve", json=body)
+    assert second.status_code == 200, second.text
+
+    evidence_after = client.get(f"/internal/evidence/{evidence_id}").json()
+    assert evidence_after["entity_id"] == infosecurs["entity_id"]
+
+
+def test_resolving_company_required_with_a_different_entity_after_assignment_conflicts(client):
+    """A conflicting reassignment attempt fails loudly — reassignment is
+    an explicit, separate, NOT-built-here governed correction workflow."""
+    upload = _post_intake(client)
+    evidence_id = upload.json()["evidence"]["evidence_id"]
+    entities = client.get("/internal/entities").json()["items"]
+    infosecurs = next(e for e in entities if e["canonical_name"] == "INFOSECURS_LIMITED")
+    noustai = next(e for e in entities if e["canonical_name"] == "NOUSTAI_LIMITED")
+
+    listing = client.get("/internal/needs-you", params={"status": "OPEN"}).json()
+    item = next(i for i in listing["items"] if i["source_object_reference"] == evidence_id)
+
+    first = client.post(
+        f"/internal/needs-you/{item['item_id']}/resolve",
+        json={
+            "new_status": "RESOLVED",
+            "resolution": {"entity_id": infosecurs["entity_id"], "what": "A", "why": "A"},
+            "actor_type": "USER", "actor_id": "matt",
+        },
+    )
+    assert first.status_code == 200, first.text
+
+    # A genuinely different resolution on an already-RESOLVED item is
+    # ALREADY a 409 under the pre-existing "different outcome" doctrine
+    # (proven above) — this test's own real point is that even if the
+    # entity-assignment step itself were reached again with a DIFFERENT
+    # entity_id, `assign_evidence_entity` raises `ConflictError` loudly
+    # rather than silently overwriting. Exercise that directly through
+    # `core.api` to prove the assignment layer's own contract, since the
+    # HTTP layer's own item-status guard would otherwise short-circuit
+    # first for this same fixture.
+    from app.api.composition import get_composition
+    from core.errors import ConflictError
+
+    composition = get_composition()
+    try:
+        composition.api.assign_evidence_entity(
+            evidence_id=evidence_id, entity_id=noustai["entity_id"], actor_type="USER", actor_id="matt",
+        )
+        raised = False
+    except ConflictError:
+        raised = True
+    assert raised is True
+
+    evidence_after = client.get(f"/internal/evidence/{evidence_id}").json()
+    assert evidence_after["entity_id"] == infosecurs["entity_id"]  # unchanged
+
+
+def test_dismissing_a_company_required_item_never_assigns_an_entity(client):
+    upload = _post_intake(client)
+    evidence_id = upload.json()["evidence"]["evidence_id"]
+    entities = client.get("/internal/entities").json()["items"]
+    infosecurs = next(e for e in entities if e["canonical_name"] == "INFOSECURS_LIMITED")
+
+    listing = client.get("/internal/needs-you", params={"status": "OPEN"}).json()
+    item = next(i for i in listing["items"] if i["source_object_reference"] == evidence_id)
+
+    # A DISMISSED resolution, even carrying an entity_id in its payload,
+    # must never assign one — DISMISSED explicitly does not assign an
+    # entity (architect's own explicit requirement).
+    dismiss_response = client.post(
+        f"/internal/needs-you/{item['item_id']}/resolve",
+        json={
+            "new_status": "DISMISSED",
+            "resolution": {"entity_id": infosecurs["entity_id"], "what": "N/A", "why": "N/A"},
+            "actor_type": "USER", "actor_id": "matt",
+        },
+    )
+    assert dismiss_response.status_code == 200, dismiss_response.text
+    assert dismiss_response.json()["status"] == "DISMISSED"
+
+    evidence_after = client.get(f"/internal/evidence/{evidence_id}").json()
+    assert evidence_after["entity_id"] is None

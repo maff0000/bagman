@@ -41,6 +41,7 @@ from pydantic import BaseModel
 
 from core.errors import ConflictError
 from app.api.composition import get_composition
+from services.needs_you.needs_you import ITEM_TYPE_COMPANY_REQUIRED
 
 router = APIRouter(prefix="/internal/needs-you")
 
@@ -133,6 +134,30 @@ async def resolve_needs_you_item(item_id: str, payload: ResolveNeedsYouItemReque
     409 to an operator who already saw success once. A genuine attempt
     to change an ALREADY-decided item to a DIFFERENT outcome (a real
     conflict, not a retry) still raises ``ConflictError`` -> HTTP 409.
+
+    CD-6 GUI-operations-foundation follow-on WO (item E) — a narrow,
+    ``COMPANY_REQUIRED``-specific branch lives directly in THIS generic
+    handler (this router, ``app/api/routers/needs_you.py``, is the HTTP
+    orchestration layer — it already legitimately depends on
+    ``core.api``/``services.evidence`` exactly like ``app/api/routers
+    /intake.py`` does; the pure domain module
+    ``services/needs_you/needs_you.py`` is untouched and gains no such
+    dependency). This endpoint is genuinely shared by BOTH the
+    pre-existing Slice-1 manual-upload flow and the mailbox document-
+    destination-review flow (both raise ``ITEM_TYPE_COMPANY_REQUIRED``/
+    ``ALLOWED_ACTION_COMPANY_WHAT_WHY`` items) — for EITHER producer,
+    resolving such an item to ``RESOLVED`` (never ``DISMISSED`` — a
+    dismissal explicitly does not assign an entity) now actually assigns
+    the referenced ``EvidenceItem``'s ``entity_id`` via
+    ``core.api.BagmanCanonicalAPI.assign_evidence_entity`` — a confirmed,
+    real, previously-unwired gap (that method already existed, with zero
+    real callers anywhere) — BEFORE this item's own ``RESOLVED`` status
+    is persisted, so a failed assignment can never leave the operator's
+    question marked resolved while the evidence remains unassigned. A
+    retry of the SAME resolve call after a partial failure (entity
+    assigned, but the Needs You resolve-write itself then failed) safely
+    completes on retry via ``assign_evidence_entity``'s own idempotent
+    same-entity no-op.
     """
     composition = get_composition()
     current = composition.needs_you_repository.get_needs_you_item(item_id)
@@ -148,6 +173,42 @@ async def resolve_needs_you_item(item_id: str, payload: ResolveNeedsYouItemReque
             "resolution — refusing to silently change an already-decided item "
             "(PID §98.5); this is a genuine conflict, not an idempotent retry"
         )
+
+    if current.item_type == ITEM_TYPE_COMPANY_REQUIRED and payload.new_status == "RESOLVED":
+        resolution = payload.resolution or {}
+        entity_id = resolution.get("entity_id")
+        # A real entity_id is the ordinary, expected shape for a
+        # COMPANY_WHAT_WHY resolution (Company is the whole point of
+        # this item type) — but `resolution.entity_id` remains a caller-
+        # supplied, optional field at the contract layer (unchanged by
+        # this WO — no request/response shape change), so an omitted/
+        # `None` entity_id is simply "nothing to assign yet", never a
+        # hard validation failure here: this item still resolves exactly
+        # as it always has. Only a REAL, truthy entity_id triggers the
+        # new canonical assignment wiring below.
+        # `source_object_reference` is likewise a genuine sanity/
+        # consistency check, never a new hard requirement this branch
+        # invents: a COMPANY_REQUIRED item this WO's own real producers
+        # (app/api/routers/intake.py, services/mailbox/sweep.py) raise
+        # ALWAYS anchors to a real evidence_id — but a caller-constructed
+        # item with no such anchor (not a real evidence question at all)
+        # simply has nothing for this branch to assign, exactly like the
+        # missing-entity_id case above; never a validation failure that
+        # would otherwise block an unrelated resolution.
+        evidence_id = current.source_object_reference
+        if entity_id and evidence_id:
+            # Real, canonical entity assignment FIRST — before this
+            # item's own RESOLVED status is persisted below (architect's
+            # own explicit ordering requirement; see
+            # `assign_evidence_entity`'s own docstring for the full
+            # idempotent/conflict contract this enforces).
+            composition.api.assign_evidence_entity(
+                evidence_id=evidence_id,
+                entity_id=entity_id,
+                actor_type=payload.actor_type,
+                actor_id=payload.actor_id,
+                correlation_id=current.correlation_id,
+            )
 
     updated = composition.needs_you_repository.resolve_needs_you_item(
         item_id,

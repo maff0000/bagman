@@ -35,6 +35,7 @@ from services.mailbox.microsoft.graph_client import (
     GraphFolderListResult,
     GraphFolderSummary,
     GraphMessageContentResult,
+    GraphMessageHeadersResult,
     GraphMessageSummary,
     GraphOutcomeStatus,
     GraphWellKnownFoldersResult,
@@ -67,17 +68,39 @@ class AlwaysMaliciousScanner(EvidenceSafetyScanner):
         return True
 
 
-#: CD-6 GUI-operations-foundation follow-on WO — the new per-message
+#: CD-6 GUI-operations-foundation follow-on WO — the per-message
 #: authentication check (`services.mailbox.sweep.evaluate_message_authentication`)
-#: escalates a message with NO captured auth signal at all (the OLD
-#: default here — an empty `{}` — now reads as "suspicious"). Every
+#: escalates a message with NO usable trusted header at all. Every
 #: EXISTING test in this file that exercises the ordinary MUST_READ
 #: MIME-fetch-and-evidence path is proving something else entirely (the
 #: sweep engine's own idempotency/cursor/quarantine machinery) and must
 #: keep passing exactly as before, so `_msg()` now defaults to a
-#: PASSING signal set; dedicated new tests further down override this
-#: explicitly to exercise the escalation path itself.
+#: PASSING signal set (synthesised into a real, trusted
+#: `Authentication-Results` header carrying `compauth=pass`, the real
+#: live-diagnostic shape — see
+#: `services.mailbox.microsoft.authentication`'s own module docstring);
+#: dedicated new tests further down override this explicitly (via
+#: `raw_headers=`) to exercise the selector/escalation path itself.
 _PASSING_AUTH_SIGNALS = {"spf": "pass", "dkim": "pass", "dmarc": "pass"}
+
+
+def _auth_results_header(auth_signals) -> dict:
+    """Synthesise ONE real-shaped `Authentication-Results` header value
+    from a flat `{"spf": ..., "dkim": ..., "dmarc": ...}` dict — mirrors
+    the exact real, live, redacted diagnostic shape this WO's own PID
+    captured (`spf=... dkim=... dmarc=... compauth=... reason=...`).
+    `compauth` is derived from `dmarc` (pass -> pass, fail -> fail,
+    anything else -> none) — a reasonable, deterministic test-fixture
+    convention, not itself part of any production code path."""
+    dmarc = auth_signals.get("dmarc")
+    compauth = "pass" if dmarc == "pass" else ("fail" if dmarc == "fail" else "none")
+    parts = []
+    for mechanism in ("spf", "dkim", "dmarc"):
+        value = auth_signals.get(mechanism)
+        if value is not None:
+            parts.append(f"{mechanism}={value}")
+    parts.append(f"compauth={compauth} reason=100")
+    return {"name": "Authentication-Results", "value": "; ".join(parts)}
 
 
 def _msg(
@@ -88,7 +111,25 @@ def _msg(
     sender_address="billing@vendor.com",
     attachment_metadata=(),
     auth_signals=None,
+    raw_headers=None,
 ) -> GraphMessageSummary:
+    """`raw_headers`, when explicitly supplied, drives the REAL
+    authentication gate directly (a list of `{"name": ..., "value": ...}`
+    dicts, exactly Graph's own `internetMessageHeaders` shape) — use this
+    for any test constructing a specific/adversarial header scenario.
+    Otherwise `auth_signals` (a flat spf/dkim/dmarc dict, defaulting to a
+    real passing set) is synthesised into one trusted header via
+    `_auth_results_header` — this keeps every pre-existing, non-auth-
+    focused test in this file working unchanged."""
+    resolved_auth_signals = dict(auth_signals) if auth_signals is not None else dict(_PASSING_AUTH_SIGNALS)
+    if raw_headers is not None:
+        resolved_raw_headers = tuple(raw_headers)
+    elif not resolved_auth_signals:
+        # An explicit empty dict means "no signal captured at all" —
+        # the real shape for that is NO header present whatsoever.
+        resolved_raw_headers = ()
+    else:
+        resolved_raw_headers = (_auth_results_header(resolved_auth_signals),)
     return GraphMessageSummary(
         immutable_id=msg_id,
         internet_message_id=f"<{msg_id}@example.com>",
@@ -98,12 +139,24 @@ def _msg(
         received_at=received_at or datetime.now(timezone.utc),
         has_attachments=bool(attachment_metadata),
         attachment_metadata=tuple(attachment_metadata),
-        auth_signals=dict(auth_signals) if auth_signals is not None else dict(_PASSING_AUTH_SIGNALS),
+        auth_signals=resolved_auth_signals,
+        raw_headers=resolved_raw_headers,
     )
 
 
 def _content(body: bytes = b"From: billing@vendor.com\r\nSubject: Invoice\r\n\r\nBody") -> GraphMessageContentResult:
     return GraphMessageContentResult(status=GraphOutcomeStatus.OK, content=body)
+
+
+#: CD-6 GUI-operations-foundation follow-on WO (item C) — historical
+#: back-processing (`_reprocess_one_message`) now fetches FRESH headers
+#: before ever fetching MIME; every test that drives it must queue a
+#: headers result too. A passing (real, trusted, `compauth=pass`) header
+#: by default — tests exercising the historical FAIL/UNKNOWN split queue
+#: their own explicit `GraphMessageHeadersResult` instead.
+def _headers_ok(auth_signals=None) -> GraphMessageHeadersResult:
+    resolved = dict(auth_signals) if auth_signals is not None else dict(_PASSING_AUTH_SIGNALS)
+    return GraphMessageHeadersResult(status=GraphOutcomeStatus.OK, raw_headers=(_auth_results_header(resolved),))
 
 
 #: The default sender domain `_msg()` uses — a real `ALLOWED`
@@ -267,6 +320,7 @@ def test_both_folders_are_attempted_and_succeed(h):
 
 def test_a_new_message_is_ingested_as_real_evidence(h):
     h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(_msg("m1"),), delta_link="d1"))
+    h.graph_client.queue_headers_result(_headers_ok())
     h.graph_client.queue_content_result(_content())
     h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link="d2"))
     run = h.sweep()
@@ -297,6 +351,7 @@ def test_duplicate_across_pages_within_one_round_is_not_double_ingested(h):
     h.graph_client.queue_delta_result(
         GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(_msg("m1"),), next_link="page2")
     )
+    h.graph_client.queue_headers_result(_headers_ok())
     h.graph_client.queue_content_result(_content())
     h.graph_client.queue_delta_result(
         GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(_msg("m1"),), delta_link="d-final")
@@ -315,6 +370,7 @@ def test_same_immutable_id_seen_in_another_folder_never_duplicates_evidence(h):
     evidence object — canonical uniqueness is (mailbox_id,
     immutable_provider_message_id) alone, folder-independent."""
     h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(_msg("m1"),), delta_link="d-inbox"))
+    h.graph_client.queue_headers_result(_headers_ok())
     h.graph_client.queue_content_result(_content())
     h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(_msg("m1"),), delta_link="d-junk"))
     run = h.sweep()
@@ -327,6 +383,7 @@ def test_same_immutable_id_seen_in_another_folder_never_duplicates_evidence(h):
 
 def test_idempotent_replay_of_a_whole_sweep_creates_no_new_evidence(h):
     h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(_msg("m1"),), delta_link="d1"))
+    h.graph_client.queue_headers_result(_headers_ok())
     h.graph_client.queue_content_result(_content())
     h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link="d2"))
     first = h.sweep()
@@ -375,6 +432,7 @@ def test_transient_content_fetch_failure_leaves_cursor_unadvanced_then_succeeds_
     # the cursor never advanced — the SAME message is safely re-seen
     # and this time succeeds.
     h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(_msg("m1"),), delta_link="d2"))
+    h.graph_client.queue_headers_result(_headers_ok())
     h.graph_client.queue_content_result(_content())
     h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link="d-junk-2"))
     second = h.sweep()
@@ -390,6 +448,7 @@ def test_transient_content_fetch_failure_leaves_cursor_unadvanced_then_succeeds_
 def test_quarantined_message_counts_as_durably_handled_and_advances_cursor():
     h = Harness(scanner=AlwaysMaliciousScanner())
     h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(_msg("m1"),), delta_link="final-link"))
+    h.graph_client.queue_headers_result(_headers_ok())
     h.graph_client.queue_content_result(_content())
     h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link="d-junk"))
     run = h.sweep()
@@ -516,6 +575,7 @@ def test_concurrent_sweep_of_the_same_mailbox_declines_cleanly(h):
 
 def test_ingested_message_emits_email_evidence_ingested_audit_event(h):
     h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(_msg("m1"),), delta_link="d1"))
+    h.graph_client.queue_headers_result(_headers_ok())
     h.graph_client.queue_content_result(_content())
     h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link="d2"))
     h.sweep()
@@ -527,6 +587,7 @@ def test_ingested_message_emits_email_evidence_ingested_audit_event(h):
 def test_quarantined_message_emits_email_evidence_quarantined_audit_event():
     h = Harness(scanner=AlwaysMaliciousScanner())
     h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(_msg("m1"),), delta_link="d1"))
+    h.graph_client.queue_headers_result(_headers_ok())
     h.graph_client.queue_content_result(_content())
     h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link="d2"))
     h.sweep()
@@ -550,6 +611,7 @@ def test_allowed_domain_proceeds_to_full_ingest():
     behaviour implicitly)."""
     h = Harness()
     h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(_msg("m1"),), delta_link="d1"))
+    h.graph_client.queue_headers_result(_headers_ok())
     h.graph_client.queue_content_result(_content())
     h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link="d-junk"))
     run = h.sweep()
@@ -681,6 +743,7 @@ def test_reprocess_all_historical_candidates_ingests_the_triggering_message_imme
         mailbox_id=h.mailbox.mailbox_id, sender_domain="vendor.com", match_mode="EXACT", policy="MUST_READ",
         destination_entity_id=None, destination_mode="REVIEW_REQUIRED", source="OPERATOR",
     )
+    h.graph_client.queue_headers_result(_headers_ok())
     h.graph_client.queue_content_result(_content())
     reprocessed = reprocess_all_historical_candidates_for_domain(
         mailbox=h.mailbox, mailbox_source_id=h.source_id, sender_domain="vendor.com",
@@ -692,6 +755,38 @@ def test_reprocess_all_historical_candidates_ingests_the_triggering_message_imme
     assert reprocessed[0].ingestion_status == "INGESTED"
     assert reprocessed[0].evidence_id is not None
     assert h.graph_client.content_calls == ["m1"]
+
+
+def test_historical_reprocess_fixed_destination_assigns_real_entity_id_to_evidence():
+    """Regression, already existed, reconfirmed here explicitly for the
+    HISTORICAL back-process path (mirrors
+    `test_must_read_fixed_destination_assigns_real_entity_id_to_evidence`'s
+    own identical proof for the ORDINARY live-sweep path): a FIXED-
+    destination rule's real `destination_entity_id` is threaded through
+    to the resulting `EvidenceItem.entity_id` at registration time when a
+    historical candidate is back-processed, not merely when it is swept
+    live."""
+    from services.mailbox.sweep import reprocess_all_historical_candidates_for_domain
+
+    h = Harness(allow_default_domain=False)
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(_msg("m1"),), delta_link="d1"))
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link="d-junk"))
+    h.sweep()
+
+    rule = h.domain_rule_repo.upsert_rule(
+        mailbox_id=h.mailbox.mailbox_id, sender_domain="vendor.com", match_mode="EXACT", policy="MUST_READ",
+        destination_entity_id=h.entity.entity_id, destination_mode="FIXED", source="OPERATOR",
+    )
+    h.graph_client.queue_headers_result(_headers_ok())
+    h.graph_client.queue_content_result(_content())
+    reprocessed = reprocess_all_historical_candidates_for_domain(
+        mailbox=h.mailbox, mailbox_source_id=h.source_id, sender_domain="vendor.com",
+        rule=rule, adapter=h.adapter, message_repository=h.message_repo, needs_you_repository=h.needs_you_repo, api=h.api, object_store=h.object_store,
+        scanner=h.scanner, actor_type="SYSTEM", actor_id="test",
+    )
+    assert len(reprocessed) == 1
+    evidence = h.api.get_evidence(reprocessed[0].evidence_id)
+    assert evidence.entity_id == h.entity.entity_id
 
 
 def test_reprocess_all_historical_candidates_is_idempotent_on_a_double_submit_of_the_whole_domain():
@@ -706,6 +801,7 @@ def test_reprocess_all_historical_candidates_is_idempotent_on_a_double_submit_of
         mailbox_id=h.mailbox.mailbox_id, sender_domain="vendor.com", match_mode="EXACT", policy="MUST_READ",
         destination_entity_id=None, destination_mode="REVIEW_REQUIRED", source="OPERATOR",
     )
+    h.graph_client.queue_headers_result(_headers_ok())
     h.graph_client.queue_content_result(_content())
     first = reprocess_all_historical_candidates_for_domain(
         mailbox=h.mailbox, mailbox_source_id=h.source_id, sender_domain="vendor.com",
@@ -767,8 +863,11 @@ def test_reprocess_all_historical_candidates_back_processes_every_historical_can
         destination_entity_id=None, destination_mode="REVIEW_REQUIRED", source="OPERATOR",
     )
     # Content is fetched once per message, sequentially — queue THREE.
+    h.graph_client.queue_headers_result(_headers_ok())
     h.graph_client.queue_content_result(_content())
+    h.graph_client.queue_headers_result(_headers_ok())
     h.graph_client.queue_content_result(_content())
+    h.graph_client.queue_headers_result(_headers_ok())
     h.graph_client.queue_content_result(_content())
 
     reprocessed = reprocess_all_historical_candidates_for_domain(
@@ -846,8 +945,11 @@ def test_reprocess_mixed_domain_only_back_processes_actual_candidates_never_ever
         mailbox_id=h.mailbox.mailbox_id, sender_domain="vendor.com", match_mode="EXACT", policy="MUST_READ",
         destination_entity_id=None, destination_mode="REVIEW_REQUIRED", source="OPERATOR",
     )
+    h.graph_client.queue_headers_result(_headers_ok())
     h.graph_client.queue_content_result(_content())
+    h.graph_client.queue_headers_result(_headers_ok())
     h.graph_client.queue_content_result(_content())
+    h.graph_client.queue_headers_result(_headers_ok())
     h.graph_client.queue_content_result(_content())
 
     reprocessed = reprocess_all_historical_candidates_for_domain(
@@ -879,6 +981,169 @@ def test_reprocess_mixed_domain_only_back_processes_actual_candidates_never_ever
     )
     assert second_call == []
     assert sorted(h.graph_client.content_calls) == ["cand-1", "cand-2", "cand-3"]
+
+
+# ---------------------------------------------------------------------
+# CD-6 GUI-operations-foundation follow-on WO (item C) — historical
+# MUST_READ back-processing must now pass the SAME security gate an
+# ordinary live sweep applies, via a bounded, headers-only refresh
+# BEFORE any MIME fetch.
+# ---------------------------------------------------------------------
+
+
+def test_historical_reprocess_fetches_headers_before_any_mime_fetch_and_passes_through_on_pass():
+    """Historical candidate authentication happens BEFORE any MIME fetch
+    — proven via the fake client's own call-tracking (mirrors the
+    existing "zero MIME fetch" proofs elsewhere in this file): a PASSING
+    fresh headers refresh proceeds to the ordinary MIME-fetch/ingest
+    path exactly as before."""
+    from services.mailbox.sweep import reprocess_all_historical_candidates_for_domain
+
+    h = Harness(allow_default_domain=False)
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(_msg("m1"),), delta_link="d1"))
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link="d-junk"))
+    h.sweep()
+
+    rule = h.domain_rule_repo.upsert_rule(
+        mailbox_id=h.mailbox.mailbox_id, sender_domain="vendor.com", match_mode="EXACT", policy="MUST_READ",
+        destination_entity_id=None, destination_mode="REVIEW_REQUIRED", source="OPERATOR",
+    )
+    h.graph_client.queue_headers_result(_headers_ok())
+    h.graph_client.queue_content_result(_content())
+    reprocessed = reprocess_all_historical_candidates_for_domain(
+        mailbox=h.mailbox, mailbox_source_id=h.source_id, sender_domain="vendor.com",
+        rule=rule, adapter=h.adapter, message_repository=h.message_repo, needs_you_repository=h.needs_you_repo, api=h.api, object_store=h.object_store,
+        scanner=h.scanner, actor_type="SYSTEM", actor_id="test",
+    )
+    assert len(reprocessed) == 1
+    assert reprocessed[0].ingestion_status == "INGESTED"
+    # Headers fetched, then content fetched — and content fetch never
+    # attempted before the headers call this same message.
+    assert h.graph_client.headers_calls == ["m1"]
+    assert h.graph_client.content_calls == ["m1"]
+
+
+def test_historical_reprocess_auth_fail_never_fetches_mime_and_marks_security_review():
+    """Auth FAIL on the fresh headers refresh -> zero MIME fetch, marked
+    SECURITY_REVIEW, and an authentication-escalation item is raised —
+    never silently skipped, never silently proceeded as if it passed."""
+    from services.mailbox.sweep import reprocess_all_historical_candidates_for_domain
+
+    h = Harness(allow_default_domain=False)
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(_msg("m1"),), delta_link="d1"))
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link="d-junk"))
+    h.sweep()
+
+    rule = h.domain_rule_repo.upsert_rule(
+        mailbox_id=h.mailbox.mailbox_id, sender_domain="vendor.com", match_mode="EXACT", policy="MUST_READ",
+        destination_entity_id=None, destination_mode="REVIEW_REQUIRED", source="OPERATOR",
+    )
+    h.graph_client.queue_headers_result(
+        GraphMessageHeadersResult(
+            status=GraphOutcomeStatus.OK,
+            raw_headers=(
+                {
+                    "name": "Authentication-Results",
+                    "value": "spf=fail smtp.mailfrom=vendor.com; dkim=fail header.d=vendor.com; "
+                    "dmarc=fail action=quarantine header.from=vendor.com; compauth=fail reason=001",
+                },
+            ),
+        )
+    )
+    reprocessed = reprocess_all_historical_candidates_for_domain(
+        mailbox=h.mailbox, mailbox_source_id=h.source_id, sender_domain="vendor.com",
+        rule=rule, adapter=h.adapter, message_repository=h.message_repo, needs_you_repository=h.needs_you_repo, api=h.api, object_store=h.object_store,
+        scanner=h.scanner, actor_type="SYSTEM", actor_id="test",
+    )
+    assert len(reprocessed) == 1
+    assert reprocessed[0].ingestion_status == INGESTION_STATUS_SECURITY_REVIEW
+    assert h.graph_client.headers_calls == ["m1"]
+    assert h.graph_client.content_calls == []  # never MIME-fetched
+    escalation_items = h.needs_you_repo.list_needs_you_items(item_type=ITEM_TYPE_MAILBOX_AUTHENTICATION_ESCALATION)
+    assert len(escalation_items) == 1
+
+
+def test_historical_reprocess_auth_unknown_never_fetches_mime_and_marks_security_review():
+    """Auth UNKNOWN (no usable header at all on the fresh refresh) ->
+    zero MIME fetch, marked SECURITY_REVIEW."""
+    from services.mailbox.sweep import reprocess_all_historical_candidates_for_domain
+
+    h = Harness(allow_default_domain=False)
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(_msg("m1"),), delta_link="d1"))
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link="d-junk"))
+    h.sweep()
+
+    rule = h.domain_rule_repo.upsert_rule(
+        mailbox_id=h.mailbox.mailbox_id, sender_domain="vendor.com", match_mode="EXACT", policy="MUST_READ",
+        destination_entity_id=None, destination_mode="REVIEW_REQUIRED", source="OPERATOR",
+    )
+    h.graph_client.queue_headers_result(GraphMessageHeadersResult(status=GraphOutcomeStatus.OK, raw_headers=()))
+    reprocessed = reprocess_all_historical_candidates_for_domain(
+        mailbox=h.mailbox, mailbox_source_id=h.source_id, sender_domain="vendor.com",
+        rule=rule, adapter=h.adapter, message_repository=h.message_repo, needs_you_repository=h.needs_you_repo, api=h.api, object_store=h.object_store,
+        scanner=h.scanner, actor_type="SYSTEM", actor_id="test",
+    )
+    assert len(reprocessed) == 1
+    assert reprocessed[0].ingestion_status == INGESTION_STATUS_SECURITY_REVIEW
+    assert h.graph_client.content_calls == []
+
+
+def test_historical_back_process_splits_passed_and_failed_auth_within_the_same_run():
+    """`reprocess_all_historical_candidates_for_domain` stays candidate-
+    only and idempotent, AND now correctly splits historical candidates
+    into 'passed auth, deep-ingested' vs 'failed/unknown auth, security-
+    reviewed' outcomes within the SAME back-process run — never silently
+    treating every candidate identically."""
+    from services.mailbox.sweep import reprocess_all_historical_candidates_for_domain
+
+    h = Harness(allow_default_domain=False)
+    h.graph_client.queue_delta_result(
+        GraphDeltaPageResult(
+            status=GraphOutcomeStatus.OK, messages=(_msg("m1"), _msg("m2"), _msg("m3")), delta_link="d1"
+        )
+    )
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link="d-junk"))
+    h.sweep()
+
+    rule = h.domain_rule_repo.upsert_rule(
+        mailbox_id=h.mailbox.mailbox_id, sender_domain="vendor.com", match_mode="EXACT", policy="MUST_READ",
+        destination_entity_id=None, destination_mode="REVIEW_REQUIRED", source="OPERATOR",
+    )
+    fail_headers = GraphMessageHeadersResult(
+        status=GraphOutcomeStatus.OK,
+        raw_headers=(
+            {
+                "name": "Authentication-Results",
+                "value": "spf=fail smtp.mailfrom=vendor.com; dkim=fail header.d=vendor.com; "
+                "dmarc=fail action=quarantine header.from=vendor.com; compauth=fail reason=001",
+            },
+        ),
+    )
+    # m1 discovered/queued first (see `list_candidate_messages_for_domain`'s
+    # own oldest-received-first ordering) -> PASS, m2 -> FAIL, m3 -> PASS.
+    h.graph_client.queue_headers_result(_headers_ok())
+    h.graph_client.queue_content_result(_content())
+    h.graph_client.queue_headers_result(fail_headers)
+    h.graph_client.queue_headers_result(_headers_ok())
+    h.graph_client.queue_content_result(_content())
+
+    reprocessed = reprocess_all_historical_candidates_for_domain(
+        mailbox=h.mailbox, mailbox_source_id=h.source_id, sender_domain="vendor.com",
+        rule=rule, adapter=h.adapter, message_repository=h.message_repo, needs_you_repository=h.needs_you_repo, api=h.api, object_store=h.object_store,
+        scanner=h.scanner, actor_type="SYSTEM", actor_id="test",
+    )
+    assert len(reprocessed) == 3
+    statuses = {m.immutable_provider_message_id: m.ingestion_status for m in reprocessed}
+    assert statuses["m1"] == "INGESTED"
+    assert statuses["m2"] == INGESTION_STATUS_SECURITY_REVIEW
+    assert statuses["m3"] == "INGESTED"
+    # Only the two PASSING candidates were ever MIME-fetched.
+    assert sorted(h.graph_client.content_calls) == ["m1", "m3"]
+    escalation_items = h.needs_you_repo.list_needs_you_items(item_type=ITEM_TYPE_MAILBOX_AUTHENTICATION_ESCALATION)
+    assert len(escalation_items) == 1
+    assert escalation_items[0].source_object_reference == [
+        m.mailbox_message_id for m in reprocessed if m.immutable_provider_message_id == "m2"
+    ][0]
 
 
 def test_ignored_domain_message_is_never_swept_in_even_after_the_domain_is_later_allowed():
@@ -1300,6 +1565,7 @@ def test_deleted_items_is_genuinely_swept_through_the_full_pipeline_same_as_inbo
     h.graph_client.queue_delta_result(
         GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(_msg("del-1"),), delta_link="d-deleted")
     )
+    h.graph_client.queue_headers_result(_headers_ok())
     h.graph_client.queue_content_result(_content())
 
     run = h.sweep(folders=_THREE_FOLDER_SET, well_known_ids=_THREE_FOLDER_WELL_KNOWN_IDS)
@@ -1343,6 +1609,7 @@ def test_message_moving_to_a_third_folder_deleted_items_still_resolves_to_one_ca
     h.graph_client.queue_delta_result(
         GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(_msg("m-moved"),), delta_link="d-inbox")
     )
+    h.graph_client.queue_headers_result(_headers_ok())
     h.graph_client.queue_content_result(_content())
     h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link="d-junk"))
     h.graph_client.queue_delta_result(
@@ -1412,6 +1679,7 @@ def test_old_inbox_junk_literal_cursor_rows_are_left_untouched_and_new_folder_id
     h.graph_client.queue_delta_result(
         GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(_msg("already-known"),), delta_link="d1")
     )
+    h.graph_client.queue_headers_result(_headers_ok())
     h.graph_client.queue_content_result(_content())
     h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link="d-junk"))
     first = h.sweep()
@@ -1483,6 +1751,7 @@ def test_sweep_run_aggregate_reporting_fields_across_mixed_messages_and_rate_lim
             delta_link="d1",
         )
     )
+    h.graph_client.queue_headers_result(_headers_ok())
     h.graph_client.queue_content_result(_content())  # the ALLOWED-domain message's own MIME fetch
     h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link="d-junk"))
 
@@ -1511,6 +1780,7 @@ def test_per_folder_operational_counts_are_correct_and_distinct_per_folder():
     h.graph_client.queue_delta_result(
         GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(_msg("m-inbox"),), delta_link="d-inbox")
     )
+    h.graph_client.queue_headers_result(_headers_ok())
     h.graph_client.queue_content_result(_content())
     junk_msg = _msg("m-junk", sender_address="billing@new-supplier.example", subject="Invoice attached")
     h.graph_client.queue_delta_result(
@@ -1624,6 +1894,7 @@ def test_must_read_fixed_destination_assigns_real_entity_id_to_evidence(h):
         policy="MUST_READ", destination_entity_id=h.entity.entity_id, destination_mode="FIXED", source="OPERATOR",
     )
     h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(_msg("m1"),), delta_link="d1"))
+    h.graph_client.queue_headers_result(_headers_ok())
     h.graph_client.queue_content_result(_content())
     h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link="d-junk"))
     run = h.sweep()
@@ -1644,6 +1915,7 @@ def test_confirmed_must_read_source_never_reraises_domain_review_across_multiple
     one')."""
     for i, msg_id in enumerate(["m1", "m2", "m3", "m4"], start=1):
         h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(_msg(msg_id),), delta_link=f"d{i}"))
+        h.graph_client.queue_headers_result(_headers_ok())
         h.graph_client.queue_content_result(_content())
         h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link=f"d-junk-{i}"))
         run = h.sweep()
@@ -1662,6 +1934,7 @@ def test_must_read_review_required_raises_company_required_per_evidence_not_doma
     uses destination_mode=REVIEW_REQUIRED)."""
     for i, msg_id in enumerate(["m1", "m2"], start=1):
         h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(_msg(msg_id),), delta_link=f"d{i}"))
+        h.graph_client.queue_headers_result(_headers_ok())
         h.graph_client.queue_content_result(_content())
         h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link=f"d-junk-{i}"))
         h.sweep()
@@ -1703,12 +1976,22 @@ def test_blacklist_suppresses_future_domain_review_noise():
 
 
 def test_must_read_message_with_hard_auth_failure_escalates_never_ingests(h):
-    """WO required test #8: a MUST_READ-policy message with a genuine
-    authentication FAIL escalates to the new security-review outcome/
-    item type — WITHOUT touching the MailboxDomainRule's own policy —
-    and does NOT get MIME-fetched/evidence-created via the normal
-    trusted path."""
-    failing_msg = _msg("m1", auth_signals={"spf": "fail", "dkim": "pass", "dmarc": "pass"})
+    """WO required test #8 (real fix's own item B) — a MUST_READ-policy
+    message with a genuine, TRUSTED authentication FAIL (a real
+    `compauth=fail` on the plain `Authentication-Results` header)
+    escalates to the security-review outcome/item type — WITHOUT
+    touching the MailboxDomainRule's own policy — and does NOT get
+    MIME-fetched/evidence-created via the normal trusted path."""
+    failing_msg = _msg(
+        "m1",
+        raw_headers=(
+            {
+                "name": "Authentication-Results",
+                "value": "spf=fail smtp.mailfrom=vendor.com; dkim=fail header.d=vendor.com; "
+                "dmarc=fail action=quarantine header.from=vendor.com; compauth=fail reason=001",
+            },
+        ),
+    )
     h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(failing_msg,), delta_link="d1"))
     h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link="d-junk"))
     run = h.sweep()
@@ -1719,6 +2002,7 @@ def test_must_read_message_with_hard_auth_failure_escalates_never_ingests(h):
     message = h.message_repo.find_by_provider_id(h.mailbox.mailbox_id, "m1")
     assert message.ingestion_status == INGESTION_STATUS_SECURITY_REVIEW
     assert message.evidence_id is None
+    assert message.metadata["auth_assessment"]["verdict"] == "FAIL"
 
     escalation_items = h.needs_you_repo.list_needs_you_items(item_type=ITEM_TYPE_MAILBOX_AUTHENTICATION_ESCALATION)
     assert len(escalation_items) == 1
@@ -1731,8 +2015,10 @@ def test_must_read_message_with_hard_auth_failure_escalates_never_ingests(h):
 
 
 def test_must_read_message_with_no_auth_signal_at_all_also_escalates(h):
-    """The documented threshold's second branch: total silence (no
-    spf/dkim/dmarc captured at all) is ALSO treated as suspicious."""
+    """No Authentication-Results (or ARC-Authentication-Results) header
+    present at all -> UNKNOWN -> ALSO escalates (treated identically to
+    FAIL by the sweep gate — an inconclusive verdict is never silently
+    trusted)."""
     silent_msg = _msg("m1", auth_signals={})
     h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(silent_msg,), delta_link="d1"))
     h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link="d-junk"))
@@ -1740,12 +2026,25 @@ def test_must_read_message_with_no_auth_signal_at_all_also_escalates(h):
 
     message = h.message_repo.find_by_provider_id(h.mailbox.mailbox_id, "m1")
     assert message.ingestion_status == INGESTION_STATUS_SECURITY_REVIEW
+    assert message.metadata["auth_assessment"]["verdict"] == "UNKNOWN"
 
 
-def test_must_read_message_with_softfail_but_a_real_signal_still_passes(h):
-    """A `softfail`/`none` value still counts as SOME captured signal —
-    only a hard `fail` or total silence escalates."""
-    passing_msg = _msg("m1", auth_signals={"spf": "softfail", "dkim": "pass", "dmarc": "none"})
+def test_must_read_message_with_dmarc_pass_on_mixed_lower_signals_still_passes(h):
+    """A trusted header's own dmarc=pass (or compauth=pass) is what
+    matters — mixed/weaker spf/dkim tokens underneath it never change
+    the outcome (this selector never gates on spf/dkim alone — see
+    `services.mailbox.microsoft.authentication`'s own module
+    docstring)."""
+    passing_msg = _msg(
+        "m1",
+        raw_headers=(
+            {
+                "name": "Authentication-Results",
+                "value": "spf=softfail smtp.mailfrom=vendor.com; dkim=pass header.d=vendor.com; "
+                "dmarc=pass action=none header.from=vendor.com; compauth=pass reason=100",
+            },
+        ),
+    )
     h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(passing_msg,), delta_link="d1"))
     h.graph_client.queue_content_result(_content())
     h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link="d-junk"))
@@ -1754,6 +2053,70 @@ def test_must_read_message_with_softfail_but_a_real_signal_still_passes(h):
     assert run.evidence_created == 1
     message = h.message_repo.find_by_provider_id(h.mailbox.mailbox_id, "m1")
     assert message.ingestion_status == "INGESTED"
+
+
+def test_dmarc_alignment_sensitive_case_spf_fail_under_dmarc_pass_never_escalates(h):
+    """WO's own explicitly-named architect concern (real problem case
+    #5): 'a DMARC PASS combined with an SPF FAIL can currently be
+    escalated merely because SPF contains fail, even though DMARC may
+    legitimately have passed through aligned DKIM' — the real, required
+    acceptance test that this is now fixed: SPF FAIL underneath a real,
+    trusted DMARC/compauth PASS must NEVER escalate."""
+    msg = _msg(
+        "m1",
+        raw_headers=(
+            {
+                "name": "Authentication-Results",
+                "value": "spf=fail (sender IP is 10.0.0.1) smtp.mailfrom=vendor.com; "
+                "dkim=pass (signature was verified) header.d=vendor.com; "
+                "dmarc=pass action=none header.from=vendor.com; compauth=pass reason=100",
+            },
+        ),
+    )
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(msg,), delta_link="d1"))
+    h.graph_client.queue_content_result(_content())
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link="d-junk"))
+    run = h.sweep()
+
+    assert run.evidence_created == 1
+    message = h.message_repo.find_by_provider_id(h.mailbox.mailbox_id, "m1")
+    assert message.ingestion_status == "INGESTED"
+    assert message.metadata["auth_assessment"]["verdict"] == "PASS"
+
+
+def test_forged_duplicate_header_cannot_manufacture_pass_over_a_genuine_fail(h):
+    """WO's own required adversarial proof, exercised end to end through
+    `run_sweep`: a forged SECOND `Authentication-Results` header claiming
+    `compauth=pass` can never override a genuine header's own real
+    `compauth=fail` — the selector's worst-wins merge (see
+    `services.mailbox.microsoft.authentication`'s own module docstring)
+    is order-independent. The forged header is placed FIRST here
+    (the position a naive 'first match wins' parser would trust) to
+    prove position alone cannot be exploited."""
+    msg = _msg(
+        "m1",
+        raw_headers=(
+            {
+                "name": "Authentication-Results",
+                "value": "spf=pass smtp.mailfrom=vendor.com; dkim=pass header.d=vendor.com; "
+                "dmarc=pass action=none header.from=vendor.com; compauth=pass reason=100",
+            },
+            {
+                "name": "Authentication-Results",
+                "value": "spf=fail smtp.mailfrom=vendor.com; dkim=fail header.d=vendor.com; "
+                "dmarc=fail action=quarantine header.from=vendor.com; compauth=fail reason=001",
+            },
+        ),
+    )
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(msg,), delta_link="d1"))
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link="d-junk"))
+    run = h.sweep()
+
+    assert run.evidence_created == 0
+    assert h.graph_client.content_calls == []
+    message = h.message_repo.find_by_provider_id(h.mailbox.mailbox_id, "m1")
+    assert message.ingestion_status == INGESTION_STATUS_SECURITY_REVIEW
+    assert message.metadata["auth_assessment"]["verdict"] == "FAIL"
 
 
 def test_fixed_destination_never_inferred_from_mailbox_default_entity_id(h):
@@ -1782,6 +2145,7 @@ def test_fixed_destination_never_inferred_from_mailbox_default_entity_id(h):
         policy="MUST_READ", destination_entity_id=h.entity.entity_id, destination_mode="FIXED", source="OPERATOR",
     )
     h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(_msg("m1"),), delta_link="d1"))
+    h.graph_client.queue_headers_result(_headers_ok())
     h.graph_client.queue_content_result(_content())
     h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link="d-junk"))
     h.sweep()

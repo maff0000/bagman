@@ -41,8 +41,11 @@ import { listEntities } from "../../shell/entities.js";
 import {
   listDomainReviewItems,
   listMicrosoftDomainRules,
+  listMicrosoftMessages,
+  listSecurityReviewItems,
   runXeroCorrelation,
   resolveMailboxDomainReviewItem,
+  resolveSecurityReviewItem,
   batchResolveMailboxDomainReview,
 } from "./mailbox-api.js";
 
@@ -259,9 +262,90 @@ export const DomainReview = {
 
     panel.appendChild(this._correlationSection(mailbox, entities));
 
+    // CD-6 GUI-operations-foundation follow-on WO (item D) — a real
+    // resolution surface for any OPEN MAILBOX_AUTHENTICATION_ESCALATION
+    // item, kept deliberately proportionate (no full batch-triage table
+    // treatment — see this module's own docstring pointer to the
+    // endpoint's own module docstring). Rendered only when at least one
+    // such item exists, never an empty placeholder section.
+    const securitySection = await this._securityReviewSection(mailbox);
+    if (securitySection) panel.appendChild(securitySection);
+
     const tableHost = el("div", { class: "domain-review__table-host" });
     panel.appendChild(tableHost);
     await this._loadTable(tableHost, mailbox, entities);
+  },
+
+  // -------------------------------------------------------------
+  // CD-6 GUI-operations-foundation follow-on WO (item D) — a real,
+  // proportionate resolution surface for MAILBOX_AUTHENTICATION_ESCALATION
+  // items (a MUST_READ-trusted source's own message failed authentication
+  // — a per-message security event, never a relevance question; see
+  // `services/mailbox/sweep.py`'s own module docstring).
+  // -------------------------------------------------------------
+
+  async _securityReviewSection(mailbox) {
+    const { ok, body } = await listSecurityReviewItems(mailbox.mailbox_id);
+    if (!ok || !body || !Array.isArray(body.items) || body.items.length === 0) return null;
+
+    const section = el("div", { class: "review-drawer__section domain-review__security-review" });
+    section.appendChild(el("h3", { text: `Security review (${body.items.length})` }));
+    section.appendChild(
+      el("p", {
+        class: "muted small",
+        text:
+          "A message from an already-trusted (Always Read) source failed its OWN authentication " +
+          "check. Resolving one of these never changes that source's own trust decision — it is a " +
+          "one-message override only.",
+      })
+    );
+    body.items.forEach((item) => section.appendChild(this._securityReviewRow(item, mailbox)));
+    return section;
+  },
+
+  _securityReviewRow(item, mailbox) {
+    const row = el("div", { class: "domain-review__security-review-row" });
+    row.appendChild(el("div", { class: "small", text: item.question }));
+    row.appendChild(this._metaRow("Reason", item.metadata.reason));
+    row.appendChild(this._metaRow("Sender", item.metadata.sender_address));
+    row.appendChild(this._metaRow("Subject", item.metadata.subject));
+
+    const statusEl = el("div", { class: "upload-status", attrs: { "aria-live": "polite" } });
+    const processBtn = el("button", {
+      class: "btn btn--primary btn--sm",
+      text: "Process this message once",
+      attrs: { type: "button" },
+    });
+    const declineBtn = el("button", { class: "btn btn--ghost btn--sm", text: "Do not process", attrs: { type: "button" } });
+    row.appendChild(el("div", { class: "review-drawer__actions" }, [processBtn, declineBtn]));
+    row.appendChild(statusEl);
+
+    const allButtons = [processBtn, declineBtn];
+    const decide = async (decision) => {
+      allButtons.forEach((btn) => (btn.disabled = true));
+      statusEl.dataset.kind = "progress";
+      statusEl.textContent = "Saving…";
+      const { ok, status, body: result } = await resolveSecurityReviewItem(mailbox.mailbox_id, item.item_id, {
+        decision,
+        actorId: getActorId(),
+      });
+      if (!ok || !result) {
+        statusEl.dataset.kind = "bad";
+        statusEl.textContent = `Could not save: ${errorMessage(status, result)}`;
+        allButtons.forEach((btn) => (btn.disabled = false));
+        return;
+      }
+      notify.ok(
+        decision === "PROCESS_THIS_MESSAGE_ONCE"
+          ? "Message processed once — this never changes the source's own trust decision."
+          : "Message left unprocessed. The source itself was never blacklisted."
+      );
+      document.dispatchEvent(new CustomEvent("bagman:needs-you-changed"));
+      this.open(mailbox); // back to the (now-refreshed) table
+    };
+    processBtn.addEventListener("click", () => decide("PROCESS_THIS_MESSAGE_ONCE"));
+    declineBtn.addEventListener("click", () => decide("DO_NOT_PROCESS_THIS_MESSAGE"));
+    return row;
   },
 
   // -------------------------------------------------------------
@@ -775,6 +859,42 @@ export const DomainReview = {
     );
     section.appendChild(el("label", { class: "field", text: "Always Read → company" }, [entitySelect]));
 
+    // CD-6 GUI-operations-foundation follow-on WO (item A) — an
+    // operator may scope ALLOW/IGNORE to ONE specific, ACTUALLY
+    // OBSERVED sender address instead of the whole domain
+    // (`match_mode: "EXACT_ADDRESS"`). Deliberately a SELECT populated
+    // from real observed addresses for this domain, never a free-text
+    // field — the server independently re-validates observation anyway,
+    // but a typo'd/unobserved address must never even be offered as a
+    // choice here (a mistyped address an operator could otherwise submit
+    // would just come back as a validation error, which is worse UX than
+    // never offering it). This capability is Details-drawer-only — the
+    // broad batch-triage table stays domain-oriented.
+    const scopeSelect = el("select", { attrs: { id: "domain-review-detail-scope-select" } }, [
+      el("option", { attrs: { value: "DOMAIN" }, text: "Whole domain" }),
+      el("option", { attrs: { value: "EXACT_ADDRESS" }, text: "Just one sender address…" }),
+    ]);
+    const addressSelect = el(
+      "select",
+      { attrs: { id: "domain-review-detail-address-select", disabled: "disabled" } },
+      [el("option", { attrs: { value: "" }, text: "Loading observed addresses…" })]
+    );
+    const scopeRow = el("label", { class: "field", text: "Scope" }, [scopeSelect]);
+    const addressRow = el("label", { class: "field", text: "Sender address" }, [addressSelect]);
+    addressRow.hidden = true;
+    section.appendChild(scopeRow);
+    section.appendChild(addressRow);
+
+    let addressesLoaded = false;
+    scopeSelect.addEventListener("change", async () => {
+      const useAddress = scopeSelect.value === "EXACT_ADDRESS";
+      addressRow.hidden = !useAddress;
+      if (useAddress && !addressesLoaded) {
+        addressesLoaded = true;
+        await this._populateObservedAddresses(addressSelect, mailbox, item.metadata.sender_domain);
+      }
+    });
+
     const statusEl = el("div", { class: "upload-status", attrs: { "aria-live": "polite" } });
     const allowBtn = el("button", { class: "btn btn--primary btn--sm", text: "Always Read", attrs: { type: "button" } });
     const grayBtn = el("button", { class: "btn btn--ghost btn--sm", text: "Keep checking with me", attrs: { type: "button" } });
@@ -784,9 +904,20 @@ export const DomainReview = {
 
     const allButtons = [allowBtn, grayBtn, ignoreBtn];
     const decide = async (decision) => {
+      const useAddress = scopeSelect.value === "EXACT_ADDRESS";
       if (decision === "ALLOW" && !entitySelect.value) {
         statusEl.dataset.kind = "bad";
         statusEl.textContent = "Select a company before choosing Always Read for this domain.";
+        return;
+      }
+      if (decision === "KEEP_GRAY" && useAddress) {
+        statusEl.dataset.kind = "bad";
+        statusEl.textContent = "\"Keep checking with me\" applies to the whole domain, not one address — switch scope to \"Whole domain\".";
+        return;
+      }
+      if (useAddress && !addressSelect.value) {
+        statusEl.dataset.kind = "bad";
+        statusEl.textContent = "Select an observed sender address, or switch scope back to \"Whole domain\".";
         return;
       }
       allButtons.forEach((btn) => (btn.disabled = true));
@@ -797,6 +928,8 @@ export const DomainReview = {
         decision,
         destinationEntityId: decision === "ALLOW" ? entitySelect.value : null,
         destinationMode: decision === "ALLOW" ? "FIXED" : null,
+        matchMode: useAddress ? "EXACT_ADDRESS" : "EXACT",
+        senderAddress: useAddress ? addressSelect.value : null,
         actorId: getActorId(),
       });
 
@@ -810,10 +943,11 @@ export const DomainReview = {
       // Explicit learning feedback (architect §7) — a clear sentence,
       // not just a generic success toast, especially for "Always Read"
       // (the whole point of the durable-memory model).
+      const scopeSuffix = useAddress ? ` (scoped to ${addressSelect.value} only)` : "";
       const message = {
-        ALLOW: "BAGMAN will always read this source and will not ask again for ordinary future messages from it.",
+        ALLOW: `BAGMAN will always read this source${scopeSuffix} and will not ask again for ordinary future messages from it.`,
         KEEP_GRAY: "This domain stays under review — BAGMAN will keep asking about it.",
-        IGNORE: "BAGMAN will not raise this domain again.",
+        IGNORE: `BAGMAN will not raise this source${scopeSuffix} again.`,
       }[decision];
       notify.ok(message || "Saved.");
       document.dispatchEvent(new CustomEvent("bagman:needs-you-changed"));
@@ -825,6 +959,39 @@ export const DomainReview = {
     ignoreBtn.addEventListener("click", () => decide("IGNORE"));
 
     return section;
+  },
+
+  /** Populates `addressSelect` with every DISTINCT sender address
+   * observed for `senderDomain` on `mailbox`, from the existing
+   * (already cheaply available) recent-messages projection — never a
+   * new backend endpoint (WO's own "check what's cheaply available
+   * before adding a new endpoint" instruction). A message list capped
+   * at 200 recent messages is a reasonable, bounded source for this —
+   * this is a convenience picker, not an exhaustive audit surface. */
+  async _populateObservedAddresses(addressSelect, mailbox, senderDomain) {
+    const { ok, body } = await listMicrosoftMessages(mailbox.mailbox_id);
+    clear(addressSelect);
+    addressSelect.disabled = false;
+    if (!ok || !body || !Array.isArray(body.items)) {
+      addressSelect.appendChild(el("option", { attrs: { value: "" }, text: "Could not load observed addresses" }));
+      addressSelect.disabled = true;
+      return;
+    }
+    const normalizedDomain = (senderDomain || "").toLowerCase();
+    const addresses = Array.from(
+      new Set(
+        body.items
+          .map((m) => m.sender_address)
+          .filter((addr) => addr && addr.toLowerCase().endsWith(`@${normalizedDomain}`))
+      )
+    ).sort();
+    if (addresses.length === 0) {
+      addressSelect.appendChild(el("option", { attrs: { value: "" }, text: "No observed addresses found for this domain" }));
+      addressSelect.disabled = true;
+      return;
+    }
+    addressSelect.appendChild(el("option", { attrs: { value: "" }, text: "Select an observed address…" }));
+    addresses.forEach((addr) => addressSelect.appendChild(el("option", { attrs: { value: addr }, text: addr })));
   },
 
   // -------------------------------------------------------------

@@ -22,6 +22,7 @@ from services.mailbox.microsoft.graph_client import (
     GraphFolderListResult,
     GraphFolderSummary,
     GraphMessageContentResult,
+    GraphMessageHeadersResult,
     GraphMessageSummary,
     GraphOutcomeStatus,
     GraphWellKnownFoldersResult,
@@ -52,6 +53,34 @@ ACTOR_ID = "bagman-mailbox-microsoft-endpoint-tests"
 #: sweep tests need no other changes.
 _INBOX_FOLDER_ID = "AAMkADinbox000000000000000000000"
 _JUNK_FOLDER_ID = "AAMkADjunkemail0000000000000000"
+
+#: CD-6 GUI-operations-foundation follow-on WO (item B) — the real
+#: per-message authentication gate now drives directly off
+#: `GraphMessageSummary.raw_headers` (never the flat `auth_signals` dict
+#: alone). A real, trusted, passing `Authentication-Results` header
+#: (`compauth=pass`, the real live-diagnostic shape) for every MUST_READ-
+#: path test in this file that exercises the ORDINARY (non-domain-
+#: review-triggering) sweep path.
+_PASSING_AUTH_HEADERS = (
+    {
+        "name": "Authentication-Results",
+        "value": "spf=pass (sender IP is 10.0.0.1) smtp.mailfrom=example.com;"
+        "dkim=pass (signature was verified) header.d=example.com;"
+        "dmarc=pass action=none header.from=example.com;"
+        "compauth=pass reason=100",
+    },
+)
+
+
+def _headers_ok() -> GraphMessageHeadersResult:
+    """CD-6 GUI-operations-foundation follow-on WO (item C) — historical
+    back-processing (`_reprocess_one_message`) now fetches FRESH headers
+    before ever fetching MIME; queue a real, trusted, passing result for
+    every such call. Harmless/unused when queued for an ordinary
+    (non-reprocessing) sweep call, which never touches this queue at
+    all — a SEPARATE queue from `queue_content_result` (see
+    `FakeMicrosoftGraphClient`'s own docstring)."""
+    return GraphMessageHeadersResult(status=GraphOutcomeStatus.OK, raw_headers=_PASSING_AUTH_HEADERS)
 
 
 def _queue_folder_discovery(comp) -> None:
@@ -290,9 +319,11 @@ def test_sweep_after_connect_ingests_a_message_and_lists_it(dev_client):
         # ORDINARY path here (the dedicated authentication-escalation
         # tests below exercise a failing/missing signal set instead).
         auth_signals={"spf": "pass", "dkim": "pass", "dmarc": "pass"},
+        raw_headers=_PASSING_AUTH_HEADERS,
     )
     _queue_folder_discovery(comp)
     comp.microsoft_graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(msg,), delta_link="d1"))
+    comp.microsoft_graph_client.queue_headers_result(_headers_ok())
     comp.microsoft_graph_client.queue_content_result(
         GraphMessageContentResult(status=GraphOutcomeStatus.OK, content=b"From: v@example.com\r\nSubject: Invoice\r\n\r\nBody")
     )
@@ -378,6 +409,7 @@ def test_resolve_domain_review_allow_fixed_creates_rule_and_reprocesses_message(
         if i.metadata.get("mailbox_id") == mailbox_id
     ][0]
 
+    comp.microsoft_graph_client.queue_headers_result(_headers_ok())
     comp.microsoft_graph_client.queue_content_result(
         GraphMessageContentResult(
             status=GraphOutcomeStatus.OK, content=b"From: billing@new-supplier.example\r\nSubject: Invoice\r\n\r\nBody"
@@ -412,6 +444,7 @@ def test_resolve_domain_review_allow_review_required_needs_no_entity(dev_client)
         if i.metadata.get("mailbox_id") == mailbox_id
     ][0]
 
+    comp.microsoft_graph_client.queue_headers_result(_headers_ok())
     comp.microsoft_graph_client.queue_content_result(
         GraphMessageContentResult(status=GraphOutcomeStatus.OK, content=b"From: x\r\nSubject: Invoice\r\n\r\nBody")
     )
@@ -523,16 +556,19 @@ def test_resolve_domain_review_allow_back_processes_every_historical_candidate_f
     item = items[0]
     assert item.metadata["candidate_message_count"] == 3
 
+    comp.microsoft_graph_client.queue_headers_result(_headers_ok())
     comp.microsoft_graph_client.queue_content_result(
         GraphMessageContentResult(
             status=GraphOutcomeStatus.OK, content=b"From: billing@new-supplier.example\r\nSubject: Invoice\r\n\r\nBody"
         )
     )
+    comp.microsoft_graph_client.queue_headers_result(_headers_ok())
     comp.microsoft_graph_client.queue_content_result(
         GraphMessageContentResult(
             status=GraphOutcomeStatus.OK, content=b"From: billing@new-supplier.example\r\nSubject: Invoice\r\n\r\nBody"
         )
     )
+    comp.microsoft_graph_client.queue_headers_result(_headers_ok())
     comp.microsoft_graph_client.queue_content_result(
         GraphMessageContentResult(
             status=GraphOutcomeStatus.OK, content=b"From: billing@new-supplier.example\r\nSubject: Invoice\r\n\r\nBody"
@@ -627,6 +663,7 @@ def test_batch_resolve_three_domains_matches_three_individual_calls_end_state(de
     items = [_open_domain_review_item_for_domain(comp, mailbox_id, d) for d in domains]
 
     for _ in domains:
+        comp.microsoft_graph_client.queue_headers_result(_headers_ok())
         comp.microsoft_graph_client.queue_content_result(
             GraphMessageContentResult(status=GraphOutcomeStatus.OK, content=b"From: x\r\nSubject: Invoice\r\n\r\nBody")
         )
@@ -700,6 +737,7 @@ def test_batch_resolve_one_bad_item_never_blocks_the_others(dev_client):
     foreign_item = _open_domain_review_item_for_domain(other_comp, other_mailbox_id, "other-mailbox-domain.example")
 
     for _ in domains:
+        comp.microsoft_graph_client.queue_headers_result(_headers_ok())
         comp.microsoft_graph_client.queue_content_result(
             GraphMessageContentResult(status=GraphOutcomeStatus.OK, content=b"From: x\r\nSubject: Invoice\r\n\r\nBody")
         )
@@ -1267,10 +1305,11 @@ def _sweep_must_read_review_required_message(client, mailbox_id, *, msg_id, doma
     msg = GraphMessageSummary(
         immutable_id=msg_id, internet_message_id=f"<{msg_id}@b>", subject="Invoice",
         sender_address=f"billing@{domain}", sender_display_name="Supplier", received_at=now,
-        has_attachments=False, auth_signals=_PASSING_AUTH_SIGNALS,
+        has_attachments=False, auth_signals=_PASSING_AUTH_SIGNALS, raw_headers=_PASSING_AUTH_HEADERS,
     )
     _queue_folder_discovery(comp)
     comp.microsoft_graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(msg,), delta_link=f"d-{msg_id}"))
+    comp.microsoft_graph_client.queue_headers_result(_headers_ok())
     comp.microsoft_graph_client.queue_content_result(
         GraphMessageContentResult(status=GraphOutcomeStatus.OK, content=f"From: billing@{domain}\r\nSubject: Invoice\r\n\r\nBody".encode())
     )
@@ -1359,6 +1398,7 @@ def test_policy_change_audit_event_carries_before_after_and_is_live_on_next_swee
     assert matching_gray[0].payload["new_policy"] == "GRAYLIST"
 
     # Step 2: ALLOW (MUST_READ + FIXED) — the real transition under test.
+    comp.microsoft_graph_client.queue_headers_result(_headers_ok())
     comp.microsoft_graph_client.queue_content_result(
         GraphMessageContentResult(status=GraphOutcomeStatus.OK, content=b"From: billing@new-supplier.example\r\nSubject: Invoice\r\n\r\nBody")
     )
@@ -1389,10 +1429,11 @@ def test_policy_change_audit_event_carries_before_after_and_is_live_on_next_swee
     msg2 = GraphMessageSummary(
         immutable_id="AAMk-unknown-2", internet_message_id="<u2@b>", subject="Invoice attached",
         sender_address="billing@new-supplier.example", sender_display_name="New Supplier", received_at=now,
-        has_attachments=False, auth_signals=_PASSING_AUTH_SIGNALS,
+        has_attachments=False, auth_signals=_PASSING_AUTH_SIGNALS, raw_headers=_PASSING_AUTH_HEADERS,
     )
     _queue_folder_discovery(comp)
     comp.microsoft_graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(msg2,), delta_link="d-next"))
+    comp.microsoft_graph_client.queue_headers_result(_headers_ok())
     comp.microsoft_graph_client.queue_content_result(
         GraphMessageContentResult(status=GraphOutcomeStatus.OK, content=b"From: billing@new-supplier.example\r\nSubject: Invoice\r\n\r\nBody")
     )
@@ -1434,3 +1475,426 @@ def test_get_domain_rules_reflects_current_policy_after_keep_gray(dev_client):
     assert rules["count"] == 1
     assert rules["items"][0]["policy"] == "GRAYLIST"
     assert rules["items"][0]["sender_address"] is None
+
+
+# =======================================================================
+# CD-6 GUI-operations-foundation follow-on WO ("five confirmed
+# integration gaps" fix) — item A: EXACT_ADDRESS wired through the real
+# operator HTTP API.
+# =======================================================================
+
+
+def test_resolve_domain_review_allow_exact_address_creates_scoped_rule(dev_client):
+    mailbox_id, comp, entity = _connected_mailbox_with_entity_seeded(dev_client)
+    _sweep_unknown_domain_message(dev_client, mailbox_id)
+    item = [
+        i for i in comp.needs_you_repository.list_needs_you_items(item_type="MAILBOX_DOMAIN_REVIEW")
+        if i.metadata.get("mailbox_id") == mailbox_id
+    ][0]
+
+    comp.microsoft_graph_client.queue_headers_result(_headers_ok())
+    comp.microsoft_graph_client.queue_content_result(
+        GraphMessageContentResult(
+            status=GraphOutcomeStatus.OK, content=b"From: billing@new-supplier.example\r\nSubject: Invoice\r\n\r\nBody"
+        )
+    )
+    r = dev_client.post(
+        f"/internal/mailboxes/{mailbox_id}/microsoft/domain-review/{item.item_id}/resolve",
+        json={
+            "actor_type": "USER", "actor_id": ACTOR_ID, "decision": "ALLOW",
+            "destination_entity_id": entity.entity_id, "destination_mode": "FIXED",
+            "match_mode": "EXACT_ADDRESS", "sender_address": "billing@new-supplier.example",
+        },
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["mailbox_domain_rule"]["match_mode"] == "EXACT_ADDRESS"
+    assert body["mailbox_domain_rule"]["sender_address"] == "billing@new-supplier.example"
+    assert body["mailbox_domain_rule"]["sender_domain"] == "new-supplier.example"
+    assert len(body["reprocessed_messages"]) == 1
+    assert body["reprocessed_messages"][0]["ingestion_status"] == "INGESTED"
+
+
+def test_resolve_domain_review_exact_address_rejects_an_unobserved_address(dev_client):
+    """An operator must never be able to pre-authorize an address BAGMAN
+    has never actually seen mail from."""
+    mailbox_id, comp, entity = _connected_mailbox_with_entity_seeded(dev_client)
+    _sweep_unknown_domain_message(dev_client, mailbox_id)
+    item = [
+        i for i in comp.needs_you_repository.list_needs_you_items(item_type="MAILBOX_DOMAIN_REVIEW")
+        if i.metadata.get("mailbox_id") == mailbox_id
+    ][0]
+
+    r = dev_client.post(
+        f"/internal/mailboxes/{mailbox_id}/microsoft/domain-review/{item.item_id}/resolve",
+        json={
+            "actor_type": "USER", "actor_id": ACTOR_ID, "decision": "ALLOW",
+            "destination_entity_id": entity.entity_id, "destination_mode": "FIXED",
+            "match_mode": "EXACT_ADDRESS", "sender_address": "never-seen@new-supplier.example",
+        },
+    )
+    assert r.status_code == 422, r.text
+
+
+def test_resolve_domain_review_exact_address_rejects_an_address_from_a_different_domain(dev_client):
+    mailbox_id, comp, entity = _connected_mailbox_with_entity_seeded(dev_client)
+    _sweep_unknown_domain_message(dev_client, mailbox_id)
+    item = [
+        i for i in comp.needs_you_repository.list_needs_you_items(item_type="MAILBOX_DOMAIN_REVIEW")
+        if i.metadata.get("mailbox_id") == mailbox_id
+    ][0]
+
+    r = dev_client.post(
+        f"/internal/mailboxes/{mailbox_id}/microsoft/domain-review/{item.item_id}/resolve",
+        json={
+            "actor_type": "USER", "actor_id": ACTOR_ID, "decision": "ALLOW",
+            "destination_entity_id": entity.entity_id, "destination_mode": "FIXED",
+            "match_mode": "EXACT_ADDRESS", "sender_address": "billing@totally-different.example",
+        },
+    )
+    assert r.status_code == 422, r.text
+
+
+def test_resolve_domain_review_domain_level_mode_rejects_a_stray_sender_address(dev_client):
+    """A domain-level match_mode must never silently accept a stray
+    sender_address."""
+    mailbox_id, comp, entity = _connected_mailbox_with_entity_seeded(dev_client)
+    _sweep_unknown_domain_message(dev_client, mailbox_id)
+    item = [
+        i for i in comp.needs_you_repository.list_needs_you_items(item_type="MAILBOX_DOMAIN_REVIEW")
+        if i.metadata.get("mailbox_id") == mailbox_id
+    ][0]
+
+    r = dev_client.post(
+        f"/internal/mailboxes/{mailbox_id}/microsoft/domain-review/{item.item_id}/resolve",
+        json={
+            "actor_type": "USER", "actor_id": ACTOR_ID, "decision": "ALLOW",
+            "destination_entity_id": entity.entity_id, "destination_mode": "FIXED",
+            "match_mode": "EXACT", "sender_address": "billing@new-supplier.example",
+        },
+    )
+    assert r.status_code == 422, r.text
+
+
+def test_keep_gray_rejects_exact_address_match_mode(dev_client):
+    mailbox_id, comp, _entity = _connected_mailbox_with_entity_seeded(dev_client)
+    _sweep_unknown_domain_message(dev_client, mailbox_id)
+    item = [
+        i for i in comp.needs_you_repository.list_needs_you_items(item_type="MAILBOX_DOMAIN_REVIEW")
+        if i.metadata.get("mailbox_id") == mailbox_id
+    ][0]
+
+    r = dev_client.post(
+        f"/internal/mailboxes/{mailbox_id}/microsoft/domain-review/{item.item_id}/resolve",
+        json={
+            "actor_type": "USER", "actor_id": ACTOR_ID, "decision": "KEEP_GRAY",
+            "match_mode": "EXACT_ADDRESS", "sender_address": "billing@new-supplier.example",
+        },
+    )
+    assert r.status_code == 422, r.text
+
+
+def test_batch_resolve_supports_exact_address_scope(dev_client):
+    mailbox_id, comp, entity = _connected_mailbox_with_entity_seeded(dev_client)
+    _sweep_unknown_domain_message(dev_client, mailbox_id)
+    item = [
+        i for i in comp.needs_you_repository.list_needs_you_items(item_type="MAILBOX_DOMAIN_REVIEW")
+        if i.metadata.get("mailbox_id") == mailbox_id
+    ][0]
+
+    comp.microsoft_graph_client.queue_headers_result(_headers_ok())
+    comp.microsoft_graph_client.queue_content_result(
+        GraphMessageContentResult(
+            status=GraphOutcomeStatus.OK, content=b"From: billing@new-supplier.example\r\nSubject: Invoice\r\n\r\nBody"
+        )
+    )
+    r = dev_client.post(
+        f"/internal/mailboxes/{mailbox_id}/microsoft/domain-review/batch-resolve",
+        json={
+            "actor_type": "USER", "actor_id": ACTOR_ID,
+            "items": [
+                {
+                    "item_id": item.item_id, "decision": "ALLOW",
+                    "destination_entity_id": entity.entity_id, "destination_mode": "FIXED",
+                    "match_mode": "EXACT_ADDRESS", "sender_address": "billing@new-supplier.example",
+                }
+            ],
+        },
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["succeeded_count"] == 1
+    assert body["results"][0]["mailbox_domain_rule"]["match_mode"] == "EXACT_ADDRESS"
+    assert body["results"][0]["mailbox_domain_rule"]["sender_address"] == "billing@new-supplier.example"
+
+
+def test_exact_address_precedence_over_domain_rules_at_http_level(dev_client):
+    """Exact-address > exact-domain > parent-subdomain precedence — the
+    HTTP-level proof (the repository layer's own equivalent proof
+    already exists; this exercises the full sweep-endpoint path)."""
+    mailbox_id, comp, entity = _connected_mailbox_with_entity_seeded(dev_client)
+    comp.mailbox_domain_rule_repository.upsert_rule(
+        mailbox_id=mailbox_id, sender_domain="example.com", match_mode="INCLUDE_SUBDOMAINS",
+        policy="BLACKLIST", destination_entity_id=None, destination_mode=None, source="OPERATOR",
+    )
+    comp.mailbox_domain_rule_repository.upsert_rule(
+        mailbox_id=mailbox_id, sender_domain="billing.example.com", match_mode="EXACT",
+        policy="BLACKLIST", destination_entity_id=None, destination_mode=None, source="OPERATOR",
+    )
+
+    now = datetime.now(timezone.utc)
+    msg1 = GraphMessageSummary(
+        immutable_id="AAMk-precedence-1", internet_message_id="<p1@b>", subject="Invoice",
+        sender_address="ap@billing.example.com", sender_display_name="AP", received_at=now,
+        has_attachments=False, raw_headers=_PASSING_AUTH_HEADERS,
+    )
+    _queue_folder_discovery(comp)
+    comp.microsoft_graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(msg1,), delta_link="d1"))
+    comp.microsoft_graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link="d1-junk"))
+    r1 = dev_client.post(f"/internal/mailboxes/{mailbox_id}/microsoft/sweep", json={"actor_type": "USER", "actor_id": ACTOR_ID})
+    assert r1.status_code == 200, r1.text
+    assert r1.json()["evidence_created"] == 0  # the EXACT domain-level BLACKLIST rule governs so far
+
+    # A real EXACT_ADDRESS rule now governs THIS specific address —
+    # requires the address to have been actually observed, which the
+    # sweep above just did.
+    comp.mailbox_domain_rule_repository.upsert_rule(
+        mailbox_id=mailbox_id, sender_domain="billing.example.com", sender_address="ap@billing.example.com",
+        match_mode="EXACT_ADDRESS", policy="MUST_READ", destination_entity_id=entity.entity_id,
+        destination_mode="FIXED", source="OPERATOR",
+    )
+
+    msg2 = GraphMessageSummary(
+        immutable_id="AAMk-precedence-2", internet_message_id="<p2@b>", subject="Invoice",
+        sender_address="ap@billing.example.com", sender_display_name="AP", received_at=now,
+        has_attachments=False, raw_headers=_PASSING_AUTH_HEADERS,
+    )
+    _queue_folder_discovery(comp)
+    comp.microsoft_graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(msg2,), delta_link="d2"))
+    comp.microsoft_graph_client.queue_content_result(
+        GraphMessageContentResult(status=GraphOutcomeStatus.OK, content=b"From: ap@billing.example.com\r\nSubject: Invoice\r\n\r\nBody")
+    )
+    comp.microsoft_graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link="d2-junk"))
+    r2 = dev_client.post(f"/internal/mailboxes/{mailbox_id}/microsoft/sweep", json={"actor_type": "USER", "actor_id": ACTOR_ID})
+    assert r2.status_code == 200, r2.text
+    assert r2.json()["evidence_created"] == 1  # EXACT_ADDRESS wins over both domain-level BLACKLIST rules
+
+    message2 = comp.mailbox_message_repository.find_by_provider_id(mailbox_id, "AAMk-precedence-2")
+    assert message2.ingestion_status == "INGESTED"
+    evidence2 = comp.api.get_evidence(message2.evidence_id)
+    assert evidence2.entity_id == entity.entity_id
+
+
+# =======================================================================
+# CD-6 GUI-operations-foundation follow-on WO ("five confirmed
+# integration gaps" fix) — item D: the real SECURITY_REVIEW resolution
+# workflow.
+# =======================================================================
+
+
+def _sweep_security_review_message(dev_client, mailbox_id, *, msg_id="sec-1", domain=None):
+    """Sweeps ONE message under a real MUST_READ rule with a genuine
+    trusted authentication FAIL — the message lands SECURITY_REVIEW and
+    raises exactly one MAILBOX_AUTHENTICATION_ESCALATION item."""
+    comp = get_composition()
+    resolved_domain = domain or _DEFAULT_ALLOWED_DOMAIN_HTTP
+    now = datetime.now(timezone.utc)
+    msg = GraphMessageSummary(
+        immutable_id=msg_id, internet_message_id=f"<{msg_id}@b>", subject="Invoice",
+        sender_address=f"billing@{resolved_domain}", sender_display_name="Vendor", received_at=now,
+        has_attachments=False,
+        raw_headers=(
+            {
+                "name": "Authentication-Results",
+                "value": "spf=fail smtp.mailfrom=vendor.com; dkim=fail header.d=vendor.com; "
+                "dmarc=fail action=quarantine header.from=vendor.com; compauth=fail reason=001",
+            },
+        ),
+    )
+    _queue_folder_discovery(comp)
+    comp.microsoft_graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(msg,), delta_link=f"d-{msg_id}"))
+    comp.microsoft_graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link=f"d-{msg_id}-junk"))
+    r = dev_client.post(f"/internal/mailboxes/{mailbox_id}/microsoft/sweep", json={"actor_type": "USER", "actor_id": ACTOR_ID})
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+_DEFAULT_ALLOWED_DOMAIN_HTTP = "security-review.example"
+
+
+def _connected_mailbox_with_must_read_rule(client, *, domain=_DEFAULT_ALLOWED_DOMAIN_HTTP, destination_mode="REVIEW_REQUIRED", destination_entity_id=None):
+    mailbox_id, comp, entity = _connected_mailbox_with_entity_seeded(client)
+    comp.mailbox_domain_rule_repository.upsert_rule(
+        mailbox_id=mailbox_id, sender_domain=domain, match_mode="EXACT", policy="MUST_READ",
+        destination_entity_id=destination_entity_id, destination_mode=destination_mode, source="OPERATOR",
+    )
+    return mailbox_id, comp, entity
+
+
+def test_security_review_list_endpoint_returns_the_open_item(dev_client):
+    mailbox_id, comp, _entity = _connected_mailbox_with_must_read_rule(dev_client)
+    _sweep_security_review_message(dev_client, mailbox_id, msg_id="sec-1")
+
+    listing = dev_client.get(f"/internal/mailboxes/{mailbox_id}/microsoft/security-review").json()
+    assert listing["count"] == 1
+    assert listing["items"][0]["item_type"] == "MAILBOX_AUTHENTICATION_ESCALATION"
+    assert listing["items"][0]["status"] == "OPEN"
+
+
+def test_resolve_security_review_process_once_ingests_exactly_one_mime_fetch(dev_client):
+    mailbox_id, comp, _entity = _connected_mailbox_with_must_read_rule(dev_client)
+    _sweep_security_review_message(dev_client, mailbox_id, msg_id="sec-1")
+    item = comp.needs_you_repository.list_needs_you_items(item_type="MAILBOX_AUTHENTICATION_ESCALATION")[0]
+
+    comp.microsoft_graph_client.queue_content_result(
+        GraphMessageContentResult(
+            status=GraphOutcomeStatus.OK,
+            content=f"From: billing@{_DEFAULT_ALLOWED_DOMAIN_HTTP}\r\nSubject: Invoice\r\n\r\nBody".encode(),
+        )
+    )
+    r = dev_client.post(
+        f"/internal/mailboxes/{mailbox_id}/microsoft/security-review/{item.item_id}/resolve",
+        json={"actor_type": "USER", "actor_id": ACTOR_ID, "decision": "PROCESS_THIS_MESSAGE_ONCE"},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["needs_you_item"]["status"] == "RESOLVED"
+    assert body["mailbox_message"]["ingestion_status"] == "INGESTED"
+    assert body["mailbox_message"]["evidence_id"] is not None
+    assert len(comp.microsoft_graph_client.content_calls) == 1
+
+    # The governing rule itself is never touched — still MUST_READ.
+    rule = comp.mailbox_domain_rule_repository.find_for_sender(mailbox_id=mailbox_id, sender_domain=_DEFAULT_ALLOWED_DOMAIN_HTTP)
+    assert rule.policy == "MUST_READ"
+
+
+def test_resolve_security_review_process_once_is_idempotent_no_duplicate_evidence(dev_client):
+    mailbox_id, comp, _entity = _connected_mailbox_with_must_read_rule(dev_client)
+    _sweep_security_review_message(dev_client, mailbox_id, msg_id="sec-1")
+    item = comp.needs_you_repository.list_needs_you_items(item_type="MAILBOX_AUTHENTICATION_ESCALATION")[0]
+
+    comp.microsoft_graph_client.queue_content_result(
+        GraphMessageContentResult(
+            status=GraphOutcomeStatus.OK,
+            content=f"From: billing@{_DEFAULT_ALLOWED_DOMAIN_HTTP}\r\nSubject: Invoice\r\n\r\nBody".encode(),
+        )
+    )
+    payload = {"actor_type": "USER", "actor_id": ACTOR_ID, "decision": "PROCESS_THIS_MESSAGE_ONCE"}
+    first = dev_client.post(f"/internal/mailboxes/{mailbox_id}/microsoft/security-review/{item.item_id}/resolve", json=payload)
+    assert first.status_code == 200, first.text
+    first_evidence_id = first.json()["mailbox_message"]["evidence_id"]
+
+    second = dev_client.post(f"/internal/mailboxes/{mailbox_id}/microsoft/security-review/{item.item_id}/resolve", json=payload)
+    assert second.status_code == 200, second.text
+    assert second.json()["mailbox_message"]["evidence_id"] == first_evidence_id
+    # No second MIME fetch at all.
+    assert len(comp.microsoft_graph_client.content_calls) == 1
+
+
+def test_resolve_security_review_do_not_process_never_fetches_mime_or_blacklists(dev_client):
+    mailbox_id, comp, _entity = _connected_mailbox_with_must_read_rule(dev_client)
+    _sweep_security_review_message(dev_client, mailbox_id, msg_id="sec-1")
+    item = comp.needs_you_repository.list_needs_you_items(item_type="MAILBOX_AUTHENTICATION_ESCALATION")[0]
+
+    r = dev_client.post(
+        f"/internal/mailboxes/{mailbox_id}/microsoft/security-review/{item.item_id}/resolve",
+        json={"actor_type": "USER", "actor_id": ACTOR_ID, "decision": "DO_NOT_PROCESS_THIS_MESSAGE"},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["needs_you_item"]["status"] == "RESOLVED"
+    assert body["mailbox_message"]["ingestion_status"] == "SECURITY_REVIEW"
+    assert body["mailbox_message"]["evidence_id"] is None
+    assert comp.microsoft_graph_client.content_calls == []
+
+    rule = comp.mailbox_domain_rule_repository.find_for_sender(mailbox_id=mailbox_id, sender_domain=_DEFAULT_ALLOWED_DOMAIN_HTTP)
+    assert rule.policy == "MUST_READ"  # never blacklisted
+
+
+def test_resolve_security_review_conflicting_second_decision_is_409(dev_client):
+    mailbox_id, comp, _entity = _connected_mailbox_with_must_read_rule(dev_client)
+    _sweep_security_review_message(dev_client, mailbox_id, msg_id="sec-1")
+    item = comp.needs_you_repository.list_needs_you_items(item_type="MAILBOX_AUTHENTICATION_ESCALATION")[0]
+
+    first = dev_client.post(
+        f"/internal/mailboxes/{mailbox_id}/microsoft/security-review/{item.item_id}/resolve",
+        json={"actor_type": "USER", "actor_id": ACTOR_ID, "decision": "DO_NOT_PROCESS_THIS_MESSAGE"},
+    )
+    assert first.status_code == 200
+
+    conflicting = dev_client.post(
+        f"/internal/mailboxes/{mailbox_id}/microsoft/security-review/{item.item_id}/resolve",
+        json={"actor_type": "USER", "actor_id": ACTOR_ID, "decision": "PROCESS_THIS_MESSAGE_ONCE"},
+    )
+    assert conflicting.status_code == 409
+
+
+# =======================================================================
+# CD-6 GUI-operations-foundation follow-on WO ("five confirmed
+# integration gaps" fix) — required mixed-destination acceptance proof
+# (Amazon-style).
+# =======================================================================
+
+
+def test_amazon_style_two_documents_two_destinations_never_reasks_relevance(dev_client):
+    """A MUST_READ + REVIEW_REQUIRED rule for one domain; two SEPARATE
+    messages/evidence items from it. Document A resolved to one entity,
+    Document B (a different evidence item, same source) — source
+    relevance is never re-asked, evidence starts entity_id=None again
+    (never inherited from Document A), gets resolved to a DIFFERENT
+    entity via its OWN separate COMPANY_REQUIRED item, and the governing
+    MailboxDomainRule stays MUST_READ+REVIEW_REQUIRED afterward — never
+    silently learned/promoted to a FIXED destination from either
+    document's own resolution."""
+    mailbox_id, comp, entity_a = _connected_mailbox_with_entity_seeded(dev_client)
+    entity_b = comp.api.register_entity(
+        entity_type="PERSON", canonical_name="AMAZON_STYLE_PERSON_B", display_name="Person B", status="ACTIVE",
+        actor_type="SYSTEM", actor_id=ACTOR_ID, fiscal_year_start_month_day="01-01",
+    )
+    domain = "amazon-style.example"
+    _sweep_must_read_review_required_message(dev_client, mailbox_id, msg_id="amazon-doc-1", domain=domain)
+    _sweep_must_read_review_required_message(dev_client, mailbox_id, msg_id="amazon-doc-2", domain=domain)
+
+    message1 = comp.mailbox_message_repository.find_by_provider_id(mailbox_id, "amazon-doc-1")
+    message2 = comp.mailbox_message_repository.find_by_provider_id(mailbox_id, "amazon-doc-2")
+    evidence1 = comp.api.get_evidence(message1.evidence_id)
+    evidence2 = comp.api.get_evidence(message2.evidence_id)
+    assert evidence1.entity_id is None
+    assert evidence2.entity_id is None  # never inherited from Document A
+
+    company_items = [
+        i for i in comp.needs_you_repository.list_needs_you_items(item_type="COMPANY_REQUIRED")
+        if i.metadata.get("mailbox_id") == mailbox_id
+    ]
+    item1 = next(i for i in company_items if i.source_object_reference == evidence1.evidence_id)
+    item2 = next(i for i in company_items if i.source_object_reference == evidence2.evidence_id)
+    assert item1.item_id != item2.item_id
+
+    r1 = dev_client.post(
+        f"/internal/needs-you/{item1.item_id}/resolve",
+        json={
+            "new_status": "RESOLVED",
+            "resolution": {"entity_id": entity_a.entity_id, "what": "Software subscription", "why": "R&D tooling"},
+            "actor_type": "USER", "actor_id": ACTOR_ID,
+        },
+    )
+    assert r1.status_code == 200, r1.text
+    r2 = dev_client.post(
+        f"/internal/needs-you/{item2.item_id}/resolve",
+        json={
+            "new_status": "RESOLVED",
+            "resolution": {"entity_id": entity_b.entity_id, "what": "Personal item", "why": "Reimbursement"},
+            "actor_type": "USER", "actor_id": ACTOR_ID,
+        },
+    )
+    assert r2.status_code == 200, r2.text
+
+    evidence1_after = comp.api.get_evidence(evidence1.evidence_id)
+    evidence2_after = comp.api.get_evidence(evidence2.evidence_id)
+    assert evidence1_after.entity_id == entity_a.entity_id
+    assert evidence2_after.entity_id == entity_b.entity_id
+
+    rule = comp.mailbox_domain_rule_repository.find_for_sender(mailbox_id=mailbox_id, sender_domain=domain)
+    assert rule.policy == "MUST_READ"
+    assert rule.destination_mode == "REVIEW_REQUIRED"
+    assert rule.destination_entity_id is None  # never silently promoted to FIXED

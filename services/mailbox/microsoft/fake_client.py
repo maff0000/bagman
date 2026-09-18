@@ -28,6 +28,7 @@ from services.mailbox.microsoft.graph_client import (
     GraphDeltaPageResult,
     GraphFolderListResult,
     GraphMessageContentResult,
+    GraphMessageHeadersResult,
     GraphOutcomeStatus,
     GraphWellKnownFoldersResult,
     MicrosoftIdentityResult,
@@ -101,6 +102,12 @@ class FakeMicrosoftGraphClient:
     def __init__(self) -> None:
         self._delta_queue: Deque[GraphDeltaPageResult] = deque()
         self._content_queue: Deque[GraphMessageContentResult] = deque()
+        #: CD-6 GUI-operations-foundation follow-on WO (item C) — a
+        #: SEPARATE queue from `_content_queue`, mirroring every other
+        #: per-method queue in this class: queuing a headers-only refresh
+        #: never interferes with/consumes a queued full-MIME-content
+        #: result, and vice versa.
+        self._headers_queue: Deque[GraphMessageHeadersResult] = deque()
         #: CD-6 architect amendment (recursive folder discovery) — a
         #: SEPARATE queue per method, exactly like `_delta_queue`/
         #: `_content_queue` above: queuing folder discovery for a sweep
@@ -110,6 +117,7 @@ class FakeMicrosoftGraphClient:
         self._well_known_folders_queue: Deque[GraphWellKnownFoldersResult] = deque()
         self.delta_calls: list[dict] = []
         self.content_calls: list[str] = []
+        self.headers_calls: list[str] = []
         self.folder_list_calls: int = 0
         self.well_known_folder_calls: list[tuple[str, ...]] = []
 
@@ -118,6 +126,9 @@ class FakeMicrosoftGraphClient:
 
     def queue_content_result(self, result: GraphMessageContentResult) -> None:
         self._content_queue.append(result)
+
+    def queue_headers_result(self, result: GraphMessageHeadersResult) -> None:
+        self._headers_queue.append(result)
 
     def queue_folder_list_result(self, result: GraphFolderListResult) -> None:
         self._folder_list_queue.append(result)
@@ -151,6 +162,12 @@ class FakeMicrosoftGraphClient:
         if not self._content_queue:
             raise AssertionError("FakeMicrosoftGraphClient.fetch_message_content() called with nothing queued")
         return self._content_queue.popleft()
+
+    def fetch_message_headers(self, *, access_token: str, immutable_message_id: str) -> GraphMessageHeadersResult:
+        self.headers_calls.append(immutable_message_id)
+        if not self._headers_queue:
+            raise AssertionError("FakeMicrosoftGraphClient.fetch_message_headers() called with nothing queued")
+        return self._headers_queue.popleft()
 
     def list_mail_folders(self, *, access_token: str) -> GraphFolderListResult:
         self.folder_list_calls += 1
