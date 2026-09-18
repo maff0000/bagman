@@ -54,6 +54,52 @@ def test_sweep_run_persists_and_completes(fresh_engine):
     assert list(fetched.folders_attempted) == folders_attempted
 
 
+def test_sweep_run_persists_operational_addendum_aggregate_fields(fresh_engine):
+    """Operational addendum (ahead of the first real large historical
+    sweep) — the seven new aggregate-reporting fields round-trip
+    through a real, disposable PostgreSQL container."""
+    repo = PostgresMailboxSweepRunRepository()
+    mailbox_id = _mailbox_id()
+    run = repo.create_run(mailbox_id=mailbox_id, trigger=TRIGGER_MANUAL)
+
+    fresh_repo = PostgresMailboxSweepRunRepository(engine=fresh_engine)
+    completed = fresh_repo.complete_run(
+        run.sweep_run_id, new_status="SUCCEEDED",
+        folders_attempted=[{"folder_id": "AAMkADinbox00000000000000000000", "display_name": "Inbox"}],
+        messages_seen=4, messages_new=4, evidence_created=1, duplicates=0, quarantined=0, failures=0,
+        unique_sender_domains=4, allowed_domain_messages=1, ignored_domain_messages=1,
+        unknown_domain_messages=2, likely_financial_candidates=1, messages_with_attachments=1,
+        graph_throttle_retries=1,
+    )
+    assert completed.unique_sender_domains == 4
+    assert completed.allowed_domain_messages == 1
+    assert completed.ignored_domain_messages == 1
+    assert completed.unknown_domain_messages == 2
+    assert completed.likely_financial_candidates == 1
+    assert completed.messages_with_attachments == 1
+    assert completed.graph_throttle_retries == 1
+
+    fetched = fresh_repo.get_run(run.sweep_run_id)
+    assert fetched.unique_sender_domains == 4
+    assert fetched.graph_throttle_retries == 1
+
+
+def test_sweep_run_operational_addendum_fields_default_to_zero_when_not_supplied():
+    """A caller that doesn't pass the new addendum kwargs (e.g. older
+    test coverage exercising only the original fields) still gets a
+    real, honest `0` for every new field — never a validation failure."""
+    repo = PostgresMailboxSweepRunRepository()
+    mailbox_id = _mailbox_id()
+    run = repo.create_run(mailbox_id=mailbox_id, trigger=TRIGGER_MANUAL)
+    completed = repo.complete_run(
+        run.sweep_run_id, new_status="SUCCEEDED", folders_attempted=[],
+        messages_seen=0, messages_new=0, evidence_created=0, duplicates=0, quarantined=0, failures=0,
+    )
+    assert completed.unique_sender_domains == 0
+    assert completed.allowed_domain_messages == 0
+    assert completed.graph_throttle_retries == 0
+
+
 def test_sweep_run_get_not_found_raises():
     repo = PostgresMailboxSweepRunRepository()
     with pytest.raises(NotFoundError):

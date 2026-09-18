@@ -81,6 +81,19 @@ class MailboxSweepRun:
     duplicates: int = 0
     quarantined: int = 0
     failures: int = 0
+    #: Operational-addendum aggregate reporting fields (CD-6 architect
+    #: operational addendum ahead of the first real large historical
+    #: sweep) — see `services/mailbox/sweep.py`'s own module docstring
+    #: for exactly where/how each of these is computed. All default to
+    #: `0` so a run built/completed before this addendum (or a test
+    #: exercising a narrower slice of `complete_run`) still validates.
+    unique_sender_domains: int = 0
+    allowed_domain_messages: int = 0
+    ignored_domain_messages: int = 0
+    unknown_domain_messages: int = 0
+    likely_financial_candidates: int = 0
+    messages_with_attachments: int = 0
+    graph_throttle_retries: int = 0
     error_code: Optional[str] = None
     error_detail: Optional[str] = None
     schema_version: str = SCHEMA_VERSION
@@ -100,6 +113,13 @@ class MailboxSweepRun:
             "duplicates": self.duplicates,
             "quarantined": self.quarantined,
             "failures": self.failures,
+            "unique_sender_domains": self.unique_sender_domains,
+            "allowed_domain_messages": self.allowed_domain_messages,
+            "ignored_domain_messages": self.ignored_domain_messages,
+            "unknown_domain_messages": self.unknown_domain_messages,
+            "likely_financial_candidates": self.likely_financial_candidates,
+            "messages_with_attachments": self.messages_with_attachments,
+            "graph_throttle_retries": self.graph_throttle_retries,
             "error_code": self.error_code,
             "error_detail": self.error_detail,
             "schema_version": self.schema_version,
@@ -142,6 +162,13 @@ class MailboxSweepRunRepository(abc.ABC):
         duplicates: int,
         quarantined: int,
         failures: int,
+        unique_sender_domains: int = 0,
+        allowed_domain_messages: int = 0,
+        ignored_domain_messages: int = 0,
+        unknown_domain_messages: int = 0,
+        likely_financial_candidates: int = 0,
+        messages_with_attachments: int = 0,
+        graph_throttle_retries: int = 0,
         error_code: Optional[str] = None,
         error_detail: Optional[str] = None,
     ) -> MailboxSweepRun:
@@ -190,6 +217,13 @@ class InMemoryMailboxSweepRunRepository(MailboxSweepRunRepository):
         duplicates: int,
         quarantined: int,
         failures: int,
+        unique_sender_domains: int = 0,
+        allowed_domain_messages: int = 0,
+        ignored_domain_messages: int = 0,
+        unknown_domain_messages: int = 0,
+        likely_financial_candidates: int = 0,
+        messages_with_attachments: int = 0,
+        graph_throttle_retries: int = 0,
         error_code: Optional[str] = None,
         error_detail: Optional[str] = None,
     ) -> MailboxSweepRun:
@@ -204,6 +238,13 @@ class InMemoryMailboxSweepRunRepository(MailboxSweepRunRepository):
             duplicates=duplicates,
             quarantined=quarantined,
             failures=failures,
+            unique_sender_domains=unique_sender_domains,
+            allowed_domain_messages=allowed_domain_messages,
+            ignored_domain_messages=ignored_domain_messages,
+            unknown_domain_messages=unknown_domain_messages,
+            likely_financial_candidates=likely_financial_candidates,
+            messages_with_attachments=messages_with_attachments,
+            graph_throttle_retries=graph_throttle_retries,
             error_code=error_code,
             error_detail=error_detail,
         )

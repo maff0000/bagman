@@ -46,15 +46,19 @@ alone.
 
 Reprocessing doctrine on a policy change — a documented judgment call
 ------------------------------------------------------------------------
-Changing a rule's policy (e.g. an operator later flips a long-ignored
-domain to ALLOWED) does NOT, by itself, retroactively reprocess every
-historically-``CHECKED_NOT_CANDIDATE``/ignored ``MailboxMessage`` row
-under the new policy — see ``services/mailbox/sweep.py``'s own module
-docstring for the full reasoning (a documented, PL/architect-flagged
-judgment call). Only the one specific message that triggered a Needs
-You domain-review item is guaranteed immediate reprocessing on
-approval (architect spec §4's own explicit requirement) — see
-``services.mailbox.sweep.reprocess_message_after_domain_rule_approval``.
+Changing a rule's policy DIRECTLY (e.g. via a bare ``upsert_rule`` call
+outside the Needs You approval flow) does NOT, by itself, retroactively
+reprocess every historically-``CHECKED_NOT_CANDIDATE``/ignored
+``MailboxMessage`` row under the new policy — see
+``services/mailbox/sweep.py``'s own module docstring for the full
+reasoning (a documented, PL/architect-flagged judgment call). The one
+real, explicit exception: resolving an OPEN ``MAILBOX_DOMAIN_REVIEW``
+Needs You item with an ``ALLOW`` decision back-processes EVERY
+historical candidate for that domain, not merely the one message that
+triggered the item (operational addendum, ahead of the first real large
+historical sweep — architect spec §4's own explicit requirement,
+corrected/broadened from its original "one message only" scope) — see
+``services.mailbox.sweep.reprocess_all_historical_candidates_for_domain``.
 """
 from __future__ import annotations
 

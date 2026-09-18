@@ -376,8 +376,9 @@ def test_resolve_domain_review_allow_fixed_creates_rule_and_reprocesses_message(
     assert body["needs_you_item"]["status"] == "RESOLVED"
     assert body["mailbox_domain_rule"]["policy"] == "ALLOWED"
     assert body["mailbox_domain_rule"]["destination_entity_id"] == entity.entity_id
-    assert body["reprocessed_message"]["ingestion_status"] == "INGESTED"
-    assert body["reprocessed_message"]["evidence_id"] is not None
+    assert len(body["reprocessed_messages"]) == 1
+    assert body["reprocessed_messages"][0]["ingestion_status"] == "INGESTED"
+    assert body["reprocessed_messages"][0]["evidence_id"] is not None
 
     rules = dev_client.get(f"/internal/mailboxes/{mailbox_id}/microsoft/domain-rules").json()
     assert rules["count"] == 1
@@ -403,7 +404,8 @@ def test_resolve_domain_review_allow_review_required_needs_no_entity(dev_client)
     body = r.json()
     assert body["mailbox_domain_rule"]["destination_entity_id"] is None
     assert body["mailbox_domain_rule"]["destination_mode"] == "REVIEW_REQUIRED"
-    assert body["reprocessed_message"]["ingestion_status"] == "INGESTED"
+    assert len(body["reprocessed_messages"]) == 1
+    assert body["reprocessed_messages"][0]["ingestion_status"] == "INGESTED"
 
 
 def test_resolve_domain_review_ignore_creates_ignored_rule_no_reprocess(dev_client):
@@ -421,7 +423,7 @@ def test_resolve_domain_review_ignore_creates_ignored_rule_no_reprocess(dev_clie
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["mailbox_domain_rule"]["policy"] == "IGNORED"
-    assert body["reprocessed_message"] is None
+    assert body["reprocessed_messages"] == []
     # No content fetch happened for an IGNORE decision.
     assert comp.microsoft_graph_client.content_calls == []
 
@@ -460,6 +462,91 @@ def test_resolve_domain_review_conflicting_second_decision_is_409(dev_client):
         },
     )
     assert r.status_code == 409
+
+
+def _sweep_three_unknown_domain_messages(client, mailbox_id):
+    """Operational addendum (ahead of the first real large historical
+    sweep) — a small 'N invoices from one new supplier' scenario at HTTP
+    level: THREE distinct candidate messages from the SAME unknown
+    domain, in one sweep."""
+    comp = get_composition()
+    now = datetime.now(timezone.utc)
+    messages = tuple(
+        GraphMessageSummary(
+            immutable_id=f"AAMk-unknown-{i}", internet_message_id=f"<u{i}@b>", subject="Invoice attached",
+            sender_address="billing@new-supplier.example", sender_display_name="New Supplier", received_at=now,
+            has_attachments=False,
+        )
+        for i in range(1, 4)
+    )
+    _queue_folder_discovery(comp)
+    comp.microsoft_graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=messages, delta_link="d1"))
+    comp.microsoft_graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link="d-junk"))
+    r = client.post(f"/internal/mailboxes/{mailbox_id}/microsoft/sweep", json={"actor_type": "USER", "actor_id": ACTOR_ID})
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+def test_resolve_domain_review_allow_back_processes_every_historical_candidate_for_the_domain(dev_client):
+    """Proof #5 (the key differentiating proof) at the HTTP layer: THREE
+    historical `CHECKED_NOT_CANDIDATE` messages from the same unknown
+    domain trigger exactly ONE Needs You item, and approving that ONE
+    item causes ALL THREE historical messages to be fetched/ingested —
+    not just the one that happened to trigger it."""
+    mailbox_id, comp, entity = _connected_mailbox_with_entity_seeded(dev_client)
+    _sweep_three_unknown_domain_messages(dev_client, mailbox_id)
+
+    items = [
+        i for i in comp.needs_you_repository.list_needs_you_items(item_type="MAILBOX_DOMAIN_REVIEW")
+        if i.metadata.get("mailbox_id") == mailbox_id
+    ]
+    assert len(items) == 1  # exactly ONE item, despite THREE candidate messages
+    item = items[0]
+    assert item.metadata["candidate_message_count"] == 3
+
+    comp.microsoft_graph_client.queue_content_result(
+        GraphMessageContentResult(
+            status=GraphOutcomeStatus.OK, content=b"From: billing@new-supplier.example\r\nSubject: Invoice\r\n\r\nBody"
+        )
+    )
+    comp.microsoft_graph_client.queue_content_result(
+        GraphMessageContentResult(
+            status=GraphOutcomeStatus.OK, content=b"From: billing@new-supplier.example\r\nSubject: Invoice\r\n\r\nBody"
+        )
+    )
+    comp.microsoft_graph_client.queue_content_result(
+        GraphMessageContentResult(
+            status=GraphOutcomeStatus.OK, content=b"From: billing@new-supplier.example\r\nSubject: Invoice\r\n\r\nBody"
+        )
+    )
+    r = dev_client.post(
+        f"/internal/mailboxes/{mailbox_id}/microsoft/domain-review/{item.item_id}/resolve",
+        json={
+            "actor_type": "USER", "actor_id": ACTOR_ID, "decision": "ALLOW",
+            "destination_entity_id": entity.entity_id, "destination_mode": "FIXED",
+        },
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert len(body["reprocessed_messages"]) == 3
+    assert all(m["ingestion_status"] == "INGESTED" for m in body["reprocessed_messages"])
+
+    messages = comp.mailbox_message_repository.list_messages(mailbox_id=mailbox_id)
+    matching = [m for m in messages if m.sender_address == "billing@new-supplier.example"]
+    assert len(matching) == 3
+    assert all(m.ingestion_status == "INGESTED" for m in matching)
+
+    # A genuine double-submit of the same approval never re-fetches/
+    # re-ingests anything a second time.
+    r2 = dev_client.post(
+        f"/internal/mailboxes/{mailbox_id}/microsoft/domain-review/{item.item_id}/resolve",
+        json={
+            "actor_type": "USER", "actor_id": ACTOR_ID, "decision": "ALLOW",
+            "destination_entity_id": entity.entity_id, "destination_mode": "FIXED",
+        },
+    )
+    assert r2.status_code == 200, r2.text
+    assert r2.json()["reprocessed_messages"] == []
 
 
 def test_noustai_imap_mailbox_never_reaches_the_microsoft_router(dev_client):

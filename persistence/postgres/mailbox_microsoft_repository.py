@@ -53,6 +53,13 @@ def _sweep_run_row_to_domain(row: MailboxSweepRunRow) -> MailboxSweepRun:
         duplicates=row.duplicates,
         quarantined=row.quarantined,
         failures=row.failures,
+        unique_sender_domains=row.unique_sender_domains,
+        allowed_domain_messages=row.allowed_domain_messages,
+        ignored_domain_messages=row.ignored_domain_messages,
+        unknown_domain_messages=row.unknown_domain_messages,
+        likely_financial_candidates=row.likely_financial_candidates,
+        messages_with_attachments=row.messages_with_attachments,
+        graph_throttle_retries=row.graph_throttle_retries,
         error_code=row.error_code,
         error_detail=row.error_detail,
     )
@@ -99,6 +106,13 @@ class PostgresMailboxSweepRunRepository(MailboxSweepRunRepository):
         duplicates: int,
         quarantined: int,
         failures: int,
+        unique_sender_domains: int = 0,
+        allowed_domain_messages: int = 0,
+        ignored_domain_messages: int = 0,
+        unknown_domain_messages: int = 0,
+        likely_financial_candidates: int = 0,
+        messages_with_attachments: int = 0,
+        graph_throttle_retries: int = 0,
         error_code: Optional[str] = None,
         error_detail: Optional[str] = None,
     ) -> MailboxSweepRun:
@@ -112,6 +126,11 @@ class PostgresMailboxSweepRunRepository(MailboxSweepRunRepository):
                     current, new_status, folders_attempted=tuple(folders_attempted),
                     messages_seen=messages_seen, messages_new=messages_new, evidence_created=evidence_created,
                     duplicates=duplicates, quarantined=quarantined, failures=failures,
+                    unique_sender_domains=unique_sender_domains, allowed_domain_messages=allowed_domain_messages,
+                    ignored_domain_messages=ignored_domain_messages, unknown_domain_messages=unknown_domain_messages,
+                    likely_financial_candidates=likely_financial_candidates,
+                    messages_with_attachments=messages_with_attachments,
+                    graph_throttle_retries=graph_throttle_retries,
                     error_code=error_code, error_detail=error_detail,
                 )
                 row.status = updated.status
@@ -123,6 +142,13 @@ class PostgresMailboxSweepRunRepository(MailboxSweepRunRepository):
                 row.duplicates = updated.duplicates
                 row.quarantined = updated.quarantined
                 row.failures = updated.failures
+                row.unique_sender_domains = updated.unique_sender_domains
+                row.allowed_domain_messages = updated.allowed_domain_messages
+                row.ignored_domain_messages = updated.ignored_domain_messages
+                row.unknown_domain_messages = updated.unknown_domain_messages
+                row.likely_financial_candidates = updated.likely_financial_candidates
+                row.messages_with_attachments = updated.messages_with_attachments
+                row.graph_throttle_retries = updated.graph_throttle_retries
                 row.error_code = updated.error_code
                 row.error_detail = updated.error_detail
         except (NotFoundError, InvalidStateTransitionError, ValidationError):

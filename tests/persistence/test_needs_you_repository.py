@@ -15,7 +15,7 @@ import pytest
 from sqlalchemy import func, select
 
 from core import identity
-from core.errors import InvalidStateTransitionError, NotFoundError, ValidationError
+from core.errors import ConflictError, InvalidStateTransitionError, NotFoundError, ValidationError
 from persistence.postgres.needs_you_models import NeedsYouItemRow
 from persistence.postgres.needs_you_repository import PostgresNeedsYouRepository
 from persistence.postgres.session import get_engine
@@ -275,6 +275,45 @@ def test_list_needs_you_items_puts_open_items_first_then_by_priority():
     assert ids.index(resolved.item_id) > ids.index(normal.item_id)
     # HIGH before NORMAL before LOW among the OPEN items
     assert ids.index(high.item_id) < ids.index(normal.item_id) < ids.index(low.item_id)
+
+
+# ---------------------------------------------------------------------
+# update_item_metadata (operational addendum, ahead of the first real
+# large historical sweep)
+# ---------------------------------------------------------------------
+
+
+def test_update_item_metadata_merges_durably_via_a_fresh_repository_instance(fresh_engine):
+    repo = PostgresNeedsYouRepository()
+    created = repo.create_needs_you_item(
+        item_type="MAILBOX_DOMAIN_REVIEW", domain="MAILBOX", question="q", allowed_action_type="MAILBOX_DOMAIN_REVIEW",
+        metadata={"candidate_message_count": 1, "sender_domain": "vendor.com"},
+    )
+    fresh_repo = PostgresNeedsYouRepository(engine=fresh_engine)
+    updated = fresh_repo.update_item_metadata(
+        created.item_id, metadata_updates={"candidate_message_count": 2, "last_seen_at": "2026-01-01T00:00:00Z"}
+    )
+    assert updated.metadata["candidate_message_count"] == 2
+    assert updated.metadata["sender_domain"] == "vendor.com"  # untouched key preserved
+    assert updated.metadata["last_seen_at"] == "2026-01-01T00:00:00Z"
+
+    refetched = PostgresNeedsYouRepository().get_needs_you_item(created.item_id)
+    assert refetched.metadata["candidate_message_count"] == 2
+
+
+def test_update_item_metadata_refuses_a_resolved_item():
+    repo = PostgresNeedsYouRepository()
+    created = repo.create_needs_you_item(
+        item_type="MAILBOX_DOMAIN_REVIEW", domain="MAILBOX", question="q", allowed_action_type="MAILBOX_DOMAIN_REVIEW",
+        metadata={"candidate_message_count": 1},
+    )
+    repo.resolve_needs_you_item(
+        created.item_id, new_status="RESOLVED", resolution={"decision": "IGNORE"}, actor_type="USER", actor_id="matt"
+    )
+    with pytest.raises(ConflictError):
+        repo.update_item_metadata(created.item_id, metadata_updates={"candidate_message_count": 2})
+    # Untouched by the refused attempt.
+    assert repo.get_needs_you_item(created.item_id).metadata["candidate_message_count"] == 1
 
 
 def test_list_needs_you_items_filters_by_status_item_type_and_domain():

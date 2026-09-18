@@ -17,7 +17,7 @@ from __future__ import annotations
 import pytest
 
 from core import identity
-from core.errors import InvalidStateTransitionError, NotFoundError, ValidationError
+from core.errors import ConflictError, InvalidStateTransitionError, NotFoundError, ValidationError
 from services.needs_you.needs_you import (
     ALLOWED_TRANSITIONS,
     DEFAULT_PRIORITY,
@@ -245,3 +245,42 @@ def test_list_respects_limit_and_offset(repo):
         _create(repo, item_type="GENERIC_QUESTION", question=f"q{i}", source_object_reference=None)
     page = repo.list_needs_you_items(limit=2, offset=1)
     assert len(page) == 2
+
+
+# ---------------------------------------------------------------------
+# update_item_metadata (operational addendum, ahead of the first real
+# large historical sweep) — proof #4 of the WO's required tests
+# ---------------------------------------------------------------------
+
+
+def test_update_item_metadata_merges_not_replaces(repo):
+    item = _create(repo, metadata={"a": 1, "b": 2})
+    updated = repo.update_item_metadata(item.item_id, metadata_updates={"b": 20, "c": 30})
+    assert updated.metadata == {"a": 1, "b": 20, "c": 30}
+    # Durable via the repository's own read path too.
+    assert repo.get_needs_you_item(item.item_id).metadata == {"a": 1, "b": 20, "c": 30}
+
+
+def test_update_item_metadata_refuses_to_touch_a_non_open_item(repo):
+    item = _create(repo, metadata={"a": 1})
+    repo.resolve_needs_you_item(
+        item.item_id, new_status="RESOLVED", resolution={"done": True}, actor_type="USER", actor_id="matt"
+    )
+    with pytest.raises(ConflictError):
+        repo.update_item_metadata(item.item_id, metadata_updates={"a": 2})
+    # Metadata genuinely untouched by the refused attempt.
+    assert repo.get_needs_you_item(item.item_id).metadata == {"a": 1}
+
+
+def test_update_item_metadata_refuses_on_a_dismissed_item_too(repo):
+    item = _create(repo, metadata={"a": 1})
+    repo.resolve_needs_you_item(
+        item.item_id, new_status="DISMISSED", resolution=None, actor_type="USER", actor_id="matt"
+    )
+    with pytest.raises(ConflictError):
+        repo.update_item_metadata(item.item_id, metadata_updates={"a": 2})
+
+
+def test_update_item_metadata_unknown_item_id_raises_not_found(repo):
+    with pytest.raises(NotFoundError):
+        repo.update_item_metadata(identity.generate_id(), metadata_updates={"a": 1})

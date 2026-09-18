@@ -40,6 +40,7 @@ from core import identity
 from core.contract_validation import validate_against_contract
 from core.errors import NotFoundError, ValidationError
 from core.timestamps import to_contract_string, utc_now
+from services.mailbox.domain_rule import normalize_domain
 
 _SCHEMA = "mailbox/bagman.mailbox_message.v1.schema.json"
 SCHEMA_VERSION = "bagman.mailbox_message.v1"
@@ -231,6 +232,41 @@ class MailboxMessageRepository(abc.ABC):
         """Most-recently-received first, scoped to ``mailbox_id``."""
         raise NotImplementedError
 
+    @abc.abstractmethod
+    def list_candidate_messages_for_domain(self, *, mailbox_id: str, sender_domain: str) -> list[MailboxMessage]:
+        """Operational addendum (ahead of the first real large historical
+        sweep) — the query
+        ``services.mailbox.sweep.reprocess_all_historical_candidates_for_domain``
+        uses to back-process EVERY historical candidate for a domain an
+        operator just approved, not only the one message that happened to
+        trigger the ``MAILBOX_DOMAIN_REVIEW`` Needs You item.
+
+        Returns every ``MailboxMessage`` for ``mailbox_id`` whose
+        ``sender_domain`` (normalised via
+        :func:`services.mailbox.domain_rule.normalize_domain`, the SAME
+        normalisation a governing ``MailboxDomainRule`` uses) matches
+        ``sender_domain`` (also normalised) AND whose
+        ``ingestion_status == INGESTION_STATUS_CHECKED_NOT_CANDIDATE`` —
+        this is deliberately the ONLY eligible status: every other
+        member of :data:`FINAL_INGESTION_STATUSES`
+        (``INGESTED``/``QUARANTINED``/``FAILED``/``VANISHED``) is
+        already a genuinely final, already-decided outcome that must
+        never be re-fetched/re-ingested a second time (see
+        ``services/mailbox/sweep.py``'s own
+        ``_reprocess_one_message``/former
+        ``reprocess_message_after_domain_rule_approval`` idempotency
+        check, which this filter mirrors exactly —
+        ``CHECKED_NOT_CANDIDATE`` is deliberately excluded from "already
+        final" there for exactly this reprocessing purpose).
+
+        Ordered oldest-received-first (``received_at`` ascending, then
+        ``mailbox_message_id`` for a stable tie-break) — a reasonable,
+        deterministic processing order: the earliest candidate from a
+        newly-approved supplier is the one most likely to matter for
+        accounting-period completeness, and a stable order makes a
+        bounded, sequential back-process reproducible/resumable."""
+        raise NotImplementedError
+
 
 def _terminal_rank(status: str) -> int:
     """INGESTED is the most 'advanced' outcome; never let a later,
@@ -370,3 +406,16 @@ class InMemoryMailboxMessageRepository(MailboxMessageRepository):
         if limit is None:
             return items[offset:]
         return items[offset : offset + limit]
+
+    def list_candidate_messages_for_domain(self, *, mailbox_id: str, sender_domain: str) -> list[MailboxMessage]:
+        normalized_domain = normalize_domain(sender_domain)
+        items = [
+            m
+            for m in self._by_id.values()
+            if m.mailbox_id == mailbox_id
+            and m.sender_domain is not None
+            and normalize_domain(m.sender_domain) == normalized_domain
+            and m.ingestion_status == INGESTION_STATUS_CHECKED_NOT_CANDIDATE
+        ]
+        items.sort(key=lambda m: (m.received_at, m.mailbox_message_id))
+        return items

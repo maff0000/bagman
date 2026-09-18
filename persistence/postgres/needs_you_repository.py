@@ -30,6 +30,7 @@ from sqlalchemy.exc import DataError, IntegrityError, SQLAlchemyError
 from core import identity
 from core.contract_validation import validate_against_contract
 from core.errors import (
+    ConflictError,
     InvalidStateTransitionError,
     NotFoundError,
     PersistenceError,
@@ -278,5 +279,39 @@ class PostgresNeedsYouRepository(NeedsYouRepository):
             raise
         except SQLAlchemyError as exc:
             raise PersistenceError(f"could not resolve NeedsYouItem: {exc}") from exc
+
+        return updated
+
+    def update_item_metadata(self, item_id: str, *, metadata_updates: Mapping[str, Any]) -> NeedsYouItem:
+        try:
+            with session_scope(self._engine) as session:
+                try:
+                    row = session.get(NeedsYouItemRow, item_id, with_for_update=True)
+                except DataError as exc:
+                    if is_invalid_uuid_format(exc):
+                        raise NotFoundError(
+                            f"no NeedsYouItem with item_id '{item_id}' "
+                            "(malformed identifier can never exist)"
+                        ) from exc
+                    raise
+                if row is None:
+                    raise NotFoundError(f"no NeedsYouItem with item_id '{item_id}'")
+                if row.status != "OPEN":
+                    raise ConflictError(
+                        f"NeedsYouItem '{item_id}' is '{row.status}', not 'OPEN' — refusing to update its "
+                        "metadata (a resolved/dismissed item's metadata is frozen at whatever data existed "
+                        "at resolution time, since the decision was already made against it)"
+                    )
+
+                new_metadata = dict(row.metadata_)
+                new_metadata.update(dict(metadata_updates))
+                row.metadata_ = new_metadata
+                session.flush()
+                updated = _row_to_item(row)
+                validate_against_contract(updated.to_dict(), _SCHEMA)
+        except (NotFoundError, ConflictError, ValidationError):
+            raise
+        except SQLAlchemyError as exc:
+            raise PersistenceError(f"could not update NeedsYouItem metadata: {exc}") from exc
 
         return updated

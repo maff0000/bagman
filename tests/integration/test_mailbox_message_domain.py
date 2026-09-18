@@ -13,6 +13,7 @@ from core import identity
 from services.mailbox.message import (
     FOLDER_INBOX,
     FOLDER_JUNK,
+    INGESTION_STATUS_CHECKED_NOT_CANDIDATE,
     INGESTION_STATUS_FAILED,
     INGESTION_STATUS_INGESTED,
     INGESTION_STATUS_QUARANTINED,
@@ -135,3 +136,76 @@ def test_failed_status_represents_a_governed_oversize_outcome(repo, mailbox_id):
     message, _ = _observe(repo, mailbox_id=mailbox_id, status=INGESTION_STATUS_FAILED)
     assert message.ingestion_status == INGESTION_STATUS_FAILED
     assert message.evidence_id is None
+
+
+# ---------------------------------------------------------------------
+# list_candidate_messages_for_domain (operational addendum, ahead of
+# the first real large historical sweep) — proof #7 of the WO's
+# required tests
+# ---------------------------------------------------------------------
+
+
+def _observe_candidate(
+    repo, *, mailbox_id, msg_id, sender_domain, status=INGESTION_STATUS_CHECKED_NOT_CANDIDATE, received_at=None
+):
+    return repo.record_observation(
+        mailbox_id=mailbox_id,
+        provider_kind="MICROSOFT_GRAPH",
+        immutable_provider_message_id=msg_id,
+        internet_message_id=f"<{msg_id}@b>",
+        observed_folder=FOLDER_INBOX,
+        subject="Invoice",
+        sender_address=f"billing@{sender_domain}",
+        sender_display_name="Vendor",
+        received_at=received_at or datetime.now(timezone.utc),
+        has_attachments=False,
+        ingestion_status=status,
+        sender_domain=sender_domain,
+    )
+
+
+def test_list_candidate_messages_filters_by_mailbox_id_and_normalised_sender_domain(repo, mailbox_id, other_mailbox_id):
+    _observe_candidate(repo, mailbox_id=mailbox_id, msg_id="m1", sender_domain="vendor.com")
+    # Different casing/whitespace — must still match via normalisation.
+    _observe_candidate(repo, mailbox_id=mailbox_id, msg_id="m2", sender_domain="VENDOR.com")
+    # A different domain entirely — never matched.
+    _observe_candidate(repo, mailbox_id=mailbox_id, msg_id="m3", sender_domain="other.example")
+    # Same domain, but a DIFFERENT mailbox — never matched.
+    _observe_candidate(repo, mailbox_id=other_mailbox_id, msg_id="m4", sender_domain="vendor.com")
+
+    results = repo.list_candidate_messages_for_domain(mailbox_id=mailbox_id, sender_domain="Vendor.COM")
+    assert {m.immutable_provider_message_id for m in results} == {"m1", "m2"}
+    assert all(m.mailbox_id == mailbox_id for m in results)
+
+
+def test_list_candidate_messages_excludes_every_status_except_checked_not_candidate(repo, mailbox_id):
+    _observe_candidate(repo, mailbox_id=mailbox_id, msg_id="eligible", sender_domain="vendor.com")
+    _observe_candidate(
+        repo, mailbox_id=mailbox_id, msg_id="already-ingested", sender_domain="vendor.com",
+        status=INGESTION_STATUS_INGESTED,
+    )
+    _observe_candidate(
+        repo, mailbox_id=mailbox_id, msg_id="already-quarantined", sender_domain="vendor.com",
+        status=INGESTION_STATUS_QUARANTINED,
+    )
+    _observe_candidate(
+        repo, mailbox_id=mailbox_id, msg_id="already-failed", sender_domain="vendor.com",
+        status=INGESTION_STATUS_FAILED,
+    )
+    _observe_candidate(
+        repo, mailbox_id=mailbox_id, msg_id="already-vanished", sender_domain="vendor.com",
+        status=INGESTION_STATUS_VANISHED,
+    )
+
+    results = repo.list_candidate_messages_for_domain(mailbox_id=mailbox_id, sender_domain="vendor.com")
+    assert [m.immutable_provider_message_id for m in results] == ["eligible"]
+
+
+def test_list_candidate_messages_ordered_oldest_received_first(repo, mailbox_id):
+    older = datetime(2025, 1, 1, tzinfo=timezone.utc)
+    newer = datetime(2025, 6, 1, tzinfo=timezone.utc)
+    _observe_candidate(repo, mailbox_id=mailbox_id, msg_id="m-newer", sender_domain="vendor.com", received_at=newer)
+    _observe_candidate(repo, mailbox_id=mailbox_id, msg_id="m-older", sender_domain="vendor.com", received_at=older)
+
+    results = repo.list_candidate_messages_for_domain(mailbox_id=mailbox_id, sender_domain="vendor.com")
+    assert [m.immutable_provider_message_id for m in results] == ["m-older", "m-newer"]

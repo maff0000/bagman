@@ -109,7 +109,7 @@ from typing import Any, Mapping, Optional
 
 from core import identity
 from core.contract_validation import validate_against_contract
-from core.errors import InvalidStateTransitionError, NotFoundError, ValidationError
+from core.errors import ConflictError, InvalidStateTransitionError, NotFoundError, ValidationError
 from core.timestamps import to_contract_string, utc_now
 
 _SCHEMA = "needs_you/bagman.needs_you_item.v1.schema.json"
@@ -392,6 +392,34 @@ class NeedsYouRepository(abc.ABC):
         return the resulting `NeedsYouItem`."""
         raise NotImplementedError
 
+    @abc.abstractmethod
+    def update_item_metadata(self, item_id: str, *, metadata_updates: Mapping[str, Any]) -> NeedsYouItem:
+        """Operational addendum (ahead of the first real large historical
+        sweep) — a narrow, single-purpose update that MERGES
+        ``metadata_updates`` into ``item_id``'s existing ``metadata``
+        dict (never a replace — any existing key not named in
+        ``metadata_updates`` is left untouched). Mirrors
+        ``core.entity.EntityRepository
+        .set_accounting_period_configuration``'s own "narrow,
+        single-purpose update, not a general PATCH" pattern: this method
+        exists for exactly one real caller
+        (``services.mailbox.sweep._create_or_reuse_domain_review_item``'s
+        own aggregate-stats accumulation on a REUSED, still-``OPEN``
+        ``MAILBOX_DOMAIN_REVIEW`` item — see that function's own
+        docstring), not a general-purpose metadata PATCH endpoint.
+
+        Raises:
+            core.errors.NotFoundError: no such ``item_id``.
+            core.errors.ConflictError: ``item_id``'s current ``status``
+                is not ``OPEN`` — a resolved/dismissed item's metadata
+                is frozen at whatever data existed at resolution time;
+                the decision has already been made against it and must
+                never silently change under it afterwards.
+            core.errors.ValidationError: the resulting item fails
+                contract validation.
+        """
+        raise NotImplementedError
+
 
 _PRIORITY_SORT_RANK = {"HIGH": 0, "NORMAL": 1, "LOW": 2}
 
@@ -517,5 +545,25 @@ class InMemoryNeedsYouRepository(NeedsYouRepository):
             resolved_by_actor_type=actor_type,
             resolved_by_actor_id=actor_id,
         )
+        self._by_id[item_id] = updated
+        return updated
+
+    def update_item_metadata(self, item_id: str, *, metadata_updates: Mapping[str, Any]) -> NeedsYouItem:
+        current = self.get_needs_you_item(item_id)
+        if current.status != "OPEN":
+            raise ConflictError(
+                f"NeedsYouItem '{item_id}' is '{current.status}', not 'OPEN' — refusing to update its "
+                "metadata (a resolved/dismissed item's metadata is frozen at whatever data existed at "
+                "resolution time, since the decision was already made against it)"
+            )
+        new_metadata = dict(current.metadata)
+        new_metadata.update(dict(metadata_updates))
+        try:
+            updated = dataclasses.replace(current, metadata=new_metadata)
+            validate_against_contract(updated.to_dict(), _SCHEMA)
+        except ValidationError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - never leak a raw exception
+            raise ValidationError(f"could not update NeedsYouItem metadata: {exc}") from exc
         self._by_id[item_id] = updated
         return updated

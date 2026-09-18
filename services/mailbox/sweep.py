@@ -55,26 +55,39 @@ ingested. For each message in a delta round:
      credible candidate raises (or reuses) exactly one
      ``services.needs_you.needs_you.ITEM_TYPE_MAILBOX_DOMAIN_REVIEW``
      item per ``(mailbox_id, sender_domain)`` — still no MIME fetch (see
-     :func:`reprocess_message_after_domain_rule_approval` for how the
-     ONE triggering message gets its MIME fetched immediately once an
+     :func:`reprocess_all_historical_candidates_for_domain` — operational
+     addendum ahead of the first real large historical sweep — for how
+     EVERY historical candidate for that domain, not merely the ONE
+     triggering message, gets its MIME fetched immediately once an
      operator approves). A non-candidate is marked
      ``CHECKED_NOT_CANDIDATE`` and nothing further happens.
 
 A message already in any of ``services.mailbox.message
 .FINAL_INGESTION_STATUSES`` (which now includes
-``CHECKED_NOT_CANDIDATE``) is never re-decided by a later sweep, even
-if the governing ``MailboxDomainRule``'s policy has since changed — a
-**documented judgment call**: a rule-policy change does NOT
-automatically reprocess previously-seen messages under the OLD policy.
-Only the ONE specific message that triggered an open
-``MAILBOX_DOMAIN_REVIEW`` Needs You item is guaranteed immediate
-reprocessing, as part of resolving THAT item (architect spec §4's own
-explicit requirement) — a broader "reprocess every historically-ignored
-message under the new rule" would be a large, potentially expensive
-backfill BAGMAN does not perform as a side effect of one operator
-decision; that would need to be an explicit, separate, later operator
-action. Flagged here prominently for PL/architect review, not silently
-chosen.
+``CHECKED_NOT_CANDIDATE``) is never re-decided by a later ORDINARY
+sweep, even if the governing ``MailboxDomainRule``'s policy has since
+changed — a **documented judgment call**: a rule-policy change does NOT,
+by itself, automatically reprocess previously-seen messages under the
+OLD policy (e.g. a domain rule updated directly, bypassing the Needs
+You approval flow entirely, still reprocesses nothing retroactively).
+
+**Operational addendum (ahead of the first real large historical
+sweep) — corrects/narrows the ORIGINAL, narrower design this paragraph
+used to describe:** resolving an OPEN ``MAILBOX_DOMAIN_REVIEW`` Needs
+You item with an ``ALLOW`` decision is the one real, explicit operator
+action this module treats differently — see
+:func:`reprocess_all_historical_candidates_for_domain`. It no longer
+reprocesses only the ONE specific message that triggered the item;
+it back-processes EVERY historical ``CHECKED_NOT_CANDIDATE`` candidate
+BAGMAN has already discovered for that ``(mailbox_id, sender_domain)``
+pair (the architect's own explicit correction: "the domain-learning
+mechanism is not useful if it only affects future mail" — a domain
+with 40 real historical candidate invoices must have all 40 reprocessed
+on approval, not just the one that happened to raise the item). This
+remains a narrow, EXPLICIT, operator-triggered action, never an
+automatic side effect of an ordinary sweep or of a bare
+``MailboxDomainRule.upsert_rule`` call outside this one approval flow —
+flagged here prominently for PL/architect review, not silently chosen.
 
 Historical bootstrap boundary — governed AND mailbox-scoped, never a
 global magic date (CD-6 architect amendment, second correction —
@@ -254,7 +267,7 @@ from typing import Any, Mapping, Optional, Protocol, Sequence
 
 from core.entity import EntityRepository
 from core.errors import ConflictError
-from core.timestamps import utc_now
+from core.timestamps import to_contract_string, utc_now
 from services.evidence.intake.scanner import EvidenceSafetyScanner
 from services.mailbox.bootstrap_policy import compute_entity_historical_bootstrap
 from services.mailbox.cursor import MailboxFolderCursorRepository
@@ -447,9 +460,70 @@ def _create_or_reuse_domain_review_item(
     message: MailboxMessage,
     reason: str,
 ):
+    """Create a fresh ``MAILBOX_DOMAIN_REVIEW`` item for the first
+    candidate seen from ``(mailbox_id, sender_domain)``, or — operational
+    addendum, ahead of the first real large historical sweep — accumulate
+    live aggregate stats on the SAME still-``OPEN`` item when a second,
+    third, ... candidate from the same still-unresolved domain is seen
+    (previously this reuse path returned the existing item completely
+    unchanged, so a domain with 40 candidate messages looked identical,
+    in the item's own metadata, to one with exactly 1 — the architect's
+    own operational addendum requires the item to say honestly how many
+    candidates are actually waiting behind it).
+
+    Accumulated fields (see ``services.needs_you.needs_you.NeedsYouItem
+    .metadata``'s own now-open-ended shape):
+
+    * ``candidate_message_count`` — how many candidate messages from
+      this domain have been seen so far, this and prior sweeps.
+    * ``first_seen_at`` — the EARLIEST candidate's ``received_at``, set
+      once at creation, never changed on reuse.
+    * ``last_seen_at`` — the LATEST candidate's ``received_at``, updated
+      on every reuse.
+    * ``attachment_bearing_count`` — how many of the candidates so far
+      had an attachment.
+
+    Populated once, at creation only, never changed on reuse (a REUSE
+    call never re-derives these — they describe the domain/mailbox
+    itself, not the individual candidate that triggered a reuse):
+
+    * ``proposed_destination_entity_id`` — the mailbox's own
+      ``default_entity_id`` HINT, if set, else ``None``. Deliberately
+      labelled here as a non-authoritative HINT ONLY — mirrors
+      ``services.mailbox.mailbox``'s own established "``default_entity_id``
+      is only ever an optional DISPLAY hint... never ownership
+      assertion" doctrine (see that module's own docstring): this is
+      never a recommendation or a pre-filled answer BAGMAN is confident
+      in, purely "this mailbox happens to have this hint set, for
+      whatever it is worth to the operator reviewing this item".
+    * ``proposed_processor_hint`` — always ``None``. Nothing in this
+      slice informs a real processor hint for an unresolved domain; this
+      key exists so a future producer that DOES know one has a place to
+      put it without a contract/metadata-shape change, but this
+      delivery must never invent one.
+    * ``confidence_reason`` — a short, plain string reusing
+      ``services.mailbox.discovery_signals.evaluate_discovery_candidate``'s
+      own ``DiscoverySignalResult.reason`` (the bounded, non-AI,
+      keyword-level heuristic's own real, honest explanation of what it
+      matched — e.g. "subject contains keyword 'invoice'") — never a
+      fabricated or more specific claim than that bounded heuristic
+      actually determined.
+    """
     existing = _find_open_domain_review_item(needs_you_repository, mailbox_id=mailbox.mailbox_id, sender_domain=sender_domain)
+    received_at_str = to_contract_string(message.received_at)
+
     if existing is not None:
-        return existing
+        current_count = existing.metadata.get("candidate_message_count") or 1
+        current_attachment_count = existing.metadata.get("attachment_bearing_count") or 0
+        return needs_you_repository.update_item_metadata(
+            existing.item_id,
+            metadata_updates={
+                "candidate_message_count": current_count + 1,
+                "last_seen_at": received_at_str,
+                "attachment_bearing_count": current_attachment_count + (1 if message.has_attachments else 0),
+            },
+        )
+
     return needs_you_repository.create_needs_you_item(
         item_type=ITEM_TYPE_MAILBOX_DOMAIN_REVIEW,
         domain="MAILBOX",
@@ -466,6 +540,15 @@ def _create_or_reuse_domain_review_item(
             "sender_domain": sender_domain,
             "triggering_mailbox_message_id": message.mailbox_message_id,
             "reason": reason,
+            "candidate_message_count": 1,
+            "first_seen_at": received_at_str,
+            "last_seen_at": received_at_str,
+            "attachment_bearing_count": 1 if message.has_attachments else 0,
+            # Non-authoritative HINT only — see this function's own
+            # docstring's "Populated once" section above.
+            "proposed_destination_entity_id": mailbox.default_entity_id,
+            "proposed_processor_hint": None,
+            "confidence_reason": reason,
         },
     )
 
@@ -578,6 +661,17 @@ def run_sweep(
         duplicates = 0
         quarantined = 0
         failures = 0
+        # Operational-addendum aggregate reporting counters (ahead of
+        # the first real large historical sweep) — see
+        # `services/mailbox/sweep_run.py`'s own `MailboxSweepRun` field
+        # docstrings for what each one means.
+        sender_domains_seen: set[str] = set()
+        allowed_domain_messages = 0
+        ignored_domain_messages = 0
+        unknown_domain_messages = 0
+        likely_financial_candidates = 0
+        messages_with_attachments = 0
+        graph_throttle_retries = 0
         any_folder_had_transient_failure = False
         any_folder_fully_succeeded = False
         # PL-review finding: RESYNC_REQUIRED (Graph invalidated this
@@ -599,6 +693,7 @@ def run_sweep(
             # discovery" section for the full reasoning below.
             discovery = adapter.discover_monitored_folders(mailbox_id=mailbox.mailbox_id)
             if discovery.status == GraphOutcomeStatus.RATE_LIMITED:
+                graph_throttle_retries += 1
                 backoff = min(discovery.retry_after_seconds or 5.0, _MAX_RATE_LIMIT_BACKOFF_SECONDS)
                 sleep_fn(backoff)
                 discovery = adapter.discover_monitored_folders(mailbox_id=mailbox.mailbox_id)
@@ -636,13 +731,40 @@ def run_sweep(
             for monitored_folder in discovery.folders:
                 folder = monitored_folder.folder_id
                 folder_display_name = monitored_folder.display_name
-                folders_attempted.append({"folder_id": folder, "display_name": folder_display_name})
+                # Operational addendum — per-folder operational counts
+                # (see `services/mailbox/sweep_run.py`'s own
+                # `folders_attempted` entry docstring/contract
+                # description for exactly what each sub-field means).
+                # This dict is appended NOW, up front, and mutated IN
+                # PLACE as this folder is processed below — so even an
+                # abrupt whole-sweep stop (`_SweepStopped`) mid-folder
+                # still leaves this entry carrying accurate PARTIAL
+                # counts for whatever was processed before the stop,
+                # rather than nothing at all.
+                folder_entry = {
+                    "folder_id": folder,
+                    "display_name": folder_display_name,
+                    "completed": False,
+                    "messages_seen": 0,
+                    "new_discovery_records": 0,
+                    "deep_processing_count": 0,
+                    "cursor_established": False,
+                }
+                folders_attempted.append(folder_entry)
                 cursor = cursor_repository.get_or_bootstrap(
                     mailbox_id=mailbox.mailbox_id,
                     provider_kind=mailbox.provider_kind,
                     folder=folder,
                     bootstrap_timestamp=bootstrap_timestamp,
                 )
+                # `get_or_bootstrap` is itself durable/synchronous — a
+                # `MailboxFolderCursor` row now exists for this folder
+                # regardless of whether it was pre-existing or just
+                # bootstrapped by this very call (distinct from
+                # `completed`, which additionally requires the round to
+                # finish AND `delta_link` to advance — see the schema's
+                # own field description).
+                folder_entry["cursor_established"] = True
                 is_bootstrap_round = cursor.delta_link is None
 
                 folder_had_transient_failure = False
@@ -661,6 +783,7 @@ def run_sweep(
                     first_page = False
 
                     if page.status == GraphOutcomeStatus.RATE_LIMITED:
+                        graph_throttle_retries += 1
                         backoff = min(page.retry_after_seconds or 5.0, _MAX_RATE_LIMIT_BACKOFF_SECONDS)
                         sleep_fn(backoff)
                         page = adapter.fetch_folder_delta(
@@ -714,6 +837,18 @@ def run_sweep(
                         if msg.removed:
                             continue
                         messages_seen += 1
+                        folder_entry["messages_seen"] += 1
+                        # Stage-A metadata is captured for EVERY observed
+                        # message this run, regardless of dedup outcome
+                        # (operational addendum — see
+                        # `unique_sender_domains`/`messages_with_attachments`'s
+                        # own contract field descriptions).
+                        sender_domain = _extract_sender_domain(msg.sender_address)
+                        if sender_domain:
+                            sender_domains_seen.add(sender_domain)
+                        if msg.has_attachments:
+                            messages_with_attachments += 1
+
                         existing = message_repository.find_by_provider_id(mailbox.mailbox_id, msg.immutable_id)
                         if existing is not None and existing.ingestion_status in FINAL_INGESTION_STATUSES:
                             duplicates += 1
@@ -731,14 +866,13 @@ def run_sweep(
                                 has_attachments=msg.has_attachments,
                                 ingestion_status=existing.ingestion_status,
                                 evidence_id=existing.evidence_id,
-                                sender_domain=_extract_sender_domain(msg.sender_address),
+                                sender_domain=sender_domain,
                                 attachment_metadata=_attachment_metadata_dicts(msg.attachment_metadata),
                                 auth_signals=dict(msg.auth_signals),
                             )
                             continue
 
                         # -- Stage A (always) + Stage B (the domain gate) --
-                        sender_domain = _extract_sender_domain(msg.sender_address)
                         attachment_metadata = _attachment_metadata_dicts(msg.attachment_metadata)
                         auth_signals = dict(msg.auth_signals)
 
@@ -769,10 +903,12 @@ def run_sweep(
                         )
 
                         if rule is not None and rule.policy == POLICY_IGNORED:
+                            ignored_domain_messages += 1
                             domain_rule_repository.touch_last_seen(
                                 mailbox_id=mailbox.mailbox_id, sender_domain=rule.sender_domain, seen_at=resolved_now
                             )
                             messages_new += 1
+                            folder_entry["new_discovery_records"] += 1
                             _record_discovery_only(INGESTION_STATUS_CHECKED_NOT_CANDIDATE)
                             continue
 
@@ -780,10 +916,14 @@ def run_sweep(
                             # Unknown domain — the bounded, non-AI
                             # discovery-candidate heuristic (architect
                             # spec §4). Never a MIME fetch either way.
+                            unknown_domain_messages += 1
                             signal = evaluate_discovery_candidate(
                                 subject=msg.subject, attachment_metadata=attachment_metadata
                             )
+                            if signal.is_candidate:
+                                likely_financial_candidates += 1
                             messages_new += 1
+                            folder_entry["new_discovery_records"] += 1
                             message = _record_discovery_only(INGESTION_STATUS_CHECKED_NOT_CANDIDATE)
                             if signal.is_candidate and sender_domain:
                                 _create_or_reuse_domain_review_item(
@@ -798,6 +938,7 @@ def run_sweep(
                         # rule.policy == POLICY_ALLOWED — the existing
                         # Slice 4A full-MIME-fetch-and-evidence-ingest
                         # path, now gated behind an approved rule.
+                        allowed_domain_messages += 1
                         domain_rule_repository.touch_last_seen(
                             mailbox_id=mailbox.mailbox_id, sender_domain=rule.sender_domain, seen_at=resolved_now
                         )
@@ -808,6 +949,7 @@ def run_sweep(
 
                         if content_result.status == GraphOutcomeStatus.NOT_FOUND:
                             messages_new += 1
+                            folder_entry["new_discovery_records"] += 1
                             _record_discovery_only(INGESTION_STATUS_VANISHED)
                             continue
 
@@ -831,6 +973,17 @@ def run_sweep(
                             continue
 
                         messages_new += 1
+                        folder_entry["new_discovery_records"] += 1
+                        # Operational addendum — "deep processing": a
+                        # full MIME fetch (`content_result.status == OK`,
+                        # already checked above) + the evidence-create
+                        # pipeline (`ingest_email_evidence` below) was
+                        # attempted this run for this message, whatever
+                        # its eventual outcome (ingested/quarantined/
+                        # governed-oversize-failed) — the ALLOWED-domain
+                        # path's own real cost centre (see the schema's
+                        # own field description).
+                        folder_entry["deep_processing_count"] += 1
                         outcome = ingest_email_evidence(
                             raw_mime_bytes=content_result.content or b"",
                             mailbox_id=mailbox.mailbox_id,
@@ -966,6 +1119,7 @@ def run_sweep(
                         delta_link=final_delta_link,
                     )
                     any_folder_fully_succeeded = True
+                    folder_entry["completed"] = True
 
         except _SweepStopped as stopped:
             completed = sweep_run_repository.complete_run(
@@ -978,6 +1132,13 @@ def run_sweep(
                 duplicates=duplicates,
                 quarantined=quarantined,
                 failures=failures,
+                unique_sender_domains=len(sender_domains_seen),
+                allowed_domain_messages=allowed_domain_messages,
+                ignored_domain_messages=ignored_domain_messages,
+                unknown_domain_messages=unknown_domain_messages,
+                likely_financial_candidates=likely_financial_candidates,
+                messages_with_attachments=messages_with_attachments,
+                graph_throttle_retries=graph_throttle_retries,
                 error_code=stopped.error_code,
                 error_detail=stopped.error_detail,
             )
@@ -1021,6 +1182,13 @@ def run_sweep(
                 duplicates=duplicates,
                 quarantined=quarantined,
                 failures=failures,
+                unique_sender_domains=len(sender_domains_seen),
+                allowed_domain_messages=allowed_domain_messages,
+                ignored_domain_messages=ignored_domain_messages,
+                unknown_domain_messages=unknown_domain_messages,
+                likely_financial_candidates=likely_financial_candidates,
+                messages_with_attachments=messages_with_attachments,
+                graph_throttle_retries=graph_throttle_retries,
                 error_code=error_code,
                 error_detail=error_detail,
             )
@@ -1036,12 +1204,19 @@ def run_sweep(
             duplicates=duplicates,
             quarantined=quarantined,
             failures=failures,
+            unique_sender_domains=len(sender_domains_seen),
+            allowed_domain_messages=allowed_domain_messages,
+            ignored_domain_messages=ignored_domain_messages,
+            unknown_domain_messages=unknown_domain_messages,
+            likely_financial_candidates=likely_financial_candidates,
+            messages_with_attachments=messages_with_attachments,
+            graph_throttle_retries=graph_throttle_retries,
         )
         mailbox_repository.record_microsoft_sweep_success(mailbox.mailbox_id, swept_at=resolved_now)
         return completed
 
 
-def reprocess_message_after_domain_rule_approval(
+def _reprocess_one_message(
     *,
     mailbox: MailboxSource,
     mailbox_source_id: str,
@@ -1057,34 +1232,38 @@ def reprocess_message_after_domain_rule_approval(
     correlation_id: Optional[str] = None,
     now: Optional[datetime] = None,
 ) -> MailboxMessage:
-    """Architect spec §4's own explicit requirement: "After approval,
-    the SPECIFIC triggering candidate email must become eligible for
-    full processing immediately — do not wait for a future unrelated
-    message to trigger re-processing." Called by
-    ``app/api/routers/mailboxes_microsoft.py`` as part of resolving an
-    ``ITEM_TYPE_MAILBOX_DOMAIN_REVIEW`` Needs You item with an ALLOW
-    decision — `message_id` is that item's own `source_object_reference`
-    (the real, canonical `mailbox_message_id` of the ONE triggering
-    message — see module docstring's "Two-stage mail processing"
-    section for why that correlation is real, not a guess).
+    """Private single-message reprocessing helper (was, until the
+    operational addendum ahead of the first real large historical
+    sweep, this module's own PUBLIC
+    ``reprocess_message_after_domain_rule_approval`` — renamed/narrowed
+    to private when :func:`reprocess_all_historical_candidates_for_domain`
+    became the real public entrypoint; every other caller/test has been
+    updated to call the plural function instead — see that function's
+    own docstring for why "only the one triggering message" was never
+    good enough).
+
+    Architect spec §4's own explicit requirement: "After approval, the
+    SPECIFIC triggering candidate email must become eligible for full
+    processing immediately — do not wait for a future unrelated message
+    to trigger re-processing." `message_id` is one specific
+    `MailboxMessage.mailbox_message_id` — either the item's own
+    `source_object_reference` (the ONE triggering message) or one of the
+    OTHER historical `CHECKED_NOT_CANDIDATE` candidates
+    :func:`reprocess_all_historical_candidates_for_domain` discovered
+    for the same domain; this helper treats every candidate identically
+    (see module docstring's "Two-stage mail processing" section for why
+    that correlation is real, not a guess).
 
     Idempotent-safe: a message already in
     `services.mailbox.message.FINAL_INGESTION_STATUSES` (a double-
     submit of the same approval, or a message this sweep already fully
     processed via a later ordinary sweep round in the meantime) is
     returned UNCHANGED — never re-fetched, never re-ingested a second
-    time.
-
-    Raises:
-        core.errors.ConflictError: `mailbox` is not ACTIVE+CONNECTED
-            (same defensive backstop as `run_sweep`'s own precondition).
+    time. Deliberately does NOT itself check `mailbox.status`/
+    `connection_state` — the caller (`reprocess_all_historical_candidates_for_domain`)
+    owns that precondition once, up front, rather than repeating a
+    per-message check across a bounded sequential loop.
     """
-    if mailbox.status != "ACTIVE" or mailbox.connection_state != CONNECTION_STATE_CONNECTED:
-        raise ConflictError(
-            f"mailbox '{mailbox.mailbox_id}' is not ACTIVE+CONNECTED — cannot reprocess a message "
-            "(reconnect the mailbox before approving this domain review item)"
-        )
-
     current = message_repository.get_message(message_id)
     if current.ingestion_status in FINAL_INGESTION_STATUSES - {INGESTION_STATUS_CHECKED_NOT_CANDIDATE}:
         # Already fully, durably decided by something else (e.g. a
@@ -1237,3 +1416,102 @@ def reprocess_message_after_domain_rule_approval(
         metadata=routing_metadata,
     )
     return message
+
+
+def reprocess_all_historical_candidates_for_domain(
+    *,
+    mailbox: MailboxSource,
+    mailbox_source_id: str,
+    sender_domain: str,
+    rule: MailboxDomainRule,
+    adapter: _AdapterProtocol,
+    message_repository: MailboxMessageRepository,
+    api: _EvidenceAPIProtocol,
+    object_store: _ObjectStoreProtocol,
+    scanner: EvidenceSafetyScanner,
+    actor_type: str,
+    actor_id: str,
+    correlation_id: Optional[str] = None,
+    now: Optional[datetime] = None,
+) -> list[MailboxMessage]:
+    """Operational addendum (ahead of the first real large historical
+    sweep) — the architect's own most important new requirement here:
+    "The domain-learning mechanism is not useful if it only affects
+    future mail." Approving a domain must back-process EVERY
+    previously-discovered historical candidate for that domain, not
+    only the one message that happened to trigger the
+    ``MAILBOX_DOMAIN_REVIEW`` Needs You item.
+
+    Supersedes the old, narrower ``reprocess_message_after_domain_rule_approval``
+    (renamed :func:`_reprocess_one_message`, now private) as this
+    module's real public reprocessing entrypoint —
+    ``app/api/routers/mailboxes_microsoft.py::resolve_mailbox_domain_review``
+    calls this on ``ALLOW``, never the private single-message helper
+    directly. Uses ``message_repository.list_candidate_messages_for_domain``
+    to discover every eligible historical candidate for
+    ``(mailbox.mailbox_id, sender_domain)`` — which, by construction
+    (see that method's own docstring), ALWAYS includes the one item-
+    triggering message too, since it is also
+    ``CHECKED_NOT_CANDIDATE`` — so there is no need to special-case it
+    separately from the rest.
+
+    Bounded execution (architect §11 — "no retry storm, no unbounded
+    parallel Graph requests"): candidates are reprocessed SEQUENTIALLY,
+    one message at a time, reusing the exact same
+    ``_MAX_RATE_LIMIT_BACKOFF_SECONDS`` rate-limit backoff discipline
+    every other Graph call in this module already uses (via
+    ``adapter.fetch_message_content`` inside
+    :func:`_reprocess_one_message`) — this function deliberately never
+    introduces concurrency here, however many historical candidates a
+    domain turns out to have.
+
+    Idempotent-safe as a whole, not merely per-message: invoking this
+    function TWICE for the same domain (e.g. a genuine double-submit of
+    the same ALLOW decision) never re-fetches/re-ingests anything a
+    second time — every individual message's own existing
+    `_reprocess_one_message` idempotency backstop still applies, AND a
+    message already reprocessed by the first call is no longer
+    ``CHECKED_NOT_CANDIDATE`` (it is now ``INGESTED``/``QUARANTINED``/
+    ``FAILED``/``VANISHED``), so `list_candidate_messages_for_domain`
+    itself naturally no longer returns it on a second call.
+
+    Returns the list of resulting `MailboxMessage` objects, oldest-
+    received-first (mirrors `list_candidate_messages_for_domain`'s own
+    ordering) — an EMPTY list, never `None`, when no eligible historical
+    candidate exists for this domain.
+
+    Raises:
+        core.errors.ConflictError: `mailbox` is not ACTIVE+CONNECTED
+            (same defensive backstop as `run_sweep`'s own precondition;
+            checked ONCE here, up front, never per-message).
+    """
+    if mailbox.status != "ACTIVE" or mailbox.connection_state != CONNECTION_STATE_CONNECTED:
+        raise ConflictError(
+            f"mailbox '{mailbox.mailbox_id}' is not ACTIVE+CONNECTED — cannot reprocess historical "
+            "candidates (reconnect the mailbox before approving this domain review item)"
+        )
+
+    candidates = message_repository.list_candidate_messages_for_domain(
+        mailbox_id=mailbox.mailbox_id, sender_domain=sender_domain
+    )
+
+    results: list[MailboxMessage] = []
+    for candidate in candidates:
+        results.append(
+            _reprocess_one_message(
+                mailbox=mailbox,
+                mailbox_source_id=mailbox_source_id,
+                message_id=candidate.mailbox_message_id,
+                rule=rule,
+                adapter=adapter,
+                message_repository=message_repository,
+                api=api,
+                object_store=object_store,
+                scanner=scanner,
+                actor_type=actor_type,
+                actor_id=actor_id,
+                correlation_id=correlation_id,
+                now=now,
+            )
+        )
+    return results

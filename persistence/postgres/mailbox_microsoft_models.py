@@ -35,6 +35,17 @@ class MailboxSweepRunRow(Base):
     duplicates: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     quarantined: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     failures: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # Operational-addendum aggregate reporting columns (ahead of the
+    # first real large historical sweep) — additive, defaulted columns;
+    # any row created before this addendum simply reads back 0 for all
+    # of these, never a silently-invented non-zero value.
+    unique_sender_domains: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    allowed_domain_messages: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    ignored_domain_messages: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    unknown_domain_messages: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    likely_financial_candidates: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    messages_with_attachments: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    graph_throttle_retries: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     error_code: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     error_detail: Mapped[Optional[str]] = mapped_column(String, nullable=True)
 

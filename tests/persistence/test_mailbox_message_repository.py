@@ -107,3 +107,45 @@ def test_get_message_not_found_raises():
     repo = PostgresMailboxMessageRepository()
     with pytest.raises(NotFoundError):
         repo.get_message(identity.generate_id())
+
+
+# ---------------------------------------------------------------------
+# list_candidate_messages_for_domain (operational addendum, ahead of
+# the first real large historical sweep)
+# ---------------------------------------------------------------------
+
+
+def _observe_candidate(repo, *, mailbox_id, msg_id, sender_domain, status="CHECKED_NOT_CANDIDATE"):
+    return repo.record_observation(
+        mailbox_id=mailbox_id,
+        provider_kind="MICROSOFT_GRAPH",
+        immutable_provider_message_id=msg_id,
+        internet_message_id=f"<{msg_id}@b>",
+        observed_folder=FOLDER_INBOX,
+        subject="Invoice",
+        sender_address=f"billing@{sender_domain}",
+        sender_display_name="Vendor",
+        received_at=datetime.now(timezone.utc),
+        has_attachments=False,
+        ingestion_status=status,
+        sender_domain=sender_domain,
+    )
+
+
+def test_list_candidate_messages_for_domain_filters_mailbox_domain_and_status(fresh_engine):
+    repo = PostgresMailboxMessageRepository()
+    mailbox_id = _mailbox_id()
+    other_mailbox_id = _mailbox_id()
+    _observe_candidate(repo, mailbox_id=mailbox_id, msg_id="eligible", sender_domain="vendor.com")
+    _observe_candidate(repo, mailbox_id=mailbox_id, msg_id="eligible-2", sender_domain="VENDOR.COM")
+    _observe_candidate(repo, mailbox_id=mailbox_id, msg_id="other-domain", sender_domain="other.example")
+    _observe_candidate(repo, mailbox_id=other_mailbox_id, msg_id="other-mailbox", sender_domain="vendor.com")
+    _observe_candidate(
+        repo, mailbox_id=mailbox_id, msg_id="already-ingested", sender_domain="vendor.com",
+        status=INGESTION_STATUS_INGESTED,
+    )
+
+    fresh_repo = PostgresMailboxMessageRepository(engine=fresh_engine)
+    results = fresh_repo.list_candidate_messages_for_domain(mailbox_id=mailbox_id, sender_domain="Vendor.com")
+    assert {m.immutable_provider_message_id for m in results} == {"eligible", "eligible-2"}
+    assert all(m.mailbox_id == mailbox_id for m in results)

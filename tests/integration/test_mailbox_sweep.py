@@ -636,12 +636,13 @@ def test_a_message_already_checked_not_candidate_is_never_re_decided_by_a_later_
 
 
 # ---------------------------------------------------------------------
-# reprocess_message_after_domain_rule_approval (architect spec §4)
+# reprocess_all_historical_candidates_for_domain (architect spec §4 +
+# operational addendum, ahead of the first real large historical sweep)
 # ---------------------------------------------------------------------
 
 
-def test_reprocess_after_domain_rule_approval_ingests_the_triggering_message_immediately():
-    from services.mailbox.sweep import reprocess_message_after_domain_rule_approval
+def test_reprocess_all_historical_candidates_ingests_the_triggering_message_immediately():
+    from services.mailbox.sweep import reprocess_all_historical_candidates_for_domain
 
     h = Harness(allow_default_domain=False)
     h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(_msg("m1"),), delta_link="d1"))
@@ -655,44 +656,109 @@ def test_reprocess_after_domain_rule_approval_ingests_the_triggering_message_imm
         destination_entity_id=None, destination_mode="REVIEW_REQUIRED", source="OPERATOR",
     )
     h.graph_client.queue_content_result(_content())
-    reprocessed = reprocess_message_after_domain_rule_approval(
-        mailbox=h.mailbox, mailbox_source_id=h.source_id, message_id=triggering_message.mailbox_message_id,
+    reprocessed = reprocess_all_historical_candidates_for_domain(
+        mailbox=h.mailbox, mailbox_source_id=h.source_id, sender_domain="vendor.com",
         rule=rule, adapter=h.adapter, message_repository=h.message_repo, api=h.api, object_store=h.object_store,
         scanner=h.scanner, actor_type="SYSTEM", actor_id="test",
     )
-    assert reprocessed.ingestion_status == "INGESTED"
-    assert reprocessed.evidence_id is not None
+    assert len(reprocessed) == 1
+    assert reprocessed[0].mailbox_message_id == triggering_message.mailbox_message_id
+    assert reprocessed[0].ingestion_status == "INGESTED"
+    assert reprocessed[0].evidence_id is not None
     assert h.graph_client.content_calls == ["m1"]
 
 
-def test_reprocess_after_domain_rule_approval_is_idempotent_on_a_double_submit():
-    from services.mailbox.sweep import reprocess_message_after_domain_rule_approval
+def test_reprocess_all_historical_candidates_is_idempotent_on_a_double_submit_of_the_whole_domain():
+    from services.mailbox.sweep import reprocess_all_historical_candidates_for_domain
 
     h = Harness(allow_default_domain=False)
     h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(_msg("m1"),), delta_link="d1"))
     h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link="d-junk"))
     h.sweep()
-    triggering_message = h.message_repo.list_messages(mailbox_id=h.mailbox.mailbox_id)[0]
 
     rule = h.domain_rule_repo.upsert_rule(
         mailbox_id=h.mailbox.mailbox_id, sender_domain="vendor.com", match_mode="EXACT", policy="ALLOWED",
         destination_entity_id=None, destination_mode="REVIEW_REQUIRED", source="OPERATOR",
     )
     h.graph_client.queue_content_result(_content())
-    first = reprocess_message_after_domain_rule_approval(
-        mailbox=h.mailbox, mailbox_source_id=h.source_id, message_id=triggering_message.mailbox_message_id,
+    first = reprocess_all_historical_candidates_for_domain(
+        mailbox=h.mailbox, mailbox_source_id=h.source_id, sender_domain="vendor.com",
         rule=rule, adapter=h.adapter, message_repository=h.message_repo, api=h.api, object_store=h.object_store,
         scanner=h.scanner, actor_type="SYSTEM", actor_id="test",
     )
-    # A second call (e.g. a double-submit of the same approval) must
-    # NOT fetch content again — the message is already fully decided.
-    second = reprocess_message_after_domain_rule_approval(
-        mailbox=h.mailbox, mailbox_source_id=h.source_id, message_id=triggering_message.mailbox_message_id,
+    assert len(first) == 1
+    # A second call for the SAME domain (e.g. a genuine double-submit of
+    # the same ALLOW decision) must NOT fetch content again, and must
+    # find NO remaining eligible candidates at all — the one historical
+    # message is no longer `CHECKED_NOT_CANDIDATE`, so
+    # `list_candidate_messages_for_domain` naturally returns nothing the
+    # second time round.
+    second = reprocess_all_historical_candidates_for_domain(
+        mailbox=h.mailbox, mailbox_source_id=h.source_id, sender_domain="vendor.com",
         rule=rule, adapter=h.adapter, message_repository=h.message_repo, api=h.api, object_store=h.object_store,
         scanner=h.scanner, actor_type="SYSTEM", actor_id="test",
     )
-    assert second.mailbox_message_id == first.mailbox_message_id
+    assert second == []
     assert h.graph_client.content_calls == ["m1"]  # only ONE content fetch total
+
+
+def test_reprocess_all_historical_candidates_back_processes_every_historical_candidate_not_just_the_trigger():
+    """The architect's own most important new requirement (operational
+    addendum): 'the domain-learning mechanism is not useful if it only
+    affects future mail'. Simulates a small 'N invoices from one new
+    supplier' scenario: THREE historical `CHECKED_NOT_CANDIDATE`
+    messages from the same unknown domain trigger exactly ONE Needs You
+    item (existing dedup behaviour — re-confirmed here), and approving
+    that ONE item back-processes ALL THREE, not just the one that
+    happened to trigger it.
+
+    This is proof #5 of the WO's required-tests list — the key
+    differentiating proof."""
+    from services.mailbox.sweep import reprocess_all_historical_candidates_for_domain
+
+    h = Harness(allow_default_domain=False)
+    h.graph_client.queue_delta_result(
+        GraphDeltaPageResult(
+            status=GraphOutcomeStatus.OK,
+            messages=(_msg("m1"), _msg("m2"), _msg("m3")),
+            delta_link="d1",
+        )
+    )
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link="d-junk"))
+    h.sweep()
+
+    messages = h.message_repo.list_messages(mailbox_id=h.mailbox.mailbox_id)
+    assert len(messages) == 3
+    assert all(m.ingestion_status == INGESTION_STATUS_CHECKED_NOT_CANDIDATE for m in messages)
+
+    # Exactly ONE Needs You item, despite THREE candidate messages.
+    items = h.needs_you_repo.list_needs_you_items(item_type=ITEM_TYPE_MAILBOX_DOMAIN_REVIEW)
+    assert len(items) == 1
+    assert items[0].metadata["candidate_message_count"] == 3
+
+    rule = h.domain_rule_repo.upsert_rule(
+        mailbox_id=h.mailbox.mailbox_id, sender_domain="vendor.com", match_mode="EXACT", policy="ALLOWED",
+        destination_entity_id=None, destination_mode="REVIEW_REQUIRED", source="OPERATOR",
+    )
+    # Content is fetched once per message, sequentially — queue THREE.
+    h.graph_client.queue_content_result(_content())
+    h.graph_client.queue_content_result(_content())
+    h.graph_client.queue_content_result(_content())
+
+    reprocessed = reprocess_all_historical_candidates_for_domain(
+        mailbox=h.mailbox, mailbox_source_id=h.source_id, sender_domain="vendor.com",
+        rule=rule, adapter=h.adapter, message_repository=h.message_repo, api=h.api, object_store=h.object_store,
+        scanner=h.scanner, actor_type="SYSTEM", actor_id="test",
+    )
+    assert len(reprocessed) == 3
+    assert {m.ingestion_status for m in reprocessed} == {"INGESTED"}
+    assert sorted(h.graph_client.content_calls) == ["m1", "m2", "m3"]
+
+    # Durably true — re-read every message from the repository fresh.
+    refreshed = h.message_repo.list_messages(mailbox_id=h.mailbox.mailbox_id)
+    assert len(refreshed) == 3
+    assert all(m.ingestion_status == "INGESTED" for m in refreshed)
+    assert all(m.evidence_id is not None for m in refreshed)
 
 
 # ---------------------------------------------------------------------
@@ -1184,3 +1250,161 @@ def test_old_inbox_junk_literal_cursor_rows_are_left_untouched_and_new_folder_id
         bootstrap_timestamp=datetime.now(timezone.utc),
     )
     assert new_style.delta_link == "d2"
+
+
+# ---------------------------------------------------------------------
+# Operational addendum (ahead of the first real large historical sweep)
+# — rich sweep-run aggregate reporting + per-folder operational counts
+# ---------------------------------------------------------------------
+
+
+def test_sweep_run_aggregate_reporting_fields_across_mixed_messages_and_rate_limiting():
+    """Proof #1 of the operational addendum's required tests: a
+    synthetic scenario mixing ALLOWED/IGNORED/unknown-credible/unknown-
+    non-credible messages, one with an attachment, plus an injected
+    Graph `RATE_LIMITED` response — proves every new `MailboxSweepRun`
+    aggregate field this addendum adds."""
+    h = Harness()  # allow_default_domain=True -> vendor.com is ALLOWED
+    h.domain_rule_repo.upsert_rule(
+        mailbox_id=h.mailbox.mailbox_id, sender_domain="ignored.example", match_mode="EXACT", policy="IGNORED",
+        destination_entity_id=None, destination_mode=None, source="OPERATOR",
+    )
+    allowed_msg = _msg(
+        "m-allowed", sender_address="billing@vendor.com", subject="Invoice",
+        attachment_metadata=({"filename": "invoice.pdf", "content_type": "application/pdf", "size_bytes": 100},),
+    )
+    ignored_msg = _msg("m-ignored", sender_address="promo@ignored.example", subject="Weekly newsletter")
+    credible_msg = _msg("m-candidate", sender_address="billing@new-supplier.example", subject="Invoice attached")
+    non_credible_msg = _msg(
+        "m-non-candidate", sender_address="friend@random.example", subject="Let's catch up for coffee"
+    )
+
+    # Inbox: one RATE_LIMITED response, retried once, then all four
+    # messages on the (successful) retry's page.
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.RATE_LIMITED, retry_after_seconds=0.01))
+    h.graph_client.queue_delta_result(
+        GraphDeltaPageResult(
+            status=GraphOutcomeStatus.OK,
+            messages=(allowed_msg, ignored_msg, credible_msg, non_credible_msg),
+            delta_link="d1",
+        )
+    )
+    h.graph_client.queue_content_result(_content())  # the ALLOWED-domain message's own MIME fetch
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link="d-junk"))
+
+    run = h.sweep()
+    assert run.status == "SUCCEEDED"
+    assert run.messages_seen == 4
+    assert run.evidence_created == 1
+    # 4 distinct sender domains: vendor.com, ignored.example,
+    # new-supplier.example, random.example.
+    assert run.unique_sender_domains == 4
+    assert run.allowed_domain_messages == 1
+    assert run.ignored_domain_messages == 1
+    assert run.unknown_domain_messages == 2
+    assert run.likely_financial_candidates == 1  # only the credible one
+    assert run.messages_with_attachments == 1
+    assert run.graph_throttle_retries == 1
+    assert h.graph_client.content_calls == ["m-allowed"]
+
+
+def test_per_folder_operational_counts_are_correct_and_distinct_per_folder():
+    """Proof #2 of the operational addendum's required tests: a
+    two-folder sweep where Inbox and Junk Email have DIFFERENT
+    message/candidate mixes — proves the per-folder entries genuinely
+    differ, not just a copy of the whole-sweep totals."""
+    h = Harness()  # allow_default_domain=True -> vendor.com is ALLOWED
+    h.graph_client.queue_delta_result(
+        GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(_msg("m-inbox"),), delta_link="d-inbox")
+    )
+    h.graph_client.queue_content_result(_content())
+    junk_msg = _msg("m-junk", sender_address="billing@new-supplier.example", subject="Invoice attached")
+    h.graph_client.queue_delta_result(
+        GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(junk_msg,), delta_link="d-junk")
+    )
+
+    run = h.sweep()
+    assert run.status == "SUCCEEDED"
+    by_folder = {f["folder_id"]: f for f in run.folders_attempted}
+    inbox_entry = by_folder[h.INBOX_FOLDER_ID]
+    junk_entry = by_folder[h.JUNK_FOLDER_ID]
+
+    assert inbox_entry["messages_seen"] == 1
+    assert inbox_entry["new_discovery_records"] == 1
+    assert inbox_entry["deep_processing_count"] == 1  # ALLOWED-domain path -> a real MIME fetch attempt
+    assert inbox_entry["completed"] is True
+    assert inbox_entry["cursor_established"] is True
+
+    assert junk_entry["messages_seen"] == 1
+    assert junk_entry["new_discovery_records"] == 1
+    assert junk_entry["deep_processing_count"] == 0  # unknown-domain candidate -> discovery only, no MIME fetch
+    assert junk_entry["completed"] is True
+    assert junk_entry["cursor_established"] is True
+
+    # Genuinely different per folder — not a copy of the whole-sweep totals.
+    assert inbox_entry["deep_processing_count"] != junk_entry["deep_processing_count"]
+    assert inbox_entry != junk_entry
+
+
+# ---------------------------------------------------------------------
+# Operational addendum — domain-review item aggregate metadata
+# accumulation across repeat candidates from the same still-open domain
+# ---------------------------------------------------------------------
+
+
+def test_domain_review_item_accumulates_aggregate_stats_across_repeat_candidates():
+    """Proof #3 of the operational addendum's required tests: a SECOND
+    candidate message from the same still-open domain updates
+    `candidate_message_count` (1->2), `last_seen_at` (advances), and
+    `attachment_bearing_count` (increments only if the new message has
+    an attachment), while `first_seen_at` stays fixed at the first
+    message's timestamp — and a THIRD candidate proves the accumulation
+    genuinely continues, not just a 1->2 one-off."""
+    h = Harness(allow_default_domain=False)
+    m1 = _msg(
+        "m1", subject="Invoice",
+        attachment_metadata=({"filename": "invoice1.pdf", "content_type": "application/pdf", "size_bytes": 10},),
+    )
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(m1,), delta_link="d1"))
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link="d-junk"))
+    h.sweep()
+
+    items = h.needs_you_repo.list_needs_you_items(item_type=ITEM_TYPE_MAILBOX_DOMAIN_REVIEW)
+    assert len(items) == 1
+    item = items[0]
+    assert item.metadata["candidate_message_count"] == 1
+    first_seen = item.metadata["first_seen_at"]
+    assert item.metadata["last_seen_at"] == first_seen
+    assert item.metadata["attachment_bearing_count"] == 1
+    assert item.metadata["proposed_processor_hint"] is None
+    assert "confidence_reason" in item.metadata
+
+    # Second candidate — no attachment this time.
+    m2 = _msg("m2", subject="Invoice", attachment_metadata=())
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(m2,), delta_link="d2"))
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link="d-junk-2"))
+    h.sweep()
+
+    items = h.needs_you_repo.list_needs_you_items(item_type=ITEM_TYPE_MAILBOX_DOMAIN_REVIEW)
+    assert len(items) == 1  # still just ONE item, not a second one
+    item = items[0]
+    assert item.metadata["candidate_message_count"] == 2
+    assert item.metadata["first_seen_at"] == first_seen  # unchanged
+    assert item.metadata["last_seen_at"] >= first_seen
+    assert item.metadata["attachment_bearing_count"] == 1  # unchanged — m2 had no attachment
+
+    # Third candidate — WITH an attachment again.
+    m3 = _msg(
+        "m3", subject="Invoice",
+        attachment_metadata=({"filename": "invoice3.pdf", "content_type": "application/pdf", "size_bytes": 20},),
+    )
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(m3,), delta_link="d3"))
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link="d-junk-3"))
+    h.sweep()
+
+    items = h.needs_you_repo.list_needs_you_items(item_type=ITEM_TYPE_MAILBOX_DOMAIN_REVIEW)
+    assert len(items) == 1
+    item = items[0]
+    assert item.metadata["candidate_message_count"] == 3
+    assert item.metadata["first_seen_at"] == first_seen  # STILL unchanged
+    assert item.metadata["attachment_bearing_count"] == 2

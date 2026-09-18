@@ -17,7 +17,13 @@ from core.contract_validation import validate_against_contract
 from core.timestamps import utc_now
 from persistence.postgres.mailbox_message_models import MailboxMessageRow
 from persistence.postgres.session import get_engine, session_scope
-from services.mailbox.message import MailboxMessage, MailboxMessageRepository, _terminal_rank
+from services.mailbox.domain_rule import normalize_domain
+from services.mailbox.message import (
+    INGESTION_STATUS_CHECKED_NOT_CANDIDATE,
+    MailboxMessage,
+    MailboxMessageRepository,
+    _terminal_rank,
+)
 
 _SCHEMA = "mailbox/bagman.mailbox_message.v1.schema.json"
 
@@ -200,3 +206,30 @@ class PostgresMailboxMessageRepository(MailboxMessageRepository):
                 return [_row_to_domain(r) for r in query.all()]
         except SQLAlchemyError as exc:
             raise PersistenceError(f"could not list MailboxMessage rows: {exc}") from exc
+
+    def list_candidate_messages_for_domain(self, *, mailbox_id: str, sender_domain: str) -> list[MailboxMessage]:
+        normalized_domain = normalize_domain(sender_domain)
+        try:
+            with session_scope(self._engine) as session:
+                rows = (
+                    session.query(MailboxMessageRow)
+                    .filter(
+                        MailboxMessageRow.mailbox_id == mailbox_id,
+                        MailboxMessageRow.ingestion_status == INGESTION_STATUS_CHECKED_NOT_CANDIDATE,
+                        # `sender_domain` is stored lowercased already (see
+                        # `services/mailbox/sweep.py::_extract_sender_domain`),
+                        # but this repository re-normalises defensively
+                        # here too, in Python, rather than trusting that
+                        # invariant at the SQL layer — mirrors this
+                        # module's own "never trust a stored value's
+                        # normalisation blindly" caution elsewhere.
+                        MailboxMessageRow.sender_domain.isnot(None),
+                    )
+                    .order_by(MailboxMessageRow.received_at.asc(), MailboxMessageRow.mailbox_message_id.asc())
+                    .all()
+                )
+        except SQLAlchemyError as exc:
+            raise PersistenceError(f"could not list candidate MailboxMessage rows for domain: {exc}") from exc
+        return [
+            _row_to_domain(row) for row in rows if normalize_domain(row.sender_domain) == normalized_domain
+        ]

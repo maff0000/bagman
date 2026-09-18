@@ -81,8 +81,11 @@ Endpoints
   entity / Allow -> destination review required / Ignore domain — "Review
   candidate"/defer needs no call at all, the item simply stays OPEN).
   Creates/updates the real ``MailboxDomainRule`` and, on ALLOW,
-  immediately reprocesses the one triggering message — see
-  ``ResolveMailboxDomainReviewRequest``'s own docstring below.
+  immediately back-processes EVERY historical candidate BAGMAN has
+  already discovered for that domain (operational addendum, ahead of
+  the first real large historical sweep — not merely the one triggering
+  message) — see ``ResolveMailboxDomainReviewRequest``'s own docstring
+  below.
 
 Needs You integration (architect spec)
 ------------------------------------------
@@ -138,7 +141,7 @@ from services.mailbox.mailbox import (
     PROVIDER_MICROSOFT_GRAPH,
 )
 from services.mailbox.microsoft.oauth_state import consume_state
-from services.mailbox.sweep import reprocess_message_after_domain_rule_approval, run_sweep
+from services.mailbox.sweep import reprocess_all_historical_candidates_for_domain, run_sweep
 from services.mailbox.sweep_run import TRIGGER_MANUAL
 from services.needs_you.needs_you import (
     ALLOWED_ACTION_CONNECT_MICROSOFT_MAILBOX,
@@ -551,11 +554,16 @@ async def resolve_mailbox_domain_review(
     ``(mailbox_id, sender_domain)`` (``source="OPERATOR"``,
     ``approved_at=now``) — never auto-adds a domain to any allowlist
     outside this explicit operator action (architect spec §4). On
-    ``ALLOW``, the ONE specific triggering message (the item's own
-    ``source_object_reference``) is reprocessed IMMEDIATELY — fetched
-    and ingested now, not deferred to the next sweep (architect spec's
-    own explicit requirement; see
-    `services.mailbox.sweep.reprocess_message_after_domain_rule_approval`).
+    ``ALLOW``, EVERY historical candidate message BAGMAN has already
+    discovered for this ``(mailbox_id, sender_domain)`` — the item's own
+    triggering ``source_object_reference`` message INCLUDED, since it is
+    also ``CHECKED_NOT_CANDIDATE`` and therefore always covered by the
+    same query — is reprocessed IMMEDIATELY: fetched and ingested now,
+    not deferred to the next sweep (architect spec's own explicit
+    requirement, corrected/broadened by the operational addendum ahead
+    of the first real large historical sweep — "the domain-learning
+    mechanism is not useful if it only affects future mail"; see
+    `services.mailbox.sweep.reprocess_all_historical_candidates_for_domain`).
 
     Idempotent-safe against a genuine double-submit of the exact same
     decision (mirrors `app/api/routers/needs_you.py::resolve_needs_you_item`'s
@@ -586,7 +594,7 @@ async def resolve_mailbox_domain_review(
 
     if item.status != "OPEN":
         if item.status == "RESOLVED" and (item.resolution or {}) == resolution:
-            return {"needs_you_item": item.to_dict(), "mailbox_domain_rule": None, "reprocessed_message": None}
+            return {"needs_you_item": item.to_dict(), "mailbox_domain_rule": None, "reprocessed_messages": []}
         raise ConflictError(
             f"NeedsYouItem '{item_id}' is already '{item.status}' with a different resolution — "
             "refusing to silently change an already-decided item; this is a genuine conflict, not "
@@ -635,13 +643,20 @@ async def resolve_mailbox_domain_review(
         payload={"mailbox_id": mailbox_id, "sender_domain": sender_domain, "needs_you_item_id": item_id},
     )
 
-    reprocessed = None
-    if policy == POLICY_ALLOWED and item.source_object_reference is not None:
+    # Operational addendum (ahead of the first real large historical
+    # sweep) — back-process EVERY historical candidate BAGMAN has
+    # already discovered for this domain, not merely the one message
+    # that happened to trigger this item. `sender_domain` is always
+    # present on a real `MAILBOX_DOMAIN_REVIEW` item's own metadata (see
+    # `_create_or_reuse_domain_review_item`); the guard below is
+    # defensive, never expected to be exercised for a well-formed item.
+    reprocessed: list = []
+    if policy == POLICY_ALLOWED and sender_domain:
         mailbox_source_id = get_mailbox_source_id(composition, mailbox)
-        reprocessed = reprocess_message_after_domain_rule_approval(
+        reprocessed = reprocess_all_historical_candidates_for_domain(
             mailbox=mailbox,
             mailbox_source_id=mailbox_source_id,
-            message_id=item.source_object_reference,
+            sender_domain=sender_domain,
             rule=rule,
             adapter=composition.microsoft_mailbox_adapter,
             message_repository=composition.mailbox_message_repository,
@@ -656,5 +671,5 @@ async def resolve_mailbox_domain_review(
     return {
         "needs_you_item": updated_item.to_dict(),
         "mailbox_domain_rule": rule.to_dict(),
-        "reprocessed_message": reprocessed.to_dict() if reprocessed is not None else None,
+        "reprocessed_messages": [m.to_dict() for m in reprocessed],
     }
