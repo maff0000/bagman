@@ -319,7 +319,7 @@ def _connected_mailbox_with_entity_seeded(client):
     entity = comp.api.register_entity(
         entity_type="COMPANY", canonical_name="TEST_DOMAIN_REVIEW_LTD", display_name="Test Ltd", status="ACTIVE",
         actor_type="SYSTEM", actor_id=ACTOR_ID,
-        fiscal_year_start_month_day="01-01", email_bootstrap_floor_at=datetime(2025, 1, 1, tzinfo=timezone.utc),
+        fiscal_year_start_month_day="01-01", historical_floor_override_at=datetime(2025, 1, 1, tzinfo=timezone.utc),
     )
     return mailbox_id, comp, entity
 

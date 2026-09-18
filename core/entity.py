@@ -36,17 +36,38 @@ class GovernedEntity:
     #: The RECURRING month-day (``MM-DD``) this entity's accounting/
     #: financial year starts on in every FUTURE year — see the
     #: contract's own field description for the full "why this is
-    #: separate from ``email_bootstrap_floor_at``" reasoning (the
+    #: separate from ``historical_floor_override_at``" reasoning (the
     #: NoustAI incorporation-date example). ``None`` is a real, honest
     #: "not yet configured" state — never invented, never silently
     #: defaulted.
     fiscal_year_start_month_day: Optional[str] = None
-    #: CD-6 architect amendment. The explicit, literal, real UTC floor
-    #: date used for THIS actual historical mailbox-sweep bootstrap for
-    #: this entity — see ``services.mailbox.sweep.compute_bootstrap_floor``,
-    #: which refuses to run any historical sweep while any governed
-    #: entity carries ``None`` here.
-    email_bootstrap_floor_at: Optional[datetime] = None
+    #: CD-6 architect amendment, RENAMED and RE-SCOPED following a
+    #: second real conceptual-conflation bug the architect caught
+    #: before any real historical sweep had run (only a superseded
+    #: 128-message acceptance run under the OLD flat-7-day scheme had
+    #: ever executed — no real data depended on the old value). This
+    #: field was previously named ``email_bootstrap_floor_at`` and was
+    #: WRONGLY treated as "the definitive literal historical-bootstrap
+    #: date" — it was not; it is, and always should have been, an
+    #: OPTIONAL CLAMP/OVERRIDE only.
+    #:
+    #: ``None`` (the correct, common case — true for Infosecurs and
+    #: Matthew Scott Personal) means "no override needed; trust the
+    #: period-derivation alone" — the real historical-bootstrap answer
+    #: is DERIVED, never read directly off this field. When set, it is
+    #: a real, independently-verified commencement/incorporation date
+    #: (e.g. NoustAI Limited's 2025-12-05 incorporation) that the naive
+    #: previous-completed-accounting-period derivation must never
+    #: predate — see ``services.mailbox.bootstrap_policy
+    #: .compute_entity_historical_bootstrap`` for the exact clamp
+    #: (``max(override, naive_previous_period_start)``) and
+    #: ``services.mailbox.sweep.compute_bootstrap_floor`` for how that
+    #: per-entity value feeds a mailbox's own bootstrap floor (both of
+    #: which refuse to run any historical sweep while any in-scope
+    #: governed entity's ``fiscal_year_start_month_day`` — the field
+    #: that is actually REQUIRED for derivation — is ``None``; this
+    #: field being ``None`` is never itself an error).
+    historical_floor_override_at: Optional[datetime] = None
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict:
@@ -60,9 +81,9 @@ class GovernedEntity:
             "status": self.status,
             "created_at": to_contract_string(self.created_at),
             "fiscal_year_start_month_day": self.fiscal_year_start_month_day,
-            "email_bootstrap_floor_at": (
-                to_contract_string(self.email_bootstrap_floor_at)
-                if self.email_bootstrap_floor_at is not None
+            "historical_floor_override_at": (
+                to_contract_string(self.historical_floor_override_at)
+                if self.historical_floor_override_at is not None
                 else None
             ),
             "metadata": dict(self.metadata),
@@ -83,7 +104,7 @@ class EntityRepository(abc.ABC):
         metadata: Optional[Mapping[str, Any]] = None,
         entity_id: Optional[str] = None,
         fiscal_year_start_month_day: Optional[str] = None,
-        email_bootstrap_floor_at: Optional[datetime] = None,
+        historical_floor_override_at: Optional[datetime] = None,
     ) -> GovernedEntity:
         """Register a new GovernedEntity.
 
@@ -95,13 +116,19 @@ class EntityRepository(abc.ABC):
         ``ImmutabilityViolationError`` if that ``entity_id`` already
         exists — ``entity_id`` is never reassigned.
 
-        ``fiscal_year_start_month_day``/``email_bootstrap_floor_at``
-        (CD-6 architect amendment) are both optional and default to
-        ``None`` — a caller that omits them is registering an entity
-        whose email historical-ingestion boundary is not yet
-        configured; that is a real, surfaced state (see
+        ``fiscal_year_start_month_day``/``historical_floor_override_at``
+        (CD-6 architect amendment, the latter renamed from
+        ``email_bootstrap_floor_at`` after a real conceptual-conflation
+        bug fix — see ``GovernedEntity.historical_floor_override_at``'s
+        own field docstring) are both optional and default to ``None``.
+        ``fiscal_year_start_month_day`` being ``None`` means an
+        entity's email historical-ingestion boundary is not yet
+        configured — a real, surfaced state (see
         ``services.mailbox.sweep.compute_bootstrap_floor``), never an
         error at registration time itself.
+        ``historical_floor_override_at`` being ``None`` is separately,
+        independently a normal, common, PERMANENT state (never itself
+        "not yet configured") — see that field's own docstring.
         """
         raise NotImplementedError
 
@@ -111,19 +138,23 @@ class EntityRepository(abc.ABC):
         entity_id: str,
         *,
         fiscal_year_start_month_day: str,
-        email_bootstrap_floor_at: datetime,
+        historical_floor_override_at: Optional[datetime],
     ) -> GovernedEntity:
         """PL-review finding, CD-6 architect amendment: an entity
         registered BEFORE ``fiscal_year_start_month_day``/
-        ``email_bootstrap_floor_at`` existed (every entity created
+        ``historical_floor_override_at`` existed (every entity created
         during CD-6 Slice 1, including all three already live on the
         production appliance) has both fields permanently ``None`` —
         ``register_entity`` only ever sets them at creation time, and
         ``GovernedEntity`` is otherwise immutable, so without a real
         update path the architect's own verified accounting-period
-        dates could never actually reach an entity that already
+        rule could never actually reach an entity that already
         exists, and ``services.mailbox.sweep.compute_bootstrap_floor``
-        would refuse the real historical sweep forever.
+        would refuse the real historical sweep forever (note:
+        ``historical_floor_override_at`` itself is legitimately
+        ``None`` for most entities — see that field's own docstring —
+        so this method accepts ``None`` for it explicitly, unlike
+        ``fiscal_year_start_month_day`` which is required here).
 
         This is a narrow, single-purpose update — it touches ONLY
         these two fields, never ``display_name``/``status``/anything
@@ -183,7 +214,7 @@ class InMemoryEntityRepository(EntityRepository):
         metadata: Optional[Mapping[str, Any]] = None,
         entity_id: Optional[str] = None,
         fiscal_year_start_month_day: Optional[str] = None,
-        email_bootstrap_floor_at: Optional[datetime] = None,
+        historical_floor_override_at: Optional[datetime] = None,
     ) -> GovernedEntity:
         resolved_id = entity_id if entity_id is not None else identity.generate_id()
         if resolved_id in self._entities:
@@ -200,7 +231,7 @@ class InMemoryEntityRepository(EntityRepository):
                 status=status,
                 created_at=utc_now(),
                 fiscal_year_start_month_day=fiscal_year_start_month_day,
-                email_bootstrap_floor_at=email_bootstrap_floor_at,
+                historical_floor_override_at=historical_floor_override_at,
                 metadata=dict(metadata) if metadata is not None else {},
             )
             validate_against_contract(candidate.to_dict(), _SCHEMA)
@@ -217,14 +248,14 @@ class InMemoryEntityRepository(EntityRepository):
         entity_id: str,
         *,
         fiscal_year_start_month_day: str,
-        email_bootstrap_floor_at: datetime,
+        historical_floor_override_at: Optional[datetime],
     ) -> GovernedEntity:
         current = self.get_entity(entity_id)
         try:
             updated = dataclasses.replace(
                 current,
                 fiscal_year_start_month_day=fiscal_year_start_month_day,
-                email_bootstrap_floor_at=email_bootstrap_floor_at,
+                historical_floor_override_at=historical_floor_override_at,
             )
             validate_against_contract(updated.to_dict(), _SCHEMA)
         except ValidationError:

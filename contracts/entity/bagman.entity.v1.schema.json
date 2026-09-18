@@ -38,14 +38,14 @@
         { "type": "string", "pattern": "^(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])$" },
         { "type": "null" }
       ],
-      "description": "CD-6 architect amendment (email historical-ingestion boundary). The RECURRING month-day (MM-DD, always UTC-calendar) on which this entity's accounting/financial year starts in every FUTURE year, e.g. `\"11-01\"` for a 1 November fiscal year start, `\"04-06\"` for the UK personal tax year. Deliberately separate from `email_bootstrap_floor_at` below — the two can legitimately differ for a real entity (e.g. a company incorporated mid-year has a recurring rule that would, naively applied, predate its own incorporation for THIS migration's one-off bootstrap). Required key, explicit `null` when this configuration is not yet known for a given entity (never invented, never silently defaulted) — a `null` here is a real, actionable 'missing configuration' state a caller must surface, not an oversight."
+      "description": "CD-6 architect amendment (email historical-ingestion boundary). The RECURRING month-day (MM-DD, always UTC-calendar) on which this entity's accounting/financial year starts in every FUTURE year, e.g. `\"11-01\"` for a 1 November fiscal year start, `\"04-06\"` for the UK personal tax year. This is the field a caller actually derives the real historical-ingestion bootstrap boundary FROM (see `services.mailbox.bootstrap_policy.compute_entity_historical_bootstrap`) — `historical_floor_override_at` below is only ever an optional clamp on that derivation, never the answer itself. Required key, explicit `null` when this configuration is not yet known for a given entity (never invented, never silently defaulted) — a `null` here is a real, actionable 'missing configuration' state a caller must surface, not an oversight."
     },
-    "email_bootstrap_floor_at": {
+    "historical_floor_override_at": {
       "oneOf": [
         { "$ref": "https://bagman.internal/contracts/common/bagman.utc_timestamp.v1.schema.json" },
         { "type": "null" }
       ],
-      "description": "CD-6 architect amendment (email historical-ingestion boundary). The explicit, literal, real UTC floor date used for THIS actual historical mailbox-sweep bootstrap for this entity — never derived on the fly from `fiscal_year_start_month_day` (which describes a RECURRING future rule, not necessarily this one-off migration's real floor; see that field's own description for the documented NoustAI incorporation-date example). Required key, explicit `null` when not yet configured — `services.mailbox.sweep.compute_bootstrap_floor` refuses to run any historical sweep while any governed entity carries `null` here, rather than inventing a fallback or silently skipping that entity (architect spec: 'surface the missing configuration before historical sweep')."
+      "description": "CD-6 architect amendment (email historical-ingestion boundary), RENAMED from `email_bootstrap_floor_at` after a real conceptual-conflation bug: the OLD name and its old description wrongly treated this as 'the definitive literal historical-bootstrap date'. It is not, and never should have been — it is an OPTIONAL CLAMP/OVERRIDE only. The real historical-ingestion bootstrap boundary is DERIVED (start of the previous COMPLETED accounting period, computed from `fiscal_year_start_month_day` + 'now' — see `services.mailbox.bootstrap_policy.compute_entity_historical_bootstrap`), and this field, when set to a real commencement/incorporation date, simply ensures that derivation never predates it (e.g. NoustAI Limited's 2025-12-05 incorporation date, which the naive '1 January' rule applied alone would otherwise predate). `null` is the correct, common, and entirely PERMANENT state for most entities (e.g. a company incorporated long before any of this matters, or a person) — it means 'no override needed, trust the period-derivation alone', never 'not yet configured'. `fiscal_year_start_month_day` being `null` is the real 'missing configuration' signal `services.mailbox.sweep.compute_bootstrap_floor` refuses to run without; this field being `null` never blocks a sweep on its own."
     },
     "metadata": {
       "type": "object",
@@ -62,7 +62,7 @@
     "status",
     "created_at",
     "fiscal_year_start_month_day",
-    "email_bootstrap_floor_at",
+    "historical_floor_override_at",
     "metadata"
   ],
   "additionalProperties": false

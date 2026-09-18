@@ -911,25 +911,45 @@ def get_manual_upload_source_id(composition: "RuntimeComposition") -> str:
 _SEED_ENTITY_TYPE_COMPANY = "COMPANY"
 _SEED_ENTITY_TYPE_PERSON = "PERSON"
 
-#: CD-6 architect amendment (email historical-ingestion boundary) —
-#: the REAL, architect-verified accounting-period configuration for
+#: CD-6 architect amendment (email historical-ingestion boundary),
+#: SECOND CORRECTION (architect finding, 2026-09-18 — see
+#: `core.entity.GovernedEntity.historical_floor_override_at`'s own
+#: docstring, and `services/mailbox/bootstrap_policy.py`'s module
+#: docstring, for the full "clamp, not the answer" doctrine this fixes)
+#: — the REAL, architect-verified accounting-period configuration for
 #: each of the three canonical entities (cross-checked against
 #: Companies House's own public register — NOT invented). Recorded on
-#: `GovernedEntity` as BOTH the recurring fiscal-year-start rule (for a
-#: later rolling-incremental system) AND the explicit one-off bootstrap
-#: FLOOR used for THIS migration — the two legitimately differ: NoustAI
-#: Limited's recurring rule is 1 January, but it was incorporated
-#: 5 December 2025, so a naive "most recent 1 January" would predate
-#: the company's own existence — the real floor for this migration is
-#: the incorporation date instead.
-#: (canonical_name, display_name, entity_type, fiscal_year_start_month_day, email_bootstrap_floor_at)
-SEED_ENTITIES: tuple[tuple[str, str, str, str, datetime], ...] = (
+#: `GovernedEntity` as the recurring `fiscal_year_start_month_day` rule
+#: (the field the real historical-ingestion bootstrap boundary is
+#: DERIVED from, per entity, at sweep time — never read as a stored
+#: literal) PLUS an OPTIONAL `historical_floor_override_at` CLAMP,
+#: which is `None` for two of the three entities and a real
+#: incorporation date for the third:
+#:
+#:   * Infosecurs Limited — override `None`. The naive previous-
+#:     completed-period derivation from `"11-01"` alone already gives
+#:     the correct answer (2024-11-01, as of "now" = 2026-09-18) —
+#:     incorporated 2021, long before any of this matters, so no clamp
+#:     is needed.
+#:   * NoustAI Limited — override stays `datetime(2025, 12, 5, ...)`,
+#:     its REAL, still-needed incorporation-date clamp: the naive
+#:     previous-period derivation from `"01-01"` alone would give
+#:     2025-01-01, which predates the company's own existence, so the
+#:     override must keep winning here (`max(override, naive) ==
+#:     override`).
+#:   * Matthew Scott Personal — override `None`. No commencement floor
+#:     applies to a person; the naive previous-tax-year derivation from
+#:     `"04-06"` alone already gives the correct answer (2025-04-06, as
+#:     of "now" = 2026-09-18).
+#:
+#: (canonical_name, display_name, entity_type, fiscal_year_start_month_day, historical_floor_override_at)
+SEED_ENTITIES: tuple[tuple[str, str, str, str, Optional[datetime]], ...] = (
     (
         "INFOSECURS_LIMITED",
         "Infosecurs Limited",
         _SEED_ENTITY_TYPE_COMPANY,
         "11-01",
-        datetime(2025, 11, 1, tzinfo=timezone.utc),
+        None,
     ),
     (
         "NOUSTAI_LIMITED",
@@ -937,8 +957,8 @@ SEED_ENTITIES: tuple[tuple[str, str, str, str, datetime], ...] = (
         _SEED_ENTITY_TYPE_COMPANY,
         "01-01",
         # Incorporated 5 Dec 2025 — see module section docstring above
-        # for why this migration's real floor is incorporation date,
-        # not the recurring 1 Jan rule naively applied.
+        # for why this is a genuine, still-needed clamp on the naive
+        # "01-01" period derivation, not the answer itself.
         datetime(2025, 12, 5, tzinfo=timezone.utc),
     ),
     (
@@ -946,7 +966,7 @@ SEED_ENTITIES: tuple[tuple[str, str, str, str, datetime], ...] = (
         "Matthew Scott Personal",
         _SEED_ENTITY_TYPE_PERSON,
         "04-06",
-        datetime(2025, 4, 6, tzinfo=timezone.utc),
+        None,
     ),
 )
 
@@ -967,7 +987,7 @@ def ensure_seed_entities(composition: "RuntimeComposition") -> dict[str, str]:
             return _seed_entity_ids
 
         resolved: dict[str, str] = {}
-        for canonical_name, display_name, entity_type, fiscal_year_start_month_day, email_bootstrap_floor_at in SEED_ENTITIES:
+        for canonical_name, display_name, entity_type, fiscal_year_start_month_day, historical_floor_override_at in SEED_ENTITIES:
             existing = composition.api.entity_repository.find_by_canonical_name(canonical_name)
             if existing is not None:
                 # PL-review finding: an entity registered before these
@@ -976,17 +996,38 @@ def ensure_seed_entities(composition: "RuntimeComposition") -> dict[str, str]:
                 # appliance) has them permanently None unless
                 # backfilled here — register_entity only ever sets
                 # them at creation time, and without this, the
-                # architect's own verified accounting-period dates
+                # architect's own verified accounting-period rule
                 # could never actually reach the real entities, and
                 # compute_bootstrap_floor would refuse the historical
-                # sweep forever. Backfill-only: never overwrites a
-                # value that is already set (a real future operator
+                # sweep forever.
+                #
+                # SECOND-CORRECTION judgment call (architect finding,
+                # 2026-09-18): the backfill gate below deliberately
+                # checks `existing.fiscal_year_start_month_day is None`
+                # — NOT `existing.historical_floor_override_at is
+                # None`, which is what this gate checked before the
+                # rename. That old gate is now WRONG: two of the three
+                # canonical entities (Infosecurs, Matthew Scott
+                # Personal) legitimately have `historical_floor_
+                # override_at=None` FOREVER (see SEED_ENTITIES' own
+                # docstring above) — gating backfill on that field
+                # being None would mean their real, required
+                # `fiscal_year_start_month_day` rule could NEVER be
+                # backfilled by this function, since the gate would
+                # already read "already configured" from the moment of
+                # creation. `fiscal_year_start_month_day` is the
+                # correct "not yet configured" signal instead: it is
+                # required for every entity's own derivation (see
+                # `services.mailbox.sweep.compute_bootstrap_floor`) and
+                # is never legitimately left `None` once an entity is
+                # actually configured. Backfill-only: never overwrites
+                # a value that is already set (a real future operator
                 # correction is not this function's concern).
-                if existing.email_bootstrap_floor_at is None and email_bootstrap_floor_at is not None:
+                if existing.fiscal_year_start_month_day is None:
                     existing = composition.api.entity_repository.set_accounting_period_configuration(
                         existing.entity_id,
                         fiscal_year_start_month_day=fiscal_year_start_month_day,
-                        email_bootstrap_floor_at=email_bootstrap_floor_at,
+                        historical_floor_override_at=historical_floor_override_at,
                     )
                 resolved[canonical_name] = existing.entity_id
                 continue
@@ -999,11 +1040,11 @@ def ensure_seed_entities(composition: "RuntimeComposition") -> dict[str, str]:
                 actor_type=actor.SYSTEM,
                 actor_id="bagman-entity-seed-bootstrap",
                 fiscal_year_start_month_day=fiscal_year_start_month_day,
-                email_bootstrap_floor_at=email_bootstrap_floor_at,
+                historical_floor_override_at=historical_floor_override_at,
                 metadata={
                     "note": "canonical entity seed, resolved-or-created once per process "
                     "(CD-6 Slice 1, PID §98.3) — never re-created on a later call; "
-                    "fiscal_year_start_month_day/email_bootstrap_floor_at set from the "
+                    "fiscal_year_start_month_day/historical_floor_override_at set from the "
                     "architect-verified accounting-period configuration (CD-6 architect "
                     "amendment, email historical-ingestion boundary)"
                 },

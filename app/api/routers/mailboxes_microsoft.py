@@ -408,11 +408,13 @@ async def sweep_microsoft(mailbox_id: str, payload: SweepMicrosoftRequest) -> di
     composition = get_composition()
     mailbox = _require_microsoft_mailbox(composition, mailbox_id)
     mailbox_source_id = get_mailbox_source_id(composition, mailbox)
-    # The governed-entity bootstrap-floor configuration
-    # (`services.mailbox.sweep.compute_bootstrap_floor`) must exist
-    # before any sweep can compute its historical boundary — ensure the
-    # canonical seed has run rather than requiring a prior, unrelated
-    # `GET /internal/entities` call first.
+    # The governed-entity accounting-period configuration
+    # (`fiscal_year_start_month_day`, required for
+    # `services.mailbox.sweep.compute_bootstrap_floor`'s own mailbox-
+    # scoped, per-entity derivation — see that function's own
+    # docstring) must exist before any sweep can compute its historical
+    # boundary — ensure the canonical seed has run rather than
+    # requiring a prior, unrelated `GET /internal/entities` call first.
     ensure_seed_entities(composition)
 
     composition.api.record_audit_event(

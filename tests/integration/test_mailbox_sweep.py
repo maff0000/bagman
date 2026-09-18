@@ -156,7 +156,6 @@ class Harness:
             entity_type="COMPANY", canonical_name="TEST_ENTITY", display_name="Test Entity", status="ACTIVE",
             actor_type="SYSTEM", actor_id="test",
             fiscal_year_start_month_day="01-01",
-            email_bootstrap_floor_at=datetime.now(timezone.utc) - timedelta(days=400),
         )
 
         if allow_default_domain:
@@ -697,58 +696,106 @@ def test_reprocess_after_domain_rule_approval_is_idempotent_on_a_double_submit()
 
 
 # ---------------------------------------------------------------------
-# compute_bootstrap_floor (architect spec §1/§10 — governed, not hardcoded)
+# compute_bootstrap_floor (architect spec §1/§10 — governed AND
+# mailbox-scoped, second correction: NEVER a global magic date)
 # ---------------------------------------------------------------------
+#
+# `compute_bootstrap_floor` no longer takes just an `entity_repository`
+# and returns the global minimum unconditionally — see
+# `services/mailbox/sweep.py`'s own module docstring, "Historical
+# bootstrap boundary" section, for the full corrected design this
+# section proves: a mailbox's in-scope destination entities (its own
+# `default_entity_id` hint UNION any `ALLOWED` `MailboxDomainRule`
+# `destination_entity_id`s) are derived and minimised; an EMPTY
+# in-scope set (the real, live `matt@infosecurs.com` state) falls back
+# to every seeded entity. Pure per-entity derivation (`services.mailbox
+# .bootstrap_policy.compute_entity_historical_bootstrap`) is proven
+# separately in `tests/services/test_bootstrap_policy.py` — the tests
+# below prove the MAILBOX-SCOPING/fallback/minimum behaviour on top of
+# it, plus the two honest-failure paths.
 
 
-def test_compute_bootstrap_floor_is_the_global_minimum_across_entities():
-    from services.mailbox.sweep import compute_bootstrap_floor
-
-    api = BagmanCanonicalAPI()
-    earlier = datetime(2025, 4, 6, tzinfo=timezone.utc)
-    later = datetime(2025, 11, 1, tzinfo=timezone.utc)
-    api.register_entity(
-        entity_type="COMPANY", canonical_name="A_LTD", display_name="A", status="ACTIVE",
-        actor_type="SYSTEM", actor_id="test", fiscal_year_start_month_day="11-01", email_bootstrap_floor_at=later,
+def _plain_mailbox(display_name: str = "M", email_address: str = "scoping@example.com"):
+    """A bare `MailboxSource` with no `default_entity_id` hint and an
+    empty `MailboxDomainRuleRepository` — the minimum fixture needed to
+    call `compute_bootstrap_floor` directly, outside a full `Harness`."""
+    mailbox_repo = InMemoryMailboxSourceRepository()
+    mailbox = mailbox_repo.create_mailbox(
+        display_name=display_name, email_address=email_address, provider_kind=PROVIDER_MICROSOFT_GRAPH
     )
-    api.register_entity(
-        entity_type="PERSON", canonical_name="B_PERSONAL", display_name="B", status="ACTIVE",
-        actor_type="SYSTEM", actor_id="test", fiscal_year_start_month_day="04-06", email_bootstrap_floor_at=earlier,
-    )
-    assert compute_bootstrap_floor(api.entity_repository) == earlier
+    return mailbox, InMemoryMailboxDomainRuleRepository()
 
 
-def test_compute_bootstrap_floor_fails_honestly_when_any_entity_is_missing_configuration():
+#: The exact "now" the architect's own worked examples were verified
+#: against (see `services/mailbox/bootstrap_policy.py`'s own module
+#: docstring) — reused here so this file's own assertions match those
+#: worked examples exactly, not merely "some plausible date".
+_ARCHITECT_WORKED_NOW = datetime(2026, 9, 18, tzinfo=timezone.utc)
+
+
+def test_compute_bootstrap_floor_falls_back_to_all_entities_and_returns_their_derived_minimum():
+    """No in-scope destination entities (mailbox.default_entity_id is
+    None, zero MailboxDomainRule rows) — the real, current state of
+    `matt@infosecurs.com` — falls back to every seeded entity and
+    returns the MINIMUM of their DERIVED (never stored-literal)
+    historical-bootstrap values. Matches the architect's own worked
+    Infosecurs example (2024-11-01 is the earliest of the two)."""
     from services.mailbox.sweep import compute_bootstrap_floor
 
     api = BagmanCanonicalAPI()
     api.register_entity(
         entity_type="COMPANY", canonical_name="A_LTD", display_name="A", status="ACTIVE",
         actor_type="SYSTEM", actor_id="test", fiscal_year_start_month_day="11-01",
-        email_bootstrap_floor_at=datetime(2025, 11, 1, tzinfo=timezone.utc),
+    )
+    api.register_entity(
+        entity_type="PERSON", canonical_name="B_PERSONAL", display_name="B", status="ACTIVE",
+        actor_type="SYSTEM", actor_id="test", fiscal_year_start_month_day="04-06",
+    )
+    mailbox, domain_rule_repo = _plain_mailbox()
+
+    floor = compute_bootstrap_floor(
+        mailbox=mailbox, entity_repository=api.entity_repository, domain_rule_repository=domain_rule_repo,
+        now=_ARCHITECT_WORKED_NOW,
+    )
+    assert floor == datetime(2024, 11, 1, tzinfo=timezone.utc)
+
+
+def test_compute_bootstrap_floor_fails_honestly_when_any_in_scope_entity_is_missing_configuration():
+    from services.mailbox.sweep import compute_bootstrap_floor
+
+    api = BagmanCanonicalAPI()
+    api.register_entity(
+        entity_type="COMPANY", canonical_name="A_LTD", display_name="A", status="ACTIVE",
+        actor_type="SYSTEM", actor_id="test", fiscal_year_start_month_day="11-01",
     )
     api.register_entity(
         entity_type="PERSON", canonical_name="B_PERSONAL", display_name="B", status="ACTIVE",
         actor_type="SYSTEM", actor_id="test",
-        # No fiscal_year_start_month_day/email_bootstrap_floor_at — real, honest gap.
+        # No fiscal_year_start_month_day — real, honest gap.
     )
+    mailbox, domain_rule_repo = _plain_mailbox()
     with pytest.raises(ConflictError):
-        compute_bootstrap_floor(api.entity_repository)
+        compute_bootstrap_floor(mailbox=mailbox, entity_repository=api.entity_repository, domain_rule_repository=domain_rule_repo)
 
 
 def test_compute_bootstrap_floor_fails_honestly_when_no_entities_exist_yet():
     from services.mailbox.sweep import compute_bootstrap_floor
 
     api = BagmanCanonicalAPI()
+    mailbox, domain_rule_repo = _plain_mailbox()
     with pytest.raises(ConflictError):
-        compute_bootstrap_floor(api.entity_repository)
+        compute_bootstrap_floor(mailbox=mailbox, entity_repository=api.entity_repository, domain_rule_repository=domain_rule_repo)
 
 
 def test_sweep_fails_honestly_when_entity_bootstrap_configuration_is_incomplete():
     h = Harness()
-    # A SECOND entity, missing the required configuration — the sweep
-    # must refuse rather than silently using only the first entity's
-    # floor or inventing a fallback.
+    # A SECOND entity, missing the required configuration — the
+    # Harness's own mailbox has no in-scope destination entity (its
+    # domain rule for vendor.com is REVIEW_REQUIRED with
+    # destination_entity_id=None — see `_DEFAULT_ALLOWED_DOMAIN`'s own
+    # setup — so it never enters the in-scope set), so this falls back
+    # to every seeded entity and must refuse rather than silently using
+    # only the first entity's floor or inventing a fallback.
     h.api.register_entity(
         entity_type="COMPANY", canonical_name="UNCONFIGURED_LTD", display_name="Unconfigured", status="ACTIVE",
         actor_type="SYSTEM", actor_id="test",
@@ -756,6 +803,152 @@ def test_sweep_fails_honestly_when_entity_bootstrap_configuration_is_incomplete(
     h.queue_empty_both_folders()
     with pytest.raises(ConflictError):
         h.sweep()
+
+
+# ---------------------------------------------------------------------
+# compute_bootstrap_floor — mailbox scoping (the key differentiating
+# proof: scoped vs. global-minimum answers genuinely differ)
+# ---------------------------------------------------------------------
+
+
+def _three_real_entities(api: BagmanCanonicalAPI) -> dict[str, "GovernedEntity"]:
+    """The three real canonical entities this delivery seeds (see
+    `app/api/composition.py::SEED_ENTITIES`), registered directly
+    against a fresh `api` for a test that wants real, distinctly-
+    derived floors to scope between. Derived floors as of
+    `_ARCHITECT_WORKED_NOW` (2026-09-18):
+
+        INFOSECURS_LIMITED     -> 2024-11-01  (global minimum)
+        MATTHEW_SCOTT_PERSONAL -> 2025-04-06
+        NOUSTAI_LIMITED        -> 2025-12-05  (clamped by its override)
+    """
+    infosecurs = api.register_entity(
+        entity_type="COMPANY", canonical_name="INFOSECURS_LIMITED", display_name="Infosecurs Limited",
+        status="ACTIVE", actor_type="SYSTEM", actor_id="test", fiscal_year_start_month_day="11-01",
+    )
+    personal = api.register_entity(
+        entity_type="PERSON", canonical_name="MATTHEW_SCOTT_PERSONAL", display_name="Matthew Scott Personal",
+        status="ACTIVE", actor_type="SYSTEM", actor_id="test", fiscal_year_start_month_day="04-06",
+    )
+    noustai = api.register_entity(
+        entity_type="COMPANY", canonical_name="NOUSTAI_LIMITED", display_name="NoustAI Limited",
+        status="ACTIVE", actor_type="SYSTEM", actor_id="test", fiscal_year_start_month_day="01-01",
+        historical_floor_override_at=datetime(2025, 12, 5, tzinfo=timezone.utc),
+    )
+    return {"INFOSECURS_LIMITED": infosecurs, "MATTHEW_SCOTT_PERSONAL": personal, "NOUSTAI_LIMITED": noustai}
+
+
+def test_mailbox_scoped_via_default_entity_id_uses_its_own_entitys_floor_not_the_global_minimum():
+    """The key differentiating proof (architect spec): a mailbox scoped
+    to ONLY the entity whose derived floor is NOT the global minimum
+    (NoustAI, 2025-12-05) must get NoustAI's own floor back — never the
+    global minimum (Infosecurs, 2024-11-01) a pre-scoping implementation
+    would have returned."""
+    from services.mailbox.sweep import compute_bootstrap_floor
+
+    api = BagmanCanonicalAPI()
+    entities = _three_real_entities(api)
+    mailbox_repo = InMemoryMailboxSourceRepository()
+    mailbox = mailbox_repo.create_mailbox(
+        display_name="Mailbox A", email_address="mailbox-a@example.com", provider_kind=PROVIDER_MICROSOFT_GRAPH,
+        default_entity_id=entities["NOUSTAI_LIMITED"].entity_id,
+    )
+    domain_rule_repo = InMemoryMailboxDomainRuleRepository()
+
+    floor = compute_bootstrap_floor(
+        mailbox=mailbox, entity_repository=api.entity_repository, domain_rule_repository=domain_rule_repo,
+        now=_ARCHITECT_WORKED_NOW,
+    )
+    assert floor == datetime(2025, 12, 5, tzinfo=timezone.utc)
+    assert floor != datetime(2024, 11, 1, tzinfo=timezone.utc)  # NOT the global minimum
+
+
+def test_mailbox_with_no_scope_hints_falls_back_to_global_minimum_matching_matt_infosecurs():
+    """Mailbox B: `default_entity_id=None`, zero domain rules — the
+    real, live `matt@infosecurs.com` state. Must fall back to the
+    global minimum across all three real entities (2024-11-01),
+    matching the architect's own worked example verbatim: "If
+    matt@infosecurs.com is presently scoped only to Infosecurs for the
+    first acceptance, its bootstrap is: 2024-11-01T00:00:00Z" — the
+    fallback-to-all answer and a hypothetical Infosecurs-only-scoped
+    answer coincide here because Infosecurs's own derived floor IS the
+    global minimum; that is expected, not a bug."""
+    from services.mailbox.sweep import compute_bootstrap_floor
+
+    api = BagmanCanonicalAPI()
+    _three_real_entities(api)
+    mailbox_repo = InMemoryMailboxSourceRepository()
+    mailbox = mailbox_repo.create_mailbox(
+        display_name="Mailbox B (matt@infosecurs.com)", email_address="matt@infosecurs.com",
+        provider_kind=PROVIDER_MICROSOFT_GRAPH,
+    )
+    domain_rule_repo = InMemoryMailboxDomainRuleRepository()
+
+    floor = compute_bootstrap_floor(
+        mailbox=mailbox, entity_repository=api.entity_repository, domain_rule_repository=domain_rule_repo,
+        now=_ARCHITECT_WORKED_NOW,
+    )
+    assert floor == datetime(2024, 11, 1, tzinfo=timezone.utc)
+
+
+def test_mailbox_scoped_via_an_allowed_domain_rule_destination_also_participates_in_scope():
+    """A mailbox with no `default_entity_id` hint at all, but ONE
+    `ALLOWED` `MailboxDomainRule` naming a real `destination_entity_id`
+    — the domain-rule-derived scope must participate exactly like the
+    hint does, not only `default_entity_id`."""
+    from services.mailbox.sweep import compute_bootstrap_floor
+
+    api = BagmanCanonicalAPI()
+    entities = _three_real_entities(api)
+    mailbox_repo = InMemoryMailboxSourceRepository()
+    mailbox = mailbox_repo.create_mailbox(
+        display_name="Mailbox C", email_address="mailbox-c@example.com", provider_kind=PROVIDER_MICROSOFT_GRAPH,
+    )
+    domain_rule_repo = InMemoryMailboxDomainRuleRepository()
+    domain_rule_repo.upsert_rule(
+        mailbox_id=mailbox.mailbox_id, sender_domain="noustai-supplier.example", match_mode="EXACT",
+        policy="ALLOWED", destination_entity_id=entities["NOUSTAI_LIMITED"].entity_id,
+        destination_mode="FIXED", source="OPERATOR",
+    )
+
+    floor = compute_bootstrap_floor(
+        mailbox=mailbox, entity_repository=api.entity_repository, domain_rule_repository=domain_rule_repo,
+        now=_ARCHITECT_WORKED_NOW,
+    )
+    assert floor == datetime(2025, 12, 5, tzinfo=timezone.utc)  # NoustAI's own floor, not the global minimum
+
+
+def test_mailbox_scoping_ignores_an_ignored_rules_destination_and_a_review_required_rules_none():
+    """Two negative-scoping proofs in one test: an `IGNORED` rule's
+    (nonexistent) destination never enters scope, and an `ALLOWED`
+    rule with `destination_mode="REVIEW_REQUIRED"`
+    (`destination_entity_id=None`) contributes nothing to scope either
+    — only a real, non-None `destination_entity_id` on an `ALLOWED`
+    rule ever does. With no real in-scope entity from either rule, this
+    still falls back to the global minimum."""
+    from services.mailbox.sweep import compute_bootstrap_floor
+
+    api = BagmanCanonicalAPI()
+    _three_real_entities(api)
+    mailbox_repo = InMemoryMailboxSourceRepository()
+    mailbox = mailbox_repo.create_mailbox(
+        display_name="Mailbox D", email_address="mailbox-d@example.com", provider_kind=PROVIDER_MICROSOFT_GRAPH,
+    )
+    domain_rule_repo = InMemoryMailboxDomainRuleRepository()
+    domain_rule_repo.upsert_rule(
+        mailbox_id=mailbox.mailbox_id, sender_domain="spam.example", match_mode="EXACT",
+        policy="IGNORED", destination_entity_id=None, destination_mode=None, source="OPERATOR",
+    )
+    domain_rule_repo.upsert_rule(
+        mailbox_id=mailbox.mailbox_id, sender_domain="unsure.example", match_mode="EXACT",
+        policy="ALLOWED", destination_entity_id=None, destination_mode="REVIEW_REQUIRED", source="OPERATOR",
+    )
+
+    floor = compute_bootstrap_floor(
+        mailbox=mailbox, entity_repository=api.entity_repository, domain_rule_repository=domain_rule_repo,
+        now=_ARCHITECT_WORKED_NOW,
+    )
+    assert floor == datetime(2024, 11, 1, tzinfo=timezone.utc)  # fallback to global minimum, exactly as with no rules at all
 
 
 # ---------------------------------------------------------------------

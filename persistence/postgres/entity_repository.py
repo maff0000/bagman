@@ -36,7 +36,7 @@ def _row_to_entity(row: GovernedEntityRow) -> GovernedEntity:
         status=row.status,
         created_at=row.created_at,
         fiscal_year_start_month_day=row.fiscal_year_start_month_day,
-        email_bootstrap_floor_at=row.email_bootstrap_floor_at,
+        historical_floor_override_at=row.historical_floor_override_at,
         metadata=dict(row.metadata_),
     )
 
@@ -61,7 +61,7 @@ class PostgresEntityRepository(EntityRepository):
         metadata: Optional[Mapping[str, Any]] = None,
         entity_id: Optional[str] = None,
         fiscal_year_start_month_day: Optional[str] = None,
-        email_bootstrap_floor_at=None,
+        historical_floor_override_at=None,
     ) -> GovernedEntity:
         resolved_id = entity_id if entity_id is not None else identity.generate_id()
 
@@ -74,7 +74,7 @@ class PostgresEntityRepository(EntityRepository):
                 status=status,
                 created_at=utc_now(),
                 fiscal_year_start_month_day=fiscal_year_start_month_day,
-                email_bootstrap_floor_at=email_bootstrap_floor_at,
+                historical_floor_override_at=historical_floor_override_at,
                 metadata=dict(metadata) if metadata is not None else {},
             )
             validate_against_contract(candidate.to_dict(), _SCHEMA)
@@ -91,7 +91,7 @@ class PostgresEntityRepository(EntityRepository):
             status=candidate.status,
             created_at=candidate.created_at,
             fiscal_year_start_month_day=candidate.fiscal_year_start_month_day,
-            email_bootstrap_floor_at=candidate.email_bootstrap_floor_at,
+            historical_floor_override_at=candidate.historical_floor_override_at,
             metadata_=dict(candidate.metadata),
         )
 
@@ -117,7 +117,7 @@ class PostgresEntityRepository(EntityRepository):
         entity_id: str,
         *,
         fiscal_year_start_month_day: str,
-        email_bootstrap_floor_at,
+        historical_floor_override_at,
     ) -> GovernedEntity:
         try:
             with session_scope(self._engine) as session:
@@ -136,11 +136,11 @@ class PostgresEntityRepository(EntityRepository):
                 updated = dataclasses.replace(
                     current,
                     fiscal_year_start_month_day=fiscal_year_start_month_day,
-                    email_bootstrap_floor_at=email_bootstrap_floor_at,
+                    historical_floor_override_at=historical_floor_override_at,
                 )
                 validate_against_contract(updated.to_dict(), _SCHEMA)
                 row.fiscal_year_start_month_day = updated.fiscal_year_start_month_day
-                row.email_bootstrap_floor_at = updated.email_bootstrap_floor_at
+                row.historical_floor_override_at = updated.historical_floor_override_at
         except (NotFoundError, ValidationError):
             raise
         except SQLAlchemyError as exc:

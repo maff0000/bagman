@@ -100,7 +100,12 @@ class GovernedEntityRow(Base):
     # honest "not yet configured" state — see core.entity.GovernedEntity's
     # own docstring), never a silently-invented default.
     fiscal_year_start_month_day: Mapped[Optional[str]] = mapped_column(String, nullable=True)
-    email_bootstrap_floor_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Renamed from `email_bootstrap_floor_at` (CD-6 architect amendment,
+    # second correction) — this is an OPTIONAL CLAMP/OVERRIDE only, never
+    # itself the historical-bootstrap answer; see
+    # `core.entity.GovernedEntity.historical_floor_override_at`'s own
+    # docstring for the full doctrine this rename encodes.
+    historical_floor_override_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     metadata_: Mapped[dict] = mapped_column("metadata", JSONB, nullable=False, default=dict)
 
 

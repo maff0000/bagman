@@ -32,10 +32,13 @@ def test_entity_persists_and_is_retrievable_via_a_fresh_repository_instance(fres
 
 def test_fiscal_year_and_email_bootstrap_floor_round_trip_through_postgres(fresh_engine):
     """CD-6 architect amendment (email historical-ingestion boundary) —
-    ``fiscal_year_start_month_day``/``email_bootstrap_floor_at`` must
+    ``fiscal_year_start_month_day``/``historical_floor_override_at`` must
     survive a real Postgres round trip via a BRAND-NEW repository
     instance, exactly like every other field this module already
-    proves durability for."""
+    proves durability for. ``historical_floor_override_at`` was renamed
+    from ``email_bootstrap_floor_at`` after a real conceptual-conflation
+    bug fix (see ``core.entity.GovernedEntity`` own docstring) — this
+    test proves the RENAMED column round-trips, not the old name."""
     import datetime as _dt
 
     repo = PostgresEntityRepository()
@@ -46,15 +49,15 @@ def test_fiscal_year_and_email_bootstrap_floor_round_trip_through_postgres(fresh
         display_name="Synthetic Fiscal Ltd",
         status="ACTIVE",
         fiscal_year_start_month_day="11-01",
-        email_bootstrap_floor_at=floor,
+        historical_floor_override_at=floor,
     )
     assert entity.fiscal_year_start_month_day == "11-01"
-    assert entity.email_bootstrap_floor_at == floor
+    assert entity.historical_floor_override_at == floor
 
     fresh_repo = PostgresEntityRepository(engine=fresh_engine)
     fetched = fresh_repo.get_entity(entity.entity_id)
     assert fetched.fiscal_year_start_month_day == "11-01"
-    assert fetched.email_bootstrap_floor_at == floor
+    assert fetched.historical_floor_override_at == floor
 
 
 def test_fiscal_year_and_email_bootstrap_floor_default_to_null_when_omitted(fresh_engine):
@@ -66,17 +69,17 @@ def test_fiscal_year_and_email_bootstrap_floor_default_to_null_when_omitted(fres
         entity_type="COMPANY", canonical_name="SYNTHETIC_UNCONFIGURED_LTD", display_name="X", status="ACTIVE"
     )
     assert entity.fiscal_year_start_month_day is None
-    assert entity.email_bootstrap_floor_at is None
+    assert entity.historical_floor_override_at is None
 
     fresh_repo = PostgresEntityRepository(engine=fresh_engine)
     fetched = fresh_repo.get_entity(entity.entity_id)
     assert fetched.fiscal_year_start_month_day is None
-    assert fetched.email_bootstrap_floor_at is None
+    assert fetched.historical_floor_override_at is None
 
 
 def test_set_accounting_period_configuration_backfills_an_existing_entity(fresh_engine):
     """PL-review finding, CD-6 architect amendment: an entity registered
-    BEFORE fiscal_year_start_month_day/email_bootstrap_floor_at existed
+    BEFORE fiscal_year_start_month_day/historical_floor_override_at existed
     (every entity from CD-6 Slice 1, including the three already live
     on the production appliance) has both fields permanently None
     unless a real update path exists -- register_entity only ever sets
@@ -92,14 +95,14 @@ def test_set_accounting_period_configuration_backfills_an_existing_entity(fresh_
     entity = repo.register_entity(
         entity_type="COMPANY", canonical_name="SYNTHETIC_BACKFILL_LTD", display_name="X", status="ACTIVE"
     )
-    assert entity.email_bootstrap_floor_at is None
+    assert entity.historical_floor_override_at is None
 
     floor = _dt.datetime(2025, 11, 1, tzinfo=_dt.timezone.utc)
     updated = repo.set_accounting_period_configuration(
-        entity.entity_id, fiscal_year_start_month_day="11-01", email_bootstrap_floor_at=floor
+        entity.entity_id, fiscal_year_start_month_day="11-01", historical_floor_override_at=floor
     )
     assert updated.fiscal_year_start_month_day == "11-01"
-    assert updated.email_bootstrap_floor_at == floor
+    assert updated.historical_floor_override_at == floor
     # Every other field is untouched by this narrow update.
     assert updated.display_name == entity.display_name
     assert updated.status == entity.status
@@ -108,7 +111,7 @@ def test_set_accounting_period_configuration_backfills_an_existing_entity(fresh_
     fresh_repo = PostgresEntityRepository(engine=fresh_engine)
     fetched = fresh_repo.get_entity(entity.entity_id)
     assert fetched.fiscal_year_start_month_day == "11-01"
-    assert fetched.email_bootstrap_floor_at == floor
+    assert fetched.historical_floor_override_at == floor
 
 
 def test_set_accounting_period_configuration_unknown_entity_raises_not_found():
@@ -119,7 +122,7 @@ def test_set_accounting_period_configuration_unknown_entity_raises_not_found():
         repo.set_accounting_period_configuration(
             identity.generate_id(),
             fiscal_year_start_month_day="11-01",
-            email_bootstrap_floor_at=_dt.datetime(2025, 11, 1, tzinfo=_dt.timezone.utc),
+            historical_floor_override_at=_dt.datetime(2025, 11, 1, tzinfo=_dt.timezone.utc),
         )
 
 

@@ -6,7 +6,7 @@
 # contracts/manifest/bagman.component_manifest.v1.schema.json.
 
 id: BAGMAN.MAILBOX
-version: 3
+version: 4
 
 responsibility: >
   Own the operator-facing mailbox DEFINITION registry (MailboxSource) —
@@ -37,10 +37,18 @@ responsibility: >
   accounting-document signal creates exactly one governed Needs You
   item; operator approval creates the routing rule AND immediately
   reprocesses the specific triggering message. The historical
-  bootstrap boundary is the real, architect-verified, per-entity
-  accounting-period configuration (never an invented default; the
-  sweep refuses to run while any governed entity's configuration is
-  missing). The first concrete provider adapter,
+  bootstrap boundary is DERIVED, per mailbox, from each of that
+  mailbox's own in-scope governed entities' recurring
+  `fiscal_year_start_month_day` accounting-period rule (previous-
+  completed-period-start policy — see
+  `services/mailbox/bootstrap_policy.py`), optionally clamped by a real
+  commencement/incorporation floor override
+  (`GovernedEntity.historical_floor_override_at`) — never a static
+  invented default, and never itself the literal stored answer (a real
+  conceptual-conflation bug this component's own second CD-6 architect
+  amendment corrected). The sweep still refuses to run while any
+  in-scope governed entity's `fiscal_year_start_month_day`
+  configuration is missing. The first concrete provider adapter,
   `services/mailbox/microsoft/` (Microsoft Graph: delegated
   authorization-code OAuth, `Mail.Read`-only delegated permissions, a
   read-only Graph client, server-side account-identity verification,

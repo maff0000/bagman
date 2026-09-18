@@ -76,25 +76,53 @@ decision; that would need to be an explicit, separate, later operator
 action. Flagged here prominently for PL/architect review, not silently
 chosen.
 
-Historical bootstrap boundary — governed, not hardcoded (CD-6 architect
-amendment, supersedes Slice 4A's flat 7-day boundary)
+Historical bootstrap boundary — governed AND mailbox-scoped, never a
+global magic date (CD-6 architect amendment, second correction —
+supersedes both Slice 4A's flat 7-day boundary AND this module's own
+first amendment's "GLOBAL MINIMUM across every entity, unconditionally"
+design)
 ------------------------------------------------------------------------
 :func:`compute_bootstrap_floor` replaces the old
-``DEFAULT_BOOTSTRAP_DAYS`` constant entirely. A mailbox's FIRST-EVER
-sweep of a folder now bootstraps from the GLOBAL MINIMUM (earliest)
-``core.entity.GovernedEntity.email_bootstrap_floor_at`` across every
-governed entity currently seeded — never something narrower tied to a
-mailbox's own optional ``default_entity_id`` hint (which remains just a
-hint, never a restriction): any mailbox could in principle discover
-REVIEW_REQUIRED-routed evidence for ANY entity via the operator-
-approval path above, so the only safe, conservative, spec-compliant
-choice is the global minimum. If ANY governed entity is missing this
-configuration, :func:`compute_bootstrap_floor` raises
-``core.errors.ConflictError`` rather than inventing a fallback or
-silently excluding that entity (architect spec: "surface the missing
-configuration before historical sweep") — checked on EVERY sweep call,
-not merely a mailbox's first, which is the simpler and more
-conservative of two reasonable designs (see that function's own
+``DEFAULT_BOOTSTRAP_DAYS`` constant entirely, and no longer computes a
+single global minimum across every governed entity in the system
+regardless of mailbox — the architect explicitly rejected that as "a
+global magic date". Instead, a mailbox's FIRST-EVER sweep of a folder
+bootstraps from a boundary DERIVED specifically for THAT mailbox:
+
+1. Determine the mailbox's in-scope destination entities — the union
+   of its own optional ``default_entity_id`` hint (when set) and every
+   ``destination_entity_id`` named by one of its own ``ALLOWED``
+   ``services.mailbox.domain_rule.MailboxDomainRule`` rows.
+2. For each in-scope entity, derive its own real historical-bootstrap
+   requirement via
+   ``services.mailbox.bootstrap_policy.compute_entity_historical_bootstrap``
+   — the previous-completed-accounting-period-start of that entity's
+   ``fiscal_year_start_month_day``, clamped by its optional
+   ``historical_floor_override_at`` (see that field's own docstring on
+   ``core.entity.GovernedEntity`` for the full "clamp, not the answer"
+   doctrine this corrects).
+3. The mailbox's bootstrap floor is the MINIMUM across those in-scope
+   entities' derived values.
+
+**The fallback rule (real, load-bearing — not a placeholder):** if a
+mailbox's in-scope set is EMPTY (the real, current state of
+``matt@infosecurs.com``: ``default_entity_id`` is ``None`` and zero
+``MailboxDomainRule`` rows exist yet — a genuine bootstrapping case),
+:func:`compute_bootstrap_floor` falls back to EVERY governed entity
+currently seeded — the previous, conservative "any mailbox could in
+principle discover REVIEW_REQUIRED-routed evidence for any entity"
+behaviour — and the floor is the minimum across all of them. This is
+still real per-entity derivation, never a stored literal read as-is;
+it is simply applied to a wider entity set when no narrower scope is
+yet known.
+
+If ANY in-scope entity (or, under the fallback, any seeded entity) is
+missing ``fiscal_year_start_month_day``, :func:`compute_bootstrap_floor`
+raises ``core.errors.ConflictError`` rather than inventing a fallback
+date or silently excluding that entity (architect spec: "surface the
+missing configuration before historical sweep") — checked on EVERY
+sweep call, not merely a mailbox's first, which remains the simpler and
+more conservative of two reasonable designs (see that function's own
 docstring for why).
 
 Idempotency & the cursor-advance rule — read before changing anything
@@ -228,6 +256,7 @@ from core.entity import EntityRepository
 from core.errors import ConflictError
 from core.timestamps import utc_now
 from services.evidence.intake.scanner import EvidenceSafetyScanner
+from services.mailbox.bootstrap_policy import compute_entity_historical_bootstrap
 from services.mailbox.cursor import MailboxFolderCursorRepository
 from services.mailbox.discovery_signals import evaluate_discovery_candidate
 from services.mailbox.domain_rule import (
@@ -268,34 +297,78 @@ from services.needs_you.needs_you import (
 )
 
 
-def compute_bootstrap_floor(entity_repository: EntityRepository) -> datetime:
-    """The GLOBAL MINIMUM ``email_bootstrap_floor_at`` across every
-    governed entity currently seeded — see module docstring's
-    "Historical bootstrap boundary" section for the full reasoning.
+def compute_bootstrap_floor(
+    *,
+    mailbox: MailboxSource,
+    entity_repository: EntityRepository,
+    domain_rule_repository: MailboxDomainRuleRepository,
+    now: Optional[datetime] = None,
+) -> datetime:
+    """``mailbox``'s own real historical-sweep bootstrap floor — never a
+    global magic date — see module docstring's "Historical bootstrap
+    boundary" section for the full reasoning this implements:
+
+    1. Resolve ``mailbox``'s in-scope destination entity ids: the union
+       of its own optional ``default_entity_id`` hint (if set) and
+       every ``destination_entity_id`` named by one of its own
+       ``ALLOWED`` ``MailboxDomainRule`` rows.
+    2. If that set is EMPTY (the real, current ``matt@infosecurs.com``
+       state — a genuine bootstrapping case, not a placeholder), fall
+       back to EVERY governed entity currently seeded (the previous,
+       conservative "any mailbox could discover REVIEW_REQUIRED
+       evidence for any entity" behaviour).
+    3. Derive each in-scope (or fallback) entity's own real historical-
+       bootstrap requirement via
+       ``services.mailbox.bootstrap_policy.compute_entity_historical_bootstrap``.
+    4. Return the MINIMUM across those derived values.
 
     Raises:
-        core.errors.ConflictError: no governed entities are seeded yet,
-            or at least one is missing ``email_bootstrap_floor_at``
-            (architect spec: "surface the missing configuration before
-            historical sweep" — this never invents a fallback date and
-            never silently excludes the incomplete entity from the
-            minimum).
+        core.errors.ConflictError: no governed entities are seeded at
+            all (only reachable via the fallback path — an in-scope
+            set can never be "resolved but empty of real entities",
+            since every id in it came from a real hint/rule), or at
+            least one IN-SCOPE entity (or, under the fallback, at
+            least one seeded entity) is missing
+            ``fiscal_year_start_month_day`` (architect spec: "surface
+            the missing configuration before historical sweep" — this
+            never invents a fallback date and never silently excludes
+            the incomplete entity from the minimum).
     """
-    entities = entity_repository.list_entities()
-    if not entities:
-        raise ConflictError(
-            "cannot compute the mailbox historical-sweep bootstrap floor: no governed entities "
-            "are seeded yet — seed the canonical entity registry before running any mailbox sweep"
-        )
-    missing = sorted(e.canonical_name for e in entities if e.email_bootstrap_floor_at is None)
+    resolved_now = now if now is not None else utc_now()
+
+    in_scope_entity_ids: set[str] = set()
+    if mailbox.default_entity_id is not None:
+        in_scope_entity_ids.add(mailbox.default_entity_id)
+    for rule in domain_rule_repository.list_rules(mailbox_id=mailbox.mailbox_id):
+        if rule.policy == POLICY_ALLOWED and rule.destination_entity_id is not None:
+            in_scope_entity_ids.add(rule.destination_entity_id)
+
+    if in_scope_entity_ids:
+        entities = [entity_repository.get_entity(entity_id) for entity_id in in_scope_entity_ids]
+        scope_description = "in-scope"
+    else:
+        # Fallback: a real, load-bearing rule (see module docstring),
+        # never a placeholder for "we haven't built scoping yet".
+        entities = entity_repository.list_entities()
+        scope_description = "fallback (no in-scope destination entities yet resolved)"
+        if not entities:
+            raise ConflictError(
+                f"cannot compute the historical-sweep bootstrap floor for mailbox '{mailbox.mailbox_id}': "
+                "no governed entities are seeded yet — seed the canonical entity registry before "
+                "running any mailbox sweep"
+            )
+
+    missing = sorted(e.canonical_name for e in entities if e.fiscal_year_start_month_day is None)
     if missing:
         raise ConflictError(
-            "cannot compute the mailbox historical-sweep bootstrap floor: the following governed "
-            f"entities are missing email_bootstrap_floor_at configuration: {missing} — surface and "
-            "resolve this configuration before any historical sweep runs (CD-6 architect amendment "
-            "§1); BAGMAN never invents a fallback bootstrap date or silently excludes an entity"
+            f"cannot compute the historical-sweep bootstrap floor for mailbox '{mailbox.mailbox_id}': "
+            f"the following {scope_description} governed entities are missing "
+            f"fiscal_year_start_month_day configuration: {missing} — surface and resolve this "
+            "configuration before any historical sweep runs (CD-6 architect amendment §1); BAGMAN "
+            "never invents a fallback bootstrap date or silently excludes an entity"
         )
-    return min(e.email_bootstrap_floor_at for e in entities)
+
+    return min(compute_entity_historical_bootstrap(entity, now=resolved_now) for entity in entities)
 
 
 def _extract_sender_domain(sender_address: Optional[str]) -> Optional[str]:
@@ -488,7 +561,12 @@ def run_sweep(
     # Validated/computed on EVERY sweep call, not merely a mailbox's
     # first — see module docstring's "Historical bootstrap boundary"
     # section for why this is the simpler, more conservative choice.
-    bootstrap_timestamp = compute_bootstrap_floor(entity_repository)
+    bootstrap_timestamp = compute_bootstrap_floor(
+        mailbox=mailbox,
+        entity_repository=entity_repository,
+        domain_rule_repository=domain_rule_repository,
+        now=resolved_now,
+    )
 
     with sweep_lock.held(mailbox.mailbox_id):
         run = sweep_run_repository.create_run(mailbox_id=mailbox.mailbox_id, trigger=trigger)

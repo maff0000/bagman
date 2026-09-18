@@ -52,7 +52,7 @@ def make_entity(new_id, now_str) -> Callable[..., dict]:
             "status": "ACTIVE",
             "created_at": now_str(),
             "fiscal_year_start_month_day": None,
-            "email_bootstrap_floor_at": None,
+            "historical_floor_override_at": None,
             "metadata": {},
         }
         instance.update(overrides)
