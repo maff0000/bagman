@@ -825,6 +825,159 @@ def test_domain_review_endpoints_reject_a_non_microsoft_mailbox(dev_client):
 
 
 # ---------------------------------------------------------------------
+# GET domain-review — mailbox-evidence-based triage addendum
+# (review_priority / discovery_reason_counts). A real sweep drives 5
+# distinct candidate messages for ONE domain, each hitting a DIFFERENT
+# one of services.mailbox.domain_review_priority's 5 discovery-reason
+# buckets, deliberately spanning >30 days with a high attachment ratio
+# — this is the module's own worked "HIGH" shape (see that module's
+# docstring Example A), proven here end-to-end through the real
+# GET response rather than re-asserted in isolation.
+# ---------------------------------------------------------------------
+
+
+def _sweep_five_bucket_domain(client, mailbox_id, *, domain="priority-test.example"):
+    comp = get_composition()
+    now = datetime.now(timezone.utc)
+    messages = (
+        # invoice_subject_signal_count
+        GraphMessageSummary(
+            immutable_id=f"AAMk-{domain}-1", internet_message_id=f"<{domain}-1@b>",
+            subject="Invoice ready", sender_address=f"billing@{domain}", sender_display_name="Supplier",
+            received_at=now - timedelta(days=40), has_attachments=False,
+        ),
+        # receipt_subject_signal_count
+        GraphMessageSummary(
+            immutable_id=f"AAMk-{domain}-2", internet_message_id=f"<{domain}-2@b>",
+            subject="See attached receipt", sender_address=f"billing@{domain}", sender_display_name="Supplier",
+            received_at=now - timedelta(days=30), has_attachments=True,
+            attachment_metadata=({"filename": "receipt.pdf", "content_type": "application/pdf", "size_bytes": 100},),
+        ),
+        # other_bounded_heuristic_reason_count (attachment filename 'statement')
+        GraphMessageSummary(
+            immutable_id=f"AAMk-{domain}-3", internet_message_id=f"<{domain}-3@b>",
+            subject="FYI", sender_address=f"billing@{domain}", sender_display_name="Supplier",
+            received_at=now - timedelta(days=20), has_attachments=True,
+            attachment_metadata=({"filename": "statement.pdf", "content_type": "application/octet-stream", "size_bytes": 200},),
+        ),
+        # accounting_document_attachment_signal_count (content_type match, no keyword anywhere)
+        GraphMessageSummary(
+            immutable_id=f"AAMk-{domain}-4", internet_message_id=f"<{domain}-4@b>",
+            subject="Scan", sender_address=f"billing@{domain}", sender_display_name="Supplier",
+            received_at=now - timedelta(days=10), has_attachments=True,
+            attachment_metadata=({"filename": "scan001.jpg", "content_type": "application/pdf", "size_bytes": 300},),
+        ),
+        # invoice_like_attachment_filename_count
+        GraphMessageSummary(
+            immutable_id=f"AAMk-{domain}-5", internet_message_id=f"<{domain}-5@b>",
+            subject="Latest doc", sender_address=f"billing@{domain}", sender_display_name="Supplier",
+            received_at=now, has_attachments=True,
+            attachment_metadata=({"filename": "invoice_2026.pdf", "content_type": "application/octet-stream", "size_bytes": 400},),
+        ),
+    )
+    _queue_folder_discovery(comp)
+    comp.microsoft_graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=messages, delta_link=f"d-{domain}-1"))
+    comp.microsoft_graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link=f"d-{domain}-junk"))
+    r = client.post(f"/internal/mailboxes/{mailbox_id}/microsoft/sweep", json={"actor_type": "USER", "actor_id": ACTOR_ID})
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+def test_list_domain_review_includes_review_priority_and_discovery_reason_counts(dev_client):
+    mailbox_id, comp, _entity = _connected_mailbox_with_entity_seeded(dev_client)
+    _sweep_five_bucket_domain(dev_client, mailbox_id)
+
+    r = dev_client.get(f"/internal/mailboxes/{mailbox_id}/microsoft/domain-review")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["count"] == 1
+    item = body["items"][0]
+
+    assert item["metadata"]["candidate_message_count"] == 5
+    assert item["metadata"]["attachment_bearing_count"] == 4
+
+    assert item["discovery_reason_counts"] == {
+        "invoice_subject_signal_count": 1,
+        "receipt_subject_signal_count": 1,
+        "invoice_like_attachment_filename_count": 1,
+        "accounting_document_attachment_signal_count": 1,
+        "other_bounded_heuristic_reason_count": 1,
+    }
+    # 5 candidates (>=5, +3), 4/5 attachment ratio (>=0.5, +3), ~40-day
+    # span (>=30, +2), no Xero correlation yet (+0), 5 distinct buckets
+    # hit (diversity, +1) => score 9 => HIGH. Mirrors
+    # services/mailbox/domain_review_priority.py's own worked Example A.
+    assert item["review_priority"] == "HIGH"
+
+    # Presentation-layer only — never persisted onto the real
+    # NeedsYouItem.metadata this GET response was built from.
+    stored = comp.needs_you_repository.get_needs_you_item(item["item_id"])
+    assert "review_priority" not in stored.metadata
+    assert "discovery_reason_counts" not in stored.metadata
+
+
+def test_review_priority_reflects_shared_domain_xero_cap(dev_client):
+    """Same 5-bucket, high-volume/attachment/span candidate shape as
+    the HIGH test above, but the sender domain itself is a real
+    `SHARED_PUBLIC_EMAIL_DOMAINS` entry (`gmail.com`) with a real,
+    qualifying Xero Contact behind it — end-to-end proof (real sweep +
+    real correlation run + real GET) that `review_priority` is never
+    `"HIGH"` once `xero_correlation_class` comes back
+    `SHARED_DOMAIN_REQUIRES_MANUAL_REVIEW`, mirroring
+    `services/mailbox/domain_review_priority.py`'s own worked
+    Example D."""
+    mailbox_id, comp, entity = _connected_mailbox_with_entity_seeded(dev_client)
+    _sweep_five_bucket_domain(dev_client, mailbox_id, domain="gmail.com")
+
+    _connect_xero_entity(dev_client, entity.entity_id)
+    comp.xero_accounting_client.queue_contacts_result(
+        XeroContactsResult(
+            status=XeroOutcomeStatus.OK,
+            contacts=(
+                RawXeroContact(
+                    contact_id="ct-shared",
+                    name="Shared Domain Co",
+                    email_address="billing@gmail.com",
+                    is_customer=False,
+                    is_supplier=True,
+                    contact_status="ACTIVE",
+                ),
+            ),
+        )
+    )
+    comp.xero_accounting_client.queue_invoices_result(
+        XeroInvoicesResult(
+            status=XeroOutcomeStatus.OK,
+            invoices=(
+                RawXeroPurchaseInvoice(
+                    invoice_id="inv-shared-1",
+                    contact_id="ct-shared",
+                    invoice_type="ACCPAY",
+                    invoice_date=datetime(2026, 3, 1, tzinfo=timezone.utc),
+                    status="AUTHORISED",
+                ),
+            ),
+        )
+    )
+    comp.xero_accounting_client.queue_bank_transactions_result(
+        XeroBankTransactionsResult(status=XeroOutcomeStatus.OK, bank_transactions=())
+    )
+
+    r = dev_client.post(
+        f"/internal/mailboxes/{mailbox_id}/microsoft/domain-review/xero-correlate",
+        json={"entity_id": entity.entity_id, "actor_type": "USER", "actor_id": ACTOR_ID},
+    )
+    assert r.status_code == 200, r.text
+
+    r_get = dev_client.get(f"/internal/mailboxes/{mailbox_id}/microsoft/domain-review")
+    assert r_get.status_code == 200, r_get.text
+    item = r_get.json()["items"][0]
+    assert item["metadata"]["xero_correlation_class"] == "SHARED_DOMAIN_REQUIRES_MANUAL_REVIEW"
+    assert item["review_priority"] != "HIGH"
+    assert item["review_priority"] == "MEDIUM"
+
+
+# ---------------------------------------------------------------------
 # POST domain-review/xero-correlate — CD-6 GUI-operations-foundation WO
 # (the new endpoint that calls
 # services.xero.supplier_correlation.correlate_xero_suppliers_for_open_domain_review_items

@@ -140,6 +140,7 @@ from __future__ import annotations
 import dataclasses
 import os
 import urllib.parse
+from datetime import datetime
 from typing import Any, Optional
 
 from fastapi import APIRouter
@@ -163,6 +164,7 @@ from services.mailbox.mailbox import (
     CONNECTION_STATE_CONNECTED,
     PROVIDER_MICROSOFT_GRAPH,
 )
+from services.mailbox.domain_review_priority import aggregate_discovery_reasons, compute_review_priority
 from services.mailbox.microsoft.oauth_state import consume_state
 from services.mailbox.sweep import reprocess_all_historical_candidates_for_domain, run_sweep
 from services.mailbox.sweep_run import TRIGGER_MANUAL
@@ -544,6 +546,24 @@ async def list_microsoft_domain_rules(mailbox_id: str) -> dict[str, Any]:
     return {"mailbox_id": mailbox_id, "items": [r.to_dict() for r in rules], "count": len(rules)}
 
 
+def _parse_metadata_timestamp(value: Optional[str]) -> Optional[datetime]:
+    """`item.metadata["first_seen_at"]`/`["last_seen_at"]` are stored as
+    contract (RFC 3339, `Z`-suffixed) strings — see
+    `services/mailbox/sweep.py::_create_or_reuse_domain_review_item`'s
+    own `received_at_str` writes. Mirrors the established
+    `datetime.fromisoformat(value.replace("Z", "+00:00"))` parse-back
+    convention this codebase already uses elsewhere for the identical
+    shape (e.g. `services/xero/client.py`,
+    `services/mailbox/microsoft/graph_client.py`) — never a new/bespoke
+    parser. `None` in, `None` out (defensive; both metadata keys are
+    always populated by the sweep engine before a domain-review item
+    ever exists, but this enrichment must never crash a GET on a
+    surprising/missing value)."""
+    if not value:
+        return None
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
 @router.get("/{mailbox_id}/microsoft/domain-review")
 async def list_microsoft_domain_review_items(mailbox_id: str, status: str = "OPEN") -> dict[str, Any]:
     """List this mailbox's own ``MAILBOX_DOMAIN_REVIEW`` Needs You
@@ -570,6 +590,28 @@ async def list_microsoft_domain_review_items(mailbox_id: str, status: str = "OPE
     ``_find_open_domain_review_item`` already use (see that module's own
     docstring) — a second mailbox's items are never even considered, let
     alone returned.
+
+    Mailbox-evidence-based triage enrichment (mailbox-evidence-based
+    triage addendum, on top of the GUI-operations-foundation WO) —
+    ``review_priority``/``discovery_reason_counts`` are added as NEW
+    TOP-LEVEL keys on each returned item dict, computed fresh on every
+    call via ``services.mailbox.domain_review_priority`` from this
+    domain's own candidate messages
+    (``MailboxMessageRepository.list_candidate_messages_for_domain`` —
+    the SAME existing query
+    ``services/mailbox/sweep.py::reprocess_all_historical_candidates_for_domain``
+    already uses) and the item's own already-populated
+    ``candidate_message_count``/``attachment_bearing_count``/
+    ``first_seen_at``/``last_seen_at``/``xero_correlation_class``
+    metadata. PRESENTATION-LAYER ONLY: never written into
+    ``item["metadata"]``, never persisted back via
+    ``update_item_metadata`` — see
+    ``services/mailbox/domain_review_priority.py``'s own module
+    docstring for the full "never persisted" discipline. An item with
+    no ``sender_domain`` metadata at all (should not happen for a real
+    ``MAILBOX_DOMAIN_REVIEW`` item, but defended against) gets
+    ``review_priority: "LOW"``/empty ``discovery_reason_counts`` rather
+    than a crash.
     """
     composition = get_composition()
     _require_microsoft_mailbox(composition, mailbox_id)
@@ -580,7 +622,32 @@ async def list_microsoft_domain_review_items(mailbox_id: str, status: str = "OPE
         )
         if item.metadata.get("mailbox_id") == mailbox_id
     ]
-    return {"mailbox_id": mailbox_id, "items": [i.to_dict() for i in items], "count": len(items)}
+
+    enriched_items = []
+    for item in items:
+        sender_domain = item.metadata.get("sender_domain")
+        candidate_messages = (
+            composition.mailbox_message_repository.list_candidate_messages_for_domain(
+                mailbox_id=mailbox_id, sender_domain=sender_domain
+            )
+            if sender_domain
+            else []
+        )
+        discovery_reason_counts = aggregate_discovery_reasons(candidate_messages)
+        review_priority = compute_review_priority(
+            candidate_message_count=item.metadata.get("candidate_message_count") or 0,
+            attachment_bearing_count=item.metadata.get("attachment_bearing_count") or 0,
+            first_seen_at=_parse_metadata_timestamp(item.metadata.get("first_seen_at")) or utc_now(),
+            last_seen_at=_parse_metadata_timestamp(item.metadata.get("last_seen_at")) or utc_now(),
+            xero_correlation_class=item.metadata.get("xero_correlation_class"),
+            discovery_reason_counts=discovery_reason_counts,
+        )
+        item_dict = item.to_dict()
+        item_dict["review_priority"] = review_priority
+        item_dict["discovery_reason_counts"] = discovery_reason_counts
+        enriched_items.append(item_dict)
+
+    return {"mailbox_id": mailbox_id, "items": enriched_items, "count": len(enriched_items)}
 
 
 class XeroCorrelateMailboxDomainReviewRequest(BaseModel):

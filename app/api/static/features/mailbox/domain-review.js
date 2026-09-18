@@ -31,7 +31,7 @@
 // discipline).
 import { el, clear } from "../../shared/dom.js";
 import { fmtDateTime } from "../../shared/format.js";
-import { xeroCorrelationClassChip } from "../../shared/chips.js";
+import { chip, xeroCorrelationClassChip } from "../../shared/chips.js";
 import { loadingState, emptyState, errorState } from "../../shared/state.js";
 import { errorMessage } from "../../shared/api.js";
 import { getActorId } from "../../shared/operator.js";
@@ -50,7 +50,26 @@ import {
 //: operator worklist, not a data-grid product). Each comparator reads
 //: straight off the raw NeedsYouItem shape this page already fetched —
 //: never a second round trip just to re-sort client-side.
+//:
+//: `review_priority_desc` is FIRST in this map on purpose — it is also
+//: this table's own DEFAULT initial sort key (see `_loadTable` below,
+//: which explicitly sets the `<select>`'s value rather than relying on
+//: map/DOM insertion order alone to make that intent obvious) — the
+//: mailbox-evidence-based triage addendum's whole point is "show the
+//: operator the highest-yield domains first", so the highest-priority
+//: domains land at the top of the table the moment the drawer opens,
+//: not only once an operator manually picks this option. `domain_asc`
+//: (the table's PREVIOUS default) remains one of the explicit choices
+//: below, unchanged.
 const SORT_OPTIONS = {
+  review_priority_desc: {
+    label: "Review priority (highest first)",
+    // Tie-break: most candidate messages first — the SAME ordering
+    // `candidates_desc` below already uses on its own, applied here as
+    // the secondary key within one priority band.
+    compare: (a, b) =>
+      _priorityRank(b) - _priorityRank(a) || (b.metadata.candidate_message_count || 0) - (a.metadata.candidate_message_count || 0),
+  },
   domain_asc: {
     label: "Domain (A–Z)",
     compare: (a, b) => (a.metadata.sender_domain || "").localeCompare(b.metadata.sender_domain || ""),
@@ -58,6 +77,14 @@ const SORT_OPTIONS = {
   candidates_desc: {
     label: "Most candidate messages first",
     compare: (a, b) => (b.metadata.candidate_message_count || 0) - (a.metadata.candidate_message_count || 0),
+  },
+  attachment_ratio_desc: {
+    label: "Attachment ratio (highest first)",
+    compare: (a, b) => _attachmentRatio(b) - _attachmentRatio(a),
+  },
+  recurrence_span_desc: {
+    label: "Recurrence span (widest first)",
+    compare: (a, b) => _recurrenceSpanMs(b) - _recurrenceSpanMs(a),
   },
   last_seen_desc: {
     label: "Most recently seen first",
@@ -68,6 +95,78 @@ const SORT_OPTIONS = {
     compare: (a, b) => _correlationRank(b) - _correlationRank(a),
   },
 };
+
+//: `review_priority` -> chip kind. Mirrors `shared/chips.js`'s own
+//: `PRIORITY_KIND` (Needs You priority: `{HIGH: "bad", NORMAL:
+//: "progress", LOW: "neutral"}`) exactly — the SAME three-bucket
+//: "attention colour" convention, applied to this page's own closed
+//: `services.mailbox.domain_review_priority.REVIEW_PRIORITIES`
+//: vocabulary instead. Built on the generic `chip()` primitive
+//: directly (see `shared/chips.js`'s own docstring) rather than a new
+//: bespoke chip function — `chip()` already supports this cleanly.
+const REVIEW_PRIORITY_KIND = { HIGH: "bad", MEDIUM: "progress", LOW: "neutral" };
+
+function _priorityRank(item) {
+  return { HIGH: 3, MEDIUM: 2, LOW: 1 }[item.review_priority] || 0;
+}
+
+//: `discovery_reason_counts` bucket key -> short, human display label
+//: for the table's own "strongest aggregated discovery signals" cell —
+//: mirrors `services/mailbox/domain_review_priority.py`'s own closed
+//: 5-bucket vocabulary exactly (see that module's docstring). Never the
+//: raw per-message `discovery_reason` string, never a subject line —
+//: only this page's own short, bucketed label.
+const DISCOVERY_REASON_BUCKET_LABELS = {
+  invoice_subject_signal_count: "invoice subject",
+  receipt_subject_signal_count: "receipt subject",
+  invoice_like_attachment_filename_count: "invoice-like attachment",
+  accounting_document_attachment_signal_count: "accounting-doc attachment",
+  other_bounded_heuristic_reason_count: "other signal",
+};
+
+function _attachmentRatio(item) {
+  const count = item.metadata.candidate_message_count || 0;
+  if (!count) return 0;
+  return (item.metadata.attachment_bearing_count || 0) / count;
+}
+
+function _attachmentRatioLabel(item) {
+  const count = item.metadata.candidate_message_count || 0;
+  if (!count) return "—";
+  return `${Math.round(_attachmentRatio(item) * 100)}%`;
+}
+
+//: `(last_seen_at - first_seen_at)` in milliseconds, `0` when either
+//: timestamp is missing — used for both the recurrence/span SORT and
+//: the "widest span first" tie-break intent; display uses
+//: `fmtDateTime` on the two raw timestamps directly (this page already
+//: shows "First seen"/"Last seen" as their own columns), so no new
+//: display-only span column is added — only the new sort key.
+function _recurrenceSpanMs(item) {
+  const first = item.metadata.first_seen_at ? new Date(item.metadata.first_seen_at).getTime() : 0;
+  const last = item.metadata.last_seen_at ? new Date(item.metadata.last_seen_at).getTime() : 0;
+  return last - first;
+}
+
+//: The single highest-count bucket from `discovery_reason_counts`,
+//: rendered as short text (e.g. "6× invoice subject") — never the raw
+//: per-message `discovery_reason` strings, never a subject line (WO's
+//: own explicit instruction). "—" when an item has no candidate
+//: messages at all (should not happen for a real domain-review item,
+//: but defended against) or every bucket is zero.
+function _strongestSignalLabel(item) {
+  const counts = item.discovery_reason_counts || {};
+  let bestBucket = null;
+  let bestCount = 0;
+  for (const [bucket, count] of Object.entries(counts)) {
+    if (count > bestCount) {
+      bestBucket = bucket;
+      bestCount = count;
+    }
+  }
+  if (!bestBucket) return "—";
+  return `${bestCount}× ${DISCOVERY_REASON_BUCKET_LABELS[bestBucket] || bestBucket}`;
+}
 
 //: STRONG_PURCHASE_BILL outranks STRONG_BANK_SPEND (the SAME "more
 //: traditionally governed accounting artifact wins by convention" rule
@@ -297,20 +396,37 @@ export const DomainReview = {
       attrs: { type: "text", placeholder: "Filter by domain…", autocomplete: "off" },
       class: "field-inline",
     });
+    // Priority filter — a simple closed `<select>` alongside the
+    // existing domain-text filter (mailbox-evidence-based triage
+    // addendum). "" (the "All priorities" option's own value) means no
+    // filtering by priority at all.
+    const priorityFilterSelect = el("select", { class: "field-inline" }, [
+      el("option", { attrs: { value: "" }, text: "All priorities" }),
+      el("option", { attrs: { value: "HIGH" }, text: "HIGH" }),
+      el("option", { attrs: { value: "MEDIUM" }, text: "MEDIUM" }),
+      el("option", { attrs: { value: "LOW" }, text: "LOW" }),
+    ]);
     const sortSelect = el(
       "select",
       {},
       Object.entries(SORT_OPTIONS).map(([key, opt]) => el("option", { attrs: { value: key }, text: opt.label }))
     );
+    // Default initial ordering: highest-yield first (see SORT_OPTIONS'
+    // own docstring above) — set explicitly rather than relying on
+    // "first `<option>` in DOM order" alone, so this intent reads
+    // clearly in the code itself.
+    sortSelect.value = "review_priority_desc";
     tableHost.appendChild(
-      el("div", { class: "filters" }, [filterInput, sortSelect])
+      el("div", { class: "filters" }, [filterInput, priorityFilterSelect, sortSelect])
     );
 
     const tableWrap = el("div", { class: "table-wrap" });
     tableHost.appendChild(tableWrap);
 
-    const rerenderRows = () => this._renderRows(tableWrap, mailbox, entities, filterInput.value, sortSelect.value);
+    const rerenderRows = () =>
+      this._renderRows(tableWrap, mailbox, entities, filterInput.value, sortSelect.value, priorityFilterSelect.value);
     filterInput.addEventListener("input", rerenderRows);
+    priorityFilterSelect.addEventListener("change", rerenderRows);
     sortSelect.addEventListener("change", rerenderRows);
     rerenderRows();
   },
@@ -367,11 +483,14 @@ export const DomainReview = {
     if (this._ignoreBtn) this._ignoreBtn.disabled = n === 0;
   },
 
-  _renderRows(tableWrap, mailbox, entities, filterText, sortKey) {
+  _renderRows(tableWrap, mailbox, entities, filterText, sortKey, priorityFilter) {
     clear(tableWrap);
     const needle = (filterText || "").trim().toLowerCase();
     let rows = this._items.filter((item) => (item.metadata.sender_domain || "").toLowerCase().includes(needle));
-    const sortOpt = SORT_OPTIONS[sortKey] || SORT_OPTIONS.domain_asc;
+    if (priorityFilter) {
+      rows = rows.filter((item) => item.review_priority === priorityFilter);
+    }
+    const sortOpt = SORT_OPTIONS[sortKey] || SORT_OPTIONS.review_priority_desc;
     rows = rows.slice().sort(sortOpt.compare);
 
     if (rows.length === 0) {
@@ -383,9 +502,12 @@ export const DomainReview = {
     const thead = el("thead", {}, [
       el("tr", {}, [
         el("th", { text: "" }),
+        el("th", { text: "Priority" }),
         el("th", { text: "Sender domain" }),
         el("th", { text: "Candidates" }),
         el("th", { text: "With attachment" }),
+        el("th", { text: "Attachment ratio" }),
+        el("th", { text: "Strongest signal" }),
         el("th", { text: "First seen" }),
         el("th", { text: "Last seen" }),
         el("th", { text: "Xero correlation" }),
@@ -420,9 +542,12 @@ export const DomainReview = {
 
     return el("tr", {}, [
       el("td", {}, [checkbox]),
+      el("td", {}, [chip(item.review_priority || "LOW", REVIEW_PRIORITY_KIND[item.review_priority] || "neutral")]),
       el("td", { text: m.sender_domain || "—" }),
       el("td", { text: m.candidate_message_count != null ? String(m.candidate_message_count) : "—" }),
       el("td", { text: m.attachment_bearing_count != null ? String(m.attachment_bearing_count) : "—" }),
+      el("td", { text: _attachmentRatioLabel(item) }),
+      el("td", { text: _strongestSignalLabel(item) }),
       el("td", { text: fmtDateTime(m.first_seen_at) }),
       el("td", { text: fmtDateTime(m.last_seen_at) }),
       el("td", {}, [xeroCorrelationClassChip(m.xero_correlation_class)]),
