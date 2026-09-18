@@ -30,8 +30,10 @@ from services.mailbox.microsoft.graph_client import (
     MicrosoftTokenResult,
 )
 from services.xero.client import (
+    RawXeroBankTransaction,
     RawXeroContact,
     RawXeroPurchaseInvoice,
+    XeroBankTransactionsResult,
     XeroConnectionInfo,
     XeroConnectionsResult,
     XeroContactsResult,
@@ -878,12 +880,20 @@ def _connect_xero_entity(client, entity_id: str, *, tenant_id="tenant-xero-corre
     )
 
 
-def _queue_xero_correlation_success(comp) -> None:
+def _queue_xero_correlation_success(comp, *, bank_transactions: tuple = ()) -> None:
     comp.xero_accounting_client.queue_contacts_result(
         XeroContactsResult(status=XeroOutcomeStatus.OK, contacts=_XERO_CORRELATE_CONTACTS)
     )
     comp.xero_accounting_client.queue_invoices_result(
         XeroInvoicesResult(status=XeroOutcomeStatus.OK, invoices=_XERO_CORRELATE_INVOICES)
+    )
+    # CD-6 second-correlation-source WO: the endpoint now also calls
+    # `list_bank_transactions` unconditionally — empty by default (most
+    # of this file's own scenarios only care about the invoice-based
+    # path); `test_xero_correlate_*_bank_spend*` below queues a
+    # non-empty tuple.
+    comp.xero_accounting_client.queue_bank_transactions_result(
+        XeroBankTransactionsResult(status=XeroOutcomeStatus.OK, bank_transactions=bank_transactions)
     )
 
 
@@ -906,15 +916,67 @@ def test_xero_correlate_success_enriches_open_items_and_returns_summary(dev_clie
     assert body["ok"] is True
     assert body["contacts_read"] == 1
     assert body["purchase_invoices_examined"] == 1
+    assert body["bank_transactions_examined"] == 0
     assert body["domain_review_items_updated"] == 1
-    assert body["strong_correlation_count"] == 1
+    assert body["strong_purchase_bill_count"] == 1
+    assert body["strong_bank_spend_count"] == 0
 
     updated = comp.needs_you_repository.get_needs_you_item(item.item_id)
-    assert updated.metadata["xero_correlation_class"] == "STRONG"
+    assert updated.metadata["xero_correlation_class"] == "STRONG_PURCHASE_BILL"
     assert updated.metadata["xero_contact_match"] is True
     assert updated.metadata["xero_purchase_invoice_count"] == 1
     assert updated.metadata["xero_correlated_at"] is not None
     assert updated.status == "OPEN"  # correlation never resolves anything itself
+
+
+def test_xero_correlate_bank_spend_only_enriches_items_and_wins_strong_bank_spend(dev_client):
+    """CD-6 second-correlation-source WO: the real, live finding that
+    Infosecurs has zero ACCPAY invoices but real SPEND BankTransactions
+    — proves the endpoint's own summary/metadata reflect
+    `STRONG_BANK_SPEND` end-to-end through the real HTTP surface, not
+    only at the domain layer (already covered by
+    `tests/integration/test_xero_supplier_correlation.py`)."""
+    mailbox_id, comp, entity = _connected_mailbox_with_entity_seeded(dev_client)
+    _sweep_unknown_domain(dev_client, mailbox_id, domain="correlate-strong.example")
+    item = _open_domain_review_item_for_domain(comp, mailbox_id, "correlate-strong.example")
+
+    _connect_xero_entity(dev_client, entity.entity_id)
+    _queue_xero_correlation_success(
+        comp,
+        bank_transactions=(
+            RawXeroBankTransaction(
+                bank_transaction_id="bt-1",
+                transaction_type="SPEND",
+                status="AUTHORISED",
+                date=datetime(2026, 3, 1, tzinfo=timezone.utc),
+                contact_id="ct-strong",
+                reference="ref",
+                total=250.0,
+                currency_code="GBP",
+                is_reconciled=True,
+            ),
+        ),
+    )
+    # No ACCPAY invoice history for this run (the real Infosecurs shape).
+    comp.xero_accounting_client._invoices_queue.clear()
+    comp.xero_accounting_client.queue_invoices_result(XeroInvoicesResult(status=XeroOutcomeStatus.OK, invoices=()))
+
+    r = dev_client.post(
+        f"/internal/mailboxes/{mailbox_id}/microsoft/domain-review/xero-correlate",
+        json={"entity_id": entity.entity_id, "actor_type": "USER", "actor_id": ACTOR_ID},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["ok"] is True
+    assert body["bank_transactions_examined"] == 1
+    assert body["strong_bank_spend_count"] == 1
+    assert body["strong_purchase_bill_count"] == 0
+
+    updated = comp.needs_you_repository.get_needs_you_item(item.item_id)
+    assert updated.metadata["xero_correlation_class"] == "STRONG_BANK_SPEND"
+    assert updated.metadata["xero_bank_spend_count"] == 1
+    assert updated.metadata["xero_bank_spend_total_amount"] == 250.0
+    assert updated.metadata["xero_bank_spend_currency"] == "GBP"
 
 
 def test_xero_correlate_failure_never_touches_any_item_metadata(dev_client):

@@ -53,15 +53,23 @@ export function needsYouStatusChip(status) {
 //: see services/xero/supplier_correlation.py's own module docstring)
 //: even though it also has real purchase history; CONTACT_ONLY/NONE
 //: both read as ordinary/uncertain, not alarming.
+//: CD-6 second-correlation-source WO: `STRONG` split into
+//: `STRONG_PURCHASE_BILL` (renamed) and `STRONG_BANK_SPEND` (new) — see
+//: services/xero/supplier_correlation.py's own module docstring. Both
+//: read as "ok" (a real, positive match found) — this chip does not
+//: distinguish evidence source by colour, only by label; the Details
+//: drawer shows the full evidence breakdown.
 const XERO_CORRELATION_CLASS_KIND = {
-  STRONG: "ok",
+  STRONG_PURCHASE_BILL: "ok",
+  STRONG_BANK_SPEND: "ok",
   CONTACT_ONLY: "progress",
   SHARED_DOMAIN_REQUIRES_MANUAL_REVIEW: "warn",
   NONE: "neutral",
 };
 
 const XERO_CORRELATION_CLASS_LABEL = {
-  STRONG: "Strong match",
+  STRONG_PURCHASE_BILL: "Strong match (purchase bill)",
+  STRONG_BANK_SPEND: "Strong match (bank spend)",
   CONTACT_ONLY: "Contact only",
   SHARED_DOMAIN_REQUIRES_MANUAL_REVIEW: "Shared domain — review",
   NONE: "No match",

@@ -690,10 +690,12 @@ async def xero_correlate_mailbox_domain_review(
     try:
         summary = correlate_xero_suppliers_for_open_domain_review_items(
             mailbox_id=mailbox_id,
+            entity_id=payload.entity_id,
             tenant_id=connection.tenant_id,
             access_token=token_resolution.access_token,
             xero_client=composition.xero_accounting_client,
             needs_you_repository=composition.needs_you_repository,
+            entity_repository=composition.api.entity_repository,
         )
     except XeroSupplierCorrelationFailedError as exc:
         composition.api.record_audit_event(
@@ -720,7 +722,8 @@ async def xero_correlate_mailbox_domain_review(
             "mailbox_id": mailbox_id,
             "entity_id": payload.entity_id,
             "domain_review_items_updated": summary.domain_review_items_updated,
-            "strong_correlation_count": summary.strong_correlation_count,
+            "strong_purchase_bill_count": summary.strong_purchase_bill_count,
+            "strong_bank_spend_count": summary.strong_bank_spend_count,
         },
     )
     return {"ok": True, **dataclasses.asdict(summary)}

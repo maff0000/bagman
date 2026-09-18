@@ -69,13 +69,17 @@ const SORT_OPTIONS = {
   },
 };
 
-//: STRONG outranks the shared-domain-capped class, which outranks
-//: CONTACT_ONLY, which outranks a real NONE verdict, which outranks
-//: "never correlated at all" — mirrors
-//: services/xero/supplier_correlation.py::_rank's own class ordering
-//: (display-only here; this file makes no correlation DECISION itself).
+//: STRONG_PURCHASE_BILL outranks STRONG_BANK_SPEND (the SAME "more
+//: traditionally governed accounting artifact wins by convention" rule
+//: — CD-6 second-correlation-source WO), which outranks the shared-
+//: domain-capped class, which outranks CONTACT_ONLY, which outranks a
+//: real NONE verdict, which outranks "never correlated at all" —
+//: mirrors services/xero/supplier_correlation.py::_rank's own class
+//: ordering (display-only here; this file makes no correlation
+//: DECISION itself).
 const _CORRELATION_RANK = {
-  STRONG: 4,
+  STRONG_PURCHASE_BILL: 5,
+  STRONG_BANK_SPEND: 4,
   SHARED_DOMAIN_REQUIRES_MANUAL_REVIEW: 3,
   CONTACT_ONLY: 2,
   NONE: 1,
@@ -248,9 +252,11 @@ export const DomainReview = {
 
     statusEl.dataset.kind = "ok";
     statusEl.textContent =
-      `Correlation complete — ${result.contacts_read} contact(s) and ${result.purchase_invoices_examined} ` +
-      `invoice(s) examined across ${result.domain_review_items_updated} open domain(s): ` +
-      `${result.strong_correlation_count} strong, ${result.contact_only_correlation_count} contact-only, ` +
+      `Correlation complete — ${result.contacts_read} contact(s), ${result.purchase_invoices_examined} ` +
+      `invoice(s), and ${result.bank_transactions_examined} bank transaction(s) examined across ` +
+      `${result.domain_review_items_updated} open domain(s): ` +
+      `${result.strong_purchase_bill_count} strong (bill), ${result.strong_bank_spend_count} strong (bank spend), ` +
+      `${result.contact_only_correlation_count} contact-only, ` +
       `${result.shared_domain_count} shared-domain, ${result.no_correlation_count} no match.`;
     notify.ok("Xero correlation complete.");
 
@@ -522,8 +528,28 @@ export const DomainReview = {
     xeroSection.appendChild(el("div", {}, [xeroCorrelationClassChip(m.xero_correlation_class)]));
     if (m.xero_correlation_class) {
       xeroSection.appendChild(this._metaRow("Contact match", m.xero_contact_match ? "Yes" : "No"));
+      xeroSection.appendChild(this._metaRow("Evidence source", m.xero_evidence_source || "—"));
       xeroSection.appendChild(this._metaRow("Purchase invoices", m.xero_purchase_invoice_count));
       xeroSection.appendChild(this._metaRow("Most recent purchase", m.xero_most_recent_purchase_date ? fmtDateTime(m.xero_most_recent_purchase_date) : "—"));
+      // CD-6 second-correlation-source WO: real SPEND BankTransaction
+      // evidence, shown alongside the invoice fields above — always
+      // rendered when present, even when purchase-bill evidence won
+      // the single `xero_correlation_class` (see supplier_correlation
+      // .py's own documented tie-break: bank-spend facts are recorded
+      // regardless of which class wins).
+      if (m.xero_bank_spend_count) {
+        xeroSection.appendChild(this._metaRow("Bank-spend transactions", m.xero_bank_spend_count));
+        xeroSection.appendChild(this._metaRow("First bank spend", m.xero_bank_spend_first_date ? fmtDateTime(m.xero_bank_spend_first_date) : "—"));
+        xeroSection.appendChild(this._metaRow("Most recent bank spend", m.xero_bank_spend_last_date ? fmtDateTime(m.xero_bank_spend_last_date) : "—"));
+        xeroSection.appendChild(
+          this._metaRow(
+            "Bank-spend total",
+            m.xero_bank_spend_total_amount != null && m.xero_bank_spend_currency
+              ? `${m.xero_bank_spend_total_amount} ${m.xero_bank_spend_currency}`
+              : "Mixed currencies — see Xero directly"
+          )
+        );
+      }
       xeroSection.appendChild(this._metaRow("Supplier reference", m.xero_supplier_reference));
       xeroSection.appendChild(this._metaRow("Shared/public domain", m.xero_is_shared_public_domain ? "Yes" : "No"));
       xeroSection.appendChild(this._metaRow("Correlated at", fmtDateTime(m.xero_correlated_at)));

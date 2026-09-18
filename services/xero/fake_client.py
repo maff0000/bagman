@@ -15,10 +15,12 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Deque, Optional
 
 from services.xero.client import (
     XeroAccountsResult,
+    XeroBankTransactionsResult,
     XeroConnectionInfo,
     XeroConnectionsResult,
     XeroContactsResult,
@@ -106,9 +108,24 @@ class FakeXeroAccountingClient:
         self._queue: Deque[XeroAccountsResult] = deque()
         self._contacts_queue: Deque[XeroContactsResult] = deque()
         self._invoices_queue: Deque[XeroInvoicesResult] = deque()
+        #: A `Deque[XeroBankTransactionsResult]` — see
+        #: `queue_bank_transactions_result`'s own docstring for why a
+        #: caller wanting to simulate several real HTTP pages worth of
+        #: rows (e.g. proving a duplicate `BankTransactionID` spanning
+        #: two "pages" does not inflate a downstream count) queues them
+        #: pre-merged into ONE `XeroBankTransactionsResult` rather than
+        #: needing this fake to reimplement real pagination — the fake
+        #: substitutes for ONE `list_bank_transactions()` call, exactly
+        #: like every other `Fake*` method here; the real, network-
+        #: speaking pagination/dedup loop lives ONLY in
+        #: `services.xero.client.XeroAccountingClient.list_bank_transactions`
+        #: itself and is proven there (`tests/integration/test_xero_client.py`),
+        #: never reimplemented here.
+        self._bank_transactions_queue: Deque[XeroBankTransactionsResult] = deque()
         self.calls: list[tuple[str, str]] = []  # (tenant_id, access_token)
         self.contact_calls: list[tuple[str, str]] = []
         self.invoice_calls: list[tuple[str, str]] = []
+        self.bank_transaction_calls: list[tuple[str, str]] = []
 
     def queue_accounts_result(self, result: XeroAccountsResult) -> None:
         self._queue.append(result)
@@ -118,6 +135,22 @@ class FakeXeroAccountingClient:
 
     def queue_invoices_result(self, result: XeroInvoicesResult) -> None:
         self._invoices_queue.append(result)
+
+    def queue_bank_transactions_result(self, result: XeroBankTransactionsResult) -> None:
+        """Script ONE `list_bank_transactions()` call's outcome — same
+        pop-one-per-call discipline as every other `queue_*` method on
+        this class. A caller that wants to prove dedup/aggregation
+        behaviour across what would, in production, have been several
+        real HTTP pages (see `services.xero.client.XeroAccountingClient
+        .list_bank_transactions`'s own real pagination) queues a SINGLE
+        `XeroBankTransactionsResult` whose own `bank_transactions` tuple
+        already contains the rows several real pages would have
+        produced (duplicates included, when that is exactly the point
+        of the test) — this fake never needs its own `page=`-aware
+        queuing, since it substitutes for the client method's already-
+        merged RETURN VALUE, not for the individual HTTP pages that
+        real method assembles it from."""
+        self._bank_transactions_queue.append(result)
 
     def list_accounts(self, *, tenant_id: str, access_token: str) -> XeroAccountsResult:
         self.calls.append((tenant_id, access_token))
@@ -136,6 +169,14 @@ class FakeXeroAccountingClient:
         if not self._invoices_queue:
             raise AssertionError("FakeXeroAccountingClient.list_purchase_invoices() called with nothing queued")
         return self._invoices_queue.popleft()
+
+    def list_bank_transactions(
+        self, *, tenant_id: str, access_token: str, since: datetime
+    ) -> XeroBankTransactionsResult:
+        self.bank_transaction_calls.append((tenant_id, access_token))
+        if not self._bank_transactions_queue:
+            raise AssertionError("FakeXeroAccountingClient.list_bank_transactions() called with nothing queued")
+        return self._bank_transactions_queue.popleft()
 
 
 def fake_token_bundle(*, access_token: str = "fake-access-token", expires_in_seconds: float = 1800.0) -> XeroTokenBundle:

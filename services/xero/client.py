@@ -34,6 +34,17 @@ extended beyond `GET /Accounts`)
   itself enforces "never treat a sales-side (``ACCREC``) customer
   invoice as purchase history" (see :meth:`XeroAccountingClient
   .list_purchase_invoices`'s own docstring).
+* Bank Transactions (``SPEND``-type only): ``GET
+  https://api.xero.com/api.xro/2.0/BankTransactions?where=Type%3D%3D%22SPEND%22%26%26Date%3E%3DDateTime(...)&page=N``
+  — CD-6 second-correlation-source addition (see
+  :meth:`XeroAccountingClient.list_bank_transactions`'s own docstring):
+  a bounded, deduplicated, real-paginated read of SPEND-type
+  BankTransactions, correlated by ``ContactID`` to the same sender
+  domains as the existing invoice-based path, for the real, live
+  finding that Infosecurs records purchase expenditure as direct
+  ``SPEND`` BankTransactions rather than ACCPAY bills (zero ACCPAY
+  invoices were returned by the first real correlation run against the
+  live Infosecurs Xero organisation).
 * Scopes: ``openid profile email offline_access accounting.settings.read``
   (PID §102.1 — confirmed current/non-deprecated for a read-only Chart-
   of-Accounts sync; see that section for the devblog citation).
@@ -41,22 +52,27 @@ extended beyond `GET /Accounts`)
 Scope extension (architect-authorized, bounded Xero-assisted supplier-
 domain correlation ahead of any bulk mailbox-domain approval)
 ------------------------------------------------------------------------
-:data:`OAUTH_SCOPES` gained two further READ-ONLY scopes,
-``accounting.contacts.read`` and ``accounting.invoices.read`` — the
-minimum necessary additional read scopes for
-:mod:`services.xero.supplier_correlation` to read Contacts/Invoices and
-correlate them against still-OPEN ``MAILBOX_DOMAIN_REVIEW`` Needs You
-items. No write-capable scope (no ``.write`` token of any kind) was
-added, and no broader accounting-transaction write authority was
-requested — this component remains READ/REFERENCE-ONLY (see this
-module's own docstring and ``services/xero/component.yaml``'s
-``prohibited: xero_write_endpoints``). Changing this constant only
-changes what scope string gets REQUESTED the next time an operator
-goes through the existing connect/reconnect OAuth flow (real,
-operator-driven, browser-based, explicitly deferred) — it does not
-retroactively grant anything against the currently-connected Infosecurs
-tenant (which today only actually holds ``accounting.settings.read``),
-and it never itself triggers or simulates any OAuth call.
+:data:`OAUTH_SCOPES` gained three further READ-ONLY scopes,
+``accounting.contacts.read``, ``accounting.invoices.read``, and
+``accounting.banktransactions.read`` — the minimum necessary additional
+read scopes for :mod:`services.xero.supplier_correlation` to read
+Contacts/Invoices/BankTransactions and correlate them against still-
+OPEN ``MAILBOX_DOMAIN_REVIEW`` Needs You items. No write-capable scope
+(no ``.write`` token of any kind) was added, and no broader accounting-
+transaction write authority was requested — this component remains
+READ/REFERENCE-ONLY (see this module's own docstring and
+``services/xero/component.yaml``'s ``prohibited: xero_write_endpoints``).
+Changing this constant only changes what scope string gets REQUESTED
+the next time an operator goes through the existing connect/reconnect
+OAuth flow (real, operator-driven, browser-based, explicitly deferred)
+— it does not retroactively grant anything against the currently-
+connected Infosecurs tenant (which today only actually holds
+``accounting.settings.read``), and it never itself triggers or
+simulates any OAuth call. Building ``list_bank_transactions`` and
+adding its scope here is explicitly CODE-ONLY (WO constraint) — no live
+OAuth scope expansion is requested, triggered, or simulated by this
+change; the real re-consent against the live Infosecurs tenant is a
+separate, later, human-driven action.
 
 No new persisted canonical domain model for Contacts/Invoices
 ------------------------------------------------------------------------
@@ -93,7 +109,7 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Mapping, Optional, Protocol
+from typing import Any, Callable, Mapping, Optional, Protocol
 
 from core.errors import ValidationError
 from services.xero.account import RawXeroAccount
@@ -104,6 +120,7 @@ CONNECTIONS_URL = "https://api.xero.com/connections"
 ACCOUNTS_URL = "https://api.xero.com/api.xro/2.0/Accounts"
 CONTACTS_URL = "https://api.xero.com/api.xro/2.0/Contacts"
 INVOICES_URL = "https://api.xero.com/api.xro/2.0/Invoices"
+BANK_TRANSACTIONS_URL = "https://api.xero.com/api.xro/2.0/BankTransactions"
 
 #: Xero's own server-side `where` filter, applied ONLY to
 #: `list_purchase_invoices` — restricts the returned set to bill-side
@@ -113,17 +130,36 @@ INVOICES_URL = "https://api.xero.com/api.xro/2.0/Invoices"
 #: query itself, not left for a later caller to remember).
 _ACCPAY_ONLY_QUERY = urllib.parse.urlencode({"where": 'Type=="ACCPAY"'})
 
+#: `list_bank_transactions`'s own bounded pagination/retry budget (see
+#: that method's own docstring's "Real pagination required" section).
+#: Hitting either bound is an honest `MALFORMED_RESPONSE`-class failure
+#: — never a silently truncated "complete" result. 50 pages at Xero's
+#: own real, fixed 100-row page size for this endpoint (not caller-
+#: configurable) is a genuinely generous ceiling for one entity's
+#: real ~10-month historical window, while still preventing any
+#: conceivable infinite-loop/retry-storm.
+_MAX_BANK_TRANSACTION_PAGES = 50
+_BANK_TRANSACTIONS_PAGE_SIZE = 100
+#: Same bounded-backoff budget/discipline as `services.xero.sync
+#: ._MAX_RATE_LIMIT_BACKOFF_SECONDS` / `services.mailbox.sweep
+#: ._MAX_RATE_LIMIT_BACKOFF_SECONDS` — this module's own two
+#: established precedents for "bound the backoff, retry exactly once,
+#: then an honest failure" — deliberately the SAME 30.0s ceiling, not a
+#: new value invented for this one method.
+_MAX_RATE_LIMIT_BACKOFF_SECONDS = 30.0
+
 #: PID §102.1 — the exact, confirmed-current scope set for this slice's
 #: read-only Chart-of-Accounts sync, EXTENDED (architect-authorized —
-#: see module docstring's "Scope extension" section) with two further
+#: see module docstring's "Scope extension" section) with three further
 #: READ-ONLY scopes for the bounded Xero-assisted supplier-domain
-#: correlation capability: `accounting.contacts.read` and
-#: `accounting.invoices.read`. No write-capable scope. `offline_access`
-#: is what makes a `refresh_token` exist at all (never re-prompting an
-#: operator for ordinary token refresh, architect spec §3).
+#: correlation capability: `accounting.contacts.read`,
+#: `accounting.invoices.read`, and `accounting.banktransactions.read`.
+#: No write-capable scope. `offline_access` is what makes a
+#: `refresh_token` exist at all (never re-prompting an operator for
+#: ordinary token refresh, architect spec §3).
 OAUTH_SCOPES = (
     "openid profile email offline_access accounting.settings.read "
-    "accounting.contacts.read accounting.invoices.read"
+    "accounting.contacts.read accounting.invoices.read accounting.banktransactions.read"
 )
 
 DEFAULT_TIMEOUT_SECONDS = 15.0
@@ -256,6 +292,64 @@ class XeroInvoicesResult:
     error_detail: Optional[str] = None
 
 
+@dataclass(frozen=True)
+class RawXeroBankTransaction:
+    """The plain, provider-shaped fields one `GET /BankTransactions` row
+    (server-side filtered to `Type=="SPEND"&&Date>=DateTime(...)`, then
+    defensively re-validated client-side — see
+    `_parse_raw_bank_transaction`'s own docstring for why this differs
+    from `RawXeroPurchaseInvoice`'s sibling RAISE-on-unexpected-type
+    choice) yields — transient, never persisted (see module docstring's
+    "No new persisted canonical domain model" section).
+
+    `transaction_type` is Xero's own `Type` (captured verbatim — always
+    `"SPEND"` by the time a row reaches this dataclass, since
+    `_parse_raw_bank_transaction` already discarded anything else; this
+    client layer never decides supplier-relevance weighting, exactly
+    like `RawXeroPurchaseInvoice.status`'s own existing doctrine).
+    `status` is Xero's own `Status` (`AUTHORISED`/`DELETED`/...,
+    captured verbatim — a `DELETED` transaction must NEVER count as
+    positive supplier evidence, per the architect's own explicit
+    instruction, but that weighting judgment belongs to
+    `services.xero.supplier_correlation` alone, not here). `total` is
+    Xero's own JSON-native numeric `Total` field, captured as a plain
+    `float` — this codebase has NO pre-existing amount-handling
+    convention anywhere (a real check: zero `Decimal` usage and zero
+    other amount-shaped fields exist in this repository today), so this
+    is genuinely the first; `float` was chosen over `Decimal` because
+    (a) there is nothing to match, and (b) every other Raw* field in
+    this module is already captured "as Xero's JSON returns it" with no
+    extra precision-conversion layer, and a `Decimal` would need one
+    more conversion step at every JSON boundary this value crosses
+    (this dataclass's own construction, and later
+    `NeedsYouItem.metadata`, which is a plain JSON-serialisable dict —
+    `Decimal` is not JSON-serialisable without a custom encoder this
+    codebase does not have). `is_reconciled` is Xero's own
+    `IsReconciled` boolean — the closest available "reconciliation
+    state" signal; Xero's public Accounting API exposes no richer
+    reconciliation-state breakdown than this one boolean at this
+    endpoint, so this is the honest ceiling of what is available here,
+    never invented beyond it."""
+
+    bank_transaction_id: str
+    transaction_type: str
+    status: Optional[str]
+    date: Optional[datetime]
+    contact_id: Optional[str]
+    reference: Optional[str]
+    total: Optional[float]
+    currency_code: Optional[str]
+    is_reconciled: bool
+
+
+@dataclass(frozen=True)
+class XeroBankTransactionsResult:
+    status: XeroOutcomeStatus
+    bank_transactions: tuple[RawXeroBankTransaction, ...] = ()
+    retry_after_seconds: Optional[float] = None
+    error_detail: Optional[str] = None
+
+
 class XeroOAuthClientProtocol(Protocol):
     def is_configured(self) -> bool: ...
 
@@ -274,6 +368,10 @@ class XeroAccountingClientProtocol(Protocol):
     def list_contacts(self, *, tenant_id: str, access_token: str) -> XeroContactsResult: ...
 
     def list_purchase_invoices(self, *, tenant_id: str, access_token: str) -> XeroInvoicesResult: ...
+
+    def list_bank_transactions(
+        self, *, tenant_id: str, access_token: str, since: datetime
+    ) -> XeroBankTransactionsResult: ...
 
 
 def _read_body(exc: urllib.error.HTTPError) -> str:
@@ -530,6 +628,84 @@ def _parse_raw_purchase_invoice(item: Mapping[str, Any]) -> RawXeroPurchaseInvoi
     )
 
 
+def _bank_transactions_spend_where_clause(since: datetime) -> str:
+    """The exact, documented Xero `where`-clause date-literal syntax —
+    `DateTime(yyyy,MM,dd)` — combined with an exact `Type=="SPEND"`
+    match (WO's own real, confirmed-documented Xero API quirk, not
+    invented). Server-side is trusted to narrow the result, but NEVER
+    blindly trusted alone — `_parse_raw_bank_transaction` re-validates
+    both conditions client-side on every row (see that function's own
+    docstring for why this differs from `_parse_raw_purchase_invoice`'s
+    own choice to RAISE on an unexpected type)."""
+    return urllib.parse.urlencode(
+        {"where": f'Type=="SPEND"&&Date>=DateTime({since.year},{since.month:02d},{since.day:02d})'}
+    )
+
+
+def _parse_raw_bank_transaction(item: Mapping[str, Any], *, since: datetime) -> Optional[RawXeroBankTransaction]:
+    """Parse one `/BankTransactions` row, defensively re-validating the
+    server-side `where=Type=="SPEND"&&Date>=DateTime(...)` filter's own
+    contract — returns `None` (silently DISCARDED, never raised) for a
+    row that fails either check, or whose `Date` could not be parsed at
+    all (never counted as satisfying `since` when the date itself could
+    not even be established — the safe direction for a FILTER, never
+    the safe direction for stored data; a row that DOES pass still has
+    its `date` field captured verbatim, naive-or-aware exactly as
+    parsed, unlike this transient comparison).
+
+    This is a DELIBERATELY different judgment call from
+    `_parse_raw_purchase_invoice`'s own choice to RAISE on an
+    unexpected `Type` (see that function's docstring). BankTransactions
+    realistically returns much higher volume with many more genuine
+    Xero `Type` variants (`SPEND`, `RECEIVE`, `SPEND-OVERPAYMENT`,
+    `SPEND-PREPAYMENT`, `SPEND-TRANSFER`, `RECEIVE-OVERPAYMENT`,
+    `RECEIVE-PREPAYMENT`, `RECEIVE-TRANSFER` are all real Xero values),
+    and is fetched over MANY real pages for a realistic ~10-month
+    window (unlike the single-page, low-volume
+    `/Invoices?where=Type=="ACCPAY"` call) — an all-or-nothing raise
+    over one stray row deep into a multi-page pull would throw away an
+    otherwise-good result over what is far more likely to be an
+    ordinary `where`-clause/pagination edge case than genuine
+    corruption. A `where` clause that only asks for exact
+    `Type=="SPEND"` may still legitimately need this defensive
+    narrowing rather than an all-or-nothing raise, given the
+    realistically higher chance of a partial/edge-case response over
+    many pages — so this method silently narrows instead, and documents
+    the choice here rather than leaving it an unexplained asymmetry
+    with its sibling."""
+    transaction_type = item.get("Type")
+    if transaction_type != "SPEND":
+        return None
+
+    raw_date = _parse_xero_wire_datetime(item.get("Date"))
+    if raw_date is None:
+        return None
+    # `since` is always canonical UTC-aware (every real caller derives
+    # it via `services.mailbox.bootstrap_policy
+    # .compute_entity_historical_bootstrap`); `raw_date` may legitimately
+    # be naive (the SAME pre-existing Xero wire-format quirk
+    # `_parse_xero_wire_datetime` already documents for invoice dates).
+    # Coerced to UTC ONLY for this transient comparison — never for the
+    # value actually stored on `RawXeroBankTransaction.date` below,
+    # which keeps `raw_date` exactly as parsed.
+    comparable_date = raw_date if raw_date.tzinfo is not None else raw_date.replace(tzinfo=timezone.utc)
+    if comparable_date < since:
+        return None
+
+    contact = item.get("Contact") or {}
+    return RawXeroBankTransaction(
+        bank_transaction_id=item["BankTransactionID"],
+        transaction_type=transaction_type,
+        status=item.get("Status"),
+        date=raw_date,
+        contact_id=contact.get("ContactID"),
+        reference=item.get("Reference"),
+        total=item.get("Total"),
+        currency_code=item.get("CurrencyCode"),
+        is_reconciled=bool(item.get("IsReconciled", False)),
+    )
+
+
 class XeroAccountingClient:
     """The real adapter for `GET /api.xro/2.0/Accounts` (PID §102.1)."""
 
@@ -690,3 +866,181 @@ class XeroAccountingClient:
                 error_detail=f"could not parse Xero /Invoices response shape: {exc}",
             )
         return XeroInvoicesResult(status=XeroOutcomeStatus.OK, invoices=invoices)
+
+    def _bank_transactions_page_request(
+        self, *, tenant_id: str, access_token: str, where_query: str, page: int
+    ) -> urllib.request.Request:
+        """The ONE place this method's GET request is built (called
+        once for the initial fetch of a page, once again for its single
+        bounded rate-limit retry — see :meth:`list_bank_transactions`)
+        — kept as a single source-level GET-request call site
+        deliberately, mirroring this class's existing GET-only
+        transport discipline."""
+        return urllib.request.Request(
+            f"{BANK_TRANSACTIONS_URL}?{where_query}&page={page}",
+            method="GET",
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "Xero-Tenant-Id": tenant_id,
+                "Accept": "application/json",
+            },
+        )
+
+    def list_bank_transactions(
+        self,
+        *,
+        tenant_id: str,
+        access_token: str,
+        since: datetime,
+        sleep_fn: Callable[[float], None] = time.sleep,
+    ) -> XeroBankTransactionsResult:
+        """`GET /BankTransactions?where=Type%3D%3D%22SPEND%22%26%26Date...&page=N`
+        — CD-6 second-correlation-source addition (see module
+        docstring's "Bank Transactions" endpoint entry and
+        `services/xero/supplier_correlation.py`'s own docstring for
+        why: the real, live Infosecurs Xero organisation returned zero
+        ACCPAY purchase invoices, so purchase expenditure there is
+        hypothesised to be recorded as direct `SPEND` BankTransactions
+        instead).
+
+        Unlike every other method on this class, this one REALLY
+        PAGINATES (a genuinely new capability — `list_accounts`/
+        `list_contacts`/`list_purchase_invoices` never need to, see
+        those methods' own single-page-is-enough shape): Xero's own
+        `/BankTransactions` endpoint returns at most
+        `_BANK_TRANSACTIONS_PAGE_SIZE` (100) rows per `page`, and a
+        realistic ~10-month window for a real operating company can
+        plausibly exceed that. Pages are fetched `page=1,2,3,...` until
+        Xero returns an empty `BankTransactions` array (Xero's own
+        documented stop condition), bounded by
+        `_MAX_BANK_TRANSACTION_PAGES` — hitting that bound returns an
+        honest `MALFORMED_RESPONSE` (never a silently truncated
+        "complete" result presented as if every row were seen).
+
+        Rate-limiting is handled per-page with the SAME bounded-
+        backoff-then-retry-exactly-once discipline this module already
+        establishes twice (`services.xero.sync`/`services.mailbox.sweep`
+        own `_MAX_RATE_LIMIT_BACKOFF_SECONDS`): a `429` on any one page
+        sleeps once (bounded) and retries that SAME page exactly once;
+        a `429` again aborts the WHOLE call as `RATE_LIMITED` — a
+        partial page haul is never silently presented as a complete
+        result.
+
+        Deduplication by `BankTransactionID` happens HERE, across every
+        page (and across a page's own bounded retry) — this client
+        method is responsible for it, not merely a caller three layers
+        up (see `RawXeroBankTransaction`'s own module-docstring
+        "Deduplication" note in the WO for the defense-in-depth
+        reasoning; `services.xero.supplier_correlation` also dedupes
+        independently as a second, defensive layer — see that module's
+        own docstring).
+
+        Every returned row already passed `_parse_raw_bank_transaction`'s
+        own defensive re-validation (`Type=="SPEND"` and `Date >= since`,
+        both re-checked client-side, never blindly trusted from the
+        server-side `where` filter alone — see that function's own
+        docstring for why this SILENTLY NARROWS rather than raising,
+        unlike `list_purchase_invoices`'s sibling choice).
+        """
+        if not tenant_id:
+            raise ValidationError(
+                "list_bank_transactions requires a real, server-resolved tenant_id — never call this "
+                "with an empty/browser-supplied value (architect spec §3)"
+            )
+
+        where_query = _bank_transactions_spend_where_clause(since)
+        collected: list[RawXeroBankTransaction] = []
+        seen_ids: set[str] = set()
+        page = 1
+
+        while True:
+            if page > _MAX_BANK_TRANSACTION_PAGES:
+                return XeroBankTransactionsResult(
+                    status=XeroOutcomeStatus.MALFORMED_RESPONSE,
+                    error_detail=(
+                        f"/BankTransactions exceeded the bounded page limit "
+                        f"({_MAX_BANK_TRANSACTION_PAGES} pages / "
+                        f"{_MAX_BANK_TRANSACTION_PAGES * _BANK_TRANSACTIONS_PAGE_SIZE} rows) without Xero "
+                        "ever returning an empty page — an honest failure, never a silently truncated "
+                        "'complete' result"
+                    ),
+                )
+
+            request = self._bank_transactions_page_request(
+                tenant_id=tenant_id, access_token=access_token, where_query=where_query, page=page
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=self._timeout_seconds) as response:
+                    raw = response.read()
+            except urllib.error.HTTPError as exc:
+                if exc.code in (401, 403):
+                    return XeroBankTransactionsResult(
+                        status=XeroOutcomeStatus.AUTH_ERROR, error_detail=f"HTTP {exc.code}: {_read_body(exc)}"
+                    )
+                if exc.code != 429:
+                    return XeroBankTransactionsResult(
+                        status=XeroOutcomeStatus.PROVIDER_ERROR, error_detail=f"HTTP {exc.code}: {_read_body(exc)}"
+                    )
+                # Bounded backoff, retry this SAME page exactly once
+                # (mirrors `services.xero.sync.run_sync`'s own
+                # identical discipline).
+                backoff = min(_retry_after_seconds(exc) or 5.0, _MAX_RATE_LIMIT_BACKOFF_SECONDS)
+                sleep_fn(backoff)
+                retry_request = self._bank_transactions_page_request(
+                    tenant_id=tenant_id, access_token=access_token, where_query=where_query, page=page
+                )
+                try:
+                    with urllib.request.urlopen(retry_request, timeout=self._timeout_seconds) as response:
+                        raw = response.read()
+                except urllib.error.HTTPError as retry_exc:
+                    if retry_exc.code in (401, 403):
+                        return XeroBankTransactionsResult(
+                            status=XeroOutcomeStatus.AUTH_ERROR,
+                            error_detail=f"HTTP {retry_exc.code}: {_read_body(retry_exc)}",
+                        )
+                    if retry_exc.code == 429:
+                        return XeroBankTransactionsResult(
+                            status=XeroOutcomeStatus.RATE_LIMITED,
+                            retry_after_seconds=_retry_after_seconds(retry_exc),
+                            error_detail=(
+                                f"rate limited on page {page} after one bounded retry: "
+                                f"HTTP 429: {_read_body(retry_exc)}"
+                            ),
+                        )
+                    return XeroBankTransactionsResult(
+                        status=XeroOutcomeStatus.PROVIDER_ERROR,
+                        error_detail=f"HTTP {retry_exc.code}: {_read_body(retry_exc)}",
+                    )
+                except Exception as retry_exc:  # noqa: BLE001
+                    is_timeout = isinstance(retry_exc, TimeoutError) or "timed out" in str(retry_exc).lower()
+                    status = XeroOutcomeStatus.TIMEOUT if is_timeout else XeroOutcomeStatus.TRANSPORT_ERROR
+                    return XeroBankTransactionsResult(status=status, error_detail=str(retry_exc)[:500])
+            except Exception as exc:  # noqa: BLE001
+                is_timeout = isinstance(exc, TimeoutError) or "timed out" in str(exc).lower()
+                status = XeroOutcomeStatus.TIMEOUT if is_timeout else XeroOutcomeStatus.TRANSPORT_ERROR
+                return XeroBankTransactionsResult(status=status, error_detail=str(exc)[:500])
+
+            try:
+                payload = json.loads(raw.decode("utf-8"))
+                page_rows = payload["BankTransactions"]
+            except (json.JSONDecodeError, KeyError, TypeError) as exc:
+                return XeroBankTransactionsResult(
+                    status=XeroOutcomeStatus.MALFORMED_RESPONSE,
+                    error_detail=f"could not parse Xero /BankTransactions response shape: {exc}",
+                )
+
+            if not page_rows:
+                break  # Xero's own documented stop condition: an empty page means "no more results".
+
+            for item in page_rows:
+                parsed = _parse_raw_bank_transaction(item, since=since)
+                if parsed is None:
+                    continue
+                if parsed.bank_transaction_id in seen_ids:
+                    continue  # defense-in-depth dedup (see method docstring)
+                seen_ids.add(parsed.bank_transaction_id)
+                collected.append(parsed)
+
+            page += 1
+
+        return XeroBankTransactionsResult(status=XeroOutcomeStatus.OK, bank_transactions=tuple(collected))

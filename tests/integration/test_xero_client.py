@@ -1,9 +1,10 @@
 """Tests for the REAL, network-speaking ``services.xero.client
-.XeroAccountingClient`` — specifically the two CD-6 supplier-domain-
-correlation additions, ``list_contacts``/``list_purchase_invoices``
-(bounded Xero-assisted correlation ahead of any bulk mailbox-domain
-approval; see ``services/xero/supplier_correlation.py``'s own module
-docstring for the feature this client work supports).
+.XeroAccountingClient`` — the CD-6 supplier-domain-correlation
+additions, ``list_contacts``/``list_purchase_invoices``/
+``list_bank_transactions`` (bounded Xero-assisted correlation ahead of
+any bulk mailbox-domain approval; see ``services/xero/supplier_correlation
+.py``'s own module docstring for the feature this client work
+supports).
 
 No real network I/O anywhere in this module (PID §61) — ``urllib
 .request.urlopen`` is monkeypatched to a deterministic fake per test,
@@ -28,13 +29,14 @@ from __future__ import annotations
 import io
 import json
 import urllib.error
-from datetime import datetime
+from datetime import datetime, timezone
 from email.message import Message
 
 import pytest
 
 from core.errors import ValidationError
 from services.xero.client import (
+    BANK_TRANSACTIONS_URL,
     CONTACTS_URL,
     INVOICES_URL,
     OAUTH_SCOPES,
@@ -87,6 +89,34 @@ def _patch_urlopen(monkeypatch, *, returns=None, raises=None):
         if raises is not None:
             raise raises
         return returns
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    return captured
+
+
+def _patch_urlopen_sequence(monkeypatch, *, responses):
+    """Like `_patch_urlopen`, but for `list_bank_transactions`'s own
+    real multi-page/bounded-retry shape: `responses` is an ordered list
+    where each entry is EITHER a `_FakeHTTPResponse` (returned) or an
+    `Exception` instance (raised) — one entry consumed per real
+    `urlopen()` call, in call order. Every `Request` object seen is
+    captured in order (`captured["requests"]`), so a test can assert on
+    each page's own `page=N`/`where=` query string. Calling `urlopen()`
+    more times than scripted raises `AssertionError` — an un-scripted
+    call is a test bug, never a silently fabricated response (same
+    discipline every `Fake*` substitute in this codebase already
+    documents)."""
+    captured: dict = {"requests": []}
+    queue = list(responses)
+
+    def fake_urlopen(request, timeout=None):  # noqa: ANN001 - test double
+        captured["requests"].append(request)
+        if not queue:
+            raise AssertionError("urlopen() called more times than this test scripted")
+        item = queue.pop(0)
+        if isinstance(item, BaseException):
+            raise item
+        return item
 
     monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
     return captured
@@ -305,14 +335,277 @@ def test_list_purchase_invoices_malformed_json_is_malformed_response(monkeypatch
 
 
 # ---------------------------------------------------------------------
+# list_bank_transactions — CD-6 second-correlation-source WO. The ONE
+# client method that really paginates/really retries — see
+# services/xero/client.py's own module docstring.
+# ---------------------------------------------------------------------
+
+_SINCE = datetime(2024, 11, 1, tzinfo=timezone.utc)
+
+
+def _bank_transaction_row(
+    *,
+    bank_transaction_id="bt-1",
+    transaction_type="SPEND",
+    status="AUTHORISED",
+    contact_id="c-1",
+    date="2026-01-15T00:00:00",
+    total=123.45,
+    currency_code="GBP",
+    is_reconciled=True,
+):
+    return {
+        "BankTransactionID": bank_transaction_id,
+        "Type": transaction_type,
+        "Status": status,
+        "Contact": {"ContactID": contact_id} if contact_id is not None else {},
+        "Date": date,
+        "Reference": "INV-REF-1",
+        "Total": total,
+        "CurrencyCode": currency_code,
+        "IsReconciled": is_reconciled,
+    }
+
+
+def test_list_bank_transactions_requires_a_real_tenant_id():
+    client = XeroAccountingClient()
+    with pytest.raises(ValidationError):
+        client.list_bank_transactions(tenant_id="", access_token="token", since=_SINCE)
+
+
+def test_list_bank_transactions_is_get_only_with_exact_spend_where_and_page(monkeypatch):
+    captured = _patch_urlopen_sequence(
+        monkeypatch,
+        responses=[
+            _ok({"BankTransactions": [_bank_transaction_row()]}),
+            _ok({"BankTransactions": []}),  # page 2 — empty, stops pagination
+        ],
+    )
+    client = XeroAccountingClient()
+    result = client.list_bank_transactions(tenant_id="tenant-1", access_token="access-1", since=_SINCE)
+
+    assert result.status == XeroOutcomeStatus.OK
+    assert len(captured["requests"]) == 2
+    first_request = captured["requests"][0]
+    assert first_request.get_method() == "GET"
+    assert first_request.full_url.startswith(BANK_TRANSACTIONS_URL)
+    assert "where=Type%3D%3D%22SPEND%22%26%26Date%3E%3DDateTime%282024%2C11%2C01%29" in first_request.full_url
+    assert "page=1" in first_request.full_url
+    assert first_request.headers["Xero-tenant-id"] == "tenant-1"
+    assert first_request.headers["Authorization"] == "Bearer access-1"
+    assert "page=2" in captured["requests"][1].full_url
+
+
+def test_list_bank_transactions_parses_a_realistic_response(monkeypatch):
+    _patch_urlopen_sequence(
+        monkeypatch,
+        responses=[
+            _ok({"BankTransactions": [_bank_transaction_row()]}),
+            _ok({"BankTransactions": []}),
+        ],
+    )
+    client = XeroAccountingClient()
+    result = client.list_bank_transactions(tenant_id="tenant-1", access_token="access-1", since=_SINCE)
+
+    assert result.status == XeroOutcomeStatus.OK
+    assert len(result.bank_transactions) == 1
+    row = result.bank_transactions[0]
+    assert row.bank_transaction_id == "bt-1"
+    assert row.transaction_type == "SPEND"
+    assert row.status == "AUTHORISED"
+    assert row.contact_id == "c-1"
+    assert row.reference == "INV-REF-1"
+    assert row.total == 123.45
+    assert row.currency_code == "GBP"
+    assert row.is_reconciled is True
+    assert row.date == datetime(2026, 1, 15, 0, 0, 0)
+
+
+def test_list_bank_transactions_paginates_across_multiple_real_pages(monkeypatch):
+    captured = _patch_urlopen_sequence(
+        monkeypatch,
+        responses=[
+            _ok({"BankTransactions": [_bank_transaction_row(bank_transaction_id="bt-1")]}),
+            _ok({"BankTransactions": [_bank_transaction_row(bank_transaction_id="bt-2")]}),
+            _ok({"BankTransactions": []}),  # Xero's own documented stop condition
+        ],
+    )
+    client = XeroAccountingClient()
+    result = client.list_bank_transactions(tenant_id="tenant-1", access_token="access-1", since=_SINCE)
+
+    assert result.status == XeroOutcomeStatus.OK
+    assert {row.bank_transaction_id for row in result.bank_transactions} == {"bt-1", "bt-2"}
+    assert len(captured["requests"]) == 3
+    assert [r for req in captured["requests"] for r in [req.full_url] if "page=1" in r]
+    assert "page=3" in captured["requests"][2].full_url
+
+
+def test_list_bank_transactions_deduplicates_by_bank_transaction_id_across_pages(monkeypatch):
+    """A `BankTransactionID` re-seen on a later page (e.g. a legitimate
+    re-fetch after a bounded retry) is never counted twice — the client
+    method itself is responsible for this (see module docstring's
+    "Deduplication" section)."""
+    _patch_urlopen_sequence(
+        monkeypatch,
+        responses=[
+            _ok({"BankTransactions": [_bank_transaction_row(bank_transaction_id="bt-dup")]}),
+            _ok({"BankTransactions": [_bank_transaction_row(bank_transaction_id="bt-dup")]}),
+            _ok({"BankTransactions": []}),
+        ],
+    )
+    client = XeroAccountingClient()
+    result = client.list_bank_transactions(tenant_id="tenant-1", access_token="access-1", since=_SINCE)
+
+    assert result.status == XeroOutcomeStatus.OK
+    assert len(result.bank_transactions) == 1
+
+
+def test_list_bank_transactions_defensively_discards_a_non_spend_row(monkeypatch):
+    """The WO's own explicit instruction: never blindly trust the
+    server-side `where=Type=="SPEND"` filter alone — a stray non-SPEND
+    row is silently discarded (NOT raised — the deliberately different
+    judgment call from `list_purchase_invoices`'s own sibling choice,
+    see `_parse_raw_bank_transaction`'s own docstring)."""
+    _patch_urlopen_sequence(
+        monkeypatch,
+        responses=[
+            _ok(
+                {
+                    "BankTransactions": [
+                        _bank_transaction_row(bank_transaction_id="bt-receive", transaction_type="RECEIVE"),
+                        _bank_transaction_row(bank_transaction_id="bt-spend", transaction_type="SPEND"),
+                    ]
+                }
+            ),
+            _ok({"BankTransactions": []}),
+        ],
+    )
+    client = XeroAccountingClient()
+    result = client.list_bank_transactions(tenant_id="tenant-1", access_token="access-1", since=_SINCE)
+
+    assert result.status == XeroOutcomeStatus.OK
+    assert [row.bank_transaction_id for row in result.bank_transactions] == ["bt-spend"]
+
+
+def test_list_bank_transactions_defensively_discards_a_row_before_since(monkeypatch):
+    _patch_urlopen_sequence(
+        monkeypatch,
+        responses=[
+            _ok(
+                {
+                    "BankTransactions": [
+                        _bank_transaction_row(bank_transaction_id="bt-too-old", date="2024-01-01T00:00:00"),
+                        _bank_transaction_row(bank_transaction_id="bt-in-window", date="2025-01-01T00:00:00"),
+                    ]
+                }
+            ),
+            _ok({"BankTransactions": []}),
+        ],
+    )
+    client = XeroAccountingClient()
+    result = client.list_bank_transactions(tenant_id="tenant-1", access_token="access-1", since=_SINCE)
+
+    assert result.status == XeroOutcomeStatus.OK
+    assert [row.bank_transaction_id for row in result.bank_transactions] == ["bt-in-window"]
+
+
+def test_list_bank_transactions_rate_limited_retries_the_same_page_exactly_once_then_succeeds(monkeypatch):
+    _patch_urlopen_sequence(
+        monkeypatch,
+        responses=[
+            _http_error(429, retry_after="7"),
+            _ok({"BankTransactions": [_bank_transaction_row()]}),
+            _ok({"BankTransactions": []}),
+        ],
+    )
+    slept = []
+    client = XeroAccountingClient()
+    result = client.list_bank_transactions(
+        tenant_id="tenant-1", access_token="access-1", since=_SINCE, sleep_fn=slept.append
+    )
+
+    assert result.status == XeroOutcomeStatus.OK
+    assert len(result.bank_transactions) == 1
+    assert slept == [7.0]  # bounded backoff honoured Retry-After, exactly one sleep
+
+
+def test_list_bank_transactions_rate_limited_after_one_retry_is_an_honest_failure(monkeypatch):
+    _patch_urlopen_sequence(
+        monkeypatch,
+        responses=[
+            _http_error(429, retry_after="3"),
+            _http_error(429, retry_after="3"),
+        ],
+    )
+    slept = []
+    client = XeroAccountingClient()
+    result = client.list_bank_transactions(
+        tenant_id="tenant-1", access_token="access-1", since=_SINCE, sleep_fn=slept.append
+    )
+
+    assert result.status == XeroOutcomeStatus.RATE_LIMITED
+    assert len(slept) == 1  # exactly one bounded retry, never unbounded
+
+
+@pytest.mark.parametrize("code", [401, 403])
+def test_list_bank_transactions_auth_error_statuses(monkeypatch, code):
+    _patch_urlopen_sequence(monkeypatch, responses=[_http_error(code, body=b"nope")])
+    client = XeroAccountingClient()
+    result = client.list_bank_transactions(tenant_id="tenant-1", access_token="access-1", since=_SINCE)
+    assert result.status == XeroOutcomeStatus.AUTH_ERROR
+
+
+def test_list_bank_transactions_other_http_error_is_provider_error(monkeypatch):
+    _patch_urlopen_sequence(monkeypatch, responses=[_http_error(500, body=b"boom")])
+    client = XeroAccountingClient()
+    result = client.list_bank_transactions(tenant_id="tenant-1", access_token="access-1", since=_SINCE)
+    assert result.status == XeroOutcomeStatus.PROVIDER_ERROR
+
+
+def test_list_bank_transactions_malformed_json_is_malformed_response(monkeypatch):
+    _patch_urlopen_sequence(monkeypatch, responses=[_FakeHTTPResponse(b"not json at all")])
+    client = XeroAccountingClient()
+    result = client.list_bank_transactions(tenant_id="tenant-1", access_token="access-1", since=_SINCE)
+    assert result.status == XeroOutcomeStatus.MALFORMED_RESPONSE
+
+
+def test_list_bank_transactions_exceeding_the_bounded_page_limit_is_an_honest_failure_never_a_silent_truncation(
+    monkeypatch,
+):
+    """Hitting `_MAX_BANK_TRANSACTION_PAGES` without Xero ever returning
+    an empty page is a genuine `MALFORMED_RESPONSE`-class failure —
+    never a silently truncated 'complete' result (see the method's own
+    docstring). Monkeypatches the bound down to 3 pages so this test
+    does not need 50 real scripted responses."""
+    import services.xero.client as client_module
+
+    monkeypatch.setattr(client_module, "_MAX_BANK_TRANSACTION_PAGES", 3)
+    _patch_urlopen_sequence(
+        monkeypatch,
+        responses=[
+            _ok({"BankTransactions": [_bank_transaction_row(bank_transaction_id="bt-1")]}),
+            _ok({"BankTransactions": [_bank_transaction_row(bank_transaction_id="bt-2")]}),
+            _ok({"BankTransactions": [_bank_transaction_row(bank_transaction_id="bt-3")]}),
+            # A 4th page would exist in reality, but the bound is hit
+            # before it is ever fetched.
+        ],
+    )
+    client = XeroAccountingClient()
+    result = client.list_bank_transactions(tenant_id="tenant-1", access_token="access-1", since=_SINCE)
+
+    assert result.status == XeroOutcomeStatus.MALFORMED_RESPONSE
+    assert "bounded page limit" in result.error_detail
+
+
+# ---------------------------------------------------------------------
 # OAUTH_SCOPES — CD-6 supplier-domain-correlation scope extension
 # ---------------------------------------------------------------------
 
 
-def test_oauth_scopes_is_extended_with_exactly_the_two_new_read_only_scopes():
+def test_oauth_scopes_is_extended_with_exactly_the_three_new_read_only_scopes():
     assert OAUTH_SCOPES == (
         "openid profile email offline_access accounting.settings.read "
-        "accounting.contacts.read accounting.invoices.read"
+        "accounting.contacts.read accounting.invoices.read accounting.banktransactions.read"
     )
     # No write-capable scope token anywhere in the string.
     assert ".write" not in OAUTH_SCOPES
@@ -334,4 +627,10 @@ def test_the_only_post_call_site_in_client_py_is_the_oauth_token_exchange():
 
     source = inspect.getsource(client_module)
     assert source.count('method="POST"') == 1
-    assert source.count('method="GET"') == 4  # list_connections, list_accounts, list_contacts, list_purchase_invoices
+    # list_connections, list_accounts, list_contacts,
+    # list_purchase_invoices, and _bank_transactions_page_request (the
+    # ONE source-level GET-request builder list_bank_transactions calls
+    # — once for the initial page fetch, once again for its own single
+    # bounded rate-limit retry, both at runtime, but only ONE literal
+    # `method="GET"` call site in the source).
+    assert source.count('method="GET"') == 5
