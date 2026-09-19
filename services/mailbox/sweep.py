@@ -375,9 +375,12 @@ from services.mailbox.domain_rule import (
     MailboxDomainRule,
     MailboxDomainRuleRepository,
 )
+from services.mailbox.imap.authentication import assess_imap_authentication
 from services.mailbox.lock import MailboxSweepLock
 from services.mailbox.mailbox import (
     CONNECTION_STATE_CONNECTED,
+    PROVIDER_IMAP,
+    PROVIDER_MICROSOFT_GRAPH,
     MailboxSource,
     MailboxSourceRepository,
 )
@@ -521,6 +524,8 @@ def _routing_metadata(rule: MailboxDomainRule) -> dict:
 
 def evaluate_message_authentication(
     raw_headers: Optional[Sequence[Mapping[str, Optional[str]]]],
+    *,
+    provider_kind: str = PROVIDER_MICROSOFT_GRAPH,
 ) -> AuthenticationAssessment:
     """CD-6 GUI-operations-foundation follow-on WO — the bounded,
     deterministic (never AI/ML) per-message authentication check a
@@ -540,16 +545,30 @@ def evaluate_message_authentication(
     in a single header), and never distinguished a genuinely trusted
     Microsoft-stamped header from an attacker-forgeable one at all. This
     function now delegates entirely to the real provider-neutral +
-    Microsoft-selector pipeline
-    (:func:`services.mailbox.microsoft.authentication.assess_microsoft_authentication`),
-    driven by the message's own RAW headers rather than that flat dict —
-    see that function's own module docstring for the complete trust-
-    boundary reasoning (built against the real, live, redacted
-    diagnostic header shape recorded there).
+    provider-specific selector pipeline, driven by the message's own RAW
+    headers rather than that flat dict.
+
+    **Second-provider addition (IMAP delivery)** — ``provider_kind`` is
+    the ONE, minimal, additive provider-neutral abstraction point this
+    delivery added to this file: a plain dispatch on the mailbox's own
+    governed ``provider_kind`` to the correct provider-specific
+    selector. Every call site in this module passes
+    ``provider_kind=mailbox.provider_kind`` explicitly; the default
+    (``PROVIDER_MICROSOFT_GRAPH``) exists purely so this remains
+    backward-compatible with any caller that predates this parameter —
+    Microsoft's own behaviour is BYTE-IDENTICAL before and after this
+    change (the exact same
+    :func:`services.mailbox.microsoft.authentication.assess_microsoft_authentication`
+    call, for the exact same inputs). See
+    :func:`services.mailbox.imap.authentication.assess_imap_authentication`'s
+    own module docstring for the IMAP selector's own (deliberately
+    PROVISIONAL) trust-boundary reasoning.
 
     Never raises; never returns anything other than a bounded
     :class:`~services.mailbox.authentication_assessment.AuthenticationAssessment`.
     """
+    if provider_kind == PROVIDER_IMAP:
+        return assess_imap_authentication(raw_headers)
     return assess_microsoft_authentication(raw_headers)
 
 
@@ -1205,7 +1224,9 @@ def run_sweep(
                             sender_address=msg.sender_address,
                         )
 
-                        assessment = evaluate_message_authentication(msg.raw_headers)
+                        assessment = evaluate_message_authentication(
+                            msg.raw_headers, provider_kind=mailbox.provider_kind
+                        )
                         if assessment.verdict != AUTH_ASSESSMENT_PASS:
                             messages_new += 1
                             folder_entry["new_discovery_records"] += 1
@@ -1290,6 +1311,7 @@ def run_sweep(
                             actor_id=actor_id,
                             correlation_id=run.sweep_run_id,
                             entity_id=entity_id_for_evidence,
+                            external_reference_namespace=mailbox.provider_kind,
                         )
 
                         # CD-6 GUI-operations-foundation follow-on WO
@@ -1643,7 +1665,7 @@ def _reprocess_one_message(
             f"{headers_result.status.value} — {headers_result.error_detail or ''}"
         )
 
-    assessment = evaluate_message_authentication(headers_result.raw_headers)
+    assessment = evaluate_message_authentication(headers_result.raw_headers, provider_kind=mailbox.provider_kind)
     if assessment.verdict != AUTH_ASSESSMENT_PASS:
         message, _ = message_repository.record_observation(
             mailbox_id=mailbox.mailbox_id,
@@ -1717,6 +1739,7 @@ def _reprocess_one_message(
         actor_id=actor_id,
         correlation_id=correlation_id,
         entity_id=entity_id_for_evidence,
+        external_reference_namespace=mailbox.provider_kind,
     )
 
     if outcome.status == INGEST_STATUS_INGESTED:
@@ -2016,6 +2039,7 @@ def process_security_reviewed_message_once(
         actor_id=actor_id,
         correlation_id=correlation_id,
         entity_id=entity_id_for_evidence,
+        external_reference_namespace=mailbox.provider_kind,
     )
 
     if outcome.status == INGEST_STATUS_INGESTED:

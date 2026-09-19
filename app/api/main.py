@@ -99,6 +99,7 @@ from app.api.routers import (
     intake,
     internal,
     mailboxes,
+    mailboxes_imap,
     mailboxes_microsoft,
     needs_you,
     operator,
@@ -136,9 +137,14 @@ app.include_router(xero.router)
 #: docstring).
 app.include_router(mailboxes.router)
 #: CD-6 Slice 4 — the first real mailbox connection lifecycle + sweep
-#: engine HTTP surface (Microsoft Graph adapter only; NoustAI IMAP has
-#: no working connect action and never reaches this router).
+#: engine HTTP surface (Microsoft Graph adapter).
 app.include_router(mailboxes_microsoft.router)
+#: CD-6 GUI-operations-foundation follow-on WO — the SECOND real
+#: mailbox connection lifecycle + sweep engine HTTP surface (plain IMAP
+#: adapter, `matt@noust.ai`). Mirrors `mailboxes_microsoft.router`'s own
+#: shape exactly — see `app/api/routers/mailboxes_imap.py`'s own module
+#: docstring.
+app.include_router(mailboxes_imap.router)
 
 #: CD-4 WI-4 — the BAGMAN Documents GUI (PID §36-42), served as plain
 #: static assets. Mounted LAST and at "/" so it never shadows any

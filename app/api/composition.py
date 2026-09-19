@@ -72,6 +72,8 @@ from services.mailbox.domain_rule import MailboxDomainRuleRepository
 from services.mailbox.lock import MailboxSweepLock
 from services.mailbox.mailbox import MailboxSourceRepository
 from services.mailbox.message import MailboxMessageRepository
+from services.mailbox.imap.imap_adapter import ImapMailboxAdapter
+from services.mailbox.imap.imap_client import ImapClientProtocol
 from services.mailbox.microsoft.adapter import MicrosoftGraphMailboxAdapter
 from services.mailbox.microsoft.graph_client import MicrosoftGraphClientProtocol, MicrosoftOAuthClientProtocol
 from services.mailbox.microsoft.oauth_state import MailboxOAuthStateRepository as MailboxMicrosoftOAuthStateRepository
@@ -378,6 +380,23 @@ class RuntimeComposition:
     microsoft_graph_client: MicrosoftGraphClientProtocol
     microsoft_token_store: MicrosoftTokenStoreProtocol
     microsoft_mailbox_adapter: MicrosoftGraphMailboxAdapter
+    #: CD-6 GUI-operations-foundation follow-on WO (second mailbox
+    #: provider — plain IMAP for `matt@noust.ai`). Mirrors
+    #: `microsoft_graph_client`/`microsoft_mailbox_adapter` above exactly
+    #: — `FakeImapClient` in development/test (no real IMAP credentials
+    #: exist yet either — see `services.mailbox.imap.secrets`'s own
+    #: module docstring), the real network-speaking `ImapClient` in
+    #: production. `imap_mailbox_adapter` is the one seam the HTTP
+    #: router (`app/api/routers/mailboxes_imap.py`) and the SAME
+    #: provider-neutral `services.mailbox.sweep.run_sweep` engine both
+    #: call through — no separate sweep engine exists for IMAP. Reuses
+    #: EVERY other mailbox-domain repository above (`mailbox_message_repository`/
+    #: `mailbox_sweep_run_repository`/`mailbox_folder_cursor_repository`/
+    #: `mailbox_sweep_lock`/`mailbox_domain_rule_repository`) — those are
+    #: already provider-neutral and mailbox_id-scoped, never
+    #: provider-scoped.
+    imap_client: ImapClientProtocol
+    imap_mailbox_adapter: ImapMailboxAdapter
     #: CD-6 architect amendment (two-stage mail processing) — the
     #: mailbox-specific domain-policy gate registry. In-memory in
     #: development/test, a real `PostgresMailboxDomainRuleRepository`
@@ -396,6 +415,8 @@ def _build_development_or_test(runtime_environment: str) -> RuntimeComposition:
     from services.mailbox.lock import InMemoryMailboxSweepLock
     from services.mailbox.mailbox import InMemoryMailboxSourceRepository
     from services.mailbox.message import InMemoryMailboxMessageRepository
+    from services.mailbox.imap.fake_imap_client import FakeImapClient
+    from services.mailbox.imap.imap_adapter import ImapMailboxAdapter
     from services.mailbox.microsoft.adapter import MicrosoftGraphMailboxAdapter
     from services.mailbox.microsoft.fake_client import FakeMicrosoftGraphClient, FakeMicrosoftOAuthClient
     from services.mailbox.microsoft.oauth_state import InMemoryMailboxOAuthStateRepository
@@ -449,6 +470,15 @@ def _build_development_or_test(runtime_environment: str) -> RuntimeComposition:
         mailbox_repository=mailbox_source_repository,
     )
 
+    # CD-6 GUI-operations-foundation follow-on WO — second mailbox
+    # provider (plain IMAP, `matt@noust.ai`). No real IMAP credentials
+    # exist yet either — development/test composition ALWAYS uses the
+    # deterministic `FakeImapClient`, never the real network-speaking
+    # adapter (same doctrine as `microsoft_oauth_client`/
+    # `microsoft_graph_client` above).
+    imap_client = FakeImapClient()
+    imap_mailbox_adapter = ImapMailboxAdapter(client=imap_client, mailbox_repository=mailbox_source_repository)
+
     # CD-6 reliability delta: shares `api.audit_repository` so the
     # bounded stale-RUNNING recovery backstop's own audit events land in
     # the SAME in-memory audit trail every test/dev-mode caller already
@@ -498,6 +528,8 @@ def _build_development_or_test(runtime_environment: str) -> RuntimeComposition:
         microsoft_graph_client=microsoft_graph_client,
         microsoft_token_store=microsoft_token_store,
         microsoft_mailbox_adapter=microsoft_mailbox_adapter,
+        imap_client=imap_client,
+        imap_mailbox_adapter=imap_mailbox_adapter,
         mailbox_domain_rule_repository=mailbox_domain_rule_repository,
     )
 
@@ -536,6 +568,8 @@ def _build_production() -> RuntimeComposition:
         PostgresXeroSyncRunRepository,
     )
     from services.evidence.intake.scanner import ClamAVScanner
+    from services.mailbox.imap.imap_adapter import ImapMailboxAdapter
+    from services.mailbox.imap.imap_client import ImapClient
     from services.mailbox.microsoft.adapter import MicrosoftGraphMailboxAdapter
     from services.mailbox.microsoft.graph_client import MicrosoftGraphClient, MicrosoftOAuthClient
     from services.mailbox.microsoft.secrets import FileMicrosoftTokenStore
@@ -691,6 +725,19 @@ def _build_production() -> RuntimeComposition:
         mailbox_repository=mailbox_source_repository,
     )
 
+    # CD-6 GUI-operations-foundation follow-on WO — second mailbox
+    # provider (plain IMAP, `matt@noust.ai`). The real `ImapClient`
+    # defaults its own credentials_provider to
+    # `services.mailbox.imap.secrets.read_noustai_imap_credentials`
+    # (no explicit wiring needed here — mirrors `MicrosoftOAuthClient()`'s
+    # own identical "no eager I/O, reads real config at first real call"
+    # construction above). Neither credential file exists on production
+    # yet (the operator provisions them independently of this deploy) —
+    # `is_configured()` returns `False` until they do, exactly like
+    # Microsoft's own `is_configured()` today.
+    imap_client = ImapClient()
+    imap_mailbox_adapter = ImapMailboxAdapter(client=imap_client, mailbox_repository=mailbox_source_repository)
+
     return RuntimeComposition(
         runtime_environment=_PRODUCTION,
         api=api,
@@ -720,6 +767,8 @@ def _build_production() -> RuntimeComposition:
         microsoft_graph_client=microsoft_graph_client,
         microsoft_token_store=microsoft_token_store,
         microsoft_mailbox_adapter=microsoft_mailbox_adapter,
+        imap_client=imap_client,
+        imap_mailbox_adapter=imap_mailbox_adapter,
         mailbox_domain_rule_repository=mailbox_domain_rule_repository,
     )
 

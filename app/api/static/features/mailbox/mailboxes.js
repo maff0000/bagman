@@ -28,6 +28,11 @@ import {
   sweepMicrosoftMailboxNow,
   listMicrosoftMessages,
   listDomainReviewItems,
+  connectImapMailbox,
+  disconnectImapMailbox,
+  sweepImapMailboxNow,
+  listImapMessages,
+  listImapDomainReviewItems,
 } from "./mailbox-api.js";
 import { DomainReview } from "./domain-review.js";
 
@@ -68,14 +73,50 @@ function connectionStateLabel(connectionState) {
   return CONNECTION_STATE_LABEL[connectionState] || connectionState;
 }
 
-//: CD-6 Slice 4 — only MICROSOFT_GRAPH has a real adapter behind it.
-//: NoustAI IMAP (and any future Gmail row) stays exactly as Slice 3
-//: left it: honest NOT_CONFIGURED, no connect/sweep button of any kind
-//: — "no dead controls, no fake availability" (architect doctrine,
-//: mirrors features/xero/connections.js's own identical discipline).
+//: CD-6 GUI-operations-foundation follow-on WO — NoustAI IMAP now ALSO
+//: has a real adapter behind it (the second mailbox provider). Any
+//: future Gmail row stays exactly as Slice 3 left it: honest
+//: NOT_CONFIGURED, no connect/sweep button of any kind — "no dead
+//: controls, no fake availability" (architect doctrine, mirrors
+//: features/xero/connections.js's own identical discipline).
 function hasWorkingAdapter(providerKind) {
-  return providerKind === "MICROSOFT_GRAPH";
+  return providerKind === "MICROSOFT_GRAPH" || providerKind === "IMAP";
 }
+
+//: CD-6 GUI-operations-foundation follow-on WO — per-provider action
+//: dispatch table. Every entry mirrors the SAME shape so `_card()`/
+//: `_sweepSummary()`/`_connect()`/`_disconnect()`/`_sweep()` below never
+//: need a provider-specific branch of their own — only this table does.
+//: `connectIsRedirect: true` (Microsoft only) means the connect action
+//: navigates the browser away (OAuth consent); `false` (IMAP) means the
+//: response IS the updated mailbox and the GUI just re-renders in place.
+const _PROVIDER_ADAPTERS = {
+  MICROSOFT_GRAPH: {
+    label: "Microsoft 365",
+    connect: connectMicrosoftMailbox,
+    disconnect: disconnectMicrosoftMailbox,
+    sweep: sweepMicrosoftMailboxNow,
+    listMessages: listMicrosoftMessages,
+    listDomainReviewItems: listDomainReviewItems,
+    connectIsRedirect: true,
+    //: The domain-review batch-triage page (features/mailbox/domain-review.js)
+    //: is wired to the Microsoft endpoints only for this delivery — see
+    //: this WO's own final report. The IMAP router already exposes the
+    //: equivalent JSON endpoints (`imapDomainReview*` in mailbox-api.js)
+    //: for a future GUI wiring pass or direct API/operator use.
+    hasDomainReviewPage: true,
+  },
+  IMAP: {
+    label: "IMAP",
+    connect: connectImapMailbox,
+    disconnect: disconnectImapMailbox,
+    sweep: sweepImapMailboxNow,
+    listMessages: listImapMessages,
+    listDomainReviewItems: listImapDomainReviewItems,
+    connectIsRedirect: false,
+    hasDomainReviewPage: false,
+  },
+};
 
 export const Mailboxes = {
   _loaded: false,
@@ -183,14 +224,18 @@ export const Mailboxes = {
     }
 
     // CD-6 GUI-operations-foundation WO — the domain-review batch-triage
-    // page. Shown for ANY Microsoft-provider mailbox with at least one
-    // OPEN MAILBOX_DOMAIN_REVIEW item, regardless of the mailbox's own
+    // page. Shown for a mailbox WHOSE PROVIDER has that page wired (see
+    // `_PROVIDER_ADAPTERS.hasDomainReviewPage`'s own docstring — IMAP's
+    // equivalent JSON endpoints exist but this delivery does not yet
+    // wire a GUI page to them) with at least one OPEN
+    // MAILBOX_DOMAIN_REVIEW item, regardless of the mailbox's own
     // enabled/connected state (these items describe REAL history a
     // historical discovery sweep already produced — an operator should
     // still be able to see/triage them even while a mailbox is
     // temporarily disabled or disconnected; unlike "Sweep now"/"Connect",
     // this is not an action that requires a live connection to perform).
-    if (hasWorkingAdapter(mailbox.provider_kind)) {
+    const providerAdapter = _PROVIDER_ADAPTERS[mailbox.provider_kind];
+    if (providerAdapter && providerAdapter.hasDomainReviewPage) {
       const domainReviewCount = await this._domainReviewOpenCount(mailbox);
       if (domainReviewCount > 0) {
         const domainReviewBtn = el("button", {
@@ -203,25 +248,26 @@ export const Mailboxes = {
       }
     }
 
-    if (hasWorkingAdapter(mailbox.provider_kind) && mailbox.status === "ACTIVE") {
+    if (providerAdapter && mailbox.status === "ACTIVE") {
       // "No dead controls, no fake availability" — Sweep now is ONLY
       // ever rendered when genuinely CONNECTED (architect doctrine,
       // mirrors features/xero/connections.js's Sync-now button exactly).
       const canConnect = mailbox.connection_state !== "CONNECTED";
-      const connectLabel = mailbox.connection_state === "AUTH_REQUIRED" || mailbox.connection_state === "ERROR"
-        ? "Reconnect Microsoft 365"
-        : "Connect Microsoft 365";
+      const connectVerb = mailbox.connection_state === "AUTH_REQUIRED" || mailbox.connection_state === "ERROR"
+        ? "Reconnect"
+        : "Connect";
+      const connectLabel = `${connectVerb} ${providerAdapter.label}`;
       if (canConnect) {
         const connectBtn = el("button", { class: "btn btn--primary btn--sm", text: connectLabel, attrs: { type: "button" } });
-        connectBtn.addEventListener("click", () => this._connectMicrosoft(mailbox));
+        connectBtn.addEventListener("click", () => this._connect(mailbox, providerAdapter));
         actions.appendChild(connectBtn);
       } else {
         const sweepBtn = el("button", { class: "btn btn--primary btn--sm", text: "Sweep now", attrs: { type: "button" } });
-        sweepBtn.addEventListener("click", () => this._sweepMicrosoft(mailbox));
+        sweepBtn.addEventListener("click", () => this._sweep(mailbox, providerAdapter));
         actions.appendChild(sweepBtn);
 
         const disconnectBtn = el("button", { class: "btn btn--ghost btn--sm", text: "Disconnect", attrs: { type: "button" } });
-        disconnectBtn.addEventListener("click", () => this._disconnectMicrosoft(mailbox));
+        disconnectBtn.addEventListener("click", () => this._disconnect(mailbox, providerAdapter));
         actions.appendChild(disconnectBtn);
       }
     }
@@ -240,7 +286,9 @@ export const Mailboxes = {
    * (the operator can still reach the items via the generic Needs You
    * queue in the meantime). */
   async _domainReviewOpenCount(mailbox) {
-    const { ok, body } = await listDomainReviewItems(mailbox.mailbox_id);
+    const providerAdapter = _PROVIDER_ADAPTERS[mailbox.provider_kind];
+    if (!providerAdapter) return 0;
+    const { ok, body } = await providerAdapter.listDomainReviewItems(mailbox.mailbox_id);
     return ok && body ? body.count : 0;
   },
 
@@ -250,8 +298,9 @@ export const Mailboxes = {
    * account coding, What/Why — none of that exists here, not even a
    * stub). Only ever rendered for a mailbox with a real adapter. */
   async _sweepSummary(mailbox) {
-    if (mailbox.connection_state !== "CONNECTED") return el("div", { class: "small muted" });
-    const { ok, body } = await listMicrosoftMessages(mailbox.mailbox_id);
+    const providerAdapter = _PROVIDER_ADAPTERS[mailbox.provider_kind];
+    if (!providerAdapter || mailbox.connection_state !== "CONNECTED") return el("div", { class: "small muted" });
+    const { ok, body } = await providerAdapter.listMessages(mailbox.mailbox_id);
     if (!ok || !body || body.count === 0) {
       return el("div", { class: "small muted", text: "No messages swept yet." });
     }
@@ -269,31 +318,48 @@ export const Mailboxes = {
     return wrap;
   },
 
-  async _connectMicrosoft(mailbox) {
-    const { ok, status, body } = await connectMicrosoftMailbox(mailbox.mailbox_id, getActorId());
-    if (!ok || !body || !body.authorize_url) {
-      notify.error(`Could not start Microsoft connect: ${errorMessage(status, body)}`);
+  /** `providerAdapter.connectIsRedirect` (Microsoft only) means the
+   * response carries `authorize_url` and this navigates the browser
+   * away to the real consent screen. IMAP's own `connect` response IS
+   * the updated `MailboxSource` — no redirect, just a reload in place. */
+  async _connect(mailbox, providerAdapter) {
+    const { ok, status, body } = await providerAdapter.connect(mailbox.mailbox_id, getActorId());
+    if (!ok || !body) {
+      notify.error(`Could not connect: ${errorMessage(status, body)}`);
       return;
     }
-    // Mirrors features/xero/connections.js's own OAuth-begin pattern
-    // exactly — a full-page navigation to the real Microsoft consent
-    // screen; the browser never receives a token here.
-    window.location.href = body.authorize_url;
+    if (providerAdapter.connectIsRedirect) {
+      if (!body.authorize_url) {
+        notify.error(`Could not start ${providerAdapter.label} connect: ${errorMessage(status, body)}`);
+        return;
+      }
+      // Mirrors features/xero/connections.js's own OAuth-begin pattern
+      // exactly — a full-page navigation to the real consent screen;
+      // the browser never receives a token here.
+      window.location.href = body.authorize_url;
+      return;
+    }
+    if (body.connection_state === "CONNECTED") {
+      notify.ok(`Connected ${mailbox.display_name} (${providerAdapter.label}).`);
+    } else {
+      notify.error(`Connect did not succeed — mailbox is now ${body.connection_state}.`);
+    }
+    this.load();
   },
 
-  async _disconnectMicrosoft(mailbox) {
-    const { ok, status, body } = await disconnectMicrosoftMailbox(mailbox.mailbox_id, getActorId());
+  async _disconnect(mailbox, providerAdapter) {
+    const { ok, status, body } = await providerAdapter.disconnect(mailbox.mailbox_id, getActorId());
     if (!ok) {
       notify.error(`Could not disconnect: ${errorMessage(status, body)}`);
       return;
     }
-    notify.ok(`Disconnected ${mailbox.display_name} from Microsoft 365.`);
+    notify.ok(`Disconnected ${mailbox.display_name} from ${providerAdapter.label}.`);
     this.load();
   },
 
-  async _sweepMicrosoft(mailbox) {
+  async _sweep(mailbox, providerAdapter) {
     notify.ok("Sweep started…");
-    const { ok, status, body } = await sweepMicrosoftMailboxNow(mailbox.mailbox_id, getActorId());
+    const { ok, status, body } = await providerAdapter.sweep(mailbox.mailbox_id, getActorId());
     if (!ok || !body) {
       notify.error(`Sweep request failed: ${errorMessage(status, body)}`);
       return;

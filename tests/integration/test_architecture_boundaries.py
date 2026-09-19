@@ -523,6 +523,23 @@ def test_internal_router_direct_upload_bypass_is_genuinely_gone():
 # .py file, not just core/services — a stray import anywhere would
 # still represent exactly the "no mailbox integration" invariant being
 # broken).
+#
+# CD-6 GUI-operations-foundation follow-on WO update (second mailbox
+# provider — plain IMAP for `matt@noust.ai`): this WO's own explicit
+# mandate is to build the real, network-speaking IMAP adapter using
+# stdlib `imaplib` (no third-party IMAP library is available/needed —
+# see `services/mailbox/imap/imap_client.py`'s own module docstring).
+# `imaplib` is therefore REMOVED from the fully-forbidden root set and
+# instead governed by :data:`_IMAPLIB_SANCTIONED_PATH_PREFIX` below —
+# the ONE sanctioned location it may be imported from; a stray
+# `imaplib` import anywhere ELSE in the repository remains a violation.
+# Every OTHER provider SDK (`msal`/`googleapiclient`/
+# `google_auth_oauthlib`/`imapclient`/`exchangelib`/`O365`) remains
+# fully forbidden repo-wide — Microsoft Graph's own real adapter
+# (`services/mailbox/microsoft/graph_client.py`) deliberately uses
+# stdlib `urllib` only, precisely so this invariant never needed
+# loosening for that provider; this is documented, minimal, additive
+# scope-narrowing for IMAP alone, never a general relaxation.
 # ---------------------------------------------------------------------
 
 _FORBIDDEN_MAILBOX_AND_PROVIDER_IMPORT_ROOTS = {
@@ -530,17 +547,24 @@ _FORBIDDEN_MAILBOX_AND_PROVIDER_IMPORT_ROOTS = {
     "googleapiclient",
     "google_auth_oauthlib",
     "imapclient",
-    "imaplib",
     "exchangelib",
     "O365",
 }
 
+#: The ONE sanctioned location `imaplib` may be imported from — see the
+#: comment block above. A POSIX-style relative path prefix (matched
+#: against the file's own repo-relative path).
+_IMAPLIB_SANCTIONED_PATH_PREFIX = "services/mailbox/imap/"
+
 
 def test_no_forbidden_mailbox_or_provider_sdk_imported_anywhere_in_the_repo():
-    """PID §67/§69: no Microsoft Graph/MSAL, Gmail/Google API client
-    library, or ``imapclient``/``imaplib``-based mailbox polling code
-    exists anywhere in the repository yet — CD-5's job, not CD-4's.
-    Scans every ``.py`` file under the repo (excluding
+    """PID §67/§69, narrowed by the CD-6 GUI-operations-foundation
+    follow-on WO (see comment block above): no Microsoft Graph/MSAL,
+    Gmail/Google API client library, or ``imapclient``/``exchangelib``/
+    ``O365`` mailbox-polling code exists anywhere in the repository —
+    and plain stdlib ``imaplib`` exists ONLY under
+    ``services/mailbox/imap/``, this delivery's own sanctioned real IMAP
+    adapter. Scans every ``.py`` file under the repo (excluding
     third-party-managed directories), via real ``ast`` import parsing,
     not a text grep."""
     violations = []
@@ -548,13 +572,18 @@ def test_no_forbidden_mailbox_or_provider_sdk_imported_anywhere_in_the_repo():
     for path in _py_files(*search_roots):
         rel = path.relative_to(REPO_ROOT).as_posix()
         for imp in _imports_of(path):
+            if imp.root == "imaplib":
+                if not rel.startswith(_IMAPLIB_SANCTIONED_PATH_PREFIX):
+                    violations.append(f"{rel}:{imp.lineno} imports {imp.full!r} (outside the sanctioned IMAP adapter package)")
+                continue
             if imp.root in _FORBIDDEN_MAILBOX_AND_PROVIDER_IMPORT_ROOTS:
                 violations.append(f"{rel}:{imp.lineno} imports {imp.full!r}")
 
     assert not violations, (
         "no Microsoft Graph/MSAL, Gmail/Google API client library, or "
-        "imapclient/imaplib mailbox-polling import may exist yet (PID §67/§69) "
-        "— CD-5's job, not CD-4's. Violations:\n" + "\n".join(violations)
+        "imapclient/exchangelib/O365 mailbox-polling import may exist anywhere, and "
+        "imaplib may only be imported from services/mailbox/imap/ (PID §67/§69, narrowed "
+        "by the CD-6 GUI-operations-foundation follow-on WO). Violations:\n" + "\n".join(violations)
     )
 
 

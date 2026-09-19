@@ -56,6 +56,26 @@ export const MAILBOX_API = {
   //: `app/api/routers/mailboxes.py::upsert_mailbox_policy_rule`'s own
   //: docstring for the full behaviour.
   policyRules: (mailboxId) => `/internal/mailboxes/${encodeURIComponent(mailboxId)}/policy-rules`,
+  //: CD-6 GUI-operations-foundation follow-on WO — the SECOND real
+  //: mailbox connection lifecycle + sweep engine HTTP surface (plain
+  //: IMAP adapter, `matt@noust.ai`). Mirrors every `microsoft*` entry
+  //: above exactly — see `app/api/routers/mailboxes_imap.py`'s own
+  //: module docstring for the one structural difference (`imapConnect`
+  //: is a direct login attempt, never an OAuth redirect).
+  imapConnect: (mailboxId) => `/internal/mailboxes/${encodeURIComponent(mailboxId)}/imap/connect`,
+  imapDisconnect: (mailboxId) => `/internal/mailboxes/${encodeURIComponent(mailboxId)}/imap/disconnect`,
+  imapSweep: (mailboxId) => `/internal/mailboxes/${encodeURIComponent(mailboxId)}/imap/sweep`,
+  imapSweeps: (mailboxId) => `/internal/mailboxes/${encodeURIComponent(mailboxId)}/imap/sweeps`,
+  imapMessages: (mailboxId) => `/internal/mailboxes/${encodeURIComponent(mailboxId)}/imap/messages`,
+  imapDomainRules: (mailboxId) => `/internal/mailboxes/${encodeURIComponent(mailboxId)}/imap/domain-rules`,
+  imapDomainReview: (mailboxId) => `/internal/mailboxes/${encodeURIComponent(mailboxId)}/imap/domain-review`,
+  imapDomainReviewResolveOne: (mailboxId, itemId) =>
+    `/internal/mailboxes/${encodeURIComponent(mailboxId)}/imap/domain-review/${encodeURIComponent(itemId)}/resolve`,
+  imapDomainReviewBatchResolve: (mailboxId) =>
+    `/internal/mailboxes/${encodeURIComponent(mailboxId)}/imap/domain-review/batch-resolve`,
+  imapSecurityReview: (mailboxId) => `/internal/mailboxes/${encodeURIComponent(mailboxId)}/imap/security-review`,
+  imapSecurityReviewResolveOne: (mailboxId, itemId) =>
+    `/internal/mailboxes/${encodeURIComponent(mailboxId)}/imap/security-review/${encodeURIComponent(itemId)}/resolve`,
 };
 
 export function listMailboxes() {
@@ -264,6 +284,42 @@ export function upsertMailboxPolicyRule(
     processor_hint: processorHint || null,
     reason,
   });
+}
+
+//: CD-6 GUI-operations-foundation follow-on WO — plain IMAP
+//: (`matt@noust.ai`) connection lifecycle + sweep. `connectImapMailbox`
+//: is the ONE structural difference from its Microsoft counterpart —
+//: no `authorize_url`/redirect; the response IS the updated
+//: `MailboxSource` (see `app/api/routers/mailboxes_imap.py::connect_imap`'s
+//: own docstring: "connect" here means "attempt a real login now").
+
+export function connectImapMailbox(mailboxId, actorId) {
+  return apiPost(MAILBOX_API.imapConnect(mailboxId), { actor_type: "USER", actor_id: actorId });
+}
+
+export function disconnectImapMailbox(mailboxId, actorId) {
+  return apiPost(MAILBOX_API.imapDisconnect(mailboxId), { actor_type: "USER", actor_id: actorId });
+}
+
+export function sweepImapMailboxNow(mailboxId, actorId) {
+  return apiPost(MAILBOX_API.imapSweep(mailboxId), { actor_type: "USER", actor_id: actorId });
+}
+
+export function listImapSweeps(mailboxId) {
+  return apiGet(MAILBOX_API.imapSweeps(mailboxId));
+}
+
+export function listImapMessages(mailboxId) {
+  return apiGet(MAILBOX_API.imapMessages(mailboxId));
+}
+
+export function listImapDomainReviewItems(mailboxId, status) {
+  const suffix = status ? `?status=${encodeURIComponent(status)}` : "";
+  return apiGet(`${MAILBOX_API.imapDomainReview(mailboxId)}${suffix}`);
+}
+
+export function listImapDomainRules(mailboxId) {
+  return apiGet(MAILBOX_API.imapDomainRules(mailboxId));
 }
 
 /** `shared/api.js` exports `apiGet`/`apiPost` only (no `apiPut`) — this

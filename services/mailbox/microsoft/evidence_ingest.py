@@ -37,7 +37,7 @@ scanning discipline" architect instruction — read literally, not
 Idempotency — reusing `external_reference`, not reinventing it
 --------------------------------------------------------------------------
 ``register_evidence`` is called with
-``external_reference=("MICROSOFT_GRAPH", "email_message",
+``external_reference=(external_reference_namespace, "email_message",
 immutable_provider_message_id)`` scoped by this mailbox's own
 ``Source`` id — the SAME ``core.external_reference`` composite-tuple
 mechanism every other idempotent-replay-safe registration call in this
@@ -47,6 +47,22 @@ replayed delta page, a crash-before-cursor-advance retry, or the SAME
 immutable id seen in a different folder therefore resolves to the
 SAME ``EvidenceItem`` automatically, at the persistence layer, rather
 than this module needing its own separate duplicate-check.
+
+``external_reference_namespace`` (CD-6 GUI-operations-foundation
+follow-on WO — second, IMAP, mailbox provider) defaults to
+``"MICROSOFT_GRAPH"`` — every existing call site in
+``services/mailbox/sweep.py`` now passes it explicitly as
+``mailbox.provider_kind`` (which equals the literal string
+``"MICROSOFT_GRAPH"`` for a Microsoft mailbox — see
+``services.mailbox.mailbox.PROVIDER_MICROSOFT_GRAPH`` — and
+``"IMAP"`` for the new plain-IMAP provider), so this module remains
+genuinely provider-neutral despite living under the `microsoft/`
+package (see this module's own historical name — a documented
+judgment call: relocating it would be a larger, riskier diff than
+threading one new keyword argument through it; nothing in its own
+logic is Microsoft-specific). Microsoft's own stored
+``external_reference`` values are BYTE-IDENTICAL before and after this
+change.
 
 Never store raw MIME in Postgres
 ------------------------------------
@@ -129,6 +145,7 @@ def ingest_email_evidence(
     causation_id: Optional[str] = None,
     max_size_bytes: int = DEFAULT_MAX_MESSAGE_SIZE_BYTES,
     entity_id: Optional[str] = None,
+    external_reference_namespace: str = "MICROSOFT_GRAPH",
 ) -> EmailIngestOutcome:
     """Ingest one email's raw MIME bytes as canonical evidence.
 
@@ -200,7 +217,7 @@ def ingest_email_evidence(
                     "sender_address": sender_address,
                     "subject": subject,
                 },
-                external_reference=("MICROSOFT_GRAPH", "email_message", immutable_provider_message_id),
+                external_reference=(external_reference_namespace, "email_message", immutable_provider_message_id),
                 correlation_id=correlation_id,
                 causation_id=causation_id,
             )
