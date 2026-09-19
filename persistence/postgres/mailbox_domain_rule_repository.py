@@ -232,6 +232,36 @@ class PostgresMailboxDomainRuleRepository(MailboxDomainRuleRepository):
         except SQLAlchemyError as exc:
             raise PersistenceError(f"could not look up MailboxDomainRule: {exc}") from exc
 
+    def find_exact(
+        self, *, mailbox_id: str, sender_domain: str, match_mode: str, sender_address: Optional[str] = None
+    ) -> Optional[MailboxDomainRule]:
+        if match_mode == MATCH_MODE_EXACT_ADDRESS and not sender_address:
+            raise ValidationError(f"sender_address is required when match_mode is '{MATCH_MODE_EXACT_ADDRESS}'")
+        try:
+            with session_scope(self._engine) as session:
+                if match_mode == MATCH_MODE_EXACT_ADDRESS:
+                    normalized_address = normalize_address(sender_address)
+                    row = (
+                        session.query(MailboxDomainRuleRow)
+                        .filter_by(
+                            mailbox_id=mailbox_id,
+                            sender_address=normalized_address,
+                            match_mode=MATCH_MODE_EXACT_ADDRESS,
+                        )
+                        .one_or_none()
+                    )
+                else:
+                    normalized_domain = normalize_domain(sender_domain)
+                    row = (
+                        session.query(MailboxDomainRuleRow)
+                        .filter_by(mailbox_id=mailbox_id, sender_domain=normalized_domain)
+                        .filter(MailboxDomainRuleRow.match_mode != MATCH_MODE_EXACT_ADDRESS)
+                        .one_or_none()
+                    )
+                return _row_to_domain(row) if row is not None else None
+        except SQLAlchemyError as exc:
+            raise PersistenceError(f"could not look up MailboxDomainRule at exact identity: {exc}") from exc
+
     def touch_last_seen(
         self, *, mailbox_id: str, sender_domain: str, seen_at, sender_address: Optional[str] = None
     ) -> MailboxDomainRule:

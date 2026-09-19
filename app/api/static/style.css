@@ -1258,6 +1258,15 @@ select {
 
 .domain-review__meta-row { padding: 2px 0; }
 
+/* CD-6 policy-rules-endpoint WO — the minimal per-address override row
+   (annotation + "Ignore this exact address" button) in the Details
+   drawer's own "Decide" section, shown once a specific observed address
+   is picked. Mirrors `.domain-review__batch-results`'s own small
+   top/bottom margin so it reads as its own distinct sub-block, not
+   crowded against the address `<select>` above it. */
+.domain-review__address-override { margin: var(--sp-3) 0; padding-top: var(--sp-2); border-top: 1px solid var(--line); }
+.domain-review__address-override-note { margin-bottom: var(--sp-2); }
+
 /* No extra narrow-viewport override needed here — `.doc-table`'s own
    base rule (min-width: 1040px, inside `.table-wrap`'s own
    `overflow-x: auto` container, both above) already gives this table

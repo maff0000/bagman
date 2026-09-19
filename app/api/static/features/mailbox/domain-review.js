@@ -47,6 +47,7 @@ import {
   resolveMailboxDomainReviewItem,
   resolveSecurityReviewItem,
   batchResolveMailboxDomainReview,
+  upsertMailboxPolicyRule,
 } from "./mailbox-api.js";
 
 //: CD-6 GUI-operations-foundation follow-on WO — the three real,
@@ -885,13 +886,81 @@ export const DomainReview = {
     section.appendChild(scopeRow);
     section.appendChild(addressRow);
 
+    // CD-6 policy-rules-endpoint WO — a minimal per-address override
+    // surface, scoped to exactly one capability per Matt's own explicit
+    // instruction: "For this specific proof, we only require: 'Ignore
+    // this exact address'". Shows the two effective layers (the
+    // domain's own default vs this one address's own override, when one
+    // already exists) and a single action button that creates a
+    // BLACKLIST EXACT_ADDRESS `MailboxDomainRule` directly via the new
+    // provider-neutral `POST .../policy-rules` endpoint — entirely
+    // independent of this Needs You item (never resolves/touches it).
+    const addressOverrideAnnotation = el("div", { class: "small muted domain-review__address-override-note" });
+    const ignoreAddressBtn = el("button", {
+      class: "btn btn--ghost btn--sm",
+      text: "Ignore this exact address",
+      attrs: { type: "button", disabled: "true" },
+    });
+    const addressOverrideStatusEl = el("div", { class: "upload-status", attrs: { "aria-live": "polite" } });
+    const addressOverrideRow = el("div", { class: "domain-review__address-override" }, [
+      addressOverrideAnnotation,
+      el("div", { class: "review-drawer__actions" }, [ignoreAddressBtn]),
+      addressOverrideStatusEl,
+    ]);
+    addressOverrideRow.hidden = true;
+    section.appendChild(addressOverrideRow);
+
     let addressesLoaded = false;
+    const refreshAddressOverrideUI = () => {
+      const address = addressSelect.value;
+      addressOverrideRow.hidden = !address;
+      if (!address) return;
+      const rule = this._addressRuleMap ? this._addressRuleMap.get(address.toLowerCase()) : undefined;
+      const domainRule = this._domainRuleForDetail;
+      addressOverrideAnnotation.textContent = rule
+        ? `This address already has its own override: ${_currentPolicyLabel(rule, entities)}` +
+          (domainRule ? ` (the domain's own default is ${_currentPolicyLabel(domainRule, entities)}).` : ".")
+        : `No address-specific override yet — this address currently follows the domain's own default: ` +
+          `${_currentPolicyLabel(domainRule, entities)}.`;
+      ignoreAddressBtn.disabled = !!(rule && rule.policy === "BLACKLIST");
+      ignoreAddressBtn.textContent = rule && rule.policy === "BLACKLIST" ? "Already ignored" : "Ignore this exact address";
+    };
+    addressSelect.addEventListener("change", refreshAddressOverrideUI);
+    ignoreAddressBtn.addEventListener("click", async () => {
+      const address = addressSelect.value;
+      if (!address) return;
+      ignoreAddressBtn.disabled = true;
+      addressOverrideStatusEl.dataset.kind = "progress";
+      addressOverrideStatusEl.textContent = "Saving…";
+      const { ok, status, body: result } = await upsertMailboxPolicyRule(mailbox.mailbox_id, {
+        matchMode: "EXACT_ADDRESS",
+        senderDomain: item.metadata.sender_domain,
+        senderAddress: address,
+        policy: "BLACKLIST",
+        reason: `Operator chose "Ignore this exact address" from the Domain Review detail view for ${address}.`,
+        actorId: getActorId(),
+      });
+      if (!ok || !result) {
+        addressOverrideStatusEl.dataset.kind = "bad";
+        addressOverrideStatusEl.textContent = `Could not save: ${errorMessage(status, result)}`;
+        ignoreAddressBtn.disabled = false;
+        return;
+      }
+      addressOverrideStatusEl.dataset.kind = "ok";
+      addressOverrideStatusEl.textContent = "Saved — this exact address will now be ignored.";
+      notify.ok(`BAGMAN will ignore ${address} specifically. The rest of the domain is unaffected.`);
+      if (this._addressRuleMap) this._addressRuleMap.set(address.toLowerCase(), result.mailbox_domain_rule);
+      refreshAddressOverrideUI();
+    });
+
     scopeSelect.addEventListener("change", async () => {
       const useAddress = scopeSelect.value === "EXACT_ADDRESS";
       addressRow.hidden = !useAddress;
+      addressOverrideRow.hidden = !useAddress || !addressSelect.value;
       if (useAddress && !addressesLoaded) {
         addressesLoaded = true;
         await this._populateObservedAddresses(addressSelect, mailbox, item.metadata.sender_domain);
+        refreshAddressOverrideUI();
       }
     });
 
@@ -967,9 +1036,33 @@ export const DomainReview = {
    * new backend endpoint (WO's own "check what's cheaply available
    * before adding a new endpoint" instruction). A message list capped
    * at 200 recent messages is a reasonable, bounded source for this —
-   * this is a convenience picker, not an exhaustive audit surface. */
+   * this is a convenience picker, not an exhaustive audit surface.
+   *
+   * CD-6 policy-rules-endpoint WO addendum — also fetches this
+   * mailbox's own `MailboxDomainRule` list alongside the messages (one
+   * extra, already-cheap GET) and splits it into `this._addressRuleMap`
+   * (lowercased sender_address -> its own EXACT_ADDRESS rule, when one
+   * exists) and `this._domainRuleForDetail` (the domain-level rule
+   * governing `senderDomain`, if any) — feeds the "Ignore this exact
+   * address" annotation/button above. A rules-fetch failure never blocks
+   * the address picker itself (falls back to "no known override"). */
   async _populateObservedAddresses(addressSelect, mailbox, senderDomain) {
-    const { ok, body } = await listMicrosoftMessages(mailbox.mailbox_id);
+    const [{ ok, body }, rulesResult] = await Promise.all([
+      listMicrosoftMessages(mailbox.mailbox_id),
+      listMicrosoftDomainRules(mailbox.mailbox_id),
+    ]);
+
+    const normalizedDomain = (senderDomain || "").toLowerCase();
+    const rules = rulesResult && rulesResult.ok && rulesResult.body ? rulesResult.body.items : [];
+    this._addressRuleMap = new Map(
+      rules
+        .filter((r) => r.match_mode === "EXACT_ADDRESS" && r.sender_address)
+        .map((r) => [r.sender_address.toLowerCase(), r])
+    );
+    this._domainRuleForDetail = rules.find(
+      (r) => r.match_mode !== "EXACT_ADDRESS" && (r.sender_domain || "").toLowerCase() === normalizedDomain
+    );
+
     clear(addressSelect);
     addressSelect.disabled = false;
     if (!ok || !body || !Array.isArray(body.items)) {
@@ -977,7 +1070,6 @@ export const DomainReview = {
       addressSelect.disabled = true;
       return;
     }
-    const normalizedDomain = (senderDomain || "").toLowerCase();
     const addresses = Array.from(
       new Set(
         body.items

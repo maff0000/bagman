@@ -170,9 +170,7 @@ from services.mailbox.domain_rule import (
     POLICY_GRAYLIST,
     POLICY_MUST_READ,
     SOURCE_OPERATOR,
-    domain_from_address,
-    normalize_address,
-    normalize_domain,
+    validate_and_normalize_sender_address,
 )
 from services.mailbox.lock import MailboxSweepLockError
 from services.mailbox.mailbox import (
@@ -859,60 +857,12 @@ class ResolveMailboxDomainReviewRequest(BaseModel):
     #: CD-6 GUI-operations-foundation follow-on WO (item A — the
     #: confirmed root defect fix) — required, and ONLY accepted, when
     #: `match_mode == MATCH_MODE_EXACT_ADDRESS`. See
-    #: `_validate_and_normalize_sender_address`'s own docstring below for
-    #: the full real-observation/domain-match validation this goes
-    #: through before a rule is ever created for it.
+    #: `services.mailbox.domain_rule.validate_and_normalize_sender_address`'s
+    #: own docstring for the full real-observation/domain-match
+    #: validation this goes through before a rule is ever created for it
+    #: (relocated there, out of this router, by the CD-6 policy-rules-
+    #: endpoint WO — see that function's own docstring for why).
     sender_address: Optional[str] = None
-
-
-def _validate_and_normalize_sender_address(
-    composition, *, mailbox_id: str, sender_domain: str, match_mode: str, sender_address: Optional[str]
-) -> Optional[str]:
-    """CD-6 GUI-operations-foundation follow-on WO (item A) — the real
-    validation an ``EXACT_ADDRESS`` resolve/batch-resolve request must
-    pass before ``upsert_rule`` is ever called (the architect's own
-    confirmed root defect: this endpoint used to reject
-    ``MATCH_MODE_EXACT_ADDRESS`` outright, since it was never imported
-    here at all):
-
-    * ``match_mode != MATCH_MODE_EXACT_ADDRESS`` -> ``sender_address``
-      must be absent/empty (a domain-level mode must never silently
-      accept a stray address).
-    * ``match_mode == MATCH_MODE_EXACT_ADDRESS`` -> ``sender_address``
-      is REQUIRED, non-empty, normalised, its own domain must equal this
-      domain-review item's own ``sender_domain`` (an operator must never
-      create a rule for an address whose domain doesn't even match the
-      item they're resolving), AND it must have been ACTUALLY OBSERVED
-      for this mailbox (``MailboxMessageRepository
-      .sender_address_observed``) — an operator must never be able to
-      pre-authorize an address BAGMAN has never actually seen mail from.
-
-    Returns the normalised address (``None`` for a domain-level rule).
-    """
-    if match_mode != MATCH_MODE_EXACT_ADDRESS:
-        if sender_address:
-            raise ValidationError(
-                f"sender_address must not be supplied when match_mode is '{match_mode}' — only "
-                f"'{MATCH_MODE_EXACT_ADDRESS}' rules are scoped to one specific address"
-            )
-        return None
-
-    if not sender_address:
-        raise ValidationError(f"sender_address is required when match_mode is '{MATCH_MODE_EXACT_ADDRESS}'")
-
-    normalized_address = normalize_address(sender_address)
-    address_domain = domain_from_address(normalized_address)
-    if address_domain != normalize_domain(sender_domain):
-        raise ValidationError(
-            f"sender_address '{sender_address}' does not belong to this domain-review item's own "
-            f"sender_domain '{sender_domain}' ('{address_domain}' != '{normalize_domain(sender_domain)}')"
-        )
-    if not composition.mailbox_message_repository.sender_address_observed(mailbox_id, normalized_address):
-        raise ValidationError(
-            f"sender_address '{normalized_address}' has never actually been observed for mailbox "
-            f"'{mailbox_id}' — refusing to pre-authorize an address BAGMAN has never seen mail from"
-        )
-    return normalized_address
 
 
 def _resolve_mailbox_domain_review_core(
@@ -970,8 +920,8 @@ def _resolve_mailbox_domain_review_core(
         )
 
     sender_domain = item.metadata.get("sender_domain")
-    normalized_sender_address = _validate_and_normalize_sender_address(
-        composition,
+    normalized_sender_address = validate_and_normalize_sender_address(
+        message_repository=composition.mailbox_message_repository,
         mailbox_id=mailbox_id,
         sender_domain=sender_domain,
         match_mode=payload.match_mode,

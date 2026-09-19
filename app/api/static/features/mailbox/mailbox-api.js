@@ -49,6 +49,13 @@ export const MAILBOX_API = {
   microsoftSecurityReview: (mailboxId) => `/internal/mailboxes/${encodeURIComponent(mailboxId)}/microsoft/security-review`,
   microsoftSecurityReviewResolveOne: (mailboxId, itemId) =>
     `/internal/mailboxes/${encodeURIComponent(mailboxId)}/microsoft/security-review/${encodeURIComponent(itemId)}/resolve`,
+  //: CD-6 policy-rules-endpoint WO — the provider-neutral surface (lives
+  //: under plain `/internal/mailboxes/*`, NOT `/microsoft/*`) for
+  //: creating/updating one `MailboxDomainRule` directly, by its own
+  //: exact identity, independent of any Needs You item. See
+  //: `app/api/routers/mailboxes.py::upsert_mailbox_policy_rule`'s own
+  //: docstring for the full behaviour.
+  policyRules: (mailboxId) => `/internal/mailboxes/${encodeURIComponent(mailboxId)}/policy-rules`,
 };
 
 export function listMailboxes() {
@@ -226,6 +233,36 @@ export function resolveSecurityReviewItem(mailboxId, itemId, { decision, actorId
     actor_type: "USER",
     actor_id: actorId,
     decision,
+  });
+}
+
+//: CD-6 policy-rules-endpoint WO.
+
+/** Create/update one `MailboxDomainRule` directly, independent of any
+ * Needs You item — the gap this closes: once a domain has already been
+ * learned (a resolved `MAILBOX_DOMAIN_REVIEW` item), there was
+ * previously no way to later add a more-specific address-level
+ * override underneath it. Never touches a Needs You item, never
+ * triggers historical back-processing (see the endpoint's own
+ * docstring). `reason` is required, free-text, operator rationale —
+ * goes only into the resulting audit event. Response carries
+ * `was_no_op: true` when this exact request changed nothing (a
+ * harmless re-submission — no misleading "changed" state to render). */
+export function upsertMailboxPolicyRule(
+  mailboxId,
+  { matchMode, senderDomain, senderAddress, policy, destinationMode, destinationEntityId, processorHint, reason, actorId }
+) {
+  return apiPost(MAILBOX_API.policyRules(mailboxId), {
+    actor_type: "USER",
+    actor_id: actorId,
+    match_mode: matchMode,
+    sender_domain: senderDomain,
+    sender_address: senderAddress || null,
+    policy,
+    destination_mode: destinationMode || null,
+    destination_entity_id: destinationEntityId || null,
+    processor_hint: processorHint || null,
+    reason,
   });
 }
 

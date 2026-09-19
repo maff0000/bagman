@@ -296,6 +296,73 @@ def domain_from_address(sender_address: str) -> str:
     return domain
 
 
+def validate_and_normalize_sender_address(
+    *,
+    message_repository,
+    mailbox_id: str,
+    sender_domain: str,
+    match_mode: str,
+    sender_address: Optional[str],
+) -> Optional[str]:
+    """The ONE shared implementation of the ``EXACT_ADDRESS`` validation
+    contract every caller that lets an operator create/update a
+    :class:`MailboxDomainRule` for one specific sender address must go
+    through (CD-6 GUI-operations-foundation follow-on WO item A;
+    relocated here — out of
+    ``app/api/routers/mailboxes_microsoft.py``, where it was originally
+    a private, router-local helper — by the CD-6 provider-neutral
+    policy-rules-endpoint WO, so ``app/api/routers/mailboxes.py``'s
+    ``POST /{mailbox_id}/policy-rules`` endpoint can reuse the EXACT
+    SAME check rather than forking a parallel implementation;
+    ``mailboxes_microsoft.py``'s own domain-review resolve/batch-resolve
+    flow now imports this same function too — no behaviour change
+    there, just the relocation):
+
+    * ``match_mode != MATCH_MODE_EXACT_ADDRESS`` -> ``sender_address``
+      must be absent/empty (a domain-level mode must never silently
+      accept a stray address).
+    * ``match_mode == MATCH_MODE_EXACT_ADDRESS`` -> ``sender_address``
+      is REQUIRED, non-empty, normalised, its own domain must equal
+      ``sender_domain`` (normalised), AND it must have been ACTUALLY
+      OBSERVED for this mailbox (``message_repository
+      .sender_address_observed(mailbox_id, normalized_address)``) — an
+      operator must never be able to pre-authorize an address BAGMAN has
+      never actually seen mail from.
+
+    ``message_repository`` is duck-typed deliberately (never a
+    ``services.mailbox.message.MailboxMessageRepository`` type import
+    here) — that module already imports FROM this one
+    (:func:`normalize_domain`), so importing its type back here would be
+    circular.
+
+    Returns the normalised address (``None`` for a domain-level rule).
+    """
+    if match_mode != MATCH_MODE_EXACT_ADDRESS:
+        if sender_address:
+            raise ValidationError(
+                f"sender_address must not be supplied when match_mode is '{match_mode}' — only "
+                f"'{MATCH_MODE_EXACT_ADDRESS}' rules are scoped to one specific address"
+            )
+        return None
+
+    if not sender_address:
+        raise ValidationError(f"sender_address is required when match_mode is '{MATCH_MODE_EXACT_ADDRESS}'")
+
+    normalized_address = normalize_address(sender_address)
+    address_domain = domain_from_address(normalized_address)
+    if address_domain != normalize_domain(sender_domain):
+        raise ValidationError(
+            f"sender_address '{sender_address}' does not belong to sender_domain "
+            f"'{sender_domain}' ('{address_domain}' != '{normalize_domain(sender_domain)}')"
+        )
+    if not message_repository.sender_address_observed(mailbox_id, normalized_address):
+        raise ValidationError(
+            f"sender_address '{normalized_address}' has never actually been observed for mailbox "
+            f"'{mailbox_id}' — refusing to pre-authorize an address BAGMAN has never seen mail from"
+        )
+    return normalized_address
+
+
 def validate_policy_fields_or_raise(
     *, policy: str, destination_entity_id: Optional[str], destination_mode: Optional[str]
 ) -> None:
@@ -442,6 +509,34 @@ class MailboxDomainRuleRepository(abc.ABC):
 
         Returns ``None`` — never ``NotFoundError`` — when no rule
         governs this sender yet (the Stage-B 'unknown domain' path)."""
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def find_exact(
+        self, *, mailbox_id: str, sender_domain: str, match_mode: str, sender_address: Optional[str] = None
+    ) -> Optional[MailboxDomainRule]:
+        """Look up the rule at this EXACT identity — never the
+        most-specific-wins resolution :meth:`find_for_sender` performs
+        (CD-6 policy-rules-endpoint WO). For ``match_mode`` ``EXACT``/
+        ``INCLUDE_SUBDOMAINS`` (the domain-level identity space),
+        resolves by ``(mailbox_id, sender_domain)`` among non-
+        ``EXACT_ADDRESS`` rows only. For ``match_mode ==
+        MATCH_MODE_EXACT_ADDRESS`` (a SEPARATE identity space),
+        resolves by ``(mailbox_id, sender_address)`` instead —
+        ``sender_address`` is then REQUIRED (raises ``ValidationError``
+        if omitted).
+
+        Returns ``None`` — never ``NotFoundError`` — when this specific
+        identity has never had a rule. This is the correct "previous
+        state" lookup for an operator-driven upsert at a specific
+        identity: a brand-new address-level rule being created
+        underneath an already-governed domain must get ``None`` here,
+        never the broader domain rule's own state (``find_for_sender``
+        would incorrectly return that broader rule via its own
+        most-specific-first resolution when no address-specific rule
+        exists yet — see
+        ``app/api/routers/mailboxes.py::upsert_mailbox_policy_rule`` for
+        the real caller this exists for)."""
         raise NotImplementedError
 
     @abc.abstractmethod
@@ -608,6 +703,19 @@ class InMemoryMailboxDomainRuleRepository(MailboxDomainRuleRepository):
             if normalized_domain == rule.sender_domain or normalized_domain.endswith(f".{rule.sender_domain}"):
                 return rule
         return None
+
+    def find_exact(
+        self, *, mailbox_id: str, sender_domain: str, match_mode: str, sender_address: Optional[str] = None
+    ) -> Optional[MailboxDomainRule]:
+        if match_mode == MATCH_MODE_EXACT_ADDRESS:
+            if not sender_address:
+                raise ValidationError(f"sender_address is required when match_mode is '{MATCH_MODE_EXACT_ADDRESS}'")
+            rule_id = self._id_by_address_key.get(
+                self._address_key(mailbox_id=mailbox_id, sender_address=sender_address)
+            )
+        else:
+            rule_id = self._id_by_domain_key.get(self._domain_key(mailbox_id=mailbox_id, sender_domain=sender_domain))
+        return self._by_id[rule_id] if rule_id is not None else None
 
     def touch_last_seen(
         self, *, mailbox_id: str, sender_domain: str, seen_at: datetime, sender_address: Optional[str] = None

@@ -20,6 +20,7 @@ from services.mailbox.domain_rule import (
     DESTINATION_MODE_FIXED,
     DESTINATION_MODE_REVIEW_REQUIRED,
     MATCH_MODE_EXACT,
+    MATCH_MODE_EXACT_ADDRESS,
     MATCH_MODE_INCLUDE_SUBDOMAINS,
     POLICY_MUST_READ,
     POLICY_BLACKLIST,
@@ -245,6 +246,84 @@ def test_touch_last_seen_for_an_ungoverned_domain_raises_not_found():
     mailbox_id = _mailbox_id()
     with pytest.raises(NotFoundError):
         repo.touch_last_seen(mailbox_id=mailbox_id, sender_domain="never-seen.example", seen_at=utc_now())
+
+
+# ---------------------------------------------------------------------
+# find_exact — CD-6 policy-rules-endpoint WO: the "previous state at
+# THIS identity" lookup, never find_for_sender's most-specific-wins
+# resolution.
+# ---------------------------------------------------------------------
+
+
+def test_find_exact_returns_none_for_a_never_governed_identity():
+    repo = PostgresMailboxDomainRuleRepository()
+    mailbox_id = _mailbox_id()
+    assert repo.find_exact(mailbox_id=mailbox_id, sender_domain="never-seen.example", match_mode=MATCH_MODE_EXACT) is None
+    assert (
+        repo.find_exact(
+            mailbox_id=mailbox_id, sender_domain="never-seen.example", match_mode=MATCH_MODE_EXACT_ADDRESS,
+            sender_address="nobody@never-seen.example",
+        )
+        is None
+    )
+
+
+def test_find_exact_returns_the_domain_level_rule_at_that_identity():
+    repo = PostgresMailboxDomainRuleRepository()
+    mailbox_id = _mailbox_id()
+    created = repo.upsert_rule(
+        mailbox_id=mailbox_id, sender_domain="vendor.com", match_mode=MATCH_MODE_EXACT, policy=POLICY_BLACKLIST,
+        destination_entity_id=None, destination_mode=None, source=SOURCE_OPERATOR,
+    )
+    found = repo.find_exact(mailbox_id=mailbox_id, sender_domain="vendor.com", match_mode=MATCH_MODE_EXACT)
+    assert found is not None
+    assert found.rule_id == created.rule_id
+
+
+def test_find_exact_address_level_is_a_separate_identity_space_from_domain_level():
+    """The core reason this method exists: a brand-new EXACT_ADDRESS
+    rule's own 'previous state' must be None even when a broader
+    domain-level rule already governs the same domain —
+    find_for_sender's most-specific-wins resolution would incorrectly
+    surface that broader rule instead."""
+    repo = PostgresMailboxDomainRuleRepository()
+    mailbox_id = _mailbox_id()
+    repo.upsert_rule(
+        mailbox_id=mailbox_id, sender_domain="send.xero.com", match_mode=MATCH_MODE_EXACT, policy=POLICY_MUST_READ,
+        destination_entity_id=None, destination_mode=DESTINATION_MODE_REVIEW_REQUIRED, source=SOURCE_OPERATOR,
+    )
+    # find_for_sender correctly falls back to the broader domain rule...
+    resolved = repo.find_for_sender(
+        mailbox_id=mailbox_id, sender_domain="send.xero.com", sender_address="noreply@send.xero.com"
+    )
+    assert resolved is not None
+    assert resolved.match_mode == MATCH_MODE_EXACT
+
+    # ...but find_exact at the EXACT_ADDRESS identity must see nothing yet.
+    exact = repo.find_exact(
+        mailbox_id=mailbox_id, sender_domain="send.xero.com", match_mode=MATCH_MODE_EXACT_ADDRESS,
+        sender_address="noreply@send.xero.com",
+    )
+    assert exact is None
+
+    created = repo.upsert_rule(
+        mailbox_id=mailbox_id, sender_domain="send.xero.com", sender_address="noreply@send.xero.com",
+        match_mode=MATCH_MODE_EXACT_ADDRESS, policy=POLICY_BLACKLIST, destination_entity_id=None,
+        destination_mode=None, source=SOURCE_OPERATOR,
+    )
+    exact_after = repo.find_exact(
+        mailbox_id=mailbox_id, sender_domain="send.xero.com", match_mode=MATCH_MODE_EXACT_ADDRESS,
+        sender_address="noreply@send.xero.com",
+    )
+    assert exact_after is not None
+    assert exact_after.rule_id == created.rule_id
+
+
+def test_find_exact_address_mode_requires_sender_address():
+    repo = PostgresMailboxDomainRuleRepository()
+    mailbox_id = _mailbox_id()
+    with pytest.raises(ValidationError):
+        repo.find_exact(mailbox_id=mailbox_id, sender_domain="vendor.com", match_mode=MATCH_MODE_EXACT_ADDRESS)
 
 
 def test_list_rules_scoped_to_one_mailbox():
