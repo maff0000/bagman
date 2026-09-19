@@ -64,7 +64,7 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import Response
 from pydantic import BaseModel
 
-from app.api.composition import get_composition
+from app.api.composition import ensure_seed_entities, get_composition
 from app.api.http_headers import safe_content_disposition_header
 
 router = APIRouter(prefix="/internal")
@@ -116,6 +116,69 @@ async def register_entity(payload: RegisterEntityRequest) -> dict:
     composition = get_composition()
     entity = composition.api.register_entity(**payload.model_dump())
     return entity.to_dict()
+
+
+def _xero_status_for(composition, entity_id: str) -> dict[str, Any]:
+    """Accounting-connection status for one entity (CD-6 Slice 2, PID
+    §98.4, architect spec §1) — a real ``LEFT JOIN``-style enrichment
+    over ``services.xero.connection.XeroConnectionRepository``, NEVER a
+    second/competing "is this company connected" source of truth (the
+    one real ``XeroConnection`` row per entity, or its absence, IS the
+    answer). An entity with no ``XeroConnection`` row at all (the
+    ordinary case for a brand-new/never-attempted company) renders
+    honestly as ``connected: false`` — never a fake/placeholder "fine"
+    state (architect spec §9's own doctrine, applied here to the
+    company selector itself, one layer up from the account dropdown it
+    already applies to).
+    """
+    connection = composition.xero_connection_repository.get_by_entity(entity_id)
+    if connection is None:
+        return {"connected": False, "status": None, "tenant_name": None, "last_successful_sync_at": None}
+    return {
+        "connected": connection.status == "CONNECTED",
+        "status": connection.status,
+        "tenant_name": connection.tenant_name,
+        "last_successful_sync_at": (
+            connection.last_successful_sync_at.isoformat() if connection.last_successful_sync_at else None
+        ),
+    }
+
+
+@router.get("/entities")
+async def list_entities() -> dict[str, Any]:
+    """List every canonical ``GovernedEntity`` (CD-6 Slice 1, PID
+    §98.3) — the GUI's Company dropdown resolves through THIS list's
+    real ``entity_id`` values, never a hardcoded label (see
+    ``app/api/composition.py``'s own "Stable canonical entity seed
+    lifecycle" section for the idempotent seed this call also
+    triggers, lazily, the first time it runs in this process). Small,
+    unbounded list deliberately (unlike ``GET /internal/intake``/
+    ``GET /internal/evidence``'s own paginated contract) — the set of
+    governed entities is operator-curated and expected to remain small
+    (PID §98.3 names exactly three today); a future delivery adds
+    pagination here if that assumption ever stops holding.
+
+    CD-6 Slice 2 (PID §98.4, architect spec §1) addition: each entity's
+    ``to_dict()`` is enriched with an ``xero_connection`` sub-object —
+    the real accounting-connection status the company selector needs,
+    resolved via a live per-entity lookup against
+    ``services.xero.connection.XeroConnectionRepository`` (see
+    :func:`_xero_status_for`). A purpose-built second endpoint was
+    considered and rejected: this list is already exactly "every
+    canonical company, for the selector", and Xero-connection status is
+    a property OF a company, not a separate resource — a second
+    endpoint would either duplicate this list's own entity iteration or
+    force the GUI into two round trips for one screen.
+    """
+    composition = get_composition()
+    ensure_seed_entities(composition)
+    entities = composition.api.entity_repository.list_entities()
+    items = []
+    for e in entities:
+        rendered = e.to_dict()
+        rendered["xero_connection"] = _xero_status_for(composition, e.entity_id)
+        items.append(rendered)
+    return {"items": items, "count": len(items)}
 
 
 @router.post("/sources", status_code=201)

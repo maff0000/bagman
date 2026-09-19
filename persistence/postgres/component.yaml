@@ -7,34 +7,38 @@
 # component.yaml validation/projection for it.
 
 id: BAGMAN.PERSISTENCE.POSTGRES
-version: 2
+version: 3
 
 responsibility: >
-  Own durable, PostgreSQL-backed implementations of every CD-2/CD-4/CD-5
-  repository interface (GovernedEntity, Source, ExternalReference,
-  EvidenceItem, Provenance, AuditEvent, IntakeRecord, AIInvocation) plus
-  the SQLAlchemy engine/session factory and Alembic migration schema —
-  preserving exactly the same canonical behaviour (immutability,
-  idempotent external-reference/evidence-observation/intake replay,
-  append-only audit, one-active-invocation-per-subject concurrency,
-  CD-5 PID §73) as the in-memory reference implementations core/,
-  services/evidence/, and ai/ ship, durably.
+  Own durable, PostgreSQL-backed implementations of every CD-2/CD-4/
+  CD-5/CD-6 repository interface (GovernedEntity, Source,
+  ExternalReference, EvidenceItem, Provenance, AuditEvent, IntakeRecord,
+  AIInvocation, NeedsYouItem) plus the SQLAlchemy engine/session factory
+  and Alembic migration schema — preserving exactly the same canonical
+  behaviour (immutability, idempotent external-reference/evidence-
+  observation/intake/needs-you-item replay, append-only audit,
+  one-active-invocation-per-subject concurrency, CD-5 PID §73) as the
+  in-memory reference implementations core/, services/evidence/, ai/,
+  and (CD-6) services/needs_you/ ship, durably.
 
 owns: []
 
 # Implements the repository ABC interfaces core/, services/evidence/,
-# services/evidence/intake/, and (CD-5 WI-1) ai/ define; does not
-# define any canonical domain type of its own. Depends on core/'s
-# errors, identity, timestamps, and contract_validation; on
-# services/evidence/'s EvidenceItem/EvidenceRepository/
-# ExternalReferenceHint; on services/evidence/intake/'s
-# IntakeRecord/IntakeRepository; and (CD-5 WI-1) on ai/'s
-# AIInvocation/AIInvocationRepository/derive_primary_input_reference.
+# services/evidence/intake/, (CD-5 WI-1) ai/, and (CD-6 Slice 1)
+# services/needs_you/ define; does not define any canonical domain type
+# of its own. Depends on core/'s errors, identity, timestamps, and
+# contract_validation; on services/evidence/'s EvidenceItem/
+# EvidenceRepository/ExternalReferenceHint; on services/evidence/intake/'s
+# IntakeRecord/IntakeRepository; on (CD-5 WI-1) ai/'s
+# AIInvocation/AIInvocationRepository/derive_primary_input_reference;
+# and on (CD-6 Slice 1) services/needs_you/'s
+# NeedsYouItem/NeedsYouRepository/transition.
 consumes:
   - BAGMAN.CORE
   - BAGMAN.SERVICES.EVIDENCE
   - BAGMAN.EVIDENCE.INTAKE
   - BAGMAN.AI
+  - BAGMAN.NEEDS_YOU
 
 produces: []
 

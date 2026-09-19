@@ -300,8 +300,25 @@ services:
     # more formal, BAGMAN-dedicated credential (e.g. via
     # `claude setup-token`) is a real future hardening step, not
     # solved speculatively here.
+    # CD-6 Slice 2 (PID §98.4, architect spec §3/§24): Xero app
+    # credentials + per-connection OAuth tokens (`services.xero.secrets`,
+    # `_DEFAULT_SECRETS_DIR = "/opt/bagman/secrets/xero"`). No CI/test
+    # path depends on this — every existing test either uses
+    # `InMemoryTokenStore`/`FakeXero*Client` (development composition)
+    # or sets `BAGMAN_XERO_SECRETS_DIR` to a disposable tmp path of its
+    # own — and `read_xero_app_credentials()` is missing-file-tolerant
+    # (returns `None`, never raises), so an absent host directory here
+    # degrades to an honest CONFIG_ERROR, never a crash. Mounted anyway,
+    # read-only, matching `claude_code_home` immediately below: this
+    # repo's own `/srv/bagman-secrets/` host convention (NOT the Mac
+    # appliance's separate `/opt/bagman/secrets/` root — see
+    # `/opt/bagman/app/compose/bagman.docker-compose.yml` on
+    # `mac-prod-01` for that one), so a local operator who places real
+    # Xero credentials at `/srv/bagman-secrets/xero/` can exercise this
+    # exact compose stack end-to-end without editing this file.
     volumes:
       - /srv/bagman-secrets/claude_code_home:/home/claude-operator:ro
+      - /srv/bagman-secrets/xero:/opt/bagman/secrets/xero:ro
     # The one deliberate host-published entry point (PID §5) — bound to
     # loopback only, not 0.0.0.0.
     ports:

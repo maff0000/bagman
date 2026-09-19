@@ -1,0 +1,188 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://bagman.internal/contracts/mailbox/bagman.mailbox_message.v1.schema.json",
+  "title": "BAGMAN MailboxMessage",
+  "description": "A durable, provider-neutral PROJECTION of one email message discovered by a mailbox sweep (CD-6 Slice 4: first real mailbox adapter + sweep engine). This is NOT the evidence bytes (the raw MIME lives in the canonical `EvidenceItem`/object-store architecture, see `evidence_id` below) and NOT an accounting fact (no invoice/classification/AI field exists here — that is Slice 5). Canonical uniqueness is (mailbox_id, immutable_provider_message_id) — a message moving between folders (e.g. Inbox to Junk) never creates a second row; `observed_folder` simply reflects wherever the message was last seen.",
+  "type": "object",
+  "properties": {
+    "mailbox_message_id": {
+      "$ref": "https://bagman.internal/contracts/common/bagman.identifier.v1.schema.json",
+      "description": "Canonical BAGMAN identifier for this message projection row."
+    },
+    "mailbox_id": {
+      "$ref": "https://bagman.internal/contracts/common/bagman.identifier.v1.schema.json",
+      "description": "The `MailboxSource` this message was swept from."
+    },
+    "provider_kind": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Deliberately open (mirrors `MailboxSource.provider_kind`'s own contract-layer doctrine) — the provider family this message was observed through, e.g. `MICROSOFT_GRAPH`."
+    },
+    "immutable_provider_message_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The provider's own IMMUTABLE, case-sensitive message identifier (for Microsoft Graph: the `Prefer: IdType=\"ImmutableId\"` id). Canonical uniqueness for this contract is (mailbox_id, immutable_provider_message_id) — enforced at the repository/database layer, not by this schema alone."
+    },
+    "internet_message_id": {
+      "oneOf": [
+        { "type": "string" },
+        { "type": "null" }
+      ],
+      "description": "The RFC 5322 `Message-ID` header value, if present. METADATA ONLY — never the idempotency key (a provider may legitimately reuse/omit this across distinct provider messages); see `immutable_provider_message_id` above for the real identity key."
+    },
+    "observed_folder": {
+      "type": "string",
+      "minLength": 1,
+      "description": "CD-6 architect amendment (recursive folder discovery). The provider's own real, immutable folder identifier (e.g. Microsoft Graph's own resolved folder id) this message was most recently observed in — deliberately OPEN (no longer a closed Inbox/Junk enum): the monitored set now includes Inbox, Junk Email, Deleted Items, and every custom/nested/hidden folder the mailbox's own folder discovery surfaces (Sent Items/Drafts/Outbox are excluded from monitoring entirely and never appear here). This is the CANONICAL, gate-relevant value — never a display name; see `observed_folder_display_name` for the human-readable counterpart."
+    },
+    "observed_folder_display_name": {
+      "oneOf": [
+        { "type": "string" },
+        { "type": "null" }
+      ],
+      "description": "CD-6 architect amendment (recursive folder discovery). The human-readable label for `observed_folder`'s own real folder id, for GUI/operator display ONLY — never used for identity, gating, or cursor lookup. `null` for a row created before this amendment, or when a caller genuinely has no display name to report."
+    },
+    "subject": {
+      "oneOf": [
+        { "type": "string" },
+        { "type": "null" }
+      ],
+      "description": "Untrusted provider-supplied string — never rendered as HTML, never treated as an instruction of any kind."
+    },
+    "sender_address": {
+      "oneOf": [
+        { "type": "string" },
+        { "type": "null" }
+      ],
+      "description": "Untrusted provider-supplied sender email address string."
+    },
+    "sender_display_name": {
+      "oneOf": [
+        { "type": "string" },
+        { "type": "null" }
+      ],
+      "description": "Untrusted provider-supplied sender display name string."
+    },
+    "sender_domain": {
+      "oneOf": [
+        { "type": "string" },
+        { "type": "null" }
+      ],
+      "description": "CD-6 architect amendment (two-stage mail processing). The domain portion of `sender_address`, lowercased — stored explicitly (rather than only derived on demand) because it is the actual gate key `services.mailbox.domain_rule.MailboxDomainRuleRepository.find_for_sender` matches against. `null` only when `sender_address` itself is absent/unparseable."
+    },
+    "received_at": {
+      "$ref": "https://bagman.internal/contracts/common/bagman.utc_timestamp.v1.schema.json",
+      "description": "The provider's own `receivedDateTime` for this message."
+    },
+    "has_attachments": {
+      "type": "boolean",
+      "description": "Provider-reported attachment flag. The whole message (headers, body, attachments) is stored as one immutable `.eml` evidence artifact once ingested (see `evidence_id`) — this flag and `attachment_metadata` below exist purely for the Stage-A discovery gate; this slice never extracts/parses individual attachment CONTENT."
+    },
+    "attachment_metadata": {
+      "type": "array",
+      "description": "CD-6 architect amendment (Stage A discovery — 'attachment metadata sufficient for discovery'). Bounded, discovery-only per-attachment metadata (filename/content type/size) — NEVER attachment bytes/content. Empty when `has_attachments` is `false`, or when the provider attachment listing itself could not be retrieved (a best-effort discovery signal, never a blocking failure).",
+      "items": {
+        "type": "object",
+        "properties": {
+          "filename": { "oneOf": [{ "type": "string" }, { "type": "null" }] },
+          "content_type": { "oneOf": [{ "type": "string" }, { "type": "null" }] },
+          "size_bytes": { "oneOf": [{ "type": "integer", "minimum": 0 }, { "type": "null" }] }
+        },
+        "additionalProperties": false
+      },
+      "default": []
+    },
+    "auth_signals": {
+      "type": "object",
+      "description": "CD-6 architect amendment (§7 — authentication/spoofing). Provider-supplied authentication-domain signals (SPF/DKIM/DMARC-alignment-style), captured SEPARATELY from the visible `sender_address`/`sender_domain` — never used by this slice to silently trust or distrust a message, only preserved honestly for a later stage. Each key is one of `spf`/`dkim`/`dmarc`; each value is whatever short verdict token the provider actually supplied (e.g. `\"pass\"`/`\"fail\"`/`\"softfail\"`/`\"none\"`), or `null` when the provider supplied nothing parseable for that mechanism — this slice never invents a verdict Graph did not actually return.",
+      "properties": {
+        "spf": { "oneOf": [{ "type": "string" }, { "type": "null" }] },
+        "dkim": { "oneOf": [{ "type": "string" }, { "type": "null" }] },
+        "dmarc": { "oneOf": [{ "type": "string" }, { "type": "null" }] }
+      },
+      "additionalProperties": false,
+      "default": {}
+    },
+    "evidence_id": {
+      "oneOf": [
+        { "$ref": "https://bagman.internal/contracts/common/bagman.identifier.v1.schema.json" },
+        { "type": "null" }
+      ],
+      "description": "The canonical `EvidenceItem` holding this message's immutable raw `.eml` bytes, once ingestion has succeeded. `null` while `ingestion_status` is not yet a terminal success (e.g. `QUARANTINED`/`FAILED` — a quarantined message's bytes live under the evidence architecture's own quarantine path, referenced by `EvidenceItem`/provenance records, not by this field)."
+    },
+    "ingestion_status": {
+      "type": "string",
+      "enum": ["INGESTED", "QUARANTINED", "FAILED", "VANISHED", "CHECKED_NOT_CANDIDATE", "SECURITY_REVIEW"],
+      "description": "Outcome of this message's own Stage-A/Stage-B processing attempt (CD-6 architect amendment — two-stage mail processing; CD-6 GUI-operations-foundation follow-on WO added `SECURITY_REVIEW`). `INGESTED` — a real `EvidenceItem` exists (`evidence_id` is set); only reachable via a `MUST_READ` `MailboxDomainRule` whose own per-message authentication check passed. `QUARANTINED` — the content-safety scanner flagged it; retained via the governed quarantine path, never parsed, never silently discarded. `FAILED` — an oversized message or another explicit terminal ingestion fault. `VANISHED` — the message existed in a delta page but had disappeared by the time its MIME content was fetched (a real, deterministic, recorded outcome — never a fabricated evidence row). `CHECKED_NOT_CANDIDATE` — this message was observed and its sender gate was evaluated (a `BLACKLIST`/`GRAYLIST` rule matched, or no rule matched and `services.mailbox.discovery_signals` found no credible accounting-document signal) — seen, checked, deliberately never fetched/stored beyond this discovery projection (architect §9's data-volume doctrine). `SECURITY_REVIEW` — a `MUST_READ`-policy message whose own SPF/DKIM/DMARC authentication signals failed a bounded, deterministic check; a genuine candidate that failed a security check, never MIME-fetched/evidence-created via the normal trusted path, and never counted toward the same 'is this domain relevant' question a `MAILBOX_DOMAIN_REVIEW` item asks — see `services/mailbox/sweep.py`'s own module docstring."
+    },
+    "first_seen_at": {
+      "$ref": "https://bagman.internal/contracts/common/bagman.utc_timestamp.v1.schema.json",
+      "description": "UTC timestamp this message was FIRST discovered by any sweep."
+    },
+    "last_seen_at": {
+      "$ref": "https://bagman.internal/contracts/common/bagman.utc_timestamp.v1.schema.json",
+      "description": "UTC timestamp this message was MOST RECENTLY observed by a sweep (e.g. re-seen after moving folders, or a safe idempotent replay)."
+    },
+    "metadata": {
+      "type": "object",
+      "description": "Free-form, non-secret context (e.g. the sweep_run_id that first discovered this message). Never raw MIME/body content — see this contract's own top-level description.",
+      "additionalProperties": true,
+      "default": {}
+    },
+    "discovery_candidate": {
+      "oneOf": [
+        { "type": "boolean" },
+        { "type": "null" }
+      ],
+      "description": "Second CD-6 architect amendment (persisted discovery decision). `true` only when `services.mailbox.discovery_signals.evaluate_discovery_candidate` actually ran for this message AND judged it a credible financial-document candidate. `false` when the heuristic ran and judged it NOT credible. `null` when the heuristic never ran at all — the honest state for an `IGNORED`-domain message (the domain gate short-circuits before Stage-A candidate evaluation ever executes) and for any `ALLOWED`-domain message (never sits in a discovery-only state at all), or for a row created before this amendment."
+    },
+    "discovery_reason": {
+      "oneOf": [
+        { "type": "string" },
+        { "type": "null" }
+      ],
+      "description": "Second CD-6 architect amendment (persisted discovery decision). The bounded, non-AI heuristic's own honest explanation of what it matched (e.g. \"subject contains keyword 'invoice'\") — set ONLY when `discovery_candidate` is `true`. `null` for the `discovery_candidate == false` case (no reason is required there) and for the `discovery_candidate == null` case (heuristic never ran)."
+    },
+    "discovery_checked_at": {
+      "oneOf": [
+        { "$ref": "https://bagman.internal/contracts/common/bagman.utc_timestamp.v1.schema.json" },
+        { "type": "null" }
+      ],
+      "description": "Second CD-6 architect amendment (persisted discovery decision). UTC timestamp Stage-A/B discovery processing actually happened for this message — set whenever discovery-only handling ran (both the `IGNORED`-domain branch AND the UNKNOWN-domain branch), regardless of `discovery_candidate`. `null` for any message that never went through discovery-only handling at all (an `ALLOWED`-domain message, or a row created before this amendment)."
+    },
+    "schema_version": {
+      "allOf": [
+        { "$ref": "https://bagman.internal/contracts/common/bagman.schema_version.v1.schema.json" }
+      ],
+      "const": "bagman.mailbox_message.v1",
+      "description": "Must literally equal \"bagman.mailbox_message.v1\"."
+    }
+  },
+  "required": [
+    "mailbox_message_id",
+    "mailbox_id",
+    "provider_kind",
+    "immutable_provider_message_id",
+    "internet_message_id",
+    "observed_folder",
+    "observed_folder_display_name",
+    "subject",
+    "sender_address",
+    "sender_display_name",
+    "sender_domain",
+    "received_at",
+    "has_attachments",
+    "attachment_metadata",
+    "auth_signals",
+    "evidence_id",
+    "ingestion_status",
+    "first_seen_at",
+    "last_seen_at",
+    "metadata",
+    "discovery_candidate",
+    "discovery_reason",
+    "discovery_checked_at",
+    "schema_version"
+  ],
+  "additionalProperties": false
+}

@@ -89,10 +89,10 @@ DB_USER = "bagman_test"
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 
 #: The canonical tables the migrations under `alembic/versions/` must
-#: create. `intake_records` (CD-4 WI-1) and `ai_invocations` (CD-5
-#: WI-1) added alongside the original six CD-2/CD-3 tables — truncated
-#: together in one statement below, so table order here does not
-#: matter (CASCADE handles FK ordering).
+#: create. `intake_records` (CD-4 WI-1), `ai_invocations` (CD-5 WI-1),
+#: and `needs_you_items` (CD-6 Slice 1) added alongside the original six
+#: CD-2/CD-3 tables — truncated together in one statement below, so
+#: table order here does not matter (CASCADE handles FK ordering).
 CANONICAL_TABLES = (
     "audit_events",
     "governed_entities",
@@ -102,6 +102,18 @@ CANONICAL_TABLES = (
     "provenance",
     "intake_records",
     "ai_invocations",
+    "needs_you_items",
+    "xero_connections",  # CD-6 Slice 2
+    "xero_accounts",  # CD-6 Slice 2
+    "xero_sync_runs",  # CD-6 Slice 2
+    "xero_oauth_states",  # CD-6 Slice 2
+    "mailbox_sources",  # CD-6 Slice 3 (previously missing from this list)
+    "mailbox_messages",  # CD-6 Slice 4
+    "mailbox_sweep_runs",  # CD-6 Slice 4
+    "mailbox_folder_cursors",  # CD-6 Slice 4
+    "mailbox_sweep_locks",  # CD-6 Slice 4
+    "mailbox_microsoft_oauth_states",  # CD-6 Slice 4
+    "mailbox_domain_rules",  # CD-6 architect amendment (two-stage mail processing)
 )
 
 

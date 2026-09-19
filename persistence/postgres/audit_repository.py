@@ -161,3 +161,33 @@ class PostgresAuditRepository(AuditRepository):
                 return [_row_to_audit_event(row) for row in rows]
         except SQLAlchemyError as exc:
             raise PersistenceError(f"could not list AuditEvent rows by subject: {exc}") from exc
+
+    def list_recent(
+        self,
+        *,
+        limit: int = 50,
+        before: Optional[datetime] = None,
+        event_type_prefix: Optional[str] = None,
+    ) -> list[AuditEvent]:
+        try:
+            with session_scope(self._engine) as session:
+                query = session.query(AuditEventRow)
+                if before is not None:
+                    query = query.filter(AuditEventRow.occurred_at < before)
+                if event_type_prefix is not None:
+                    # Escaped LIKE prefix match — event_type_prefix is
+                    # ALWAYS a caller-supplied literal (e.g.
+                    # "NEEDS_YOU_" from app/api/routers/needs_you.py),
+                    # never end-user input reaching this far unescaped,
+                    # but escaping the two LIKE wildcard characters
+                    # costs nothing and keeps this correct even if a
+                    # future caller's prefix happens to contain one.
+                    escaped = event_type_prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+                    query = query.filter(AuditEventRow.event_type.like(f"{escaped}%", escape="\\"))
+                query = query.order_by(
+                    AuditEventRow.occurred_at.desc(), AuditEventRow.audit_event_id.desc()
+                ).limit(limit)
+                rows = query.all()
+                return [_row_to_audit_event(row) for row in rows]
+        except SQLAlchemyError as exc:
+            raise PersistenceError(f"could not list recent AuditEvent rows: {exc}") from exc

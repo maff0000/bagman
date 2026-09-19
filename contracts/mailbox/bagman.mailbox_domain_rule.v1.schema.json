@@ -1,0 +1,110 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://bagman.internal/contracts/mailbox/bagman.mailbox_domain_rule.v1.schema.json",
+  "title": "BAGMAN MailboxDomainRule",
+  "description": "A durable, MAILBOX-SPECIFIC sender-policy routing rule (CD-6 architect amendment — two-stage mail processing, Stage B relevance/domain gate; extended by the CD-6 GUI-operations-foundation follow-on WO into a three-state MUST_READ/GRAYLIST/BLACKLIST operator-learning model — see services.mailbox.domain_rule's own module docstring). A rule is never a global domain->entity assumption: the same sender domain may legitimately mean something different in two different mailboxes, so uniqueness/matching is always scoped to (mailbox_id, sender_domain) for a domain-level rule, or (mailbox_id, sender_address) for an EXACT_ADDRESS rule — never sender_domain/sender_address alone. A rule is always a governed, OPERATOR-APPROVED (or, for a future delivery, BAGMAN-PROPOSED-but-not-yet-approved) routing decision — never an automatic inference that mailbox == company (see services/mailbox/mailbox.py's own identical doctrine).",
+  "type": "object",
+  "properties": {
+    "rule_id": {
+      "$ref": "https://bagman.internal/contracts/common/bagman.identifier.v1.schema.json",
+      "description": "Canonical BAGMAN identifier for this rule row."
+    },
+    "mailbox_id": {
+      "$ref": "https://bagman.internal/contracts/common/bagman.identifier.v1.schema.json",
+      "description": "The `MailboxSource` this rule applies to. Rules are never shared/global across mailboxes."
+    },
+    "sender_domain": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[^\\s@]+\\.[^\\s@]+$",
+      "description": "The sender email domain this rule matches (for `EXACT`/`INCLUDE_SUBDOMAINS`), or the domain portion of `sender_address` (for `EXACT_ADDRESS`, always kept consistent with it) — always lowercase (e.g. `vendor.com`). For a domain-level rule, canonical uniqueness is (mailbox_id, sender_domain), enforced at the repository/database layer — an operator changing their mind about a domain updates this SAME row, never creates a second one. For an `EXACT_ADDRESS` rule this field is populated purely for reporting/grouping — see `sender_address` for that rule's real identity key."
+    },
+    "sender_address": {
+      "oneOf": [
+        { "type": "string", "minLength": 3, "pattern": "^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$" },
+        { "type": "null" }
+      ],
+      "description": "CD-6 GUI-operations-foundation follow-on WO. The exact sender email address this rule matches — populated ONLY when `match_mode` is `EXACT_ADDRESS` (the real identity/uniqueness key for that match mode, scoped to (mailbox_id, sender_address)), always `null` for a domain-level (`EXACT`/`INCLUDE_SUBDOMAINS`) rule."
+    },
+    "match_mode": {
+      "type": "string",
+      "enum": ["EXACT", "INCLUDE_SUBDOMAINS", "EXACT_ADDRESS"],
+      "description": "`EXACT` — only the literal `sender_domain` matches. `INCLUDE_SUBDOMAINS` — `sender_domain` and any subdomain of it (e.g. a rule for `vendor.com` also matches `mail.vendor.com`) matches. `EXACT_ADDRESS` (CD-6 GUI-operations-foundation follow-on WO) — only the literal `sender_address` matches, overriding any broader domain-level rule for the same domain (most-specific-rule-wins — see `services.mailbox.domain_rule.MailboxDomainRuleRepository.find_for_sender`'s own docstring). Closed, small, operator-chosen set."
+    },
+    "policy": {
+      "type": "string",
+      "enum": ["MUST_READ", "GRAYLIST", "BLACKLIST"],
+      "description": "The Stage-B gate decision for mail from this sender in this mailbox (CD-6 GUI-operations-foundation follow-on WO's three-state operator-learning model — see services.mailbox.domain_rule's own module docstring for the full reasoning and the exact wire-string choice). `MUST_READ` (was `ALLOWED`) — full MIME fetch + evidence intake proceeds (subject to a per-message authentication check — see services/mailbox/sweep.py), and a later ordinary message from this SAME confirmed source never re-raises a MAILBOX_DOMAIN_REVIEW item. `GRAYLIST` (new) — Matt has looked at this domain and deliberately left it under review; behaves identically to 'no rule at all' at the Stage-B gate (bounded discovery heuristic still runs, one aggregated Needs You item is still raised/reused), the only difference being a real row now exists for GUI display. `BLACKLIST` (was `IGNORED`) — the message is observed/checked (for cursor correctness and duplicate detection) but never fetched beyond Stage-A discovery metadata, and no Needs You item is ever raised. A closed, small, real vocabulary with a real, tested, fully-reversible lifecycle transition between all three values — see `services.mailbox.domain_rule.ALLOWED_POLICY_TRANSITIONS`."
+    },
+    "destination_entity_id": {
+      "oneOf": [
+        { "$ref": "https://bagman.internal/contracts/common/bagman.identifier.v1.schema.json" },
+        { "type": "null" }
+      ],
+      "description": "The canonical `GovernedEntity` this sender's evidence should route to — a real, operator-approved id, NEVER a string/name (architect spec §3). Always `null` when `policy` is `GRAYLIST` or `BLACKLIST`. May also be `null` when `policy` is `MUST_READ` and `destination_mode` is `REVIEW_REQUIRED` (domain alone cannot safely determine destination — never silently guessed)."
+    },
+    "destination_mode": {
+      "oneOf": [
+        { "type": "string", "enum": ["FIXED", "REVIEW_REQUIRED"] },
+        { "type": "null" }
+      ],
+      "description": "`FIXED` — `destination_entity_id` is a confident, operator-approved routing decision. `REVIEW_REQUIRED` — this sender is a genuine accounting-evidence source but its destination entity could not be safely determined from the domain alone; evidence still gets fully ingested (per architect §5) with `entity_id` left unresolved, and a document-scoped `COMPANY_REQUIRED` Needs You item is raised per evidence item (see services/mailbox/sweep.py's own module docstring) — `destination_entity_id` stays `null` pending that per-document resolution. `null` only when `policy` is `GRAYLIST` or `BLACKLIST` (a destination concept does not apply to either)."
+    },
+    "source": {
+      "type": "string",
+      "pattern": "^[A-Z][A-Z_]*$",
+      "description": "Who/what proposed this rule. Deliberately OPEN (NOT a closed enum) per architect spec §2 — a later delivery adds a `PROPOSED_XERO_SEED` value and must never need a migration/contract change to do so. Documented (non-exhaustive) known values: `OPERATOR` (a human approved this rule directly, e.g. via a Needs You resolution), `BAGMAN_PROPOSED` (forward-declared for a future automated-proposal producer; no producer exists in this delivery)."
+    },
+    "processor_hint": {
+      "oneOf": [
+        { "type": "string", "minLength": 1 },
+        { "type": "null" }
+      ],
+      "description": "An OPEN, free-text routing hint a human operator (or a later delivery's proposer) may attach to this rule — deliberately never a closed set of hardcoded commercial-brand-shaped values (mirrors `MailboxSource.provider_kind`'s own 'open at this layer, no hardcoded brand' doctrine one layer down). This delivery carries the field faithfully but never produces a real value for it itself."
+    },
+    "approved_at": {
+      "oneOf": [
+        { "$ref": "https://bagman.internal/contracts/common/bagman.utc_timestamp.v1.schema.json" },
+        { "type": "null" }
+      ],
+      "description": "UTC timestamp this rule was last approved/set by its `source`. `null` only for a rule that has never actually been approved (not reachable by this delivery's own operator-approval-only creation path, but kept nullable for a future `BAGMAN_PROPOSED`-and-not-yet-approved row)."
+    },
+    "created_at": {
+      "$ref": "https://bagman.internal/contracts/common/bagman.utc_timestamp.v1.schema.json",
+      "description": "UTC timestamp this rule row was first created."
+    },
+    "updated_at": {
+      "$ref": "https://bagman.internal/contracts/common/bagman.utc_timestamp.v1.schema.json",
+      "description": "UTC timestamp of the most recent change to this row (any field)."
+    },
+    "last_seen_at": {
+      "$ref": "https://bagman.internal/contracts/common/bagman.utc_timestamp.v1.schema.json",
+      "description": "UTC timestamp of the most recent message this rule matched during a sweep — observability only, never itself a gate decision."
+    },
+    "schema_version": {
+      "allOf": [
+        { "$ref": "https://bagman.internal/contracts/common/bagman.schema_version.v1.schema.json" }
+      ],
+      "const": "bagman.mailbox_domain_rule.v1",
+      "description": "Must literally equal `\"bagman.mailbox_domain_rule.v1\"`."
+    }
+  },
+  "required": [
+    "rule_id",
+    "mailbox_id",
+    "sender_domain",
+    "sender_address",
+    "match_mode",
+    "policy",
+    "destination_entity_id",
+    "destination_mode",
+    "source",
+    "processor_hint",
+    "approved_at",
+    "created_at",
+    "updated_at",
+    "last_seen_at",
+    "schema_version"
+  ],
+  "additionalProperties": false
+}

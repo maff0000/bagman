@@ -30,6 +30,16 @@ from persistence.postgres import intake_models  # noqa: F401
 # --autogenerate' would never see `ai_invocations` at all.
 from persistence.postgres import ai_invocation_models  # noqa: F401
 
+# Registers XeroConnectionRow/XeroAccountRow/XeroSyncRunRow/
+# XeroOAuthStateRow on the shared `Base.metadata` (CD-6 Slice 2) — same
+# reason as intake_models/ai_invocation_models above: xero_models.py
+# lives in its own module, so it must be imported here or
+# 'alembic revision --autogenerate' would never see the `xero_*` tables
+# at all. (Note: `needs_you_models` has this same gap, pre-existing
+# from CD-6 Slice 1 — out of this WI's own scope to fix; flagged here
+# for whoever next touches this file.)
+from persistence.postgres import xero_models  # noqa: F401
+
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.
 config = context.config

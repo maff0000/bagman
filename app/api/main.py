@@ -85,12 +85,27 @@ from core.errors import (
     InvalidProvenanceError,
     InvalidStateTransitionError,
     NotFoundError,
+    OAuthStateError,
     PersistenceError,
     StorageError,
+    TenantSelectionError,
     ValidationError,
 )
 from app.api.logging_config import configure_logging
-from app.api.routers import ai, health, intake, internal, operator, version
+from app.api.routers import (
+    activity,
+    ai,
+    health,
+    intake,
+    internal,
+    mailboxes,
+    mailboxes_imap,
+    mailboxes_microsoft,
+    needs_you,
+    operator,
+    version,
+    xero,
+)
 
 configure_logging(level=os.environ.get("BAGMAN_LOG_LEVEL", "INFO"))
 logger = logging.getLogger("bagman.runtime.api")
@@ -107,6 +122,29 @@ app.include_router(ai.router)
 #: operator.py), never added to routers/ai.py (WI-2's own in-parallel
 #: file) — see that router's own docstring.
 app.include_router(operator.router)
+#: CD-6 Slice 1 — the universal Needs You queue HTTP surface (PID
+#: §98.2/§98.5) and the cross-BAGMAN activity/audit stream (PID §98.8).
+app.include_router(needs_you.router)
+app.include_router(activity.router)
+#: CD-6 Slice 2 — the Xero OAuth connection lifecycle and
+#: read-only Chart-of-Accounts reference-data HTTP surface (PID
+#: §98.4, architect spec §1-24).
+app.include_router(xero.router)
+#: CD-6 Slice 3 — the mailbox-definition registry HTTP surface (Mailbox
+#: Management, TAB 1 / Email): create/list/get/edit/enable/disable/
+#: retire only — no provider connectivity of any kind exists behind
+#: this router (see app/api/routers/mailboxes.py's own module
+#: docstring).
+app.include_router(mailboxes.router)
+#: CD-6 Slice 4 — the first real mailbox connection lifecycle + sweep
+#: engine HTTP surface (Microsoft Graph adapter).
+app.include_router(mailboxes_microsoft.router)
+#: CD-6 GUI-operations-foundation follow-on WO — the SECOND real
+#: mailbox connection lifecycle + sweep engine HTTP surface (plain IMAP
+#: adapter, `matt@noust.ai`). Mirrors `mailboxes_microsoft.router`'s own
+#: shape exactly — see `app/api/routers/mailboxes_imap.py`'s own module
+#: docstring.
+app.include_router(mailboxes_imap.router)
 
 #: CD-4 WI-4 — the BAGMAN Documents GUI (PID §36-42), served as plain
 #: static assets. Mounted LAST and at "/" so it never shadows any
@@ -144,11 +182,31 @@ _STATUS_BY_ERROR_TYPE: dict[type[BagmanError], int] = {
     # BAGMAN's own /internal/operator/chat (WI-3) would otherwise
     # incorrectly 500 on a duplicate rapid double-submit.
     ActiveInvocationConflictError: 409,
+    # CD-6 Slice 2 (PID §98.4, architect spec §3): a rejected OAuth
+    # anti-CSRF/replay `state` value is a genuine SECURITY rejection —
+    # mapped to 403 (Forbidden), distinct from the 422 an ordinary
+    # malformed-input `ValidationError` gets, and distinct from the 409
+    # a same-resource-state conflict gets (this is never "resubmit with
+    # different content", it is "this request must not be honoured at
+    # all").
+    OAuthStateError: 403,
+    # Architect finding, real live acceptance run (Infosecurs+NoustAI):
+    # the governed Xero tenant-selection broker (a rejected/expired/
+    # already-resolved selection, or a browser-submitted tenant_id
+    # outside the exact authorised candidate set) is the same class of
+    # genuine SECURITY rejection OAuthStateError already gets 403 for —
+    # see services.xero.tenant_selection's own module docstring.
+    TenantSelectionError: 403,
 }
+
+#: 403 is client-actionable in the same sense 404/409/422 are (see
+#: `_CLIENT_SAFE_STATUSES` below) — the message names exactly what was
+#: wrong (unknown/expired/replayed state), never a raw driver/provider
+#: exception string.
 
 #: 5xx statuses never return the raw exception message to the client
 #: (see module docstring) — only these client-actionable statuses do.
-_CLIENT_SAFE_STATUSES = frozenset({404, 409, 422})
+_CLIENT_SAFE_STATUSES = frozenset({403, 404, 409, 422})
 
 
 def _status_for(exc: BagmanError) -> int:

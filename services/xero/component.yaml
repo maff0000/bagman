@@ -1,0 +1,97 @@
+# BAGMAN component manifest (CD-6 Slice 2, PID §98.4, architect spec
+# §1-24) for services/xero/.
+# Validated by scripts/generate_architecture_memory.py against
+# contracts/manifest/bagman.component_manifest.v1.schema.json.
+
+id: BAGMAN.XERO
+version: 2
+
+responsibility: >
+  Own the durable Company<->Xero-organisation mapping (XeroConnection,
+  its closed connect/disconnect/error/revoke state machine, and the
+  server-side OAuth anti-CSRF/replay `state` token that protects the
+  Authorization Code callback), the synced read-only Chart-of-Accounts
+  reference-data projection (XeroAccount, idempotent on (tenant_id,
+  account_id), history-preserving — never deleted, only re-synced), and
+  the sync-attempt ledger (XeroSyncRun) that makes a failed/partial
+  sync provably unable to ever replace last-known-good projection data
+  (PID §98.4, architect spec §4/§5/§20). Also owns the documented,
+  extensible account-eligibility-filtering policy (which synced
+  accounts a coding dropdown shows by default) and the AI-suggestion
+  candidate-set validation (an AI-proposed AccountID/Code/Name/TaxType
+  must resolve to a real synced eligible account or be treated as
+  UNRESOLVED — never invented). This is a READ/REFERENCE-ONLY
+  integration: the only "write" direction to Xero is the OAuth token
+  lifecycle itself (authorize/refresh/revoke) — no Xero write endpoint
+  (invoice/bill/journal/payment/contact creation, bank reconciliation,
+  tax filing) is implemented anywhere in this component. As of this
+  version, also owns the read-only Contacts/Purchase-Invoices/
+  BankTransactions client methods
+  (`XeroAccountingClient.list_contacts`/`list_purchase_invoices`/
+  `list_bank_transactions`, transient/never-persisted — see
+  `services/xero/client.py`'s own module docstring;
+  `list_bank_transactions` is the one method in this component that
+  really paginates real network I/O over multiple pages, deduplicated
+  by `BankTransactionID`) and the bounded, on-demand, non-AI Xero-
+  assisted supplier-domain correlation capability
+  (`services/xero/supplier_correlation.py`) that enriches still-OPEN
+  `MAILBOX_DOMAIN_REVIEW` Needs You items' own metadata as a review aid
+  from TWO independent evidence sources — real ACCPAY purchase-invoice
+  history and real SPEND BankTransaction history, correlated through
+  `ContactID` only, never fuzzy name matching — this component's first
+  real cross-component orchestration function (see that module's own
+  "why this lives in services/xero/" docstring section), never
+  auto-approving anything.
+
+owns:
+  - XeroConnection
+  - XeroAccount
+  - XeroSyncRun
+
+# services/xero/*.py depends on core/ exactly like every other CD-2/
+# CD-4/CD-5/CD-6 domain module: identity (id generation), timestamps
+# (UTC handling), errors (ConflictError, ConflictError's own new
+# sibling OAuthStateError, InvalidStateTransitionError, NotFoundError,
+# ValidationError), and contract_validation (validate_against_contract).
+# services/xero/client.py additionally depends on
+# services.xero.account.RawXeroAccount (same package, not a boundary
+# crossing). services/xero/supplier_correlation.py additionally depends
+# on services.mailbox.domain_rule.normalize_domain (BAGMAN.MAILBOX) and
+# services.needs_you.needs_you.NeedsYouRepository/
+# ITEM_TYPE_MAILBOX_DOMAIN_REVIEW (BAGMAN.NEEDS_YOU) — a real, narrow
+# cross-component read/enrich dependency, the mirror image of
+# services/mailbox/sweep.py's own existing BAGMAN.NEEDS_YOU dependency
+# (see supplier_correlation.py's own module docstring for why this
+# capability lives here rather than in either of those two components).
+consumes:
+  - BAGMAN.CORE
+  - BAGMAN.MAILBOX
+  - BAGMAN.NEEDS_YOU
+
+# This component does not itself emit AuditEvents — every
+# XERO_CONNECTION_*/XERO_SYNC_* audit event is minted by the HTTP
+# orchestration layer that calls this component's repositories/
+# run_sync (app/api/routers/xero.py) via
+# core.api.BagmanCanonicalAPI.record_audit_event(), exactly like
+# services/needs_you/ and services/evidence/intake/ never emitting
+# their own audit events (see those components' own manifests, and
+# architect spec §22's explicit "use the existing core.audit
+# infrastructure, do not invent a second audit mechanism" instruction).
+produces: []
+
+# No new third-party dependency: services/xero/client.py speaks HTTP
+# via stdlib urllib.request only (mirrors ai/providers/litellm/client.py
+# exactly — see that module's own "Dependency choice" docstring
+# section for the identical reasoning, applied here to the Xero
+# identity/Accounting API instead of LiteLLM).
+dependencies:
+  - jsonschema
+  - rfc3339-validator
+
+external_access: true
+
+prohibited:
+  - direct_email_access
+  - direct_bank_access
+  - direct_chargebee_access
+  - xero_write_endpoints

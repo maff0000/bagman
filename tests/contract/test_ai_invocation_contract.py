@@ -34,7 +34,11 @@ def test_ai_invocation_unknown_additional_property_is_rejected(make_ai_invocatio
 # ---------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("valid_status", ["REQUESTED", "RUNNING", "SUCCEEDED", "FAILED", "REJECTED"])
+@pytest.mark.parametrize(
+    "valid_status",
+    # TIMED_OUT/CANCELLED added by the CD-6 reliability delta (PID §100.14/§100.16).
+    ["REQUESTED", "RUNNING", "SUCCEEDED", "FAILED", "REJECTED", "TIMED_OUT", "CANCELLED"],
+)
 def test_every_pid_section_28_status_value_is_accepted(make_ai_invocation, valid_status):
     instance = make_ai_invocation(status=valid_status)
     validate_against_contract(instance, SCHEMA)
@@ -163,6 +167,14 @@ def test_input_references_missing_key_is_rejected(make_ai_invocation):
     del instance["input_references"]
     with pytest.raises(ValidationError):
         validate_against_contract(instance, SCHEMA)
+
+
+def test_input_references_with_only_conversation_id_is_accepted(make_ai_invocation):
+    """CD-6 reliability delta (PID §98/§100): a genuinely contextless
+    Ask BAGMAN turn's `input_references` — no evidence/intake/entity_id
+    at all — is still a valid instance of this open contract."""
+    instance = make_ai_invocation(input_references={"message": "hi bagman", "conversation_id": "conv-1"})
+    validate_against_contract(instance, SCHEMA)
 
 
 # ---------------------------------------------------------------------

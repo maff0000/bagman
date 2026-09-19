@@ -100,11 +100,17 @@ export function getAiHealth() {
 /** `POST /internal/operator/chat` — Ask BAGMAN (PID §42-44). `context`
  * is whichever of `evidence_id`/`intake_id`/`entity_id` is attached (at
  * most one is normally set from the GUI's own "Ask BAGMAN about this"
- * entry point — see `agent/bagman/orchestrator.py`'s own module
- * docstring: at least one is REQUIRED by this backend today, a real,
- * documented WI-3 scope boundary this GUI surfaces honestly rather
- * than papering over — see features/ai/ask-bagman.js). */
-export function sendOperatorChat({ message, actorId, evidenceId, intakeId, entityId, correlationId }) {
+ * entry point). `conversationId`/`source` (CD-6 reliability delta, PID
+ * §98/§100): `conversationId` is the GUI-generated "this open Ask
+ * BAGMAN drawer session" id (see features/ai/ask-bagman.js) — the
+ * backend's own conversation-scoped fallback subject when none of
+ * `evidence_id`/`intake_id`/`entity_id` is attached, which is exactly
+ * what fixed the previously-real, previously-documented "general chat
+ * has no evidence_id" 422 for a bare "hi bagman" message (see
+ * `ai.invocation.derive_primary_input_reference`'s own module
+ * docstring for the full history). `source` records which UI surface
+ * this call came from. */
+export function sendOperatorChat({ message, actorId, evidenceId, intakeId, entityId, correlationId, conversationId, source }) {
   return apiPost(AI_API.operatorChat, {
     message,
     actor_type: "USER",
@@ -113,5 +119,7 @@ export function sendOperatorChat({ message, actorId, evidenceId, intakeId, entit
     evidence_id: evidenceId || null,
     intake_id: intakeId || null,
     entity_id: entityId || null,
+    conversation_id: conversationId || null,
+    source: source || null,
   });
 }

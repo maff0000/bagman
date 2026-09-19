@@ -10,66 +10,84 @@
   <header class="shell-header">
     <div class="shell-header__brand">
       <span class="shell-header__mark">BAGMAN</span>
-      <span class="shell-header__sub">Evidence Intake</span>
+      <span class="shell-header__sub">Operations</span>
     </div>
-    <nav class="shell-header__nav" aria-label="Primary">
-      <button class="tab-btn" data-tab="overview" type="button" aria-current="page">Overview</button>
-      <button class="tab-btn" data-tab="documents" type="button">Documents</button>
-      <button class="tab-btn tab-btn--disabled" type="button" disabled title="Not part of this delivery">
-        Entities <span class="pill pill--muted">unavailable</span>
-      </button>
-      <button class="tab-btn tab-btn--disabled" type="button" disabled title="Not part of this delivery">
-        Audit <span class="pill pill--muted">unavailable</span>
-      </button>
-    </nav>
+
+    <!-- Ask BAGMAN (PID §42) — reachable from anywhere in the shell, not
+         buried inside one tab; styled as the header's search affordance.
+         Opens features/ai/ask-bagman.js's drawer (markup just before
+         </body>) with no context attached — "Ask BAGMAN about this"
+         (Documents detail panel) is the separate, contextual entry
+         point into the same drawer. -->
+    <button class="shell-header__ask" id="ask-bagman-toggle" type="button">
+      <svg width="15" height="15" viewBox="0 0 15 15" fill="none" aria-hidden="true">
+        <circle cx="6.5" cy="6.5" r="5" stroke="currentColor" stroke-width="1.4" />
+        <path d="M10.2 10.2L13.5 13.5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" />
+      </svg>
+      <span>Ask BAGMAN anything…</span>
+    </button>
+
     <div class="shell-header__actions">
+      <!-- Global + Add (PID §98.3) — reachable from anywhere, funnels
+           through the one governed intake endpoint (shell/add-menu.js). -->
+      <div class="add-menu">
+        <button class="btn btn--primary" id="add-menu-toggle" type="button" aria-haspopup="true" aria-expanded="false">
+          + Add
+        </button>
+        <div class="add-menu__list" id="add-menu-list" hidden role="menu">
+          <button type="button" role="menuitem" data-add-kind="INVOICE_RECEIPT">Upload invoice / receipt</button>
+          <button type="button" role="menuitem" data-add-kind="OTHER_DOCUMENT">Upload other document</button>
+          <button type="button" role="menuitem" data-add-kind="PHOTO">Add photo</button>
+        </div>
+      </div>
       <label class="operator-identity">
         <span>Acting as</span>
         <input type="text" id="operator-identity-input" autocomplete="off" />
       </label>
-      <!-- Ask BAGMAN (PID §42) — reachable from anywhere in the shell,
-           not buried inside one tab; opens features/ai/ask-bagman.js's
-           drawer (markup below, just before </body>). -->
-      <button class="btn btn--primary" id="ask-bagman-toggle" type="button">Ask BAGMAN</button>
     </div>
   </header>
+
+  <nav class="shell-nav" aria-label="Primary">
+    <button class="tab-btn" data-tab="overview" type="button" aria-current="page">Overview</button>
+    <button class="tab-btn" data-tab="needs-you" type="button">Needs You</button>
+    <div class="shell-nav__group-label">Records</div>
+    <button class="tab-btn" data-tab="documents" type="button">Documents</button>
+    <!-- CD-6 Slice 3 (Mailbox Management) — was a disabled placeholder
+         in Slice 1/2; now a real, live mailbox-registry tab. Mail
+         fetch/monitoring itself remains a future delivery — this tab
+         manages mailbox DEFINITIONS only (see
+         app/api/static/features/mailbox/mailboxes.js's own docstring). -->
+    <button class="tab-btn" data-tab="mailboxes" type="button">Email</button>
+    <button class="tab-btn tab-btn--disabled" type="button" disabled title="Not part of this delivery">
+      Invoices <span class="pill pill--muted">unavailable</span>
+    </button>
+    <button class="tab-btn tab-btn--disabled" type="button" disabled title="Not part of this delivery">
+      Banking <span class="pill pill--muted">unavailable</span>
+    </button>
+    <button class="tab-btn tab-btn--disabled" type="button" disabled title="Not part of this delivery">
+      Tax <span class="pill pill--muted">unavailable</span>
+    </button>
+    <div class="shell-nav__divider"></div>
+    <button class="tab-btn" data-tab="activity" type="button">Activity</button>
+    <!-- CD-6 Slice 2 (architect spec §16) — was a disabled placeholder
+         in Slice 1; now a real, live Connections tab. -->
+    <button class="tab-btn" data-tab="connections" type="button">Connections</button>
+  </nav>
 
   <main class="shell-main">
 
     <!-- ============================= OVERVIEW ============================= -->
     <section id="panel-overview" class="tab-panel">
-      <h1>Runtime Overview</h1>
-      <p class="muted">
-        A minimal liveness/readiness summary. This is not the focus of this delivery —
-        see the <button class="link-btn" data-goto-tab="documents" type="button">Documents</button> tab
-        for the governed evidence intake workflow.
-      </p>
-
-      <div class="card-grid" id="overview-cards">
-        <div class="card" data-card="health">
-          <div class="card__title">Liveness — <code>GET /health</code></div>
-          <div class="card__body">
-            <div class="status-line"><span class="dot dot--pending"></span><span class="status-text">checking…</span></div>
-          </div>
-        </div>
-        <div class="card" data-card="ready">
-          <div class="card__title">Readiness — <code>GET /ready</code></div>
-          <div class="card__body">
-            <div class="status-line"><span class="dot dot--pending"></span><span class="status-text">checking…</span></div>
-          </div>
-        </div>
-        <div class="card" data-card="version">
-          <div class="card__title">Build — <code>GET /version</code></div>
-          <div class="card__body">
-            <dl class="kv" id="version-kv"><dt>loading…</dt></dl>
-          </div>
+      <div class="overview-hero">
+        <div id="overview-greeting" class="overview-greeting">
+          <h1>Good morning Matt</h1>
         </div>
       </div>
 
-      <button class="btn btn--secondary" id="overview-refresh" type="button">Refresh</button>
-
-      <!-- ---------- AI status (CD-5 WI-4, PID §46-48) ---------- -->
-      <h2 class="ai-status__heading">AI Status</h2>
+      <!-- ---------- AI status (CD-5 WI-4, PID §46-48) — deliberately
+           BELOW the greeting and visually quiet: Overview's primary job
+           is "what needs Matt", not an infrastructure dashboard. ---------- -->
+      <h2 class="ai-status__heading section-heading">AI status</h2>
       <div class="card-grid" id="ai-status-cards">
         <div class="card" data-card="ai-claude">
           <div class="card__title">Claude operator</div>
@@ -91,11 +109,49 @@
           </div>
         </div>
       </div>
+
+      <h2 class="section-heading">System</h2>
+      <div class="card-grid" id="overview-cards">
+        <div class="card" data-card="health">
+          <div class="card__title">Liveness — <code>GET /health</code></div>
+          <div class="card__body">
+            <div class="status-line"><span class="dot dot--pending"></span><span class="status-text">checking…</span></div>
+          </div>
+        </div>
+        <div class="card" data-card="ready">
+          <div class="card__title">Readiness — <code>GET /ready</code></div>
+          <div class="card__body">
+            <div class="status-line"><span class="dot dot--pending"></span><span class="status-text">checking…</span></div>
+          </div>
+        </div>
+        <div class="card" data-card="version">
+          <div class="card__title">Build — <code>GET /version</code></div>
+          <div class="card__body">
+            <dl class="kv" id="version-kv"><dt>loading…</dt></dl>
+          </div>
+        </div>
+      </div>
+
+      <button class="btn btn--ghost btn--sm" id="overview-refresh" type="button">Refresh</button>
+    </section>
+
+    <!-- ============================= NEEDS YOU ============================= -->
+    <section id="panel-needs-you" class="tab-panel" hidden>
+      <div class="page-head">
+        <div>
+          <h1>Needs You</h1>
+          <p class="muted">Every decision, across every BAGMAN module, that only Matt can make — open items first, most pressing on top.</p>
+        </div>
+      </div>
+      <div id="needs-you-list" class="needs-you-list"></div>
     </section>
 
     <!-- ============================= DOCUMENTS ============================= -->
     <section id="panel-documents" class="tab-panel" hidden>
-      <h1>Documents</h1>
+      <div class="documents-header">
+        <h1>Documents</h1>
+        <button class="btn btn--secondary" id="documents-upload-invoice" type="button">Upload invoice</button>
+      </div>
 
       <!-- ---------- Upload ---------- -->
       <div class="upload-panel">
@@ -113,11 +169,12 @@
           <div class="form-grid">
             <label class="field">
               <span>Entity</span>
+              <!-- Real canonical companies are populated at runtime by
+                   features/documents/documents.js's own listEntities()
+                   call (CD-6 Slice 2, architect spec §1) — no company
+                   name is hardcoded in this markup. -->
               <select id="entity-select">
                 <option value="">UNRESOLVED (no entity yet)</option>
-                <option value="NOUSTAI_LIMITED">NoustAI Limited</option>
-                <option value="INFOSECURS_LIMITED">Infosecurs Limited</option>
-                <option value="MATTHEW_SCOTT_PERSONAL">Matthew Scott (personal)</option>
                 <option value="__custom__">Other (type below)…</option>
               </select>
               <input type="text" id="entity-custom" class="field-inline" placeholder="free-text entity hint" hidden />
@@ -180,7 +237,7 @@
             </label>
             <label>
               Entity hint
-              <input type="text" id="filter-entity" placeholder="e.g. NOUSTAI_LIMITED" />
+              <input type="text" id="filter-entity" placeholder="a company's canonical_name" />
             </label>
             <label>
               From
@@ -226,6 +283,44 @@
       </div>
     </section>
 
+    <!-- ============================= ACTIVITY ============================= -->
+    <section id="panel-activity" class="tab-panel" hidden>
+      <div class="page-head">
+        <div>
+          <h1>Activity</h1>
+          <p class="muted">Every automatic action and every operator decision, in one place (PID §98.8). Click a row for the full forensic detail.</p>
+        </div>
+      </div>
+      <div id="activity-list" class="activity-list"></div>
+    </section>
+
+    <!-- ============================= EMAIL / MAILBOXES ============================= -->
+    <section id="panel-mailboxes" class="tab-panel" hidden>
+      <div class="page-head">
+        <div>
+          <h1>Email</h1>
+          <p class="muted">
+            Mailboxes BAGMAN will monitor for evidence — definitions only. A mailbox is a source of
+            evidence, never a company, ledger, or invoice owner. Connecting to a real provider and
+            fetching mail is a future delivery.
+          </p>
+        </div>
+        <button class="btn btn--primary" id="mailboxes-add" type="button">Add mailbox</button>
+      </div>
+      <div id="mailboxes-list" class="card-grid"></div>
+    </section>
+
+    <!-- ============================= CONNECTIONS ============================= -->
+    <section id="panel-connections" class="tab-panel" hidden>
+      <div class="page-head">
+        <div>
+          <h1>Connections</h1>
+          <p class="muted">Each BAGMAN company's Xero accounting connection — state, last sync, account count. No token details are ever shown here (PID §98.4).</p>
+        </div>
+      </div>
+      <div id="connections-list" class="card-grid"></div>
+    </section>
+
   </main>
 
   <!-- ---------- Detail panel (slide-over) ---------- -->
@@ -240,6 +335,35 @@
       </div>
     </div>
   </div>
+
+  <!-- ---------- Needs You review drawer (CD-6 Slice 1, shell/drawer.js) ---------- -->
+  <div id="review-drawer" class="review-drawer-overlay" hidden>
+    <div class="review-drawer" role="dialog" aria-modal="true" aria-labelledby="review-drawer-title">
+      <div class="review-drawer__header">
+        <h2 id="review-drawer-title">Review</h2>
+        <button class="btn btn--ghost" id="review-drawer-close" type="button" aria-label="Close">&times;</button>
+      </div>
+      <div class="review-drawer__body" id="review-drawer-body">
+        <!-- populated by features/needs-you/needs-you.js -->
+      </div>
+    </div>
+  </div>
+
+  <!-- ---------- Global upload modal (CD-6 Slice 1, shell/add-menu.js) ---------- -->
+  <div id="upload-modal" class="modal-overlay" hidden>
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="upload-modal-title">
+      <div class="modal__header">
+        <h2 id="upload-modal-title">Upload</h2>
+        <button class="btn btn--ghost" id="upload-modal-close" type="button" aria-label="Close">&times;</button>
+      </div>
+      <div class="modal__body" id="upload-modal-body">
+        <!-- populated by shell/add-menu.js -->
+      </div>
+    </div>
+  </div>
+
+  <!-- ---------- Toast/notice stack (CD-6 Slice 1, shared/notify.js) ---------- -->
+  <div id="toast-stack" class="toast-stack" aria-live="polite"></div>
 
   <!-- ---------- Ask BAGMAN drawer (PID §42-44) ---------- -->
   <div id="ask-bagman-drawer" class="ask-bagman-drawer" hidden>

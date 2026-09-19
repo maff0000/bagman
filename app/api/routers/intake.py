@@ -171,6 +171,10 @@ from pydantic import BaseModel, ValidationError as PydanticValidationError
 from core import identity
 from core.errors import BagmanError, InvalidStateTransitionError
 from services.evidence.intake.validation_pipeline import run_intake_validation
+from services.needs_you.needs_you import (
+    ALLOWED_ACTION_COMPANY_WHAT_WHY as NEEDS_YOU_ALLOWED_ACTION_COMPANY_WHAT_WHY,
+    ITEM_TYPE_COMPANY_REQUIRED as NEEDS_YOU_ITEM_TYPE_COMPANY_REQUIRED,
+)
 from app.api.composition import get_composition, get_manual_upload_source_id
 
 router = APIRouter(prefix="/internal/intake")
@@ -243,7 +247,12 @@ def _register_accepted_evidence(*, composition, record, meta: IntakeUploadMetada
     partial-failure/orphan-object story this function's ``except``
     branch implements.
 
-    Returns ``(registered_intake_record, evidence_item)``.
+    Returns ``(registered_intake_record, evidence_item, intake_completed_event)``
+    — CD-6 Slice 1 adds the third element (the ``INTAKE_COMPLETED``
+    event this function already emitted internally) so its caller can
+    thread the Needs You item's own creation event onto the SAME causal
+    chain, rather than re-querying for "the most recent event on this
+    subject" (fragile under concurrent activity) just to find it again.
     """
     try:
         storage_reference = record.metadata["storage_reference"]
@@ -323,7 +332,7 @@ def _register_accepted_evidence(*, composition, record, meta: IntakeUploadMetada
             record.intake_id, "REGISTERED", evidence_id=evidence.evidence_id
         )
 
-        _emit(
+        completed_event = _emit(
             composition,
             event_type="INTAKE_COMPLETED",
             actor_type=meta.actor_type,
@@ -334,7 +343,7 @@ def _register_accepted_evidence(*, composition, record, meta: IntakeUploadMetada
             causation_id=registered_event.audit_event_id,
             payload={"evidence_id": evidence.evidence_id},
         )
-        return registered_record, evidence
+        return registered_record, evidence, completed_event
     except BagmanError as exc:
         # Orphan-object doctrine (see module docstring): the intake
         # must never be reported as a success once it cannot honestly
@@ -354,6 +363,60 @@ def _register_accepted_evidence(*, composition, record, meta: IntakeUploadMetada
             payload={"failure_code": "EVIDENCE_REGISTRATION_FAILED", "detail": str(exc)[:500]},
         )
         raise
+
+
+def _create_needs_you_item_for_accepted_evidence(
+    *, composition, record, evidence, meta: IntakeUploadMetadata, causation_id: Optional[str]
+) -> None:
+    """CD-6 Slice 1's one real Needs You trigger (PID §98.3/§98.5): the
+    moment an intake attempt reaches ``REGISTERED`` (i.e. a canonical
+    ``EvidenceItem`` now genuinely exists — never before, per this
+    module's own "an item that never reaches canonical evidence has
+    nothing to ask an operator about" doctrine), raise exactly one
+    ``COMPANY_REQUIRED`` item whose resolution captures Company/What/Why
+    together (see ``services.needs_you.needs_you``'s own module
+    docstring, "Slice 1's one real trigger", for why this is ONE item
+    typed ``COMPANY_REQUIRED`` rather than three).
+
+    Idempotency: ``composition.needs_you_repository.create_needs_you_item``
+    is itself idempotent on ``(item_type, source_object_reference)`` —
+    see that repository's own docstring — so this function is safe to
+    call at most once per genuinely NEW registration (which is exactly
+    how often this module's own call site below invokes it: only inside
+    the ``result.status == "ACCEPTED"`` branch that itself only runs for
+    a genuinely new registration or the narrow still-``RECEIVED``
+    in-flight-replay case — see this module's own docstring's
+    idempotent-replay analysis). A hypothetical future double-invocation
+    bug would still resolve to the SAME item rather than silently
+    duplicating the operator's queue.
+    """
+    original_label = record.original_filename or evidence.evidence_id
+    item = composition.needs_you_repository.create_needs_you_item(
+        item_type=NEEDS_YOU_ITEM_TYPE_COMPANY_REQUIRED,
+        domain="EVIDENCE_INTAKE",
+        source_object_reference=evidence.evidence_id,
+        question=f"Which company is this for, and what/why? ({original_label})",
+        allowed_action_type=NEEDS_YOU_ALLOWED_ACTION_COMPANY_WHAT_WHY,
+        correlation_id=record.correlation_id,
+        metadata={
+            "evidence_id": evidence.evidence_id,
+            "intake_id": record.intake_id,
+            "original_filename": record.original_filename,
+            "detected_mime_type": record.detected_mime_type,
+            "entity_hint": record.entity_hint,
+        },
+    )
+    _emit(
+        composition,
+        event_type="NEEDS_YOU_ITEM_CREATED",
+        actor_type=meta.actor_type,
+        actor_id=meta.actor_id,
+        subject_type="NeedsYouItem",
+        subject_id=item.item_id,
+        correlation_id=item.correlation_id,
+        causation_id=causation_id,
+        payload={"item_type": item.item_type, "evidence_id": evidence.evidence_id},
+    )
 
 
 def _http_status_for(record, *, just_registered: bool) -> int:
@@ -537,13 +600,31 @@ async def intake_evidence(
                         "size_bytes": result.size_bytes,
                     },
                 )
-                record, evidence = _register_accepted_evidence(
+                record, evidence, completed_event = _register_accepted_evidence(
                     composition=composition,
                     record=result,
                     meta=meta,
                     causation_id=accepted_event.audit_event_id,
                 )
                 just_registered = True
+                # CD-6 Slice 1 (PID §98.3/§98.5) — raise the one Needs
+                # You item this newly-registered evidence needs, right
+                # after registration succeeds (never before — see this
+                # module's own docstring). Deliberately NOT inside the
+                # try/except _register_accepted_evidence itself wraps
+                # (that except branch's own orphan-object doctrine is
+                # scoped to evidence registration alone) — a failure
+                # here would be a genuine new bug class this slice does
+                # not attempt to make transactional with evidence
+                # registration; it propagates as an ordinary 500 rather
+                # than being silently swallowed.
+                _create_needs_you_item_for_accepted_evidence(
+                    composition=composition,
+                    record=record,
+                    evidence=evidence,
+                    meta=meta,
+                    causation_id=completed_event.audit_event_id,
+                )
             else:  # pragma: no cover - defensive; the pipeline never returns anything else
                 record = result
     # else: replay resolving to an already-progressed record

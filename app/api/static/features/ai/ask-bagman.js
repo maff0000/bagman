@@ -7,28 +7,45 @@
 // persistence exists yet, and this module does not pretend otherwise:
 // a page reload loses history, honestly).
 //
-// A real, documented API gap this WI surfaces rather than silently
-// works around (see `agent/bagman/orchestrator.py`'s own module
-// docstring, "the general chat has no evidence_id tension"):
-// `handle_operator_message` REQUIRES at least one of
+// CD-6 reliability delta (PID §98/§100) fixed a real, previously-live
+// backend defect this module used to have to surface rather than work
+// around: `handle_operator_message` used to REQUIRE at least one of
 // `evidence_id`/`intake_id`/`entity_id` to be attached — a genuinely
-// subject-less "what needs my attention?" question is explicitly out
-// of WI-3's scope and returns HTTP 422. This module does NOT invent
-// browser-side logic to block that (PID's own "no business logic in
-// the browser" invariant — the JS never decides what Claude/BAGMAN is
-// allowed to do), it only shows an honest, non-blocking notice when no
-// context is attached, and renders the real 422 plainly if the
-// operator sends one anyway.
+// subject-less "what needs my attention?" question returned HTTP 422.
+// The architect ruled that wrong ("an operator-originated
+// conversational message is itself a valid traceable input") and the
+// backend now accepts a `conversation_id` as its own fallback subject
+// (see `ai.invocation.derive_primary_input_reference`'s module
+// docstring). This module generates ONE `conversationId` per OPEN
+// drawer session (see `open()`/`close()` below) and sends it on every
+// turn — PID's own "no business logic in the browser" invariant still
+// holds: the JS does not decide what Claude/BAGMAN is allowed to do,
+// it only supplies the conversation-scoped identifier the backend's
+// own concurrency guard needs.
 import { el, clear, qs } from "../../shared/dom.js";
 import { fmtDateTime } from "../../shared/format.js";
 import { errorMessage } from "../../shared/api.js";
 import { getActorId } from "../../shared/operator.js";
+import { generateRequestId } from "../../shared/uuid.js";
 import { sendOperatorChat } from "./ai-api.js";
 import { renderToolCalls, renderWarningsList } from "./invocation-card.js";
+
+//: The literal `source` value sent on every turn from this surface
+//: (CD-6 reliability delta, PID §98/§100) — a simple, honest literal,
+//: not a taxonomy; this module is currently the ONLY caller of
+//: `POST /internal/operator/chat`.
+const SOURCE = "ask_bagman_drawer";
 
 const conversation = []; // {role: 'user'|'assistant'|'error', text, toolCalls, referencedEvidenceIds, warnings, at}
 
 let context = { evidenceId: null, intakeId: null, entityId: null };
+//: One id per OPEN drawer session (CD-6 reliability delta) — generated
+//: fresh the moment the drawer transitions from hidden to visible
+//: (`open()`), reused across every turn typed while it stays open
+//: (including across "Ask BAGMAN about this" re-attaching a different
+//: document mid-conversation), and cleared on `close()` so the NEXT
+//: open starts a genuinely new, non-conflicting conversation subject.
+let conversationId = null;
 let evidenceLinkHandler = null;
 let sending = false;
 
@@ -162,6 +179,8 @@ async function submit() {
     evidenceId: context.evidenceId,
     intakeId: context.intakeId,
     entityId: context.entityId,
+    conversationId,
+    source: SOURCE,
   });
 
   sending = false;
@@ -207,6 +226,15 @@ export function open(newContext = {}) {
     entityId: newContext.entityId || null,
   };
   const drawer = qs("#ask-bagman-drawer");
+  // CD-6 reliability delta: generate a fresh conversation id only on a
+  // genuine hidden->visible transition (or if none exists yet) —
+  // reused, not regenerated, if `open()` is called again while the
+  // drawer is ALREADY visible (e.g. "Ask BAGMAN about this" clicked on
+  // a different document while the drawer stays open) — see module
+  // docstring and `close()` below.
+  if (drawer.hidden || !conversationId) {
+    conversationId = generateRequestId();
+  }
   drawer.hidden = false;
   render();
   qs("#ask-bagman-input").focus();
@@ -214,6 +242,11 @@ export function open(newContext = {}) {
 
 export function close() {
   qs("#ask-bagman-drawer").hidden = true;
+  // CD-6 reliability delta: closing the drawer ends this conversation
+  // subject — the NEXT open() (even with the same document re-attached)
+  // must not conflict with a still-in-flight turn from a conversation
+  // the operator has already left (module docstring).
+  conversationId = null;
 }
 
 /** The shell header's "Ask BAGMAN" button (reachable from anywhere,

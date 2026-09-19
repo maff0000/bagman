@@ -138,6 +138,19 @@ _ALL_MODULE_PATHS = [
     "features/ai/ai-api.js",
     "features/ai/invocation-card.js",
     "features/ai/ask-bagman.js",
+    # CD-6 Slice 1 (PID §98) additions:
+    "shared/chips.js",
+    "shared/notify.js",
+    "shared/state.js",
+    "shell/entities.js",
+    "shell/preview.js",
+    "shell/drawer.js",
+    "shell/add-menu.js",
+    "shell/intake-upload.js",
+    "features/needs-you/needs-you-api.js",
+    "features/needs-you/needs-you.js",
+    "features/activity/activity-api.js",
+    "features/activity/activity.js",
 ]
 
 

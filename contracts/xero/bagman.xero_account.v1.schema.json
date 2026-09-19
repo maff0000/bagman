@@ -1,0 +1,133 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://bagman.internal/contracts/xero/bagman.xero_account.v1.schema.json",
+  "title": "BAGMAN XeroAccount",
+  "description": "One synced projection of a Xero Chart-of-Accounts row (`GET /Accounts`, CD-6 Slice 2, PID §98.4, architect spec §4). Durable external identity is `(tenant_id, account_id)` — enforced as a real database-level unique constraint (`persistence/postgres/xero_models.py`), so a repeated sync of the same account UPDATES this same row rather than duplicating it (idempotency, architect spec §4/§29). `type`/`account_class`/`status`/`tax_type` are captured VERBATIM from Xero and are deliberately OPEN string fields here (never a hand-typed closed enum) — PID §102.1's own researched doctrine, matching this repository's existing 'open taxonomy field' pattern for every other provider-supplied vocabulary (`entity_type`, `evidence_type`, `source_type`, ...). An account that becomes inactive/archived in Xero is never deleted from this projection — only its `status` is updated on a later sync (architect spec §5/§6's 'retained historically, not silently deleted').",
+  "type": "object",
+  "properties": {
+    "xero_account_row_id": {
+      "$ref": "https://bagman.internal/contracts/common/bagman.identifier.v1.schema.json",
+      "description": "Canonical BAGMAN identifier for this projection row (distinct from Xero's own `account_id`)."
+    },
+    "entity_id": {
+      "$ref": "https://bagman.internal/contracts/common/bagman.identifier.v1.schema.json",
+      "description": "The BAGMAN `GovernedEntity` this account belongs to (via its `XeroConnection`) — denormalised onto every row so a query for 'accounts for company X' never needs to join through the connection table, and so cross-company isolation is directly, trivially provable (a query scoped to one `entity_id` structurally cannot return another company's rows)."
+    },
+    "tenant_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The Xero organisation/tenant this account belongs to (half of this row's durable external identity, together with `account_id`)."
+    },
+    "account_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Xero's own `AccountID` (a Xero-minted GUID) — the other half of this row's durable external identity. This, not `code` or `name`, is what a BAGMAN record that references a Xero account actually stores (architect spec §8/§9-10's 'the stored selector value is the real AccountID, never a display string')."
+    },
+    "code": {
+      "oneOf": [
+        { "type": "string" },
+        { "type": "null" }
+      ],
+      "description": "Xero's `Code` (e.g. `\"453\"`) verbatim. Xero permits a null/blank code on some account types."
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Xero's `Name` verbatim (e.g. `\"Hosting & Cloud Services\"`)."
+    },
+    "type": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Xero's `Type` verbatim (e.g. `EXPENSE`, `OVERHEADS`, `CURRENT`). Deliberately open — see this schema's own top-level description."
+    },
+    "account_class": {
+      "oneOf": [
+        { "type": "string" },
+        { "type": "null" }
+      ],
+      "description": "Xero's `Class` verbatim, when supplied (e.g. `EXPENSE`, `ASSET`, `REVENUE`) — PID §98.4's own 'Class if supplied'. Deliberately open. Named `account_class` (not `class`) purely because `class` is a reserved word in several languages this contract's consumers are written in; the value is Xero's `Class` field unmodified."
+    },
+    "tax_type": {
+      "oneOf": [
+        { "type": "string" },
+        { "type": "null" }
+      ],
+      "description": "Xero's `TaxType` verbatim (e.g. `INPUT2`, `NONE`). Deliberately open."
+    },
+    "status": {
+      "oneOf": [
+        { "type": "string", "minLength": 1 },
+        { "type": "null" }
+      ],
+      "description": "Xero's own `Status` verbatim (e.g. `ACTIVE`, `ARCHIVED`, `DELETED`) — deliberately open (NOT validated against a hand-typed closed set here); see `services/xero/eligibility.py` for the DOCUMENTED, separate application-layer filtering policy that reads this field to decide default dropdown visibility without ever deleting a row for it."
+    },
+    "show_in_expense_claims": {
+      "oneOf": [
+        { "type": "boolean" },
+        { "type": "null" }
+      ],
+      "description": "Xero's `ShowInExpenseClaims` verbatim. Useful eligibility-filtering signal, but NEVER the sole eligibility rule (architect spec §5/PID §98.4's explicit instruction) — see `services/xero/eligibility.py`."
+    },
+    "reporting_code": {
+      "oneOf": [
+        { "type": "string" },
+        { "type": "null" }
+      ],
+      "description": "Xero's `ReportingCode` verbatim."
+    },
+    "reporting_code_name": {
+      "oneOf": [
+        { "type": "string" },
+        { "type": "null" }
+      ],
+      "description": "Xero's `ReportingCodeName` verbatim."
+    },
+    "source_updated_date_utc": {
+      "oneOf": [
+        { "$ref": "https://bagman.internal/contracts/common/bagman.utc_timestamp.v1.schema.json" },
+        { "type": "null" }
+      ],
+      "description": "Xero's own `UpdatedDateUTC` for this account — the PROVIDER's last-modified timestamp, distinct from `last_synced_at` below (BAGMAN's own fetch time)."
+    },
+    "first_synced_at": {
+      "$ref": "https://bagman.internal/contracts/common/bagman.utc_timestamp.v1.schema.json",
+      "description": "UTC timestamp this row was first created by a sync — immutable once set (never updated by a later sync of the same account)."
+    },
+    "last_synced_at": {
+      "$ref": "https://bagman.internal/contracts/common/bagman.utc_timestamp.v1.schema.json",
+      "description": "UTC timestamp of the most recent sync run that observed this exact account (updated on every idempotent re-sync, whether or not any other field actually changed)."
+    },
+    "last_sync_run_id": {
+      "$ref": "https://bagman.internal/contracts/common/bagman.identifier.v1.schema.json",
+      "description": "The `XeroSyncRun.sync_run_id` that most recently wrote this row — traceability back to exactly which sync attempt produced the current projection (architect spec §29's provenance requirement)."
+    },
+    "schema_version": {
+      "allOf": [
+        { "$ref": "https://bagman.internal/contracts/common/bagman.schema_version.v1.schema.json" }
+      ],
+      "const": "bagman.xero_account.v1",
+      "description": "Must literally equal `\"bagman.xero_account.v1\"`."
+    }
+  },
+  "required": [
+    "xero_account_row_id",
+    "entity_id",
+    "tenant_id",
+    "account_id",
+    "code",
+    "name",
+    "type",
+    "account_class",
+    "tax_type",
+    "status",
+    "show_in_expense_claims",
+    "reporting_code",
+    "reporting_code_name",
+    "source_updated_date_utc",
+    "first_synced_at",
+    "last_synced_at",
+    "last_sync_run_id",
+    "schema_version"
+  ],
+  "additionalProperties": false
+}

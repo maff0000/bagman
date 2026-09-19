@@ -7,10 +7,76 @@ import { el, clear, qs } from "../../shared/dom.js";
 import { fmtDateTime } from "../../shared/format.js";
 import { API, apiGet } from "../../shared/api.js";
 import { getAiHealth, listRecentInvocations, countPendingInvocations } from "../ai/ai-api.js";
+import { NeedsYou } from "../needs-you/needs-you.js";
+
+//: PID §98.2's own worked example greeting is time-of-day-agnostic in
+//: spirit ("Good morning Matt") — this GUI renders the REAL local
+//: time-of-day greeting rather than hardcoding "morning" regardless of
+//: when Matt actually opens BAGMAN (a small honesty detail: PID §98.2's
+//: whole design doctrine is "no fake buttons"/no fabricated content,
+//: and an afternoon "Good morning" would be exactly that).
+function timeOfDayGreeting() {
+  const hour = new Date().getHours();
+  if (hour < 12) return "Good morning";
+  if (hour < 18) return "Good afternoon";
+  return "Good evening";
+}
 
 export const Overview = {
   async load() {
-    await Promise.all([this._loadHealth(), this._loadReady(), this._loadVersion(), this._loadAiStatus()]);
+    await Promise.all([
+      this._loadGreeting(),
+      this._loadHealth(),
+      this._loadReady(),
+      this._loadVersion(),
+      this._loadAiStatus(),
+    ]);
+  },
+
+  // ---- greeting / Needs You summary (PID §98.2) ----
+
+  async _loadGreeting() {
+    const host = qs("#overview-greeting");
+    if (!host) return;
+    clear(host);
+
+    const summary = await NeedsYou.getOpenSummary();
+
+    host.appendChild(el("h1", { text: `${timeOfDayGreeting()} Matt` }));
+
+    if (summary.total === null) {
+      host.appendChild(
+        el("p", { class: "muted", text: "Could not reach the Needs You queue — try refreshing." })
+      );
+      return;
+    }
+
+    if (summary.total === 0) {
+      host.appendChild(el("p", { class: "overview-greeting__count", text: "Nothing needs your attention." }));
+      host.appendChild(el("p", { class: "muted", text: "Everything else is running normally." }));
+      return;
+    }
+
+    host.appendChild(
+      el("p", {
+        class: "overview-greeting__count",
+        text: `${summary.total} thing${summary.total === 1 ? "" : "s"} need${summary.total === 1 ? "s" : ""} your attention`,
+      })
+    );
+    const lines = NeedsYou.summaryLines(summary.byType);
+    if (lines.length) {
+      const list = el("ul", { class: "overview-greeting__lines" });
+      for (const line of lines) list.appendChild(el("li", { text: line }));
+      host.appendChild(list);
+    }
+    host.appendChild(el("p", { class: "muted", text: "Everything else is running normally." }));
+
+    const goToNeedsYouBtn = el("button", {
+      class: "btn btn--secondary",
+      text: "Open Needs You",
+      attrs: { type: "button", "data-goto-tab": "needs-you" },
+    });
+    host.appendChild(goToNeedsYouBtn);
   },
 
   async _loadHealth() {
@@ -130,7 +196,10 @@ export const Overview = {
       list.appendChild(
         el("li", {}, [
           el("span", { class: "ai-recent-list__task", text: `${invocation.task_id}` }),
-          el("span", { class: `pill pill--${invocation.status === "SUCCEEDED" ? "ok" : invocation.status === "FAILED" || invocation.status === "REJECTED" ? "bad" : "muted"}`, text: invocation.status }),
+          // TIMED_OUT/CANCELLED (CD-6 reliability delta, PID §100) join
+          // FAILED/REJECTED's terminal-outcome pill styling rather than
+          // falling through to the still-in-flight "muted" default.
+          el("span", { class: `pill pill--${invocation.status === "SUCCEEDED" ? "ok" : ["FAILED", "REJECTED", "TIMED_OUT", "CANCELLED"].includes(invocation.status) ? "bad" : "muted"}`, text: invocation.status }),
           el("span", { class: "muted small", text: fmtDateTime(invocation.started_at) }),
         ])
       );

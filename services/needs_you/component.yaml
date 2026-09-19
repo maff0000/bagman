@@ -1,0 +1,52 @@
+# BAGMAN component manifest (PID §98.5) for services/needs_you/.
+# Validated by scripts/generate_architecture_memory.py against
+# contracts/manifest/bagman.component_manifest.v1.schema.json.
+
+id: BAGMAN.NEEDS_YOU
+version: 1
+
+responsibility: >
+  Own the universal, cross-domain NeedsYouItem domain object and its
+  small closed state machine (OPEN -> RESOLVED/DISMISSED) — the one
+  queue every BAGMAN producer (evidence intake today; email triage,
+  invoice review, rule proposals in later CD-6 slices) raises a
+  question into when a human decision is required before BAGMAN can
+  keep going (PID §98.2/§98.5). Deliberately its own top-level
+  component rather than folded into services/evidence/intake/ — see
+  this module's own docstring ("What this is, and why it is its own
+  top-level component") for the full rationale. Does not itself decide
+  WHEN to raise an item for a given domain event (that orchestration
+  lives in the calling HTTP router, e.g. app/api/routers/intake.py's
+  own documented hook, exactly like core.api.BagmanCanonicalAPI never
+  deciding when services.evidence.intake's pipeline should run).
+
+owns:
+  - NeedsYouItem
+
+# What services/needs_you/*.py actually imports from core/: identity
+# (id generation), timestamps (UTC handling), errors
+# (InvalidStateTransitionError, NotFoundError, ValidationError), and
+# contract_validation (validate_against_contract) — the exact same set
+# services/evidence/intake/intake.py depends on, for the same reasons.
+consumes:
+  - BAGMAN.CORE
+
+# This component does not itself emit AuditEvents — NEEDS_YOU_ITEM_CREATED/
+# NEEDS_YOU_ITEM_RESOLVED are minted by the HTTP orchestration layer
+# that calls this repository (app/api/routers/intake.py,
+# app/api/routers/needs_you.py) via core.api.BagmanCanonicalAPI
+# .record_audit_event(), exactly like services/evidence/intake/ never
+# emitting its own audit events (see that component's own manifest).
+produces: []
+
+dependencies:
+  - jsonschema
+  - rfc3339-validator
+
+external_access: false
+
+prohibited:
+  - direct_email_access
+  - direct_bank_access
+  - direct_xero_access
+  - direct_chargebee_access

@@ -7,7 +7,10 @@
 import { el, clear, qs } from "../../shared/dom.js";
 import { fmtBytes, fmtDateTime, hashPrefix, statusBadge } from "../../shared/format.js";
 import { API, apiGet, errorMessage } from "../../shared/api.js";
+import { generateRequestId } from "../../shared/uuid.js";
 import { Detail } from "./detail.js";
+import { openUploadModal } from "../../shell/add-menu.js";
+import { listEntities } from "../../shell/entities.js";
 
 export const Documents = {
   _loaded: false,
@@ -26,7 +29,19 @@ export const Documents = {
     this._loaded = true;
     this._wireUpload();
     this._wireFilters();
+    this._wireUploadInvoiceButton();
     this.load();
+    document.addEventListener("bagman:evidence-registered", () => this.load());
+  },
+
+  // CD-6 Slice 1 (PID §98.3) — "Also add Upload invoice within the
+  // Invoices/Documents tab": opens the SAME global upload modal
+  // (shell/add-menu.js) pre-selected to the invoice/receipt kind,
+  // rather than a second, duplicated upload form.
+  _wireUploadInvoiceButton() {
+    const btn = qs("#documents-upload-invoice");
+    if (!btn) return;
+    btn.addEventListener("click", () => openUploadModal("INVOICE_RECEIPT"));
   },
 
   // ---- filters / pagination ----
@@ -128,10 +143,22 @@ export const Documents = {
     });
 
     tr.appendChild(el("td", {}, [statusBadge(record.status)]));
-    tr.appendChild(el("td", { text: record.evidence_id || "—" }));
+    tr.appendChild(
+      el("td", {
+        class: "mono",
+        text: record.evidence_id || "—",
+        attrs: record.evidence_id ? { title: record.evidence_id } : {},
+      })
+    );
     tr.appendChild(el("td", { text: entity }));
     tr.appendChild(el("td", { text: evidenceTypeHint }));
-    tr.appendChild(el("td", { class: "wrap", text: record.original_filename || "—" }));
+    tr.appendChild(
+      el("td", {
+        class: "wrap",
+        text: record.original_filename || "—",
+        attrs: record.original_filename ? { title: record.original_filename } : {},
+      })
+    );
     tr.appendChild(el("td", { text: fmtDateTime(record.received_at) }));
     tr.appendChild(el("td", { text: fmtBytes(record.size_bytes) }));
     tr.appendChild(
@@ -188,6 +215,23 @@ export const Documents = {
     const submitBtn = qs("#upload-submit");
     const entitySelect = qs("#entity-select");
     const entityCustom = qs("#entity-custom");
+
+    // CD-6 Slice 2 (architect spec §1): populated from the real
+    // canonical entity list, never hardcoded company labels in
+    // index.html's own markup — the static markup keeps only the two
+    // app-semantic, non-business options ("UNRESOLVED"/"Other…").
+    // `entity.canonical_name` is used as this <option>'s value (the
+    // SAME shape this free-text `entity_hint` field already expected —
+    // see `_submitUpload()` below), never `entity_id`, so this remains
+    // a pure "swap the source of the labels" fix with no change to
+    // what CD-4's intake endpoint actually receives.
+    listEntities().then((entities) => {
+      const customOption = entitySelect.querySelector('option[value="__custom__"]');
+      for (const entity of entities) {
+        const option = el("option", { attrs: { value: entity.canonical_name }, text: entity.display_name });
+        entitySelect.insertBefore(option, customOption);
+      }
+    });
 
     entitySelect.addEventListener("change", () => {
       entityCustom.hidden = entitySelect.value !== "__custom__";
@@ -253,82 +297,100 @@ export const Documents = {
     if (submitBtn.disabled) return;
     submitBtn.disabled = true;
 
-    const file = fileInput.files && fileInput.files[0];
-    const actorId = actorInput.value.trim();
-
-    if (!file) {
-      statusEl.dataset.kind = "bad";
-      statusEl.textContent = "Choose a file before uploading.";
-      submitBtn.disabled = false;
-      return;
-    }
-    if (!actorId) {
-      statusEl.dataset.kind = "bad";
-      statusEl.textContent = "Enter who is uploading (operator identity) before uploading.";
-      submitBtn.disabled = false;
-      return;
-    }
-
-    let entityHint = entitySelect.value;
-    if (entityHint === "__custom__") entityHint = entityCustom.value.trim() || null;
-    if (entityHint === "") entityHint = null;
-
-    let evidenceType = evidenceTypeSelect.value || null;
-
-    const metadata = {
-      entity_hint: entityHint,
-      evidence_type: evidenceType,
-      actor_type: "USER",
-      actor_id: actorId,
-      note: noteInput.value.trim() || null,
-    };
-
-    const formData = new FormData();
-    formData.append("file", file);
-    formData.append("metadata", JSON.stringify(metadata));
-
-    const idempotencyKey = crypto.randomUUID();
-
-    statusEl.dataset.kind = "progress";
-    statusEl.textContent = "Uploading…"; // honest — this is the actual in-flight fetch, not a fabricated step (PID §38)
-
-    let response;
+    // Real bug found by a fresh Auditor testing live against the
+    // actual deployed URL (not a localhost/SSH-tunnel secure context):
+    // `crypto.randomUUID()` (used below, and previously called
+    // directly here) throws outside a browser secure context, which
+    // this plain-HTTP LAN deployment always is — and, because nothing
+    // wrapped that early a step, the exception silently left this
+    // button disabled and the status text stuck at "Uploading…"
+    // forever, indistinguishable from a hung request. Every step from
+    // here on is now wrapped so ANY unexpected exception — not just a
+    // network error from fetch() — surfaces a real, visible error and
+    // re-enables the button, matching PID §98.2's own "no fake
+    // buttons" doctrine in the failure direction too.
     try {
-      response = await fetch(API.intakeEvidence, {
-        method: "POST",
-        headers: { "Idempotency-Key": idempotencyKey },
-        body: formData,
-      });
-    } catch (networkErr) {
-      statusEl.dataset.kind = "bad";
-      statusEl.textContent = `Network error — could not reach BAGMAN: ${networkErr.message}`;
+      const file = fileInput.files && fileInput.files[0];
+      const actorId = actorInput.value.trim();
+
+      if (!file) {
+        statusEl.dataset.kind = "bad";
+        statusEl.textContent = "Choose a file before uploading.";
+        submitBtn.disabled = false;
+        return;
+      }
+      if (!actorId) {
+        statusEl.dataset.kind = "bad";
+        statusEl.textContent = "Enter who is uploading (operator identity) before uploading.";
+        submitBtn.disabled = false;
+        return;
+      }
+
+      let entityHint = entitySelect.value;
+      if (entityHint === "__custom__") entityHint = entityCustom.value.trim() || null;
+      if (entityHint === "") entityHint = null;
+
+      let evidenceType = evidenceTypeSelect.value || null;
+
+      const metadata = {
+        entity_hint: entityHint,
+        evidence_type: evidenceType,
+        actor_type: "USER",
+        actor_id: actorId,
+        note: noteInput.value.trim() || null,
+      };
+
+      const formData = new FormData();
+      formData.append("file", file);
+      formData.append("metadata", JSON.stringify(metadata));
+
+      const idempotencyKey = generateRequestId();
+
+      statusEl.dataset.kind = "progress";
+      statusEl.textContent = "Uploading…"; // honest — this is the actual in-flight fetch, not a fabricated step (PID §38)
+
+      let response;
+      try {
+        response = await fetch(API.intakeEvidence, {
+          method: "POST",
+          headers: { "Idempotency-Key": idempotencyKey },
+          body: formData,
+        });
+      } catch (networkErr) {
+        statusEl.dataset.kind = "bad";
+        statusEl.textContent = `Network error — could not reach BAGMAN: ${networkErr.message}`;
+        submitBtn.disabled = false;
+        return;
+      }
+
+      let body = null;
+      try {
+        body = await response.json();
+      } catch {
+        body = null;
+      }
+
+      // Distinguish a genuine workflow outcome (body carries "intake" —
+      // see app/api/routers/intake.py: this shape is returned for EVERY
+      // status the pipeline can honestly reach, including 422 REJECTED
+      // and 503 FAILED, which are real outcomes, not framework errors)
+      // from an actual request-level error (malformed metadata JSON,
+      // idempotency conflict, or an unrelated 5xx) that never reached
+      // the intake pipeline at all.
+      if (body && body.intake) {
+        await this._resolveOutcome(body, statusEl);
+      } else {
+        statusEl.dataset.kind = "bad";
+        statusEl.textContent = `Upload failed: ${errorMessage(response.status, body)}`;
+      }
+
       submitBtn.disabled = false;
-      return;
-    }
-
-    let body = null;
-    try {
-      body = await response.json();
-    } catch {
-      body = null;
-    }
-
-    // Distinguish a genuine workflow outcome (body carries "intake" —
-    // see app/api/routers/intake.py: this shape is returned for EVERY
-    // status the pipeline can honestly reach, including 422 REJECTED
-    // and 503 FAILED, which are real outcomes, not framework errors)
-    // from an actual request-level error (malformed metadata JSON,
-    // idempotency conflict, or an unrelated 5xx) that never reached
-    // the intake pipeline at all.
-    if (body && body.intake) {
-      await this._resolveOutcome(body, statusEl);
-    } else {
+      this.load();
+    } catch (unexpectedErr) {
       statusEl.dataset.kind = "bad";
-      statusEl.textContent = `Upload failed: ${errorMessage(response.status, body)}`;
+      statusEl.textContent = `Upload failed: ${unexpectedErr.message || "unexpected error"}`;
+      submitBtn.disabled = false;
     }
-
-    submitBtn.disabled = false;
-    this.load();
   },
 
   async _resolveOutcome(body, statusEl) {

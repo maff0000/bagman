@@ -1,0 +1,118 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://bagman.internal/contracts/needs_you/bagman.needs_you_item.v1.schema.json",
+  "title": "BAGMAN NeedsYouItem",
+  "description": "Canonical `NeedsYouItem` (CD-6 Slice 1, PID §98.2/§98.5) — one entry in BAGMAN's universal, cross-domain operator queue: 'the small set of things a human must decide before BAGMAN can keep going'. A NeedsYouItem is deliberately NOT scoped to one BAGMAN domain (evidence intake, email triage, invoice review, rule approval, ...) — `item_type`/`domain`/`source_object_reference` together let any future producer raise a question here without this schema changing. `item_type` and `allowed_action_type` are both open (NOT closed enums, unlike `status`) so a later CD-6 slice (email classification, rule approval) can introduce a new value without a contract redesign — see `services.needs_you.needs_you`'s module docstring for the documented, non-exhaustive vocabulary this delivery already knows about (`COMPANY_REQUIRED`, `PURPOSE_REQUIRED`, `CLASSIFICATION_REVIEW`, `RULE_APPROVAL`, `GENERIC_QUESTION`) and for exactly which of these Slice 1's own real trigger (governed evidence intake reaching ACCEPTED/registered) uses.",
+  "type": "object",
+  "properties": {
+    "item_id": {
+      "$ref": "https://bagman.internal/contracts/common/bagman.identifier.v1.schema.json",
+      "description": "Canonical BAGMAN identifier for this Needs You item."
+    },
+    "item_type": {
+      "type": "string",
+      "pattern": "^[A-Z][A-Z_]*$",
+      "description": "The kind of question this item asks. Deliberately open (NOT a closed enum) — see this schema's own top-level description and `services.needs_you.needs_you`'s module docstring for the documented, non-exhaustive vocabulary."
+    },
+    "domain": {
+      "type": "string",
+      "pattern": "^[A-Z][A-Z_]*$",
+      "description": "The BAGMAN source module/workflow that raised this item, e.g. `EVIDENCE_INTAKE`, `EMAIL_TRIAGE`, `INVOICE_REVIEW`. Deliberately open for the same extensibility reason as `item_type` — a later slice introduces new producers without a contract change."
+    },
+    "source_object_reference": {
+      "oneOf": [
+        { "$ref": "https://bagman.internal/contracts/common/bagman.identifier.v1.schema.json" },
+        { "type": "null" }
+      ],
+      "description": "The canonical BAGMAN object this item is about, e.g. an `evidence_id` (PID §98.5's own worked examples — 'Screwfix receipt', 'AWS invoice' — are both evidence-anchored). Required key, explicit `null` for an item that is not anchored to one single canonical object (e.g. a general operator question, PID §98.5's 'HMRC email' / 'Adobe rule' examples could be email- or rule-anchored instead once those domains exist) — never omitted, so 'not yet known' can never be confused with 'field left out by accident'. Also the natural key this delivery's idempotent-creation guarantee is keyed on together with `item_type` (see the repository's own docstring) — a replayed producer call for the same `(item_type, source_object_reference)` pair must resolve to the SAME item, never a duplicate."
+    },
+    "question": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Concise, human-readable question the operator must answer (PID §98.5's own worked examples, e.g. 'Which company is this for?')."
+    },
+    "allowed_action_type": {
+      "type": "string",
+      "pattern": "^[A-Z][A-Z_]*$",
+      "description": "What kind of answer/action this item expects, e.g. `COMPANY_WHAT_WHY` (Slice 1's own single real action type — see `services.needs_you.needs_you` module docstring). Deliberately open for the same extensibility reason as `item_type`/`domain`."
+    },
+    "priority": {
+      "type": "string",
+      "enum": ["LOW", "NORMAL", "HIGH"],
+      "description": "Operator-facing priority/urgency bucket. A closed enum (unlike `item_type`/`domain`/`allowed_action_type` above) — PID §98.5 lists `priority` as a plain field with no extensibility requirement, and a small closed set is simpler for the GUI to sort/colour consistently."
+    },
+    "status": {
+      "type": "string",
+      "enum": ["OPEN", "RESOLVED", "DISMISSED"],
+      "description": "Queue-item lifecycle state (this delivery's own documented, deliberately small state machine — see `services.needs_you.needs_you.ALLOWED_TRANSITIONS`): `OPEN` (awaiting an operator answer) -> `RESOLVED` (the operator answered it) or `DISMISSED` (the operator explicitly declined to answer it, e.g. not applicable). Both `RESOLVED` and `DISMISSED` are terminal — an item is never reopened; a producer that still has a live question creates a fresh item instead (mirrors `IntakeRecord.status`'s own closed, non-reopenable terminal-state doctrine, CD-4 PID §7)."
+    },
+    "created_at": {
+      "$ref": "https://bagman.internal/contracts/common/bagman.utc_timestamp.v1.schema.json",
+      "description": "UTC timestamp at which this item was raised."
+    },
+    "resolved_at": {
+      "oneOf": [
+        { "$ref": "https://bagman.internal/contracts/common/bagman.utc_timestamp.v1.schema.json" },
+        { "type": "null" }
+      ],
+      "description": "UTC timestamp at which this item reached a terminal state (`RESOLVED`/`DISMISSED`). Required key, explicit `null` while `status` is still `OPEN`."
+    },
+    "resolved_by_actor_type": {
+      "oneOf": [
+        { "type": "string", "minLength": 1 },
+        { "type": "null" }
+      ],
+      "description": "PID §14 actor-type vocabulary value for whoever resolved/dismissed this item (operator provenance, PID §98.5's own 'operator provenance' field). `null` while `status` is still `OPEN`."
+    },
+    "resolved_by_actor_id": {
+      "oneOf": [
+        { "type": "string", "minLength": 1 },
+        { "type": "null" }
+      ],
+      "description": "The specific actor identity that resolved/dismissed this item (PID §14 — never a generic 'system' literal). `null` while `status` is still `OPEN`."
+    },
+    "resolution": {
+      "oneOf": [
+        { "type": "object", "additionalProperties": true },
+        { "type": "null" }
+      ],
+      "description": "The operator's answer, shaped per `allowed_action_type` — e.g. for Slice 1's `COMPANY_WHAT_WHY`, `{\"entity_id\": ..., \"what\": ..., \"why\": ...}` (PID §98.3's Company/What/Why review interaction). Deliberately a free-form object rather than a typed-per-`allowed_action_type` union at this contract layer (Slice 1 has exactly one real action type; a future slice with a genuinely divergent shape can still be validated at the domain layer without a breaking contract change). `null` while `status` is still `OPEN`."
+    },
+    "correlation_id": {
+      "$ref": "https://bagman.internal/contracts/common/bagman.identifier.v1.schema.json",
+      "description": "Identifier shared by this item's own creation/resolution AuditEvents and, where applicable, the upstream workflow that raised it (e.g. the same `correlation_id` as the `IntakeRecord`/`EvidenceItem` that triggered a `COMPANY_REQUIRED` item) — same correlation doctrine as `bagman.audit_event.v1.correlation_id` (PID §31)."
+    },
+    "metadata": {
+      "type": "object",
+      "description": "Free-form, genuinely open context about this item (e.g. `evidence_id`/`original_filename`/`detected_mime_type` for an evidence-anchored item) — display/context only, never a substitute for `resolution` once answered.",
+      "additionalProperties": true,
+      "default": {}
+    },
+    "schema_version": {
+      "allOf": [
+        { "$ref": "https://bagman.internal/contracts/common/bagman.schema_version.v1.schema.json" }
+      ],
+      "const": "bagman.needs_you_item.v1",
+      "description": "Contract version identifier for this NeedsYouItem. Must literally equal `\"bagman.needs_you_item.v1\"` for instances of this schema version."
+    }
+  },
+  "required": [
+    "item_id",
+    "item_type",
+    "domain",
+    "source_object_reference",
+    "question",
+    "allowed_action_type",
+    "priority",
+    "status",
+    "created_at",
+    "resolved_at",
+    "resolved_by_actor_type",
+    "resolved_by_actor_id",
+    "resolution",
+    "correlation_id",
+    "metadata",
+    "schema_version"
+  ],
+  "additionalProperties": false
+}

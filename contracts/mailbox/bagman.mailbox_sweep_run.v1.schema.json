@@ -1,0 +1,167 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://bagman.internal/contracts/mailbox/bagman.mailbox_sweep_run.v1.schema.json",
+  "title": "BAGMAN MailboxSweepRun",
+  "description": "One durable sweep-attempt ledger row for a single `MailboxSource` (CD-6 Slice 4). Mirrors `services.xero.sync.XeroSyncRun`'s own role for the Xero domain: a terminal record of exactly what one sweep attempt did, never SUCCEEDED if a message that should have ingested failed irrecoverably.",
+  "type": "object",
+  "properties": {
+    "sweep_run_id": {
+      "$ref": "https://bagman.internal/contracts/common/bagman.identifier.v1.schema.json",
+      "description": "Canonical BAGMAN identifier for this sweep attempt."
+    },
+    "mailbox_id": {
+      "$ref": "https://bagman.internal/contracts/common/bagman.identifier.v1.schema.json",
+      "description": "The `MailboxSource` this sweep ran against."
+    },
+    "trigger": {
+      "type": "string",
+      "enum": ["MANUAL", "SCHEDULED"],
+      "description": "`MANUAL` — an operator clicked 'Sweep now'. `SCHEDULED` — the optional dedicated worker (see `services/mailbox/sweep.py`'s module docstring for whether this slice built one)."
+    },
+    "status": {
+      "type": "string",
+      "enum": ["RUNNING", "SUCCEEDED", "PARTIAL", "FAILED"],
+      "description": "`SUCCEEDED` — every folder's delta round completed and every discovered message reached a durably-handled terminal record (ingested, quarantined, or a governed vanished/oversize outcome). `PARTIAL` — at least one folder/message hit a transient failure but at least one other folder/message succeeded; the affected folder's cursor is NOT advanced. `FAILED` — nothing durable was accomplished this run (e.g. token refresh failed before any folder could even be attempted)."
+    },
+    "started_at": {
+      "$ref": "https://bagman.internal/contracts/common/bagman.utc_timestamp.v1.schema.json"
+    },
+    "completed_at": {
+      "oneOf": [
+        { "$ref": "https://bagman.internal/contracts/common/bagman.utc_timestamp.v1.schema.json" },
+        { "type": "null" }
+      ],
+      "description": "`null` while `status == \"RUNNING\"`."
+    },
+    "folders_attempted": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "folder_id": { "type": "string", "minLength": 1, "description": "The provider's own real, immutable folder identifier — the canonical value; never a display name." },
+          "display_name": { "type": "string", "description": "Human-readable label for GUI/operator rendering only." },
+          "completed": { "type": "boolean", "description": "Operational addendum. Whether this folder's delta round finished durably this run — i.e. contributed to a cursor advance — as opposed to a transient failure that left it un-advanced this round. Optional (not `required` below): only `run_sweep` itself populates it; a hand-built `folders_attempted` entry (e.g. an older/narrower test fixture) may omit it." },
+          "messages_seen": { "type": "integer", "minimum": 0, "description": "Operational addendum. Messages observed in THIS folder's delta pages this run (a per-folder breakdown of the run-level `messages_seen` total). Optional — see `completed`'s own note." },
+          "new_discovery_records": { "type": "integer", "minimum": 0, "description": "Operational addendum. Messages newly seen in THIS folder this run — i.e. `MailboxMessageRepository.record_observation` returned `is_new=True` (a per-folder breakdown of the run-level `messages_new` total). Optional — see `completed`'s own note." },
+          "deep_processing_count": { "type": "integer", "minimum": 0, "description": "Operational addendum. Messages in THIS folder that went through the ALLOWED-domain path this run and had a full MIME fetch attempted (whether it was then ingested, quarantined, or governed-failed as oversized). Optional — see `completed`'s own note." },
+          "cursor_established": { "type": "boolean", "description": "Operational addendum. Whether a durable `MailboxFolderCursor` row now exists for this folder after this run, regardless of whether it was pre-existing or newly bootstrapped this run (distinct from `completed`, which additionally requires the round to have finished and the cursor's own `delta_link` to have advanced). Optional — see `completed`'s own note." }
+        },
+        "required": ["folder_id", "display_name"],
+        "additionalProperties": false
+      },
+      "description": "CD-6 architect amendment (recursive folder discovery) + operational addendum (per-folder operational counts). Which folders this run actually attempted — now the REAL, per-mailbox discovered/monitored folder set (Inbox, Junk Email, Deleted Items, every custom/nested/hidden folder discovered; never Sent Items/Drafts/Outbox), not a hardcoded two-value list. Each entry carries both the canonical folder id and a human-readable display name so a GUI never has to render a raw opaque Graph folder id as if it were a friendly name, plus (from the operational addendum) per-folder operational counts populated by `run_sweep` itself — see each sub-field's own description."
+    },
+    "messages_seen": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Total messages observed across every attempted folder's delta pages this run (including ones already known from a prior sweep)."
+    },
+    "messages_new": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Messages discovered for the FIRST time this run (new `MailboxMessage` rows created)."
+    },
+    "evidence_created": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "New `EvidenceItem` rows successfully registered this run."
+    },
+    "duplicates": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Messages seen this run whose (mailbox_id, immutable_provider_message_id) already had a `MailboxMessage`/`EvidenceItem` — an idempotent re-observation (e.g. a re-seen page, or a message that moved folders), never double-ingested."
+    },
+    "quarantined": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Messages whose content-safety scan was not CLEAN — governed-quarantined, never parsed/classified."
+    },
+    "failures": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Messages that hit a transient, non-durably-handled failure this run (their folder's cursor is not advanced past them)."
+    },
+    "unique_sender_domains": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Operational addendum (ahead of the first real large historical sweep). Count of distinct sender domains observed across every message seen this run (including duplicates/re-observations — Stage-A metadata is captured for every observed message regardless of dedup outcome)."
+    },
+    "allowed_domain_messages": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Operational addendum. Messages this run whose sender domain had an `ALLOWED` `MailboxDomainRule` at the time they were processed (i.e. went through the Stage-B gate this run — a duplicate/already-final message short-circuits before the gate and is never counted here)."
+    },
+    "ignored_domain_messages": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Operational addendum. Messages this run whose sender domain had an `IGNORED` `MailboxDomainRule` at the time they were processed."
+    },
+    "unknown_domain_messages": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Operational addendum. Messages this run with no governing `MailboxDomainRule` yet (candidate-evaluated by `services.mailbox.discovery_signals.evaluate_discovery_candidate`)."
+    },
+    "likely_financial_candidates": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Operational addendum. Among `unknown_domain_messages`, how many `services.mailbox.discovery_signals.evaluate_discovery_candidate` judged a credible accounting-document candidate."
+    },
+    "messages_with_attachments": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Operational addendum. Messages this run whose Stage-A discovery metadata reported `has_attachments=True` (counted for every observed message, including duplicates)."
+    },
+    "graph_throttle_retries": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Operational addendum. Count of Microsoft Graph `RATE_LIMITED` outcomes encountered and retried this run — both the whole-sweep folder-discovery call and every per-folder delta-page call."
+    },
+    "error_code": {
+      "oneOf": [
+        { "type": "string" },
+        { "type": "null" }
+      ],
+      "description": "Closed-vocabulary failure reason when `status` is `PARTIAL`/`FAILED` (see `services/mailbox/sweep.py::SweepFailureReason`). `null` for `RUNNING`/`SUCCEEDED`."
+    },
+    "error_detail": {
+      "oneOf": [
+        { "type": "string" },
+        { "type": "null" }
+      ],
+      "description": "Short, non-secret detail. NEVER a raw token/deltaLink/authorization code/OAuth state."
+    },
+    "schema_version": {
+      "allOf": [
+        { "$ref": "https://bagman.internal/contracts/common/bagman.schema_version.v1.schema.json" }
+      ],
+      "const": "bagman.mailbox_sweep_run.v1",
+      "description": "Must literally equal \"bagman.mailbox_sweep_run.v1\"."
+    }
+  },
+  "required": [
+    "sweep_run_id",
+    "mailbox_id",
+    "trigger",
+    "status",
+    "started_at",
+    "completed_at",
+    "folders_attempted",
+    "messages_seen",
+    "messages_new",
+    "evidence_created",
+    "duplicates",
+    "quarantined",
+    "failures",
+    "unique_sender_domains",
+    "allowed_domain_messages",
+    "ignored_domain_messages",
+    "unknown_domain_messages",
+    "likely_financial_candidates",
+    "messages_with_attachments",
+    "graph_throttle_retries",
+    "error_code",
+    "error_detail",
+    "schema_version"
+  ],
+  "additionalProperties": false
+}

@@ -523,6 +523,23 @@ def test_internal_router_direct_upload_bypass_is_genuinely_gone():
 # .py file, not just core/services — a stray import anywhere would
 # still represent exactly the "no mailbox integration" invariant being
 # broken).
+#
+# CD-6 GUI-operations-foundation follow-on WO update (second mailbox
+# provider — plain IMAP for `matt@noust.ai`): this WO's own explicit
+# mandate is to build the real, network-speaking IMAP adapter using
+# stdlib `imaplib` (no third-party IMAP library is available/needed —
+# see `services/mailbox/imap/imap_client.py`'s own module docstring).
+# `imaplib` is therefore REMOVED from the fully-forbidden root set and
+# instead governed by :data:`_IMAPLIB_SANCTIONED_PATH_PREFIX` below —
+# the ONE sanctioned location it may be imported from; a stray
+# `imaplib` import anywhere ELSE in the repository remains a violation.
+# Every OTHER provider SDK (`msal`/`googleapiclient`/
+# `google_auth_oauthlib`/`imapclient`/`exchangelib`/`O365`) remains
+# fully forbidden repo-wide — Microsoft Graph's own real adapter
+# (`services/mailbox/microsoft/graph_client.py`) deliberately uses
+# stdlib `urllib` only, precisely so this invariant never needed
+# loosening for that provider; this is documented, minimal, additive
+# scope-narrowing for IMAP alone, never a general relaxation.
 # ---------------------------------------------------------------------
 
 _FORBIDDEN_MAILBOX_AND_PROVIDER_IMPORT_ROOTS = {
@@ -530,17 +547,24 @@ _FORBIDDEN_MAILBOX_AND_PROVIDER_IMPORT_ROOTS = {
     "googleapiclient",
     "google_auth_oauthlib",
     "imapclient",
-    "imaplib",
     "exchangelib",
     "O365",
 }
 
+#: The ONE sanctioned location `imaplib` may be imported from — see the
+#: comment block above. A POSIX-style relative path prefix (matched
+#: against the file's own repo-relative path).
+_IMAPLIB_SANCTIONED_PATH_PREFIX = "services/mailbox/imap/"
+
 
 def test_no_forbidden_mailbox_or_provider_sdk_imported_anywhere_in_the_repo():
-    """PID §67/§69: no Microsoft Graph/MSAL, Gmail/Google API client
-    library, or ``imapclient``/``imaplib``-based mailbox polling code
-    exists anywhere in the repository yet — CD-5's job, not CD-4's.
-    Scans every ``.py`` file under the repo (excluding
+    """PID §67/§69, narrowed by the CD-6 GUI-operations-foundation
+    follow-on WO (see comment block above): no Microsoft Graph/MSAL,
+    Gmail/Google API client library, or ``imapclient``/``exchangelib``/
+    ``O365`` mailbox-polling code exists anywhere in the repository —
+    and plain stdlib ``imaplib`` exists ONLY under
+    ``services/mailbox/imap/``, this delivery's own sanctioned real IMAP
+    adapter. Scans every ``.py`` file under the repo (excluding
     third-party-managed directories), via real ``ast`` import parsing,
     not a text grep."""
     violations = []
@@ -548,13 +572,18 @@ def test_no_forbidden_mailbox_or_provider_sdk_imported_anywhere_in_the_repo():
     for path in _py_files(*search_roots):
         rel = path.relative_to(REPO_ROOT).as_posix()
         for imp in _imports_of(path):
+            if imp.root == "imaplib":
+                if not rel.startswith(_IMAPLIB_SANCTIONED_PATH_PREFIX):
+                    violations.append(f"{rel}:{imp.lineno} imports {imp.full!r} (outside the sanctioned IMAP adapter package)")
+                continue
             if imp.root in _FORBIDDEN_MAILBOX_AND_PROVIDER_IMPORT_ROOTS:
                 violations.append(f"{rel}:{imp.lineno} imports {imp.full!r}")
 
     assert not violations, (
         "no Microsoft Graph/MSAL, Gmail/Google API client library, or "
-        "imapclient/imaplib mailbox-polling import may exist yet (PID §67/§69) "
-        "— CD-5's job, not CD-4's. Violations:\n" + "\n".join(violations)
+        "imapclient/exchangelib/O365 mailbox-polling import may exist anywhere, and "
+        "imaplib may only be imported from services/mailbox/imap/ (PID §67/§69, narrowed "
+        "by the CD-6 GUI-operations-foundation follow-on WO). Violations:\n" + "\n".join(violations)
     )
 
 
@@ -642,3 +671,65 @@ def test_requirements_files_do_not_mention_forbidden_mailbox_or_provider_sdks():
         assert violations == [], f"{req_file} must not depend on: {violations}"
 
     assert not violations, "\n".join(violations)
+
+
+# ---------------------------------------------------------------------
+# CD-6 Slice 2 (PID §98.4, architect spec §1) — "No hardcoded company
+# strings anywhere in app/api/static/... the existing seed entities
+# remain the canonical source; do not duplicate or shadow them."
+# ---------------------------------------------------------------------
+
+#: The exact literal tokens PID §98.3/§98.4 name as this delivery's
+#: real, canonical BAGMAN companies (`app/api/composition.py
+#: ::SEED_ENTITIES` — the single source of truth these tokens are
+#: copied from, not re-typed independently). Every one of these is
+#: "business truth" the GUI must resolve through a live `GET
+#: /internal/entities` call, never bake in as a literal — both the
+#: `canonical_name` form (`INFOSECURS_LIMITED`) an `<option value=...>`
+#: could hardcode, and the `display_name` form (`Infosecurs Limited`) a
+#: label could hardcode.
+_HARDCODED_COMPANY_TOKENS: tuple[str, ...] = (
+    "INFOSECURS_LIMITED",
+    "NOUSTAI_LIMITED",
+    "MATTHEW_SCOTT_PERSONAL",
+    "Infosecurs Limited",
+    "NoustAI Limited",
+    "Matthew Scott Personal",
+)
+
+
+def test_no_hardcoded_company_truth_anywhere_in_static_ui():
+    """A real, repo-wide grep proof — mirrors
+    ``test_no_trinity_star_alias_literal_anywhere_in_application_source``'s
+    own "scan every file, not just .py" technique, scoped to
+    ``app/api/static/`` and CD-6's own closed set of real company
+    tokens (see :data:`_HARDCODED_COMPANY_TOKENS`).
+
+    This is not merely aspirational: CD-6 Slice 2's own delivery
+    removed a real violation this test caught during development — CD-4
+    WI-4's Documents "Upload evidence" panel (``index.html``) hardcoded
+    all three companies directly as ``<option>`` literals. It now
+    resolves them at runtime via ``shell/entities.js``'s existing
+    ``listEntities()`` cache (see
+    ``features/documents/documents.js::_wireUpload``), exactly like
+    every other company-aware surface in this GUI already does.
+    """
+    static_dir = REPO_ROOT / "app" / "api" / "static"
+    violations: list[str] = []
+    for path in sorted(static_dir.rglob("*")):
+        if not path.is_file():
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (UnicodeDecodeError, OSError):
+            continue
+        for token in _HARDCODED_COMPANY_TOKENS:
+            if token in text:
+                violations.append(f"{path.relative_to(REPO_ROOT)} contains hardcoded company token {token!r}")
+
+    assert violations == [], (
+        "app/api/static/ must never hardcode a real company name/canonical_name — every "
+        "company-aware surface must resolve companies through GET /internal/entities "
+        "(shell/entities.js::listEntities()), the one canonical source (PID §98.3/§98.4):\n"
+        + "\n".join(violations)
+    )

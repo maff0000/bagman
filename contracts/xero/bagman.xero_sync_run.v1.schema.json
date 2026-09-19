@@ -1,0 +1,95 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://bagman.internal/contracts/xero/bagman.xero_sync_run.v1.schema.json",
+  "title": "BAGMAN XeroSyncRun",
+  "description": "One durable attempt to synchronise a `XeroConnection`'s reference data (`GET /Accounts`, CD-6 Slice 2, architect spec §4/§20). Exists specifically so a failed/partial sync can be recorded WITHOUT ever touching the last-known-good `XeroAccount` projection rows (architect spec §5/§20's 'a failed/partial sync must never replace last-known-good data with an empty or partial set') — the projection is only updated once a run reaches `SUCCEEDED`, inside one all-or-nothing transaction (see `services/xero/sync.py`).",
+  "type": "object",
+  "properties": {
+    "sync_run_id": {
+      "$ref": "https://bagman.internal/contracts/common/bagman.identifier.v1.schema.json",
+      "description": "Canonical BAGMAN identifier for this sync attempt."
+    },
+    "entity_id": {
+      "$ref": "https://bagman.internal/contracts/common/bagman.identifier.v1.schema.json",
+      "description": "The BAGMAN `GovernedEntity` (via its `XeroConnection`) this sync attempt was for."
+    },
+    "tenant_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The Xero tenant this attempt fetched from — a snapshot of the connection's `tenant_id` at the moment the run started, so this row remains meaningful even if the connection is later disconnected/reconnected to a different tenant."
+    },
+    "status": {
+      "type": "string",
+      "enum": ["RUNNING", "SUCCEEDED", "FAILED"],
+      "description": "This run's own closed, small state machine (mirrors `services.evidence.intake.intake`'s minimal shape): `RUNNING` (in flight) -> `SUCCEEDED` or `FAILED` (both terminal — a run is never retried in place; a retry creates a new `XeroSyncRun` row, exactly like `AIInvocation`'s own 'retries create new, auditable attempts' doctrine)."
+    },
+    "started_at": {
+      "$ref": "https://bagman.internal/contracts/common/bagman.utc_timestamp.v1.schema.json",
+      "description": "UTC timestamp this attempt began."
+    },
+    "completed_at": {
+      "oneOf": [
+        { "$ref": "https://bagman.internal/contracts/common/bagman.utc_timestamp.v1.schema.json" },
+        { "type": "null" }
+      ],
+      "description": "UTC timestamp this attempt reached a terminal state. `null` while `status` is `RUNNING`."
+    },
+    "accounts_seen_count": {
+      "oneOf": [
+        { "type": "integer", "minimum": 0 },
+        { "type": "null" }
+      ],
+      "description": "Total accounts returned by the provider in this attempt. `null` until known (e.g. still `RUNNING`, or `FAILED` before any page was fetched)."
+    },
+    "accounts_created_count": {
+      "oneOf": [
+        { "type": "integer", "minimum": 0 },
+        { "type": "null" }
+      ],
+      "description": "Of `accounts_seen_count`, how many were genuinely new `XeroAccount` rows this run created. `null` until known."
+    },
+    "accounts_updated_count": {
+      "oneOf": [
+        { "type": "integer", "minimum": 0 },
+        { "type": "null" }
+      ],
+      "description": "Of `accounts_seen_count`, how many matched an existing `(tenant_id, account_id)` row and were updated in place. `null` until known."
+    },
+    "error_code": {
+      "oneOf": [
+        { "type": "string", "minLength": 1 },
+        { "type": "null" }
+      ],
+      "description": "A short, stable machine-readable failure classification (e.g. `TOKEN_REFRESH_FAILED`, `AUTH_REVOKED`, `RATE_LIMITED`, `PROVIDER_ERROR`, `MALFORMED_RESPONSE`, `PERSISTENCE_ERROR`) when `status` is `FAILED` — see `services/xero/sync.py::SyncFailureReason` for the closed set this is drawn from. `null` when `status` is not `FAILED`."
+    },
+    "error_detail": {
+      "oneOf": [
+        { "type": "string" },
+        { "type": "null" }
+      ],
+      "description": "Short, safe, NON-SECRET human-readable detail for `error_code`. Never a raw token/header/full provider response body."
+    },
+    "schema_version": {
+      "allOf": [
+        { "$ref": "https://bagman.internal/contracts/common/bagman.schema_version.v1.schema.json" }
+      ],
+      "const": "bagman.xero_sync_run.v1",
+      "description": "Must literally equal `\"bagman.xero_sync_run.v1\"`."
+    }
+  },
+  "required": [
+    "sync_run_id",
+    "entity_id",
+    "tenant_id",
+    "status",
+    "started_at",
+    "completed_at",
+    "accounts_seen_count",
+    "accounts_created_count",
+    "accounts_updated_count",
+    "error_code",
+    "error_detail",
+    "schema_version"
+  ],
+  "additionalProperties": false
+}

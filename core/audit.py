@@ -91,6 +91,32 @@ class AuditRepository(abc.ABC):
     def list_by_subject(self, subject_type: str, subject_id: str) -> list[AuditEvent]:
         raise NotImplementedError
 
+    @abc.abstractmethod
+    def list_recent(
+        self,
+        *,
+        limit: int = 50,
+        before: Optional[datetime] = None,
+        event_type_prefix: Optional[str] = None,
+    ) -> list[AuditEvent]:
+        """Chronological (``occurred_at`` DESC, ``audit_event_id`` DESC
+        deterministic tie-breaker) listing across EVERY subject —
+        CD-6 Slice 1's Activity view (PID §98.8) needs "what happened
+        recently, system-wide", which neither ``list_by_correlation``
+        nor ``list_by_subject`` can answer (both require already
+        knowing which one workflow/subject to look at). ``before``
+        pages backwards in time (the caller passes the ``occurred_at``
+        of the last item it already has to fetch the next older page —
+        a cursor over a naturally append-only, monotonically-timestamped
+        stream, simpler than an offset that shifts under a stream still
+        being written to). ``event_type_prefix`` is an optional
+        ``str.startswith`` filter (e.g. ``"NEEDS_YOU_"``) — deliberately
+        a prefix match, not a full closed-enum filter, since
+        ``event_type`` is itself an open, non-enum vocabulary (PID §13;
+        see ``tests/integration/test_architecture_boundaries.py``'s own
+        "open taxonomy field" lock-in for this exact field)."""
+        raise NotImplementedError
+
 
 class InMemoryAuditRepository(AuditRepository):
     """Narrow in-memory reference implementation (PID §21 Option A)."""
@@ -157,3 +183,18 @@ class InMemoryAuditRepository(AuditRepository):
 
     def list_by_subject(self, subject_type: str, subject_id: str) -> list[AuditEvent]:
         return [self._by_id[i] for i in self._by_subject.get((subject_type, subject_id), [])]
+
+    def list_recent(
+        self,
+        *,
+        limit: int = 50,
+        before: Optional[datetime] = None,
+        event_type_prefix: Optional[str] = None,
+    ) -> list[AuditEvent]:
+        events = list(self._by_id.values())
+        if before is not None:
+            events = [e for e in events if e.occurred_at < before]
+        if event_type_prefix is not None:
+            events = [e for e in events if e.event_type.startswith(event_type_prefix)]
+        events.sort(key=lambda e: (e.occurred_at, e.audit_event_id), reverse=True)
+        return events[:limit]
