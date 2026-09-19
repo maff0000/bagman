@@ -549,6 +549,147 @@ def test_endpoint_provider_neutral_never_requires_microsoft_provider_kind(dev_cl
     assert r.json()["mailbox_domain_rule"]["match_mode"] == "EXACT"
 
 
+def test_identical_resubmission_is_a_true_no_op_with_zero_writes(dev_client):
+    """Test A — an exact duplicate re-submission performs NO repository
+    write at all: `approved_at`/`updated_at`/`processor_hint` are all
+    byte-identical to before, and no new audit event is emitted."""
+    mailbox_id = _create_mailbox(dev_client)
+    comp = get_composition()
+    payload = {
+        "actor_type": "USER", "actor_id": ACTOR_ID, "match_mode": "EXACT",
+        "sender_domain": "true-no-op.example", "policy": "BLACKLIST", "reason": "known spam vendor",
+    }
+
+    first = dev_client.post(f"/internal/mailboxes/{mailbox_id}/policy-rules", json=payload)
+    assert first.status_code == 200, first.text
+    first_rule = first.json()["mailbox_domain_rule"]
+    rule_id = first_rule["rule_id"]
+    approved_at_before = first_rule["approved_at"]
+    updated_at_before = first_rule["updated_at"]
+    processor_hint_before = first_rule["processor_hint"]
+
+    events_before = [
+        e for e in comp.api.audit_repository.list_by_subject("MailboxDomainRule", rule_id)
+        if e.event_type == "MAILBOX_POLICY_RULE_UPSERTED"
+    ]
+
+    second = dev_client.post(f"/internal/mailboxes/{mailbox_id}/policy-rules", json=payload)
+    assert second.status_code == 200, second.text
+    second_body = second.json()
+    second_rule = second_body["mailbox_domain_rule"]
+
+    assert second_body["was_no_op"] is True
+    assert second_rule["rule_id"] == rule_id
+    # Byte-identical — nothing was written.
+    assert second_rule["approved_at"] == approved_at_before
+    assert second_rule["updated_at"] == updated_at_before
+    assert second_rule["created_at"] == first_rule["created_at"]
+    assert second_rule["last_seen_at"] == first_rule["last_seen_at"]
+    assert second_rule["processor_hint"] == processor_hint_before
+
+    events_after = [
+        e for e in comp.api.audit_repository.list_by_subject("MailboxDomainRule", rule_id)
+        if e.event_type == "MAILBOX_POLICY_RULE_UPSERTED"
+    ]
+    assert len(events_after) == len(events_before)
+
+
+def test_processor_hint_only_change_is_a_real_mutation(dev_client):
+    """Test B — a request that changes ONLY `processor_hint` must NOT be
+    misclassified as a no-op: it is a real mutation, on the same rule
+    identity, with a real audit event carrying previous/new hint."""
+    mailbox_id = _create_mailbox(dev_client)
+    comp = get_composition()
+    base_payload = {
+        "actor_type": "USER", "actor_id": ACTOR_ID, "match_mode": "EXACT",
+        "sender_domain": "hint-only-change.example", "policy": "BLACKLIST", "reason": "known spam vendor",
+    }
+
+    first = dev_client.post(f"/internal/mailboxes/{mailbox_id}/policy-rules", json=base_payload)
+    assert first.status_code == 200, first.text
+    first_rule = first.json()["mailbox_domain_rule"]
+    rule_id = first_rule["rule_id"]
+    assert first_rule["processor_hint"] is None
+    updated_at_before = first_rule["updated_at"]
+
+    hint_payload = dict(base_payload, processor_hint="SOME_HINT")
+    second = dev_client.post(f"/internal/mailboxes/{mailbox_id}/policy-rules", json=hint_payload)
+    assert second.status_code == 200, second.text
+    second_body = second.json()
+    second_rule = second_body["mailbox_domain_rule"]
+
+    assert second_body["was_no_op"] is False
+    assert second_rule["rule_id"] == rule_id
+    assert second_rule["processor_hint"] == "SOME_HINT"
+    assert second_rule["updated_at"] != updated_at_before
+
+    events = [
+        e for e in comp.api.audit_repository.list_by_subject("MailboxDomainRule", rule_id)
+        if e.event_type == "MAILBOX_POLICY_RULE_UPSERTED"
+    ]
+    assert len(events) == 2  # the initial create + the hint-only change
+    last_event = events[-1]
+    assert last_event.payload["previous_processor_hint"] is None
+    assert last_event.payload["new_processor_hint"] == "SOME_HINT"
+
+
+def test_match_mode_only_change_is_a_real_mutation_and_then_a_true_no_op(dev_client):
+    """Test C — flipping a domain-level rule's `match_mode` in place
+    (EXACT <-> INCLUDE_SUBDOMAINS, same rule identity via `find_exact`'s
+    domain-identity behaviour) is a real mutation whose audit event
+    carries both the previous and new match_mode. Repeating the same
+    `INCLUDE_SUBDOMAINS` request afterwards is then a true no-op."""
+    mailbox_id = _create_mailbox(dev_client)
+    comp = get_composition()
+    exact_payload = {
+        "actor_type": "USER", "actor_id": ACTOR_ID, "match_mode": "EXACT",
+        "sender_domain": "match-mode-change.example", "policy": "BLACKLIST", "reason": "known spam vendor",
+    }
+
+    first = dev_client.post(f"/internal/mailboxes/{mailbox_id}/policy-rules", json=exact_payload)
+    assert first.status_code == 200, first.text
+    rule_id = first.json()["mailbox_domain_rule"]["rule_id"]
+
+    subdomains_payload = dict(exact_payload, match_mode="INCLUDE_SUBDOMAINS", reason="widen to subdomains too")
+    second = dev_client.post(f"/internal/mailboxes/{mailbox_id}/policy-rules", json=subdomains_payload)
+    assert second.status_code == 200, second.text
+    second_body = second.json()
+    second_rule = second_body["mailbox_domain_rule"]
+
+    assert second_rule["rule_id"] == rule_id  # same identity, in place
+    assert second_body["was_no_op"] is False
+    assert second_rule["match_mode"] == "INCLUDE_SUBDOMAINS"
+
+    events = [
+        e for e in comp.api.audit_repository.list_by_subject("MailboxDomainRule", rule_id)
+        if e.event_type == "MAILBOX_POLICY_RULE_UPSERTED"
+    ]
+    assert len(events) == 2
+    change_event = events[-1]
+    assert change_event.payload["previous_match_mode"] == "EXACT"
+    assert change_event.payload["new_match_mode"] == "INCLUDE_SUBDOMAINS"
+    # A brand-new rule's own create event must carry `previous_match_mode: null`.
+    assert events[0].payload["previous_match_mode"] is None
+    assert events[0].payload["new_match_mode"] == "EXACT"
+
+    # Repeating the IDENTICAL INCLUDE_SUBDOMAINS request is a true no-op.
+    updated_at_before = second_rule["updated_at"]
+    third = dev_client.post(f"/internal/mailboxes/{mailbox_id}/policy-rules", json=subdomains_payload)
+    assert third.status_code == 200, third.text
+    third_body = third.json()
+    third_rule = third_body["mailbox_domain_rule"]
+    assert third_body["was_no_op"] is True
+    assert third_rule["rule_id"] == rule_id
+    assert third_rule["updated_at"] == updated_at_before
+    assert third_rule["approved_at"] == second_rule["approved_at"]
+
+    events_after = [
+        e for e in comp.api.audit_repository.list_by_subject("MailboxDomainRule", rule_id)
+        if e.event_type == "MAILBOX_POLICY_RULE_UPSERTED"
+    ]
+    assert len(events_after) == 2  # no third event added by the no-op
+
+
 def test_never_touches_needs_you_and_never_back_processes_history(dev_client):
     mailbox_id, comp, entity = _connected_mailbox_with_entity_seeded(dev_client)
     _sweep_message_from(dev_client, mailbox_id, sender_address="ap@vendor.com", msg_id="AAMk-nobackfill-1")

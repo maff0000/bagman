@@ -364,18 +364,34 @@ async def upsert_mailbox_policy_rule(mailbox_id: str, payload: UpsertMailboxPoli
     explicit instruction: a rule edit here must not cause surprise
     historical ingestion).
 
-    Idempotency — no misleading duplicate audit events
+    Idempotency — a true no-op performs NO repository write at all
     ------------------------------------------------------------------
-    ``MailboxDomainRuleRepository.upsert_rule`` is itself a harmless
-    no-op for an identical re-submission (see its own docstring), but a
-    same-state re-submission must never ALSO emit an audit event that
-    looks like a real change (``previous_policy: X -> new_policy: X`` is
-    not a change). ``was_no_op`` is computed BEFORE the upsert call (by
-    comparing the identity's previous state — from ``find_exact`` — to
-    the resolved new state) and, when true, no
-    ``MAILBOX_POLICY_RULE_UPSERTED`` audit event is emitted at all; the
-    response's own ``was_no_op`` field tells the caller this was a
-    confirmed no-op rather than a real change.
+    ``was_no_op`` is computed BEFORE any repository call, by comparing
+    EVERY operator-controlled semantic field of the identity's previous
+    state (from ``find_exact``) to the resolved new state:
+    ``match_mode``, ``policy``, ``destination_mode``,
+    ``destination_entity_id``, AND ``processor_hint``. When all of them
+    are identical, this handler does NOT call
+    ``MailboxDomainRuleRepository.upsert_rule`` at all (never touching
+    ``approved_at``/``updated_at`` on the persisted row — an unconditional
+    ``upsert_rule`` call would otherwise silently refresh those
+    timestamps even though nothing semantically changed) and does NOT
+    emit a ``MAILBOX_POLICY_RULE_UPSERTED`` audit event; the response
+    returns the EXISTING ``previous_rule`` unchanged, with
+    ``was_no_op: true``.
+
+    A request that changes ONLY ``processor_hint`` is a genuine
+    mutation (``was_no_op: false``) — it updates the SAME rule identity
+    (same ``rule_id``) via ``upsert_rule`` and emits one audit event
+    whose payload carries ``previous_processor_hint``/
+    ``new_processor_hint``.
+
+    A domain-level rule's ``match_mode`` may legitimately change in
+    place between ``EXACT`` and ``INCLUDE_SUBDOMAINS`` (same rule
+    identity, via ``find_exact``'s own domain-identity behaviour); the
+    audit payload carries both ``previous_match_mode`` and
+    ``new_match_mode`` (``previous_match_mode`` is ``null`` when
+    creating a brand-new rule).
     """
     composition = get_composition()
     # Existence check only — provider-neutral (no `provider_kind`
@@ -427,32 +443,40 @@ async def upsert_mailbox_policy_rule(mailbox_id: str, payload: UpsertMailboxPoli
         match_mode=payload.match_mode,
         sender_address=normalized_sender_address,
     )
+    previous_match_mode = previous_rule.match_mode if previous_rule is not None else None
     previous_policy = previous_rule.policy if previous_rule is not None else None
     previous_destination_mode = previous_rule.destination_mode if previous_rule is not None else None
     previous_destination_entity_id = previous_rule.destination_entity_id if previous_rule is not None else None
+    previous_processor_hint = previous_rule.processor_hint if previous_rule is not None else None
 
     was_no_op = (
         previous_rule is not None
-        and previous_rule.match_mode == payload.match_mode
+        and previous_match_mode == payload.match_mode
         and previous_policy == payload.policy
         and previous_destination_mode == resolved_destination_mode
         and previous_destination_entity_id == resolved_destination_entity_id
+        and previous_processor_hint == payload.processor_hint
     )
 
-    rule = composition.mailbox_domain_rule_repository.upsert_rule(
-        mailbox_id=mailbox_id,
-        sender_domain=payload.sender_domain,
-        match_mode=payload.match_mode,
-        policy=payload.policy,
-        destination_entity_id=resolved_destination_entity_id,
-        destination_mode=resolved_destination_mode,
-        source=SOURCE_OPERATOR,
-        processor_hint=payload.processor_hint,
-        approved_at=utc_now(),
-        sender_address=normalized_sender_address,
-    )
+    if was_no_op:
+        # A true no-op performs NO repository write at all — never
+        # touches `approved_at`/`updated_at` on the persisted row, and
+        # never emits an audit event. Return the existing rule as-is.
+        rule = previous_rule
+    else:
+        rule = composition.mailbox_domain_rule_repository.upsert_rule(
+            mailbox_id=mailbox_id,
+            sender_domain=payload.sender_domain,
+            match_mode=payload.match_mode,
+            policy=payload.policy,
+            destination_entity_id=resolved_destination_entity_id,
+            destination_mode=resolved_destination_mode,
+            source=SOURCE_OPERATOR,
+            processor_hint=payload.processor_hint,
+            approved_at=utc_now(),
+            sender_address=normalized_sender_address,
+        )
 
-    if not was_no_op:
         composition.api.record_audit_event(
             event_type="MAILBOX_POLICY_RULE_UPSERTED",
             actor_type=payload.actor_type,
@@ -464,7 +488,8 @@ async def upsert_mailbox_policy_rule(mailbox_id: str, payload: UpsertMailboxPoli
             payload={
                 "mailbox_id": mailbox_id,
                 "rule_id": rule.rule_id,
-                "match_mode": payload.match_mode,
+                "previous_match_mode": previous_match_mode,
+                "new_match_mode": rule.match_mode,
                 "sender_domain": rule.sender_domain,
                 "sender_address": normalized_sender_address,
                 "previous_policy": previous_policy,
@@ -473,6 +498,8 @@ async def upsert_mailbox_policy_rule(mailbox_id: str, payload: UpsertMailboxPoli
                 "new_destination_mode": rule.destination_mode,
                 "previous_destination_entity_id": previous_destination_entity_id,
                 "new_destination_entity_id": rule.destination_entity_id,
+                "previous_processor_hint": previous_processor_hint,
+                "new_processor_hint": rule.processor_hint,
                 "reason": payload.reason,
             },
         )
