@@ -76,6 +76,26 @@ export const MAILBOX_API = {
   imapSecurityReview: (mailboxId) => `/internal/mailboxes/${encodeURIComponent(mailboxId)}/imap/security-review`,
   imapSecurityReviewResolveOne: (mailboxId, itemId) =>
     `/internal/mailboxes/${encodeURIComponent(mailboxId)}/imap/security-review/${encodeURIComponent(itemId)}/resolve`,
+  //: CD-6 GUI-operations-foundation follow-on WO — the THIRD real
+  //: mailbox connection lifecycle + sweep engine HTTP surface (Gmail API
+  //: adapter, two independent accounts). Mirrors every `microsoft*`
+  //: entry above exactly — `gmailConnect` is an OAuth redirect (like
+  //: Microsoft), never a direct-login attempt (unlike IMAP) — see
+  //: `app/api/routers/mailboxes_gmail.py`'s own module docstring.
+  gmailConnect: (mailboxId) => `/internal/mailboxes/${encodeURIComponent(mailboxId)}/gmail/connect`,
+  gmailDisconnect: (mailboxId) => `/internal/mailboxes/${encodeURIComponent(mailboxId)}/gmail/disconnect`,
+  gmailSweep: (mailboxId) => `/internal/mailboxes/${encodeURIComponent(mailboxId)}/gmail/sweep`,
+  gmailSweeps: (mailboxId) => `/internal/mailboxes/${encodeURIComponent(mailboxId)}/gmail/sweeps`,
+  gmailMessages: (mailboxId) => `/internal/mailboxes/${encodeURIComponent(mailboxId)}/gmail/messages`,
+  gmailDomainRules: (mailboxId) => `/internal/mailboxes/${encodeURIComponent(mailboxId)}/gmail/domain-rules`,
+  gmailDomainReview: (mailboxId) => `/internal/mailboxes/${encodeURIComponent(mailboxId)}/gmail/domain-review`,
+  gmailDomainReviewResolveOne: (mailboxId, itemId) =>
+    `/internal/mailboxes/${encodeURIComponent(mailboxId)}/gmail/domain-review/${encodeURIComponent(itemId)}/resolve`,
+  gmailDomainReviewBatchResolve: (mailboxId) =>
+    `/internal/mailboxes/${encodeURIComponent(mailboxId)}/gmail/domain-review/batch-resolve`,
+  gmailSecurityReview: (mailboxId) => `/internal/mailboxes/${encodeURIComponent(mailboxId)}/gmail/security-review`,
+  gmailSecurityReviewResolveOne: (mailboxId, itemId) =>
+    `/internal/mailboxes/${encodeURIComponent(mailboxId)}/gmail/security-review/${encodeURIComponent(itemId)}/resolve`,
 };
 
 export function listMailboxes() {
@@ -320,6 +340,40 @@ export function listImapDomainReviewItems(mailboxId, status) {
 
 export function listImapDomainRules(mailboxId) {
   return apiGet(MAILBOX_API.imapDomainRules(mailboxId));
+}
+
+//: CD-6 GUI-operations-foundation follow-on WO — Gmail (two independent
+//: accounts). `connectGmailMailbox`'s response carries `authorize_url`,
+//: mirroring `connectMicrosoftMailbox` exactly (never a direct-login
+//: response like IMAP's).
+
+export function connectGmailMailbox(mailboxId, actorId) {
+  return apiPost(MAILBOX_API.gmailConnect(mailboxId), { actor_type: "USER", actor_id: actorId });
+}
+
+export function disconnectGmailMailbox(mailboxId, actorId) {
+  return apiPost(MAILBOX_API.gmailDisconnect(mailboxId), { actor_type: "USER", actor_id: actorId });
+}
+
+export function sweepGmailMailboxNow(mailboxId, actorId) {
+  return apiPost(MAILBOX_API.gmailSweep(mailboxId), { actor_type: "USER", actor_id: actorId });
+}
+
+export function listGmailSweeps(mailboxId) {
+  return apiGet(MAILBOX_API.gmailSweeps(mailboxId));
+}
+
+export function listGmailMessages(mailboxId) {
+  return apiGet(MAILBOX_API.gmailMessages(mailboxId));
+}
+
+export function listGmailDomainReviewItems(mailboxId, status) {
+  const suffix = status ? `?status=${encodeURIComponent(status)}` : "";
+  return apiGet(`${MAILBOX_API.gmailDomainReview(mailboxId)}${suffix}`);
+}
+
+export function listGmailDomainRules(mailboxId) {
+  return apiGet(MAILBOX_API.gmailDomainRules(mailboxId));
 }
 
 /** `shared/api.js` exports `apiGet`/`apiPost` only (no `apiPut`) — this

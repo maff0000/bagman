@@ -33,6 +33,11 @@ import {
   sweepImapMailboxNow,
   listImapMessages,
   listImapDomainReviewItems,
+  connectGmailMailbox,
+  disconnectGmailMailbox,
+  sweepGmailMailboxNow,
+  listGmailMessages,
+  listGmailDomainReviewItems,
 } from "./mailbox-api.js";
 import { DomainReview } from "./domain-review.js";
 
@@ -73,14 +78,15 @@ function connectionStateLabel(connectionState) {
   return CONNECTION_STATE_LABEL[connectionState] || connectionState;
 }
 
-//: CD-6 GUI-operations-foundation follow-on WO — NoustAI IMAP now ALSO
-//: has a real adapter behind it (the second mailbox provider). Any
-//: future Gmail row stays exactly as Slice 3 left it: honest
-//: NOT_CONFIGURED, no connect/sweep button of any kind — "no dead
-//: controls, no fake availability" (architect doctrine, mirrors
-//: features/xero/connections.js's own identical discipline).
+//: CD-6 GUI-operations-foundation follow-on WO — NoustAI IMAP, then
+//: Gmail, now ALSO have real adapters behind them (the second and third
+//: mailbox providers). Any future FOURTH-provider row stays exactly as
+//: Slice 3 left it: honest NOT_CONFIGURED, no connect/sweep button of
+//: any kind — "no dead controls, no fake availability" (architect
+//: doctrine, mirrors features/xero/connections.js's own identical
+//: discipline).
 function hasWorkingAdapter(providerKind) {
-  return providerKind === "MICROSOFT_GRAPH" || providerKind === "IMAP";
+  return providerKind === "MICROSOFT_GRAPH" || providerKind === "IMAP" || providerKind === "GOOGLE_GMAIL";
 }
 
 //: CD-6 GUI-operations-foundation follow-on WO — per-provider action
@@ -114,6 +120,26 @@ const _PROVIDER_ADAPTERS = {
     listMessages: listImapMessages,
     listDomainReviewItems: listImapDomainReviewItems,
     connectIsRedirect: false,
+    hasDomainReviewPage: false,
+  },
+  //: CD-6 GUI-operations-foundation follow-on WO — Gmail (third
+  //: provider, two independent accounts). `connectIsRedirect: true`
+  //: exactly like Microsoft (a real OAuth consent-screen navigation) —
+  //: never IMAP's direct-login shape. `hasDomainReviewPage: false`
+  //: mirrors IMAP's own identical choice: the batch-triage page
+  //: (features/mailbox/domain-review.js) is wired to the Microsoft
+  //: endpoints only for this delivery — the Gmail router already
+  //: exposes the equivalent JSON endpoints (`gmailDomainReview*` in
+  //: mailbox-api.js) for a future GUI wiring pass or direct API/operator
+  //: use.
+  GOOGLE_GMAIL: {
+    label: "Gmail",
+    connect: connectGmailMailbox,
+    disconnect: disconnectGmailMailbox,
+    sweep: sweepGmailMailboxNow,
+    listMessages: listGmailMessages,
+    listDomainReviewItems: listGmailDomainReviewItems,
+    connectIsRedirect: true,
     hasDomainReviewPage: false,
   },
 };

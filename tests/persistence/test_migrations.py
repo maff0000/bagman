@@ -40,6 +40,7 @@ EXPECTED_TABLES = {
     "mailbox_sweep_locks",  # CD-6 Slice 4
     "mailbox_microsoft_oauth_states",  # CD-6 Slice 4
     "mailbox_domain_rules",  # CD-6 architect amendment (two-stage mail processing)
+    "mailbox_gmail_oauth_states",  # CD-6 GUI-operations-foundation follow-on WO (Gmail OAuth state persistence)
 }
 
 
@@ -100,6 +101,7 @@ def test_xero_migration_downgrade_genuinely_undoes_the_upgrade(postgres_containe
         "mailbox_sources", "mailbox_messages", "mailbox_sweep_runs", "mailbox_folder_cursors",
         "mailbox_sweep_locks", "mailbox_microsoft_oauth_states",
         "mailbox_domain_rules",  # CD-6 architect amendment, chained downstream of b7e2f5a9c1d3
+        "mailbox_gmail_oauth_states",  # CD-6 GUI-ops-foundation follow-on WO, chained downstream of f7c3a58b1e9d
     }
     try:
         command.downgrade(cfg, "712c5a2aab92")
@@ -137,6 +139,7 @@ def test_mailbox_migration_downgrade_genuinely_undoes_the_upgrade(postgres_conta
         "mailbox_messages", "mailbox_sweep_runs", "mailbox_folder_cursors",
         "mailbox_sweep_locks", "mailbox_microsoft_oauth_states",
         "mailbox_domain_rules",  # CD-6 architect amendment, chained downstream of b7e2f5a9c1d3
+        "mailbox_gmail_oauth_states",  # CD-6 GUI-ops-foundation follow-on WO, chained downstream of f7c3a58b1e9d
     }
     try:
         command.downgrade(cfg, "5e8c1f42b9a7")
@@ -163,6 +166,7 @@ def test_mailbox_microsoft_sweep_migration_downgrade_genuinely_undoes_the_upgrad
         "mailbox_messages", "mailbox_sweep_runs", "mailbox_folder_cursors",
         "mailbox_sweep_locks", "mailbox_microsoft_oauth_states",
         "mailbox_domain_rules",  # CD-6 architect amendment, chained downstream of b7e2f5a9c1d3
+        "mailbox_gmail_oauth_states",  # CD-6 GUI-ops-foundation follow-on WO, chained downstream of f7c3a58b1e9d
     }
     try:
         command.downgrade(cfg, "a3d7c1f9e246")

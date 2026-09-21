@@ -375,10 +375,12 @@ from services.mailbox.domain_rule import (
     MailboxDomainRule,
     MailboxDomainRuleRepository,
 )
+from services.mailbox.gmail.authentication import assess_gmail_authentication
 from services.mailbox.imap.authentication import assess_imap_authentication
 from services.mailbox.lock import MailboxSweepLock
 from services.mailbox.mailbox import (
     CONNECTION_STATE_CONNECTED,
+    PROVIDER_GOOGLE_GMAIL,
     PROVIDER_IMAP,
     PROVIDER_MICROSOFT_GRAPH,
     MailboxSource,
@@ -564,11 +566,20 @@ def evaluate_message_authentication(
     own module docstring for the IMAP selector's own (deliberately
     PROVISIONAL) trust-boundary reasoning.
 
+    **Third-provider addition (Gmail delivery)** — one further additive
+    branch, dispatching ``PROVIDER_GOOGLE_GMAIL`` to
+    :func:`services.mailbox.gmail.authentication.assess_gmail_authentication`
+    (also deliberately PROVISIONAL — see that module's own docstring).
+    The Microsoft and IMAP branches above are UNCHANGED, byte-identical,
+    by this addition.
+
     Never raises; never returns anything other than a bounded
     :class:`~services.mailbox.authentication_assessment.AuthenticationAssessment`.
     """
     if provider_kind == PROVIDER_IMAP:
         return assess_imap_authentication(raw_headers)
+    if provider_kind == PROVIDER_GOOGLE_GMAIL:
+        return assess_gmail_authentication(raw_headers)
     return assess_microsoft_authentication(raw_headers)
 
 

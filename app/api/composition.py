@@ -72,6 +72,10 @@ from services.mailbox.domain_rule import MailboxDomainRuleRepository
 from services.mailbox.lock import MailboxSweepLock
 from services.mailbox.mailbox import MailboxSourceRepository
 from services.mailbox.message import MailboxMessageRepository
+from services.mailbox.gmail.gmail_adapter import GmailMailboxAdapter
+from services.mailbox.gmail.gmail_client import GmailClientProtocol, GmailOAuthClientProtocol
+from services.mailbox.gmail.oauth_state import GmailOAuthStateRepository
+from services.mailbox.gmail.secrets import GmailTokenStoreProtocol
 from services.mailbox.imap.imap_adapter import ImapMailboxAdapter
 from services.mailbox.imap.imap_client import ImapClientProtocol
 from services.mailbox.microsoft.adapter import MicrosoftGraphMailboxAdapter
@@ -397,6 +401,31 @@ class RuntimeComposition:
     #: provider-scoped.
     imap_client: ImapClientProtocol
     imap_mailbox_adapter: ImapMailboxAdapter
+    #: CD-6 GUI-operations-foundation follow-on WO — THIRD mailbox
+    #: provider (Gmail API, two independent accounts:
+    #: `mgs241171@gmail.com`/`matt.george.scott@gmail.com`). Mirrors
+    #: `microsoft_oauth_client`/`microsoft_graph_client`/
+    #: `microsoft_mailbox_adapter` above exactly — `FakeGmailOAuthClient`/
+    #: `FakeGmailClient` in development/test (no real Google Cloud OAuth
+    #: app exists yet either — see `services.mailbox.gmail.secrets`'s own
+    #: module docstring), the real network-speaking
+    #: `GmailOAuthClient`/`GmailClient` in production.
+    #: `mailbox_gmail_oauth_state_repository` is now Postgres-backed in
+    #: production (`PostgresMailboxGmailOAuthStateRepository`), exactly
+    #: like Microsoft's own `mailbox_microsoft_oauth_state_repository`
+    #: — CD-6 GUI-operations-foundation follow-on WO closed the prior
+    #: in-memory-in-production gap (a short-lived, in-flight
+    #: authorize->callback round trip must survive a container
+    #: restart/deploy, the same real operational scenario Microsoft's
+    #: own precedent was already built for). Development/test
+    #: composition still uses `InMemoryGmailOAuthStateRepository`
+    #: (unchanged). Reuses EVERY other mailbox-domain repository above
+    #: (mailbox_id-scoped, never provider-scoped).
+    mailbox_gmail_oauth_state_repository: GmailOAuthStateRepository
+    gmail_oauth_client: GmailOAuthClientProtocol
+    gmail_client: GmailClientProtocol
+    gmail_token_store: GmailTokenStoreProtocol
+    gmail_mailbox_adapter: GmailMailboxAdapter
     #: CD-6 architect amendment (two-stage mail processing) — the
     #: mailbox-specific domain-policy gate registry. In-memory in
     #: development/test, a real `PostgresMailboxDomainRuleRepository`
@@ -415,6 +444,10 @@ def _build_development_or_test(runtime_environment: str) -> RuntimeComposition:
     from services.mailbox.lock import InMemoryMailboxSweepLock
     from services.mailbox.mailbox import InMemoryMailboxSourceRepository
     from services.mailbox.message import InMemoryMailboxMessageRepository
+    from services.mailbox.gmail.fake_gmail_client import FakeGmailClient, FakeGmailOAuthClient
+    from services.mailbox.gmail.gmail_adapter import GmailMailboxAdapter
+    from services.mailbox.gmail.oauth_state import InMemoryGmailOAuthStateRepository
+    from services.mailbox.gmail.secrets import InMemoryGmailTokenStore
     from services.mailbox.imap.fake_imap_client import FakeImapClient
     from services.mailbox.imap.imap_adapter import ImapMailboxAdapter
     from services.mailbox.microsoft.adapter import MicrosoftGraphMailboxAdapter
@@ -479,6 +512,23 @@ def _build_development_or_test(runtime_environment: str) -> RuntimeComposition:
     imap_client = FakeImapClient()
     imap_mailbox_adapter = ImapMailboxAdapter(client=imap_client, mailbox_repository=mailbox_source_repository)
 
+    # CD-6 GUI-operations-foundation follow-on WO — THIRD mailbox
+    # provider (Gmail API, two independent accounts). No real Google
+    # Cloud OAuth app exists yet — development/test composition ALWAYS
+    # uses the deterministic fakes, never the real network-speaking
+    # adapters (same doctrine as microsoft_oauth_client/
+    # microsoft_graph_client/imap_client above).
+    mailbox_gmail_oauth_state_repository = InMemoryGmailOAuthStateRepository()
+    gmail_oauth_client = FakeGmailOAuthClient()
+    gmail_client = FakeGmailClient()
+    gmail_token_store = InMemoryGmailTokenStore()
+    gmail_mailbox_adapter = GmailMailboxAdapter(
+        oauth_client=gmail_oauth_client,
+        gmail_client=gmail_client,
+        token_store=gmail_token_store,
+        mailbox_repository=mailbox_source_repository,
+    )
+
     # CD-6 reliability delta: shares `api.audit_repository` so the
     # bounded stale-RUNNING recovery backstop's own audit events land in
     # the SAME in-memory audit trail every test/dev-mode caller already
@@ -530,6 +580,11 @@ def _build_development_or_test(runtime_environment: str) -> RuntimeComposition:
         microsoft_mailbox_adapter=microsoft_mailbox_adapter,
         imap_client=imap_client,
         imap_mailbox_adapter=imap_mailbox_adapter,
+        mailbox_gmail_oauth_state_repository=mailbox_gmail_oauth_state_repository,
+        gmail_oauth_client=gmail_oauth_client,
+        gmail_client=gmail_client,
+        gmail_token_store=gmail_token_store,
+        gmail_mailbox_adapter=gmail_mailbox_adapter,
         mailbox_domain_rule_repository=mailbox_domain_rule_repository,
     )
 
@@ -549,6 +604,7 @@ def _build_production() -> RuntimeComposition:
     )
     from persistence.postgres.intake_repository import PostgresIntakeRepository
     from persistence.postgres.mailbox_domain_rule_repository import PostgresMailboxDomainRuleRepository
+    from persistence.postgres.mailbox_gmail_repository import PostgresMailboxGmailOAuthStateRepository
     from persistence.postgres.mailbox_message_repository import PostgresMailboxMessageRepository
     from persistence.postgres.mailbox_microsoft_repository import (
         PostgresMailboxFolderCursorRepository,
@@ -568,6 +624,9 @@ def _build_production() -> RuntimeComposition:
         PostgresXeroSyncRunRepository,
     )
     from services.evidence.intake.scanner import ClamAVScanner
+    from services.mailbox.gmail.gmail_adapter import GmailMailboxAdapter
+    from services.mailbox.gmail.gmail_client import GmailClient, GmailOAuthClient
+    from services.mailbox.gmail.secrets import FileGmailTokenStore
     from services.mailbox.imap.imap_adapter import ImapMailboxAdapter
     from services.mailbox.imap.imap_client import ImapClient
     from services.mailbox.microsoft.adapter import MicrosoftGraphMailboxAdapter
@@ -738,6 +797,38 @@ def _build_production() -> RuntimeComposition:
     imap_client = ImapClient()
     imap_mailbox_adapter = ImapMailboxAdapter(client=imap_client, mailbox_repository=mailbox_source_repository)
 
+    # CD-6 GUI-operations-foundation follow-on WO — THIRD mailbox
+    # provider (Gmail API, two independent accounts:
+    # `mgs241171@gmail.com`/`matt.george.scott@gmail.com`). The real
+    # `GmailOAuthClient()`/`GmailClient()` default their own
+    # credentials_provider to
+    # `services.mailbox.gmail.secrets.read_gmail_app_credentials` (no
+    # explicit wiring needed here — mirrors `MicrosoftOAuthClient()`'s
+    # own identical "no eager I/O, reads real config at first real call"
+    # construction above). No real Google Cloud OAuth app is provisioned
+    # yet — `is_configured()` returns `False` until the PL places one,
+    # exactly like Microsoft's/IMAP's own `is_configured()` today.
+    # `mailbox_gmail_oauth_state_repository` is now Postgres-backed
+    # here, sharing `engine` with every other Postgres-backed repository
+    # in this function, exactly like `mailbox_microsoft_oauth_state_repository`
+    # above (CD-6 GUI-operations-foundation follow-on WO — Gmail OAuth
+    # state persistence correction; see
+    # `RuntimeComposition.mailbox_gmail_oauth_state_repository`'s own
+    # field docstring). No special-casing for a down/unreachable
+    # Postgres: this fails exactly the same way every other
+    # Postgres-backed repository constructed in this function already
+    # does — no silent in-memory fallback.
+    mailbox_gmail_oauth_state_repository = PostgresMailboxGmailOAuthStateRepository(engine)
+    gmail_oauth_client = GmailOAuthClient()
+    gmail_client = GmailClient()
+    gmail_token_store = FileGmailTokenStore()
+    gmail_mailbox_adapter = GmailMailboxAdapter(
+        oauth_client=gmail_oauth_client,
+        gmail_client=gmail_client,
+        token_store=gmail_token_store,
+        mailbox_repository=mailbox_source_repository,
+    )
+
     return RuntimeComposition(
         runtime_environment=_PRODUCTION,
         api=api,
@@ -769,6 +860,11 @@ def _build_production() -> RuntimeComposition:
         microsoft_mailbox_adapter=microsoft_mailbox_adapter,
         imap_client=imap_client,
         imap_mailbox_adapter=imap_mailbox_adapter,
+        mailbox_gmail_oauth_state_repository=mailbox_gmail_oauth_state_repository,
+        gmail_oauth_client=gmail_oauth_client,
+        gmail_client=gmail_client,
+        gmail_token_store=gmail_token_store,
+        gmail_mailbox_adapter=gmail_mailbox_adapter,
         mailbox_domain_rule_repository=mailbox_domain_rule_repository,
     )
 
