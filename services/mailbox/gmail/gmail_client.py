@@ -168,19 +168,40 @@ _AUTHORIZE_EXTRA_PARAMS = {"access_type": "offline", "prompt": "consent"}
 #: The metadata-only headers this module requests on every bounded
 #: headers-only fetch — sufficient for `services/mailbox/sweep.py`'s own
 #: Stage-A discovery (subject/sender/internet-message-id/received-at)
-#: plus the two headers `services.mailbox.gmail.authentication`'s own
-#: PROVISIONAL diagnostic-only counters inspect. Bounded and explicit —
-#: never `metadataHeaders` omitted entirely (Gmail returns NO headers at
-#: all for `format=metadata` without at least one `metadataHeaders`
-#: value).
+#: PLUS every header `services.mailbox.gmail.authentication
+#: .assess_gmail_authentication` structurally requires to reach a
+#: decisive (non-`UNKNOWN`) verdict on a real, legitimately authenticated
+#: message. `Received` is MANDATORY, not optional: that selector's own
+#: eligibility criterion 3 (see that module's docstring) requires the
+#: nearest PRECEDING header before the candidate `Authentication-Results`
+#: header to be a `Received` header whose `by` host is exactly
+#: `mx.google.com` — with `Received` never fetched, the selector can
+#: never find an eligible candidate and always fails closed to `UNKNOWN`,
+#: even for genuinely, legitimately authenticated mail (the exact
+#: metadata-contract bug this tuple now fixes: the selector's own logic
+#: was already correct and proven, but the adapter was never asking
+#: Gmail for the one header that logic depends on). `ARC-Seal`/
+#: `ARC-Message-Signature` are included alongside the already-present
+#: `ARC-Authentication-Results` so the selector's bounded evidence output
+#: (`arc_seal_header_count`/`arc_message_signature_header_count`)
+#: reflects true ARC presence on the real production path too — ARC
+#: remains strictly evidence-only and never gates (see that module's
+#: docstring, "ARC — evidence-only, never gates"); adding these headers
+#: to what is REQUESTED changes no gating logic whatsoever. Bounded and
+#: explicit — never `metadataHeaders` omitted entirely (Gmail returns NO
+#: headers at all for `format=metadata` without at least one
+#: `metadataHeaders` value).
 DEFAULT_METADATA_HEADERS: tuple[str, ...] = (
     "Subject",
     "From",
     "Message-ID",
     "Date",
     "Content-Type",
+    "Received",
     "Authentication-Results",
     "ARC-Authentication-Results",
+    "ARC-Seal",
+    "ARC-Message-Signature",
 )
 
 #: Bounded page size for one `messages.list` round — mirrors

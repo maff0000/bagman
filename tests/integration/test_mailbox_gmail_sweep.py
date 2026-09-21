@@ -89,6 +89,58 @@ def _metadata(message_id: str, *, subject="Invoice", sender="billing@vendor.com"
     )
 
 
+def _genuine_trusted_gmail_headers(*, domain: str = "vendor.com", dmarc: str = "pass") -> list[dict]:
+    """A sanitized, structurally-real Gmail trust-boundary header shape
+    (RFC 5737 documentation IP `203.0.113.10`, Google's own real
+    `mx.google.com` structural markers — never real captured data) —
+    mirrors `tests/integration/test_mailbox_gmail_authentication.py`'s
+    own genuine-sample shape exactly: a `Received ... by mx.google.com
+    ...` hop immediately preceding a genuine `Authentication-Results:
+    mx.google.com; ...` header, plus the genuine ARC triple
+    (`ARC-Seal`/`ARC-Message-Signature`/`ARC-Authentication-Results`) —
+    the exact header set the CD-6 metadata-contract fix added to
+    `DEFAULT_METADATA_HEADERS` (see `gmail_client.py`'s own docstring).
+    `ARC`/`Authentication-Results` header ORDER here is deliberately the
+    same order `_metadata()` below appends `extra_headers` in — never
+    reordered by anything downstream."""
+    return [
+        {
+            "name": "Received",
+            "value": (
+                f"from mail.{domain} (mail.{domain}. [203.0.113.10]) "
+                "by mx.google.com with ESMTPS id ab1cd23ef456.2026.09.21.00.00.00 "
+                "for <mgs241171@example.invalid>; Mon, 21 Sep 2026 00:00:00 -0700 (PDT)"
+            ),
+        },
+        {
+            "name": "Authentication-Results",
+            "value": (
+                f"mx.google.com; dkim=pass header.i=@{domain} header.s=selector1 header.b=redacted; "
+                f"spf=pass (google.com: domain of billing@{domain} designates 203.0.113.10 as permitted "
+                f"sender) smtp.mailfrom=billing@{domain}; dmarc={dmarc} header.from={domain}"
+            ),
+        },
+        {
+            "name": "ARC-Seal",
+            "value": "i=1; a=rsa-sha256; t=1758412800; cv=none; d=google.com; s=arc-20160816; b=REDACTEDGENUINESIGNATURE==",
+        },
+        {
+            "name": "ARC-Message-Signature",
+            "value": (
+                "i=1; a=rsa-sha256; c=relaxed/relaxed; d=google.com; s=arc-20160816; "
+                "h=from:to:subject:date:message-id; bh=REDACTED=; b=REDACTEDGENUINE=="
+            ),
+        },
+        {
+            "name": "ARC-Authentication-Results",
+            "value": (
+                f"i=1; mx.google.com; dkim=pass header.i=@{domain} header.s=selector1 header.b=redacted; "
+                f"spf=pass smtp.mailfrom=billing@{domain}; dmarc={dmarc} header.from={domain}"
+            ),
+        },
+    ]
+
+
 class Harness:
     def __init__(self, *, allow_default_domain: bool = True, email: str = "mgs241171@gmail.com"):
         self.api = BagmanCanonicalAPI()
@@ -227,6 +279,77 @@ def test_must_read_message_with_the_real_unforced_selector_goes_to_security_revi
     SECURITY_REVIEW, never proceed to MIME/evidence."""
     h.queue_discovery()
     h.queue_folder_round(message_ids=("m1",))
+    # Deliberately NOT calling h.queue_content() — MIME must never be
+    # fetched for a SECURITY_REVIEW-routed message.
+    run = h.sweep()
+    assert run.status == "SUCCEEDED"
+    assert run.evidence_created == 0
+    assert h.gmail_client.raw_calls == []
+
+    messages = h.message_repo.list_messages(mailbox_id=h.mailbox.mailbox_id)
+    assert len(messages) == 1
+    assert messages[0].ingestion_status == INGESTION_STATUS_SECURITY_REVIEW
+    assert messages[0].evidence_id is None
+
+    escalations = [
+        i for i in h.needs_you_repo.list_needs_you_items(item_type=ITEM_TYPE_MAILBOX_AUTHENTICATION_ESCALATION)
+        if i.metadata.get("mailbox_id") == h.mailbox.mailbox_id
+    ]
+    assert len(escalations) == 1
+
+
+# ---------------------------------------------------------------------
+# CD-6 metadata-contract fix (DEFAULT_METADATA_HEADERS now requests
+# `Received`) — MUST_READ + the REAL, unforced selector, provider-
+# neutral sweep-level proof (section 3 of the fix's own WO): a
+# genuinely, legitimately authenticated Gmail message from a MUST_READ
+# source must PASS the real gate and reach evidence, never be forced to
+# SECURITY_REVIEW merely because the metadata fetch omitted the
+# selector's structurally-required trace header. The fail-closed
+# counterpart proves this fix never weakens the selector's own
+# conservative behaviour when a response genuinely lacks `Received`.
+# ---------------------------------------------------------------------
+
+
+def test_must_read_message_with_real_trusted_headers_passes_gate_and_ingests_evidence(h):
+    """The metadata-contract fix's own headline proof: a MUST_READ-domain
+    message carrying the REAL, structurally genuine Gmail trust-boundary
+    headers (`Received ... by mx.google.com` immediately preceding a
+    genuine `Authentication-Results: mx.google.com; ...dmarc=pass...`
+    header) now resolves to PASS through the REAL, unforced
+    `assess_gmail_authentication` selector and proceeds to evidence —
+    the exact scenario the old `DEFAULT_METADATA_HEADERS` (missing
+    `Received`) made structurally impossible, even for genuinely
+    authenticated mail."""
+    h.queue_discovery()
+    h.queue_folder_round(
+        message_ids=("m1",),
+        metadata_by_id={"m1": _metadata("m1", extra_headers=_genuine_trusted_gmail_headers())},
+    )
+    h.queue_content()
+    run = h.sweep()
+    assert run.status == "SUCCEEDED"
+    assert run.evidence_created == 1
+    messages = h.message_repo.list_messages(mailbox_id=h.mailbox.mailbox_id)
+    assert len(messages) == 1
+    assert messages[0].ingestion_status == INGESTION_STATUS_INGESTED
+    assert messages[0].evidence_id is not None
+
+
+def test_must_read_message_missing_received_header_fails_closed_to_security_review(h):
+    """The fail-closed regression proof this fix must NEVER weaken: a
+    message whose fetched metadata genuinely lacks a `Received` header
+    (whatever the reason — including, historically, exactly what the OLD
+    buggy `DEFAULT_METADATA_HEADERS` produced by never requesting it)
+    still correctly resolves to UNKNOWN and SECURITY_REVIEW, never PASS.
+    This fix changes what is REQUESTED; it must never change what
+    happens when a real response genuinely omits `Received`."""
+    headers_without_received = [hdr for hdr in _genuine_trusted_gmail_headers() if hdr["name"] != "Received"]
+    h.queue_discovery()
+    h.queue_folder_round(
+        message_ids=("m1",),
+        metadata_by_id={"m1": _metadata("m1", extra_headers=headers_without_received)},
+    )
     # Deliberately NOT calling h.queue_content() — MIME must never be
     # fetched for a SECURITY_REVIEW-routed message.
     run = h.sweep()
@@ -404,6 +527,125 @@ def test_revoking_one_mailboxs_connection_never_affects_the_others():
 
     assert harness_a.mailbox_repo.get_mailbox(harness_a.mailbox.mailbox_id).connection_state == "AUTH_REQUIRED"
     assert harness_b.mailbox_repo.get_mailbox(harness_b.mailbox.mailbox_id).connection_state == "CONNECTED"
+
+
+# ---------------------------------------------------------------------
+# CD-6 metadata-contract fix — historical-candidate reprocessing (section
+# 4 of the fix's own WO, the architect's own highest-priority scenario:
+# "A real Gmail historical candidate must not be forced to
+# SECURITY_REVIEW merely because the refresh path omitted the
+# selector's trusted trace header."). `reprocess_all_historical_
+# candidates_for_domain` -> `_reprocess_one_message` performs a fresh,
+# bounded, METADATA-ONLY `adapter.fetch_message_headers()` refresh
+# BEFORE the authentication gate runs (real production call shape — see
+# `services/mailbox/sweep.py`'s own module docstring) — this refresh now
+# carries `Received` (this fix), so a genuinely authenticated historical
+# candidate reaches a real dmarc=pass verdict instead of being forced to
+# UNKNOWN. The fail-closed counterpart proves the historical path is
+# equally honest when the refresh genuinely still lacks `Received`.
+# ---------------------------------------------------------------------
+
+
+def test_historical_reprocess_with_fixed_metadata_headers_reaches_real_dmarc_pass():
+    """A Gmail historical candidate (discovered as `CHECKED_NOT_CANDIDATE`
+    before its domain was `MUST_READ`) is promoted by an operator to
+    `MUST_READ`. The resulting back-processing refresh
+    (`adapter.fetch_message_headers()`) now returns headers that include
+    `Received` (thanks to the `DEFAULT_METADATA_HEADERS` fix), so the
+    REAL, unforced `assess_gmail_authentication` selector reaches
+    dmarc=pass and the message proceeds all the way to evidence — never
+    forced to SECURITY_REVIEW merely because the refresh path omitted
+    the trace header."""
+    from services.mailbox.sweep import reprocess_all_historical_candidates_for_domain
+
+    h = Harness(allow_default_domain=False)
+    h.queue_discovery()
+    h.queue_folder_round(
+        message_ids=("m1",),
+        metadata_by_id={"m1": _metadata("m1", subject="Your invoice", sender="ap@newsupplier.com")},
+    )
+    h.sweep()
+
+    rule = h.domain_rule_repo.upsert_rule(
+        mailbox_id=h.mailbox.mailbox_id, sender_domain="newsupplier.com", match_mode="EXACT", policy="MUST_READ",
+        destination_entity_id=None, destination_mode="REVIEW_REQUIRED", source="OPERATOR",
+    )
+    # The fresh headers-only refresh `_reprocess_one_message` performs —
+    # simulating exactly what Gmail's real API returns for the FIXED
+    # `DEFAULT_METADATA_HEADERS` set (`Received` now included).
+    h.gmail_client.queue_metadata_result(
+        GmailMessageMetadataResult(
+            status=GmailOutcomeStatus.OK,
+            metadata=_metadata(
+                "m1", subject="Your invoice", sender="ap@newsupplier.com",
+                extra_headers=_genuine_trusted_gmail_headers(domain="newsupplier.com"),
+            ),
+        )
+    )
+    h.queue_content(body=b"From: ap@newsupplier.com\r\nSubject: Your invoice\r\n\r\nBody")
+
+    reprocessed = reprocess_all_historical_candidates_for_domain(
+        mailbox=h.mailbox, mailbox_source_id=h.source_id, sender_domain="newsupplier.com",
+        rule=rule, adapter=h.adapter, message_repository=h.message_repo, needs_you_repository=h.needs_you_repo,
+        api=h.api, object_store=h.object_store, scanner=h.scanner, actor_type="SYSTEM", actor_id="test",
+    )
+    assert len(reprocessed) == 1
+    assert reprocessed[0].ingestion_status == INGESTION_STATUS_INGESTED
+    assert reprocessed[0].evidence_id is not None
+    # Metadata fetched twice: once during original Stage-A discovery,
+    # once as the historical-reprocessing refresh — then, and only after
+    # a PASS verdict, exactly one MIME fetch.
+    assert h.gmail_client.metadata_calls.count("m1") == 2
+    assert h.gmail_client.raw_calls == ["m1"]
+
+
+def test_historical_reprocess_still_fails_closed_when_refreshed_headers_omit_received():
+    """The historical-reprocessing fail-closed regression proof: if the
+    refreshed headers genuinely still lack `Received` (for any reason),
+    the selector correctly returns UNKNOWN and the message is marked
+    SECURITY_REVIEW, never silently proceeded as PASS. This must keep
+    working exactly as before this fix — the fix changes what is
+    REQUESTED, never what happens when a real response genuinely omits
+    `Received`."""
+    from services.mailbox.sweep import reprocess_all_historical_candidates_for_domain
+
+    h = Harness(allow_default_domain=False)
+    h.queue_discovery()
+    h.queue_folder_round(
+        message_ids=("m1",),
+        metadata_by_id={"m1": _metadata("m1", subject="Your invoice", sender="ap@newsupplier.com")},
+    )
+    h.sweep()
+
+    rule = h.domain_rule_repo.upsert_rule(
+        mailbox_id=h.mailbox.mailbox_id, sender_domain="newsupplier.com", match_mode="EXACT", policy="MUST_READ",
+        destination_entity_id=None, destination_mode="REVIEW_REQUIRED", source="OPERATOR",
+    )
+    headers_without_received = [
+        hdr for hdr in _genuine_trusted_gmail_headers(domain="newsupplier.com") if hdr["name"] != "Received"
+    ]
+    h.gmail_client.queue_metadata_result(
+        GmailMessageMetadataResult(
+            status=GmailOutcomeStatus.OK,
+            metadata=_metadata(
+                "m1", subject="Your invoice", sender="ap@newsupplier.com", extra_headers=headers_without_received,
+            ),
+        )
+    )
+    reprocessed = reprocess_all_historical_candidates_for_domain(
+        mailbox=h.mailbox, mailbox_source_id=h.source_id, sender_domain="newsupplier.com",
+        rule=rule, adapter=h.adapter, message_repository=h.message_repo, needs_you_repository=h.needs_you_repo,
+        api=h.api, object_store=h.object_store, scanner=h.scanner, actor_type="SYSTEM", actor_id="test",
+    )
+    assert len(reprocessed) == 1
+    assert reprocessed[0].ingestion_status == INGESTION_STATUS_SECURITY_REVIEW
+    assert reprocessed[0].evidence_id is None
+    assert h.gmail_client.raw_calls == []  # never MIME-fetched
+    escalation_items = [
+        i for i in h.needs_you_repo.list_needs_you_items(item_type=ITEM_TYPE_MAILBOX_AUTHENTICATION_ESCALATION)
+        if i.metadata.get("mailbox_id") == h.mailbox.mailbox_id
+    ]
+    assert len(escalation_items) == 1
 
 
 # -- precondition -----------------------------------------------------------

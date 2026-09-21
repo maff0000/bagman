@@ -583,3 +583,116 @@ def test_exchange_code_and_verify_identity_routes_tokens_to_the_right_mailbox_of
 
     assert token_store.read(mailbox_a.mailbox_id).access_token == "token-for-a"
     assert token_store.read(mailbox_b.mailbox_id).access_token == "token-for-b"
+
+
+# ---------------------------------------------------------------------
+# CD-6 metadata-contract fix — real production-shaped path proof:
+# `DEFAULT_METADATA_HEADERS` (now including `Received`) -> real, fake-
+# client-backed `fetch_message_headers()` -> provider-neutral
+# `evaluate_message_authentication()` -> `assess_gmail_authentication()`.
+# `fetch_message_headers()` is the exact call `services/mailbox/sweep
+# .py::_reprocess_one_message` (the historical-candidate refresh path)
+# uses, and mirrors the metadata-fetch shape every ordinary live sweep
+# round's own per-message headers fetch performs — the more direct real
+# entry point for this proof than `fetch_folder_delta()`, since it takes
+# no `metadata_headers` argument at all: callers can never override it,
+# so this exercises the REAL default exactly as production does.
+# ---------------------------------------------------------------------
+
+
+def _genuine_trusted_gmail_headers(*, domain: str = "trusted-vendor.example", dmarc: str = "pass") -> list[dict]:
+    """A sanitized, `.example`-domain/RFC-5737-IP genuine Gmail header
+    shape — mirrors `tests/integration/test_mailbox_gmail_authentication
+    .py`'s own `_normal_sample_headers()` structural shape (a `Received
+    ... by mx.google.com ...` hop immediately preceding a genuine
+    `Authentication-Results: mx.google.com; ...` header, plus the
+    genuine ARC triple) — never real captured data."""
+    return [
+        {
+            "name": "Received",
+            "value": (
+                f"from mail.{domain} (mail.{domain}. [203.0.113.10]) "
+                "by mx.google.com with ESMTPS id ab1cd23ef456.2026.09.21.00.00.00 "
+                "for <mgs241171@example.invalid>; Mon, 21 Sep 2026 00:00:00 -0700 (PDT)"
+            ),
+        },
+        {
+            "name": "Authentication-Results",
+            "value": (
+                f"mx.google.com; dkim=pass header.i=@{domain} header.s=selector1 header.b=redacted; "
+                f"spf=pass (google.com: domain of billing@{domain} designates 203.0.113.10 as permitted "
+                f"sender) smtp.mailfrom=billing@{domain}; dmarc={dmarc} header.from={domain}"
+            ),
+        },
+        {
+            "name": "ARC-Seal",
+            "value": "i=1; a=rsa-sha256; t=1758412800; cv=none; d=google.com; s=arc-20160816; b=REDACTEDGENUINESIGNATURE==",
+        },
+        {
+            "name": "ARC-Message-Signature",
+            "value": (
+                "i=1; a=rsa-sha256; c=relaxed/relaxed; d=google.com; s=arc-20160816; "
+                "h=from:to:subject:date:message-id; bh=REDACTED=; b=REDACTEDGENUINE=="
+            ),
+        },
+        {
+            "name": "ARC-Authentication-Results",
+            "value": (
+                f"i=1; mx.google.com; dkim=pass header.i=@{domain} header.s=selector1 header.b=redacted; "
+                f"spf=pass smtp.mailfrom=billing@{domain}; dmarc={dmarc} header.from={domain}"
+            ),
+        },
+    ]
+
+
+def test_default_metadata_headers_production_path_reaches_pass_via_fetch_message_headers():
+    """CD-6 metadata-contract fix regression proof: `DEFAULT_METADATA_HEADERS`
+    used to omit `Received` entirely, so this exact real production call
+    chain (`GmailMailboxAdapter.fetch_message_headers()` -> provider-
+    neutral `evaluate_message_authentication()` ->
+    `assess_gmail_authentication()`) could never reach a decisive verdict
+    for a genuinely authenticated message — it always fell back to
+    UNKNOWN, forcing real, legitimate mail into SECURITY_REVIEW. This
+    drives the REAL, unmodified call (no `metadata_headers` override —
+    the exact shape `_reprocess_one_message`/every live sweep round's own
+    per-message headers fetch uses) against a fake Gmail response
+    simulating exactly what Gmail's own API returns for that requested
+    header set, and proves it now resolves to PASS for a realistic,
+    sanitized, genuinely-authenticated message — with header order
+    preserved exactly, never sorted/reordered anywhere in this chain."""
+    from services.mailbox.authentication_assessment import AUTH_ASSESSMENT_PASS
+    from services.mailbox.gmail.gmail_client import DEFAULT_METADATA_HEADERS
+    from services.mailbox.sweep import evaluate_message_authentication
+
+    # The metadata-contract fix itself: `Received` is now requested.
+    assert "Received" in DEFAULT_METADATA_HEADERS
+
+    oauth_client, gmail_client, token_store, mailbox_repo, adapter = _adapter()
+    mailbox = _seeded_mailbox(mailbox_repo)
+    token_store.write(mailbox.mailbox_id, access_token="a", refresh_token="r", expires_at=datetime.now(timezone.utc) + timedelta(hours=1))
+
+    metadata_headers = _headers_for(sender="billing@trusted-vendor.example") + _genuine_trusted_gmail_headers()
+    gmail_client.queue_metadata_result(
+        GmailMessageMetadataResult(
+            status=GmailOutcomeStatus.OK,
+            metadata=GmailMessageMetadata(
+                message_id="m1", raw_headers=metadata_headers, internal_date=datetime(2026, 9, 21, tzinfo=timezone.utc)
+            ),
+        )
+    )
+
+    # The real production call — NO `metadata_headers` override, exactly
+    # as `_reprocess_one_message`/every live sweep round's per-message
+    # headers-only fetch calls it.
+    headers_result = adapter.fetch_message_headers(mailbox_id=mailbox.mailbox_id, immutable_message_id="m1")
+    assert headers_result.status == GmailOutcomeStatus.OK
+    # Header ORDER preserved exactly as Gmail returned it — never sorted
+    # or reordered anywhere in this call chain (see gmail_client.py's own
+    # docstring, and services.mailbox.gmail.authentication's own
+    # "Evidence chronology" step 3 for why this order is load-bearing).
+    assert list(headers_result.raw_headers) == metadata_headers
+
+    assessment = evaluate_message_authentication(headers_result.raw_headers, provider_kind=PROVIDER_GOOGLE_GMAIL)
+    assert assessment.verdict == AUTH_ASSESSMENT_PASS
+    assert assessment.evidence["eligible_candidate_count"] == 1
+    assert assessment.evidence["selected_header_tokens"]["dmarc"] == "pass"
