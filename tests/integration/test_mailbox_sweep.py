@@ -517,6 +517,128 @@ def test_429_rate_limited_exhausted_is_a_bounded_transient_failure(h):
     assert run.failures >= 1
 
 
+# ---------------------------------------------------------------------
+# CD-6 fix — a rate-limited page retry must retry the EXACT SAME
+# logical page request (`services/mailbox/sweep.py`'s own retry block):
+# never recompute or lose the bootstrap boundary / delta cursor /
+# continuation token on retry. Provider-neutral — driven via
+# `FakeMicrosoftGraphClient`/`MicrosoftGraphMailboxAdapter`, but the
+# fix itself lives entirely in the shared `run_sweep` loop (see
+# `test_mailbox_gmail_sweep.py` for the Gmail-specific exploit proof
+# of the identical bug).
+# ---------------------------------------------------------------------
+
+
+def test_429_rate_limited_bootstrap_first_page_preserves_bootstrap_timestamp_on_retry(h):
+    """Bootstrap first page (fresh mailbox, no cursor yet): the retry
+    must carry the SAME bootstrap_timestamp the initial call resolved —
+    never a hardcoded None."""
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.RATE_LIMITED, retry_after_seconds=0.01))
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link="d1"))
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link="d2"))
+    run = h.sweep()
+    assert run.status == "SUCCEEDED"
+    initial_call, retry_call = h.graph_client.delta_calls[0], h.graph_client.delta_calls[1]
+    assert initial_call["bootstrap_timestamp"] is not None
+    assert initial_call["delta_link"] is None
+    assert initial_call["next_link"] is None
+    assert retry_call["bootstrap_timestamp"] == initial_call["bootstrap_timestamp"]
+    assert retry_call["delta_link"] is None
+    assert retry_call["next_link"] is None
+
+
+def test_429_rate_limited_incremental_first_page_preserves_delta_link_on_retry(h):
+    """Incremental (non-bootstrap) first page — a cursor already exists
+    from a prior successful sweep. The retry must carry the SAME
+    delta_link the initial call resolved — never a hardcoded None."""
+    h.queue_empty_both_folders(inbox_delta="established-delta", junk_delta="junk-1")
+    h.sweep()
+
+    start = len(h.graph_client.delta_calls)
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.RATE_LIMITED, retry_after_seconds=0.01))
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link="d-inbox-2"))
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link="d-junk-2"))
+    run = h.sweep()
+    assert run.status == "SUCCEEDED"
+    calls = h.graph_client.delta_calls[start:]
+    initial_call, retry_call = calls[0], calls[1]
+    assert initial_call["delta_link"] == "established-delta"
+    assert initial_call["bootstrap_timestamp"] is None
+    assert initial_call["next_link"] is None
+    assert retry_call["delta_link"] == "established-delta"
+    assert retry_call["bootstrap_timestamp"] is None
+    assert retry_call["next_link"] is None
+
+
+def test_429_rate_limited_continuation_page_preserves_next_link_on_retry(h):
+    """A continuation (pagination) page — the retry must carry the SAME
+    next_link the initial continuation call used."""
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), next_link="page-2"))
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.RATE_LIMITED, retry_after_seconds=0.01))
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link="d-inbox-final"))
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link="d-junk"))
+    run = h.sweep()
+    assert run.status == "SUCCEEDED"
+    calls = h.graph_client.delta_calls
+    # calls[0] = inbox first page (OK, returns next_link="page-2")
+    # calls[1] = inbox continuation page, initial attempt (RATE_LIMITED)
+    # calls[2] = inbox continuation page, retry (OK)
+    # calls[3] = junk first page
+    continuation_initial, continuation_retry = calls[1], calls[2]
+    assert continuation_initial["next_link"] == "page-2"
+    assert continuation_initial["delta_link"] is None
+    assert continuation_initial["bootstrap_timestamp"] is None
+    assert continuation_retry["next_link"] == "page-2"
+    assert continuation_retry["delta_link"] is None
+    assert continuation_retry["bootstrap_timestamp"] is None
+
+
+def test_429_rate_limited_twice_preserves_same_position_and_marks_transient_failure(h):
+    """A SECOND RATE_LIMITED (the retry itself is also throttled) must
+    not fabricate a different position for that retry, must mark the
+    folder as a bounded transient failure, and must never advance the
+    cursor for that folder."""
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.RATE_LIMITED, retry_after_seconds=0.01))
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.RATE_LIMITED, retry_after_seconds=0.01))
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link="d-junk"))
+    run = h.sweep()
+    assert run.status in ("PARTIAL", "FAILED")
+    assert run.failures >= 1
+    initial_call, retry_call = h.graph_client.delta_calls[0], h.graph_client.delta_calls[1]
+    assert initial_call["bootstrap_timestamp"] is not None
+    assert retry_call["bootstrap_timestamp"] == initial_call["bootstrap_timestamp"]
+    assert retry_call["delta_link"] is None
+    assert retry_call["next_link"] is None
+    cursor = h.cursor_repo.get_or_bootstrap(
+        mailbox_id=h.mailbox.mailbox_id, provider_kind=h.mailbox.provider_kind, folder=h.INBOX_FOLDER_ID,
+        bootstrap_timestamp=datetime.now(timezone.utc),
+    )
+    assert cursor.delta_link is None
+
+
+def test_429_rate_limited_retry_then_success_processes_the_page_exactly_once(h):
+    """Initial call 429s, the same-position retry succeeds: the page's
+    message must be processed exactly once (no double-ingestion), and
+    the final cursor must reflect the position derived from the
+    actually-processed (retried) page."""
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.RATE_LIMITED, retry_after_seconds=0.01))
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(_msg("m1"),), delta_link="d-inbox-final"))
+    h.graph_client.queue_headers_result(_headers_ok())
+    h.graph_client.queue_content_result(_content())
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link="d-junk"))
+    run = h.sweep()
+    assert run.status == "SUCCEEDED"
+    assert run.evidence_created == 1
+    assert run.duplicates == 0
+    messages = h.message_repo.list_messages(mailbox_id=h.mailbox.mailbox_id)
+    assert len(messages) == 1
+    cursor = h.cursor_repo.get_or_bootstrap(
+        mailbox_id=h.mailbox.mailbox_id, provider_kind=h.mailbox.provider_kind, folder=h.INBOX_FOLDER_ID,
+        bootstrap_timestamp=datetime.now(timezone.utc),
+    )
+    assert cursor.delta_link == "d-inbox-final"
+
+
 def test_resync_required_never_silently_restarts_and_duplicates(h):
     h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.RESYNC_REQUIRED, error_detail="expired delta token"))
     h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link="d-junk"))

@@ -1017,14 +1017,26 @@ def run_sweep(
                 first_page = True
 
                 while True:
+                    # Resolve this page's request position ONCE, into
+                    # local variables, before the first attempt. A
+                    # rate-limited retry below reuses these exact same
+                    # values — it must retry the identical logical page
+                    # request, never recompute or lose the bootstrap
+                    # boundary / delta cursor / continuation token.
+                    request_delta_link = cursor.delta_link if (first_page and not is_bootstrap_round) else None
+                    request_next_link = next_link if not first_page else None
+                    request_bootstrap_timestamp = (
+                        cursor.bootstrap_timestamp if (first_page and is_bootstrap_round) else None
+                    )
+                    first_page = False
+
                     page = adapter.fetch_folder_delta(
                         mailbox_id=mailbox.mailbox_id,
                         folder=folder,
-                        delta_link=cursor.delta_link if (first_page and not is_bootstrap_round) else None,
-                        next_link=next_link if not first_page else None,
-                        bootstrap_timestamp=cursor.bootstrap_timestamp if (first_page and is_bootstrap_round) else None,
+                        delta_link=request_delta_link,
+                        next_link=request_next_link,
+                        bootstrap_timestamp=request_bootstrap_timestamp,
                     )
-                    first_page = False
 
                     if page.status == GraphOutcomeStatus.RATE_LIMITED:
                         graph_throttle_retries += 1
@@ -1033,9 +1045,9 @@ def run_sweep(
                         page = adapter.fetch_folder_delta(
                             mailbox_id=mailbox.mailbox_id,
                             folder=folder,
-                            delta_link=None,
-                            next_link=next_link,
-                            bootstrap_timestamp=None,
+                            delta_link=request_delta_link,
+                            next_link=request_next_link,
+                            bootstrap_timestamp=request_bootstrap_timestamp,
                         )
                         if page.status == GraphOutcomeStatus.RATE_LIMITED:
                             folder_had_transient_failure = True

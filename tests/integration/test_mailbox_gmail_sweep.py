@@ -148,7 +148,13 @@ def _genuine_trusted_gmail_headers(*, domain: str = "vendor.com", dmarc: str = "
 
 
 class Harness:
-    def __init__(self, *, allow_default_domain: bool = True, email: str = "mgs241171@gmail.com"):
+    def __init__(
+        self,
+        *,
+        allow_default_domain: bool = True,
+        email: str = "mgs241171@gmail.com",
+        fiscal_year_start_month_day: str = "01-01",
+    ):
         self.api = BagmanCanonicalAPI()
         self.object_store = InMemoryObjectStore()
         self.scanner = AlwaysCleanScanner()
@@ -185,7 +191,7 @@ class Harness:
         canonical_suffix = "".join(c if c.isalnum() else "_" for c in email.upper())
         self.entity = self.api.register_entity(
             entity_type="COMPANY", canonical_name=f"TEST_ENTITY_{canonical_suffix}", display_name="Test Entity", status="ACTIVE",
-            actor_type="SYSTEM", actor_id="test", fiscal_year_start_month_day="01-01",
+            actor_type="SYSTEM", actor_id="test", fiscal_year_start_month_day=fiscal_year_start_month_day,
         )
 
         if allow_default_domain:
@@ -863,3 +869,91 @@ def test_concurrent_sweep_declines_cleanly(h):
             h.sweep()
     finally:
         h.lock.release(h.mailbox.mailbox_id, token)
+
+
+# ---------------------------------------------------------------------
+# CD-6 fix — RATE_LIMITED page retry must retry the EXACT SAME logical
+# page request (see `services/mailbox/sweep.py`'s own retry-block
+# comment). These two tests prove the PRECISE Gmail exploit the bug
+# caused: the old code hardcoded `delta_link=None, bootstrap_timestamp=
+# None` on retry, so `GmailMailboxAdapter.fetch_folder_delta` (see its
+# own module docstring's "since_epoch resolution" section) resolved
+# `since_epoch=0` whenever BOTH were lost — issuing an UNBOUNDED
+# `list_messages(query=None)` call that would enumerate the mailbox's
+# entire lifetime instead of the governed bootstrap floor / delta
+# cursor. Driven end-to-end through the real, provider-neutral
+# `run_sweep()` (not the adapter in isolation) because the retry itself
+# is `run_sweep`'s own loop's responsibility — `GmailMailboxAdapter`
+# has no retry logic of its own; a rate limit simply passes its status
+# straight through (see `fetch_folder_delta`'s `list_result.status !=
+# GmailOutcomeStatus.OK` branch). Testing at the adapter level alone
+# could not exercise the actual bug or its fix.
+# ---------------------------------------------------------------------
+
+
+def test_429_rate_limited_bootstrap_first_page_preserves_after_bound_on_retry_gmail_exploit():
+    """Bootstrap first page (fresh Gmail mailbox, no cursor yet) hits a
+    429, then succeeds on retry. Both underlying `list_messages` calls
+    must carry the identical `after:<epoch>` bound, derived from the
+    SAME bootstrap timestamp — never a `query=None` unbounded call.
+
+    `fiscal_year_start_month_day="11-01"` derives the exact, real,
+    documented worked example in
+    `services/mailbox/bootstrap_policy.py`'s own module docstring
+    ("Infosecurs Limited"): historical bootstrap =
+    `datetime(2024, 11, 1, tzinfo=timezone.utc)`.
+    """
+    from datetime import datetime, timezone
+
+    h = Harness(fiscal_year_start_month_day="11-01")
+    h.queue_discovery()
+    h.gmail_client.queue_list_messages_result(GmailMessageListPageResult(status=GmailOutcomeStatus.RATE_LIMITED, retry_after_seconds=0.01))
+    h.gmail_client.queue_list_messages_result(GmailMessageListPageResult(status=GmailOutcomeStatus.OK, message_ids=()))
+    run = h.sweep()
+    assert run.status == "SUCCEEDED"
+
+    calls = h.gmail_client.list_messages_calls
+    assert len(calls) == 2
+    expected_epoch = int(datetime(2024, 11, 1, tzinfo=timezone.utc).timestamp())
+    expected_query = f"after:{expected_epoch}"
+    assert calls[0].query == expected_query
+    assert calls[1].query == expected_query
+    # The exact regression this bug caused: neither call fell back to an
+    # unbounded (query=None) lifetime enumeration.
+    assert all(call.query is not None for call in calls)
+
+
+def test_429_rate_limited_existing_cursor_preserves_after_bound_on_retry_gmail_exploit():
+    """Incremental (non-bootstrap) round: a synthetic existing
+    `delta_link` encoding `{"since_epoch": X}` (the adapter's own real
+    `_encode_delta_link` format) hits a 429 on its first page, then
+    succeeds on retry. Both underlying `list_messages` calls must carry
+    `after:X` — the SAME `X` from the existing cursor — never falling
+    back to an unbounded/lifetime query."""
+    from datetime import datetime, timezone
+
+    from services.mailbox.gmail.gmail_adapter import GMAIL_ALL_RECEIVED_STREAM_ID, _encode_delta_link
+
+    h = Harness()
+    since_epoch_x = int(datetime(2025, 3, 15, tzinfo=timezone.utc).timestamp())
+    h.cursor_repo.get_or_bootstrap(
+        mailbox_id=h.mailbox.mailbox_id, provider_kind=PROVIDER_GOOGLE_GMAIL, folder=GMAIL_ALL_RECEIVED_STREAM_ID,
+        bootstrap_timestamp=datetime(2020, 1, 1, tzinfo=timezone.utc),
+    )
+    h.cursor_repo.advance_cursor(
+        mailbox_id=h.mailbox.mailbox_id, provider_kind=PROVIDER_GOOGLE_GMAIL, folder=GMAIL_ALL_RECEIVED_STREAM_ID,
+        delta_link=_encode_delta_link(since_epoch=since_epoch_x),
+    )
+
+    h.queue_discovery()
+    h.gmail_client.queue_list_messages_result(GmailMessageListPageResult(status=GmailOutcomeStatus.RATE_LIMITED, retry_after_seconds=0.01))
+    h.gmail_client.queue_list_messages_result(GmailMessageListPageResult(status=GmailOutcomeStatus.OK, message_ids=()))
+    run = h.sweep()
+    assert run.status == "SUCCEEDED"
+
+    calls = h.gmail_client.list_messages_calls
+    assert len(calls) == 2
+    expected_query = f"after:{since_epoch_x}"
+    assert calls[0].query == expected_query
+    assert calls[1].query == expected_query
+    assert all(call.query is not None for call in calls)
