@@ -44,7 +44,7 @@ def _fresh_tokens(*, refresh_token="refresh-1"):
     return GmailTokenBundle(access_token="access-1", refresh_token=refresh_token, expires_at=datetime.now(timezone.utc) + timedelta(hours=1))
 
 
-def _headers_for(*, subject="Invoice", sender="billing@vendor.com", message_id="msg-abc", content_type=None):
+def _headers_for(*, subject="Invoice", sender="billing@vendor.com", message_id="msg-abc", content_type=None, content_disposition=None, content_type_header_name="Content-Type", content_disposition_header_name="Content-Disposition"):
     headers = [
         {"name": "Subject", "value": subject},
         {"name": "From", "value": f"Vendor <{sender}>"},
@@ -52,7 +52,9 @@ def _headers_for(*, subject="Invoice", sender="billing@vendor.com", message_id="
         {"name": "Date", "value": "Mon, 01 Jan 2024 12:00:00 +0000"},
     ]
     if content_type:
-        headers.append({"name": "Content-Type", "value": content_type})
+        headers.append({"name": content_type_header_name, "value": content_type})
+    if content_disposition:
+        headers.append({"name": content_disposition_header_name, "value": content_disposition})
     return headers
 
 
@@ -98,6 +100,71 @@ def test_has_attachments_false_without_multipart_mixed():
 
     metadata = GmailMessageMetadata(message_id="m1", raw_headers=_headers_for(content_type="text/plain"), label_ids=(), internal_date=None)
     assert _to_message_summary(metadata).has_attachments is False
+
+
+# -- `has_attachments` derivation broadening (CD-6 discovery-signal fix) --
+#
+# `_derive_has_attachments` extends the original `multipart/mixed`-only
+# check with two more bounded, metadata-only signals: an exact/prefix
+# match on an attachment-shaped top-level `Content-Type`, and a
+# top-level `Content-Disposition: attachment`. See that function's own
+# docstring for the full, honest scope of what this is (and is not).
+
+
+def test_has_attachments_true_for_top_level_pdf_content_type_no_multipart():
+    from services.mailbox.gmail.gmail_adapter import _to_message_summary
+
+    metadata = GmailMessageMetadata(message_id="m1", raw_headers=_headers_for(content_type="application/pdf"), label_ids=(), internal_date=None)
+    assert _to_message_summary(metadata).has_attachments is True
+
+
+def test_has_attachments_true_for_pdf_content_type_with_trailing_parameters():
+    """Proves the exact/prefix match tolerates trailing `; name=...`-
+    style parameters rather than requiring an exact full-string match."""
+    from services.mailbox.gmail.gmail_adapter import _to_message_summary
+
+    metadata = GmailMessageMetadata(
+        message_id="m1", raw_headers=_headers_for(content_type='application/pdf; name="invoice.pdf"'), label_ids=(), internal_date=None
+    )
+    assert _to_message_summary(metadata).has_attachments is True
+
+
+def test_has_attachments_true_for_content_disposition_attachment():
+    from services.mailbox.gmail.gmail_adapter import _to_message_summary
+
+    metadata = GmailMessageMetadata(
+        message_id="m1",
+        raw_headers=_headers_for(content_type="text/plain", content_disposition='attachment; filename="x.pdf"'),
+        label_ids=(),
+        internal_date=None,
+    )
+    assert _to_message_summary(metadata).has_attachments is True
+
+
+def test_has_attachments_false_for_plain_text_no_disposition():
+    from services.mailbox.gmail.gmail_adapter import _to_message_summary
+
+    metadata = GmailMessageMetadata(message_id="m1", raw_headers=_headers_for(content_type="text/plain"), label_ids=(), internal_date=None)
+    assert _to_message_summary(metadata).has_attachments is False
+
+
+def test_has_attachments_derivation_is_case_insensitive():
+    """Mixed-case header NAME and VALUE for both `Content-Type` and
+    `Content-Disposition` must still be recognised."""
+    from services.mailbox.gmail.gmail_adapter import _to_message_summary
+
+    metadata = GmailMessageMetadata(
+        message_id="m1",
+        raw_headers=_headers_for(
+            content_type="MULTIPART/MIXED; boundary=xyz",
+            content_type_header_name="content-type",
+            content_disposition="ATTACHMENT",
+            content_disposition_header_name="Content-Disposition",
+        ),
+        label_ids=(),
+        internal_date=None,
+    )
+    assert _to_message_summary(metadata).has_attachments is True
 
 
 # -- folder (label) discovery --------------------------------------------

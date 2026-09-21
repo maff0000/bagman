@@ -323,6 +323,63 @@ def _header_lookup(raw_headers: Sequence[Mapping[str, Optional[str]]], name: str
     return None
 
 
+#: Top-level media types (no parameters) that, on their own, are a
+#: strong signal the message body itself IS an attachment-shaped part —
+#: deliberately the same bounded set
+#: `services.mailbox.discovery_signals._CANDIDATE_ATTACHMENT_CONTENT_TYPES`
+#: uses (kept in sync by hand — that name is private to its own module,
+#: so this is a separate, intentionally identical constant rather than a
+#: cross-module import of a private symbol).
+_ATTACHMENT_SHAPED_CONTENT_TYPES: frozenset[str] = frozenset(
+    {"application/pdf", "image/jpeg", "image/jpg", "image/png", "image/heic"}
+)
+
+
+def _derive_has_attachments(*, content_type: Optional[str], content_disposition: Optional[str]) -> bool:
+    """Bounded, metadata-only ATTACHMENT-PRESENCE signal for Gmail's
+    `format=metadata` Stage-A fetch — NOT real MIME attachment
+    enumeration.
+
+    Honest limits: this module's Stage-A fetch never walks a real
+    `payload.parts` tree (no such tree exists at `format=metadata`), so
+    nested/multi-part attachment filenames and content-types remain
+    permanently unavailable here without requesting materially richer
+    message payload data (`format=full`/raw MIME) — a boundary this
+    adapter deliberately never crosses (see module docstring). This
+    function only answers "does the TOP-LEVEL metadata this module
+    already has give any honest reason to believe an attachment is
+    present" — a conservative presence signal, nothing more.
+
+    True when ANY of:
+    * top-level `Content-Type` CONTAINS `multipart/mixed` (a multipart
+      envelope commonly, though not exclusively, carrying attachments);
+    * top-level `Content-Disposition` CONTAINS `attachment`;
+    * top-level `Content-Type` IS (exact/prefix match on the media type
+      itself, tolerating trailing `; parameter=...` text, e.g.
+      `application/pdf; name="invoice.pdf"`) one of
+      :data:`_ATTACHMENT_SHAPED_CONTENT_TYPES` — the message's own body
+      IS an attachment-shaped part.
+
+    Case-insensitive throughout — header value casing is never
+    guaranteed."""
+    lowered_content_type = (content_type or "").strip().lower()
+    lowered_disposition = (content_disposition or "").strip().lower()
+
+    if "multipart/mixed" in lowered_content_type:
+        return True
+    if "attachment" in lowered_disposition:
+        return True
+
+    # Strip any trailing `; parameter=...` text before the exact/prefix
+    # match — `Content-Type` values are a media type optionally followed
+    # by parameters (e.g. `application/pdf; name="invoice.pdf"`).
+    media_type = lowered_content_type.split(";", 1)[0].strip()
+    if media_type in _ATTACHMENT_SHAPED_CONTENT_TYPES:
+        return True
+
+    return False
+
+
 def _to_message_summary(metadata: GmailMessageMetadata) -> GmailMessageSummary:
     """The ONE place this module composes a `GmailMessageSummary` from a
     real (or faked) `GmailMessageMetadata` — and, critically, the ONE
@@ -353,16 +410,10 @@ def _to_message_summary(metadata: GmailMessageMetadata) -> GmailMessageSummary:
         # `Date` header is not.
         received_at = metadata.internal_date
 
-    # Bounded, best-effort proxy for "this message probably has an
-    # attachment" from the TOP-LEVEL Content-Type header alone — mirrors
-    # `services.mailbox.imap.imap_adapter`'s own identical, documented
-    # scoped simplification (this module's own Stage-A fetch is
-    # headers-only, never a full `payload.parts` structure walk, so no
-    # real per-attachment filename/content-type/size list is available;
-    # `attachment_metadata` therefore stays empty for every Gmail
-    # message, exactly like IMAP's own identical choice).
-    content_type = (_header_lookup(metadata.raw_headers, "Content-Type") or "").lower()
-    has_attachments = "multipart/mixed" in content_type
+    has_attachments = _derive_has_attachments(
+        content_type=_header_lookup(metadata.raw_headers, "Content-Type"),
+        content_disposition=_header_lookup(metadata.raw_headers, "Content-Disposition"),
+    )
 
     return GmailMessageSummary(
         immutable_id=metadata.message_id,

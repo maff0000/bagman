@@ -63,7 +63,15 @@ from services.needs_you.needs_you import (
 
 
 class AlwaysCleanScanner(EvidenceSafetyScanner):
+    def __init__(self) -> None:
+        #: Bounded call-count proof for Stage-A-only tests: a message
+        #: that never leaves discovery-only handling must never reach
+        #: `scan()` at all (scanning only happens downstream of a real
+        #: MIME fetch, which discovery-only messages never trigger).
+        self.scan_calls = 0
+
     def scan(self, content):
+        self.scan_calls += 1
         return ScanResult(ScanVerdict.CLEAN, detail="clean")
 
     def is_available(self):
@@ -398,6 +406,98 @@ def test_unknown_domain_credible_candidate_raises_exactly_one_needs_you_item_nev
     assert "newsupplier.com" not in {r.sender_domain for r in rules}
 
 
+# -- Gmail `has_attachments` discovery-signal fallback (CD-6 fix) --------
+#
+# Real, end-to-end proof (not the unit-level `discovery_signals` tests
+# above) that a Gmail message with a genuine attachment but no
+# accounting-keyword subject/filename/content-type detail — the exact
+# shape Gmail's Stage-A `format=metadata` fetch structurally always
+# produces — is still surfaced as a discovery candidate, driven through
+# the real provider-neutral sweep engine via the real header-derivation
+# path (`_derive_has_attachments`), never a hand-injected boolean.
+
+
+def test_gmail_message_with_only_multipart_mixed_header_is_a_candidate_via_real_header_derivation():
+    """Positive: zero `MailboxDomainRule`s for this mailbox at all, a
+    generic/non-financial subject, and `has_attachments=True` produced
+    ENTIRELY by the real Gmail header-derivation path (a genuine
+    top-level `Content-Type: multipart/mixed` header) — never a
+    hand-injected `has_attachments` boolean."""
+    harness = Harness(allow_default_domain=False)
+    assert harness.domain_rule_repo.list_rules(mailbox_id=harness.mailbox.mailbox_id) == []
+
+    harness.queue_discovery()
+    harness.queue_folder_round(
+        message_ids=("m1",),
+        metadata_by_id={
+            "m1": _metadata(
+                "m1",
+                subject="Your document",
+                sender="someone@example.com",
+                extra_headers=[{"name": "Content-Type", "value": "multipart/mixed; boundary=xyz"}],
+            )
+        },
+    )
+    run = harness.sweep()
+    assert run.status == "SUCCEEDED"
+
+    messages = harness.message_repo.list_messages(mailbox_id=harness.mailbox.mailbox_id)
+    assert len(messages) == 1
+    assert messages[0].ingestion_status == INGESTION_STATUS_CHECKED_NOT_CANDIDATE
+    assert messages[0].discovery_candidate is True
+    assert messages[0].discovery_reason == "message metadata indicates one or more attachments"
+
+    items = harness.needs_you_repo.list_needs_you_items(item_type=ITEM_TYPE_MAILBOX_DOMAIN_REVIEW, domain="MAILBOX", status="OPEN")
+    matching = [i for i in items if i.metadata.get("mailbox_id") == harness.mailbox.mailbox_id]
+    assert len(matching) == 1
+
+    # Zero deep processing throughout: no MIME/raw fetch, no evidence,
+    # no scanner invocation, no entity assignment.
+    assert harness.gmail_client.raw_calls == []
+    assert run.evidence_created == 0
+    assert messages[0].evidence_id is None
+    assert harness.scanner.scan_calls == 0
+    assert harness.refresh_mailbox().default_entity_id is None
+
+
+def test_gmail_message_with_no_attachment_indication_at_all_is_not_a_candidate_and_raises_no_review_item():
+    """Negative: identical setup, but the message genuinely carries no
+    attachment indication at all (plain `text/plain`, no
+    `Content-Disposition`) and no other candidate signal -> not a
+    candidate, NO domain-review item raised, and the same zero-deep-
+    processing guarantees as the positive case."""
+    harness = Harness(allow_default_domain=False)
+    harness.queue_discovery()
+    harness.queue_folder_round(
+        message_ids=("m1",),
+        metadata_by_id={
+            "m1": _metadata(
+                "m1",
+                subject="Your document",
+                sender="someone@example.com",
+                extra_headers=[{"name": "Content-Type", "value": "text/plain"}],
+            )
+        },
+    )
+    run = harness.sweep()
+    assert run.status == "SUCCEEDED"
+
+    messages = harness.message_repo.list_messages(mailbox_id=harness.mailbox.mailbox_id)
+    assert len(messages) == 1
+    assert messages[0].ingestion_status == INGESTION_STATUS_CHECKED_NOT_CANDIDATE
+    assert messages[0].discovery_candidate is False
+
+    items = harness.needs_you_repo.list_needs_you_items(item_type=ITEM_TYPE_MAILBOX_DOMAIN_REVIEW, domain="MAILBOX", status="OPEN")
+    matching = [i for i in items if i.metadata.get("mailbox_id") == harness.mailbox.mailbox_id]
+    assert len(matching) == 0
+
+    assert harness.gmail_client.raw_calls == []
+    assert run.evidence_created == 0
+    assert messages[0].evidence_id is None
+    assert harness.scanner.scan_calls == 0
+    assert harness.refresh_mailbox().default_entity_id is None
+
+
 def test_default_entity_id_stays_null_for_both_gmail_mailbox_rows():
     """Explicit WO-required proof: NOTHING in the Gmail router/adapter/
     composition wiring ever assigns `default_entity_id` — for either of
@@ -407,6 +507,33 @@ def test_default_entity_id_stays_null_for_both_gmail_mailbox_rows():
     mailbox_b = repo.create_mailbox(display_name="Work Gmail", email_address="matt.george.scott@gmail.com", provider_kind=PROVIDER_GOOGLE_GMAIL)
     assert mailbox_a.default_entity_id is None
     assert mailbox_b.default_entity_id is None
+
+
+def test_operational_preflight_both_connected_gmail_mailboxes_start_with_zero_domain_rules():
+    """Operational preflight (CD-6 discovery-signal fix, §7): before ANY
+    historical reprocessing run against BOTH real, connected Gmail
+    mailboxes (`mgs241171@gmail.com` / `matt.george.scott@gmail.com`),
+    the real `MailboxDomainRuleRepository.list_rules` query must show
+    ZERO rows for each — this is what makes the new `has_attachments`
+    fallback signal safe to enable broadly: with no `MUST_READ`/
+    `BLACKLIST` rule governing either mailbox yet, every message still
+    flows through the SAME bounded, non-AI `evaluate_discovery_candidate`
+    heuristic this delivery extends, never a silently-broader auto-read
+    path.
+
+    This is a TEST-LEVEL proof only, using the real repository query
+    against a representative fixture (freshly created mailboxes, exactly
+    mirroring `test_default_entity_id_stays_null_for_both_gmail_mailbox_
+    rows` above) — it does NOT reach for, and cannot substitute for, the
+    real production database. The PL is expected to run the equivalent
+    live check directly against the real deployed system separately."""
+    mailbox_repo = InMemoryMailboxSourceRepository()
+    domain_rule_repo = InMemoryMailboxDomainRuleRepository()
+    mailbox_a = mailbox_repo.create_mailbox(display_name="Personal Gmail", email_address="mgs241171@gmail.com", provider_kind=PROVIDER_GOOGLE_GMAIL)
+    mailbox_b = mailbox_repo.create_mailbox(display_name="Work Gmail", email_address="matt.george.scott@gmail.com", provider_kind=PROVIDER_GOOGLE_GMAIL)
+
+    assert domain_rule_repo.list_rules(mailbox_id=mailbox_a.mailbox_id) == []
+    assert domain_rule_repo.list_rules(mailbox_id=mailbox_b.mailbox_id) == []
 
 
 # -- Gmail durable message identity ----------------------------------------

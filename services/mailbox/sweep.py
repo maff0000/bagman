@@ -1200,7 +1200,9 @@ def run_sweep(
                             # spec §4). Never a MIME fetch either way.
                             unknown_domain_messages += 1
                             signal = evaluate_discovery_candidate(
-                                subject=msg.subject, attachment_metadata=attachment_metadata
+                                subject=msg.subject,
+                                attachment_metadata=attachment_metadata,
+                                has_attachments=msg.has_attachments,
                             )
                             if signal.is_candidate:
                                 likely_financial_candidates += 1

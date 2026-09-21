@@ -191,12 +191,26 @@ _AUTHORIZE_EXTRA_PARAMS = {"access_type": "offline", "prompt": "consent"}
 #: explicit — never `metadataHeaders` omitted entirely (Gmail returns NO
 #: headers at all for `format=metadata` without at least one
 #: `metadataHeaders` value).
+#:
+#: `Content-Disposition` was added on top of the above (discovery-
+#: signal fix, CD-6 follow-on) for exactly one purpose: a bounded,
+#: metadata-only ATTACHMENT-PRESENCE signal — NOT real MIME part
+#: enumeration. Gmail's `format=metadata` fetch has no parsed
+#: `payload.parts` tree, so this module can never know real per-
+#: attachment filenames/content-types for Gmail (that stays exactly as
+#: true as it already was — see `gmail_adapter.py`'s own
+#: `_derive_has_attachments` docstring). The TOP-LEVEL
+#: `Content-Disposition` header, when present, is one more honest,
+#: bounded clue (alongside the top-level `Content-Type` this module
+#: already requested) that the message carries at least one attachment
+#: — nothing more.
 DEFAULT_METADATA_HEADERS: tuple[str, ...] = (
     "Subject",
     "From",
     "Message-ID",
     "Date",
     "Content-Type",
+    "Content-Disposition",
     "Received",
     "Authentication-Results",
     "ARC-Authentication-Results",

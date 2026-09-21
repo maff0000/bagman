@@ -80,11 +80,36 @@ def _contains_keyword(text: Optional[str]) -> Optional[str]:
 
 
 def evaluate_discovery_candidate(
-    *, subject: Optional[str], attachment_metadata: Optional[Sequence[Mapping[str, Any]]]
+    *,
+    subject: Optional[str],
+    attachment_metadata: Optional[Sequence[Mapping[str, Any]]],
+    has_attachments: bool = False,
 ) -> DiscoverySignalResult:
     """Bounded, non-AI verdict: does this UNKNOWN-domain message look
     like a credible new accounting-document source? Uses only Stage-A
-    discovery metadata (never MIME content)."""
+    discovery metadata (never MIME content).
+
+    Decision order (each step only runs if the previous ones found
+    nothing — the richer, more-specific signal always wins over a
+    coarser one so the operator-facing reason stays maximally useful):
+
+    A. Subject keyword hit.
+    B. Attachment filename keyword hit (real per-attachment metadata —
+       only ever populated by providers that expose it, e.g. Microsoft/
+       IMAP; always empty for Gmail's own metadata-only Stage-A fetch).
+    C. Known accounting attachment content-type (same per-attachment
+       metadata as B).
+    D. LAST-RESORT fallback: no detailed signal from A-C, but the
+       provider's own coarser, provider-neutral `has_attachments` fact
+       says the message carries at least one attachment. This exists
+       because some providers (Gmail's `format=metadata` Stage-A fetch,
+       deliberately, structurally, permanently) cannot populate real
+       per-attachment filename/content-type detail at all — see
+       `services.mailbox.gmail.gmail_adapter`'s own module for why. A
+       genuine attachment is still a meaningful, conservative candidate
+       signal even with zero filename/content-type detail behind it.
+    E. Otherwise: not a candidate.
+    """
     subject_hit = _contains_keyword(subject)
     if subject_hit is not None:
         return DiscoverySignalResult(True, f"subject contains keyword {subject_hit!r}")
@@ -99,6 +124,9 @@ def evaluate_discovery_candidate(
             return DiscoverySignalResult(
                 True, f"attachment content_type {content_type!r} is a common accounting-document type"
             )
+
+    if has_attachments:
+        return DiscoverySignalResult(True, "message metadata indicates one or more attachments")
 
     return DiscoverySignalResult(
         False, "no invoice/receipt/statement-style signal found in subject or attachment metadata"
