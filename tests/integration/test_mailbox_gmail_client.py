@@ -8,13 +8,16 @@ constraint — no live credentials exist).
 from __future__ import annotations
 
 import base64
+import json
 import urllib.error
 import urllib.parse
+import urllib.request
 
 import pytest
 
 from services.mailbox.gmail.gmail_client import (
     DEFAULT_METADATA_HEADERS,
+    GMAIL_MESSAGES_LIST_URL,
     GMAIL_PROFILE_URL,
     GmailClient,
     GmailClientProtocol,
@@ -283,3 +286,124 @@ def test_gmail_client_source_never_imports_a_forbidden_google_sdk():
     assert "googleapiclient" not in imported_roots
     assert "google_auth_oauthlib" not in imported_roots
     assert "urllib" in imported_roots
+
+
+# ---------------------------------------------------------------------
+# CD-6 ALL_RECEIVED discovery-model fix — real `GmailClient.list_messages`
+# HTTP request shape. These drive the REAL client (never `FakeGmailClient`)
+# against a monkeypatched `urllib.request.urlopen`, capturing the exact
+# constructed `Request` so the real query-string parameters can be
+# asserted directly — no real network call is ever made.
+# ---------------------------------------------------------------------
+
+
+class _FakeUrlopenResponse:
+    """A minimal stand-in for the `http.client.HTTPResponse` context
+    manager `urllib.request.urlopen` normally returns — just enough for
+    `GmailClient._get_json`'s own `with ... as response: response.read()`
+    usage."""
+
+    def __init__(self, payload: dict) -> None:
+        self._body = json.dumps(payload).encode("utf-8")
+
+    def read(self) -> bytes:
+        return self._body
+
+    def __enter__(self) -> "_FakeUrlopenResponse":
+        return self
+
+    def __exit__(self, *exc_info) -> bool:
+        return False
+
+
+def _capture_request_url(monkeypatch, *, payload: dict) -> dict:
+    """Monkeypatches `urllib.request.urlopen` (the exact call
+    `GmailClient._get_json` makes) to record the real constructed
+    `Request`'s `full_url` and return `payload` as the JSON body. Returns
+    a mutable dict the caller reads `["request"]` from after the real
+    client call completes."""
+    captured: dict = {}
+
+    def _fake_urlopen(request, timeout=None):  # noqa: ARG001 - timeout unused, matches urlopen's own signature
+        captured["request"] = request
+        return _FakeUrlopenResponse(payload)
+
+    monkeypatch.setattr(urllib.request, "urlopen", _fake_urlopen)
+    return captured
+
+
+def test_list_messages_real_client_includes_spam_trash_true_param(monkeypatch):
+    """13. `include_spam_trash=True` must produce a real
+    `includeSpamTrash=true` query parameter on the constructed request —
+    the ONE mechanism that structurally guarantees Spam/Trash coverage
+    for the `ALL_RECEIVED` stream (Gmail's `messages.list` otherwise
+    excludes those dispositions from normal results even with no
+    `labelIds` restriction at all)."""
+    captured = _capture_request_url(monkeypatch, payload={"messages": []})
+    client = GmailClient()
+
+    result = client.list_messages(access_token="tok", label_id=None, include_spam_trash=True, query="after:100")
+
+    assert result.status == GmailOutcomeStatus.OK
+    parsed = urllib.parse.urlparse(captured["request"].full_url)
+    assert parsed.scheme == "https"
+    assert parsed.netloc == "www.googleapis.com"
+    assert parsed.path == urllib.parse.urlparse(GMAIL_MESSAGES_LIST_URL).path
+    params = urllib.parse.parse_qs(parsed.query)
+    assert params["includeSpamTrash"] == ["true"]
+    assert params["q"] == ["after:100"]
+
+
+def test_list_messages_real_client_omits_label_ids_param_when_label_id_is_none(monkeypatch):
+    """14. `label_id=None` must produce a constructed request carrying NO
+    `labelIds` parameter at all — never the string `"None"`, never a
+    fabricated value, and (per this delivery's own hard boundary) the
+    synthetic `ALL_RECEIVED` stream identity must never itself be sent
+    as a real `labelIds` value."""
+    captured = _capture_request_url(monkeypatch, payload={"messages": []})
+    client = GmailClient()
+
+    client.list_messages(access_token="tok", label_id=None, include_spam_trash=True)
+
+    parsed = urllib.parse.urlparse(captured["request"].full_url)
+    params = urllib.parse.parse_qs(parsed.query)
+    assert "labelIds" not in params
+
+
+def test_list_messages_real_client_still_includes_label_ids_when_provided(monkeypatch):
+    """Backward-compatibility proof: `label_id`, when explicitly
+    provided, still produces a single real `labelIds` value exactly as
+    before — the parameter is kept for flexibility, even though nothing
+    in this delivery calls it that way any more."""
+    captured = _capture_request_url(monkeypatch, payload={"messages": []})
+    client = GmailClient()
+
+    client.list_messages(access_token="tok", label_id="INBOX")
+
+    parsed = urllib.parse.urlparse(captured["request"].full_url)
+    params = urllib.parse.parse_qs(parsed.query)
+    assert params["labelIds"] == ["INBOX"]
+
+
+def test_list_messages_real_client_after_query_construction_unchanged(monkeypatch):
+    """15. The existing governed `after:<epoch>` query construction is
+    unchanged in behavior for the real client — the `q` parameter is
+    forwarded verbatim, whatever the caller builds it as (the ALL_RECEIVED
+    discovery-model fix never touches this mechanic)."""
+    captured = _capture_request_url(monkeypatch, payload={"messages": []})
+    client = GmailClient()
+
+    client.list_messages(access_token="tok", label_id=None, include_spam_trash=True, query="after:1700000000")
+
+    parsed = urllib.parse.urlparse(captured["request"].full_url)
+    params = urllib.parse.parse_qs(parsed.query)
+    assert params["q"] == ["after:1700000000"]
+
+
+def test_list_messages_real_client_sends_bearer_authorization_header(monkeypatch):
+    captured = _capture_request_url(monkeypatch, payload={"messages": []})
+    client = GmailClient()
+
+    client.list_messages(access_token="secret-token", label_id=None, include_spam_trash=True)
+
+    assert captured["request"].get_header("Authorization") == "Bearer secret-token"

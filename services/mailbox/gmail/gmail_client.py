@@ -395,8 +395,8 @@ class GmailClientProtocol(Protocol):
     def list_labels(self, *, access_token: str) -> GmailLabelListResult: ...
 
     def list_messages(
-        self, *, access_token: str, label_id: str, query: Optional[str] = None, page_token: Optional[str] = None,
-        max_results: int = DEFAULT_PAGE_SIZE,
+        self, *, access_token: str, label_id: Optional[str] = None, query: Optional[str] = None,
+        page_token: Optional[str] = None, max_results: int = DEFAULT_PAGE_SIZE, include_spam_trash: bool = False,
     ) -> GmailMessageListPageResult: ...
 
     def fetch_message_metadata(
@@ -598,19 +598,32 @@ class GmailClient:
         self,
         *,
         access_token: str,
-        label_id: str,
+        label_id: Optional[str] = None,
         query: Optional[str] = None,
         page_token: Optional[str] = None,
         max_results: int = DEFAULT_PAGE_SIZE,
+        include_spam_trash: bool = False,
     ) -> GmailMessageListPageResult:
-        # A SINGLE `labelIds` value only — Gmail's own `labelIds`
-        # parameter is AND-semantics across multiple values ("messages
-        # with labels that match ALL specified label ids"), never OR —
-        # so this method deliberately queries ONE label at a time; see
-        # `gmail_adapter.py`'s own module docstring for how the adapter
-        # composes one "folder" per monitored label rather than a single
-        # multi-label query.
-        params: dict[str, str] = {"labelIds": label_id, "maxResults": str(max_results)}
+        # `label_id` is `None` for BAGMAN's own `ALL_RECEIVED` logical
+        # stream (see `gmail_adapter.py`'s own module docstring's
+        # "Label/folder normalisation" section) — Gmail's `messages.list`
+        # simply omits `labelIds` entirely in that case, returning every
+        # message regardless of label. `label_id`, when provided, is
+        # still a SINGLE value only — Gmail's own `labelIds` parameter is
+        # AND-semantics across multiple values ("messages with labels
+        # that match ALL specified label ids"), never OR — kept for
+        # flexibility/backward compatibility; nothing in this delivery
+        # passes it any more.
+        #
+        # `include_spam_trash=True` is what makes Spam/Trash inclusion
+        # structurally guaranteed for the `ALL_RECEIVED` stream — Gmail's
+        # `messages.list` otherwise excludes those dispositions from
+        # normal results even with no `labelIds` restriction at all.
+        params: dict[str, str] = {"maxResults": str(max_results)}
+        if label_id:
+            params["labelIds"] = label_id
+        if include_spam_trash:
+            params["includeSpamTrash"] = "true"
         if query:
             params["q"] = query
         if page_token:

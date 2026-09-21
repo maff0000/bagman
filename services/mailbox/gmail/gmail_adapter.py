@@ -91,54 +91,99 @@ secondary fields — never folded into identity (mirrors both other
 providers' identical doctrine); `internet_message_id` is populated from
 the `Message-ID` header when present, exactly like Microsoft/IMAP.
 
-Label/folder normalisation — bounded to INBOX/SPAM/TRASH this delivery
+Label/folder normalisation — ONE synthetic BAGMAN discovery stream,
+replacing the original three-system-label model entirely
 --------------------------------------------------------------------------
-Gmail uses LABELS, not folders — a message can carry several
-simultaneously, and Gmail's own `messages.list` `labelIds` query
-parameter is AND-semantics across multiple values ("has ALL of these
-labels"), never OR — so this module queries GmailClient.list_messages
-ONE label at a time (see `gmail_client.py`'s own module docstring),
-exposing each monitored label to `services/mailbox/sweep.py` as its own
-`MonitoredFolder`, exactly the same shape Microsoft's own
-Inbox/Junk/DeletedItems and IMAP's own INBOX/Junk/Trash folders already
-are.
+Gmail uses LABELS, not folders — a message can carry SEVERAL
+simultaneously (many-to-many), unlike IMAP/Microsoft's own folder
+hierarchy. This module's reasoning, in the order it was actually
+reached (CD-6 follow-on delivery):
 
-:func:`compute_monitored_labels` is this delivery's own bounded,
-DOCUMENTED first-provider-delivery scope decision: only the three
-SYSTEM labels `INBOX`/`SPAM`/`TRASH` are monitored (mirrors the
-"junk/trash coverage" doctrine already established for Microsoft/IMAP,
-applied at the minimum this delivery's own WO names explicitly) —
-`SENT`/`DRAFT` are always excluded, and no USER-created label (Gmail's
-own arbitrary custom labels, or the built-in `CATEGORY_*`
-promotions/social/updates/forums labels) is monitored by this delivery
-at all, unlike Microsoft/IMAP's own "every custom/nested folder is
-monitored" doctrine. This is a real, deliberate scope narrowing (not an
-oversight) — Gmail's own label taxonomy has no equivalent of a plain
-IMAP/Graph "user-created folder" that is unambiguously financially
-relevant by construction; deciding which user labels (if any) should
-also be monitored needs real label samples from a live mailbox this
-delivery does not have. Extending monitored-label coverage is a natural,
-narrow follow-up once real credentials/samples exist — flagged here
-prominently, not silently chosen. Classification is by the label's own
-`type == "system"` field and `id` — NEVER by `name` (mirrors Microsoft's
-own "never guessed from display name" well-known-folder doctrine
-exactly).
+1. Initial provider delivery (this package's first Gmail slice) used a
+   bounded first implementation: exactly three Gmail SYSTEM labels
+   (`INBOX`/`SPAM`/`TRASH`), one `MonitoredFolder` per label, one
+   `fetch_folder_delta` round per label per sweep — a deliberate,
+   documented, bounded first scope, not an oversight.
+2. A pre-historical-sweep review (this delivery) found this
+   structurally OMITTED archived mail — any message carrying NONE of
+   those three labels (e.g. archived, or carrying only a user/category
+   label) was never discovered at all. Historical financial discovery
+   must see archived mail too — an old invoice/receipt is exactly the
+   kind of thing an operator routinely archives.
+3. Gmail's label model is many-to-many, unlike IMAP/Graph's own folder
+   hierarchy — a message can carry multiple labels at once, so the old
+   per-label query model also risked the SAME message being enumerated
+   once per matching monitored label within one sweep round (even
+   though `sweep.py`'s own existing `find_by_provider_id`-then-skip-
+   if-already-FINAL check already collapsed that safely at the
+   provider-neutral layer — see that module's own docstring; this
+   delivery never depended solely on that mechanism for correctness,
+   only for cheapness).
+4. The fix: ONE complete inbound logical stream —
+   :data:`GMAIL_ALL_RECEIVED_STREAM_ID` (`"ALL_RECEIVED"`, paired with
+   :data:`GMAIL_ALL_RECEIVED_STREAM_DISPLAY_NAME` — a stable,
+   BAGMAN-logical cursor-identity constant, NOT a real Gmail label id,
+   and NEVER sent to a real Gmail API request as a `labelIds` value —
+   see `GmailClient.list_messages`'s own `label_id=None` handling) —
+   gives correct historical coverage AND avoids label-driven duplicate
+   enumeration entirely: there is now only ONE `fetch_folder_delta`
+   call per sweep round, not three, so a message can no longer be
+   enumerated twice within one round at all (the class of duplication
+   `sweep.py`'s own dedup mechanism used to also absorb for Gmail
+   specifically is now structurally impossible, not merely absorbed).
+   `GmailClient.list_messages`'s `include_spam_trash=True` is what
+   keeps Spam/Trash coverage for this stream — Gmail's `messages.list`
+   otherwise excludes those dispositions from normal results even with
+   no `labelIds` restriction at all.
+5. `SENT`/`DRAFT` exclusion (the ONLY exclusion this stream applies) is
+   based ENTIRELY on Gmail's own real, provider-authored `labelIds` on
+   each message's own metadata response (`GmailMessageMetadata
+   .label_ids`) — NEVER subject/from heuristics. A message carrying
+   `SENT` is excluded even if it ALSO carries `INBOX`/`TRASH`/anything
+   else — SENT/DRAFT exclusion always wins, checked independently, and
+   is applied strictly AFTER this round's watermark
+   (`running_max`/the resulting `delta_link`) has already advanced past
+   that message — see :meth:`fetch_folder_delta`'s own watermark-then-
+   exclude ordering below. Getting this order wrong would let a page
+   whose newest messages are all outbound leave the cursor stuck behind
+   them, re-enumerating the same excluded messages on every future
+   sweep forever.
+
+This is a CLEAN REPLACEMENT, never an addition — there is exactly ONE
+Gmail discovery model in this codebase, never two competing ones (the
+old `MONITORED_SYSTEM_LABEL_IDS`/`compute_monitored_labels` doctrine is
+gone entirely, not layered under/alongside this one).
+:meth:`discover_monitored_folders` therefore no longer needs a
+`list_labels()` API round-trip at all (nothing is being discovered FROM
+real Gmail labels for this purpose any more) — it still calls
+`_ensure_fresh_access_token` first (so a genuinely broken/expired
+connection still surfaces `AUTH_ERROR` at the same whole-sweep-
+precondition point `sweep.py` already expects — see that module's own
+"Folder discovery" section), then returns the single, fixed
+:data:`_ALL_RECEIVED_MONITORED_FOLDERS` tuple. `GmailClient.list_labels`
+itself is UNCHANGED and NOT removed — it remains available for
+connection/health diagnostics elsewhere; this module simply no longer
+calls it for folder discovery.
 
 Not-processing-the-same-message-twice-per-pass
 --------------------------------------------------------------------------
-Within ONE `fetch_folder_delta` call (one label's own paginated
-`messages.list` round), this module de-duplicates the page's own message
-ids before fetching metadata for each (`list(dict.fromkeys(...))` — see
-:meth:`fetch_folder_delta` below) — cheap, defensive, and never relies
-solely on `MailboxMessageRepository`'s own idempotency to paper over a
-redundant N-times-refetch (per this delivery's own explicit instruction).
-The SAME message appearing under a DIFFERENT monitored label (a second,
-separate `fetch_folder_delta` call, for a different `folder`) is instead
-collapsed by `services/mailbox/sweep.py`'s own existing, provider-
-neutral `find_by_provider_id`-then-skip-if-already-FINAL check (the SAME
-mechanism that already collapses Microsoft's own Inbox/Deleted-Items
-overlap, or a message an IMAP mailbox has already fully processed) —
-this delivery adds no new cross-folder logic to `sweep.py` at all (and
+Within ONE `fetch_folder_delta` call (the single `ALL_RECEIVED` stream's
+own paginated `messages.list` round), this module de-duplicates the
+page's own message ids before fetching metadata for each
+(`list(dict.fromkeys(...))` — see :meth:`fetch_folder_delta` below) —
+cheap, defensive, and never relies solely on
+`MailboxMessageRepository`'s own idempotency to paper over a redundant
+N-times-refetch. Since this delivery collapsed the old three-label model
+into ONE stream (see "Label/folder normalisation" above), there is no
+longer a SEPARATE second-folder pass a message could also appear under
+at all within one sweep round. `services/mailbox/sweep.py`'s own
+existing, provider-neutral `find_by_provider_id`-then-skip-if-already-
+FINAL check still exists and still protects against a message re-
+observed across DIFFERENT sweep ROUNDS (e.g. a page re-read after a
+restart, or a resumed `next_link`) — but the WITHIN-one-round
+cross-folder duplication class this mechanism used to also absorb for
+Gmail specifically is now structurally impossible, not merely absorbed
+(this delivery adds no new cross-folder logic to `sweep.py` at all, and
 is not permitted to — see this delivery's own instructions).
 
 Pagination / resumability — Gmail's own mechanics, never a fabricated
@@ -193,7 +238,6 @@ from core.timestamps import utc_now
 from services.mailbox.gmail.gmail_client import (
     DEFAULT_METADATA_HEADERS,
     GmailClientProtocol,
-    GmailLabel,
     GmailMessageMetadata,
     GmailOAuthClientProtocol,
     GmailOutcomeStatus,
@@ -205,15 +249,27 @@ from services.mailbox.mailbox import MailboxSourceRepository
 #: `services.mailbox.microsoft.adapter._REFRESH_SKEW_SECONDS`.
 _REFRESH_SKEW_SECONDS = 120.0
 
-#: See module docstring's "Label/folder normalisation" section — the
-#: ONLY three Gmail system labels this delivery monitors, in this fixed,
-#: canonical order (a mailbox missing one of them, e.g. no SPAM label
-#: yet observed, simply omits that entry — never a crash).
-MONITORED_SYSTEM_LABEL_IDS: tuple[str, ...] = ("INBOX", "SPAM", "TRASH")
+#: See module docstring's "Label/folder normalisation" section —
+#: BAGMAN's own single, synthetic, BAGMAN-logical discovery stream
+#: identity: "every Gmail message in the mailbox within the governed
+#: time window, including Inbox, archived, Spam, Trash, snoozed/custom-
+#: labelled mail, except messages carrying Gmail's own `SENT`/`DRAFT`
+#: labels." NOT a real Gmail label — never sent to a real Gmail API
+#: request as a `labelIds` value (see `GmailClient.list_messages`'s own
+#: `label_id=None` handling in `fetch_folder_delta` below).
+GMAIL_ALL_RECEIVED_STREAM_ID: str = "ALL_RECEIVED"
 
-#: Gmail's own SYSTEM label type discriminator — see
-#: `gmail_client.GmailLabel.label_type`'s own docstring.
-_SYSTEM_LABEL_TYPE = "system"
+#: GUI/human-facing rendering only for the stream above — never used for
+#: identity (mirrors `MonitoredFolder.display_name`'s own doctrine).
+GMAIL_ALL_RECEIVED_STREAM_DISPLAY_NAME: str = "All received mail"
+
+#: Gmail's own real, provider-authored `labelIds` values that mark a
+#: message OUTBOUND — checked against each message's own metadata
+#: response (`GmailMessageMetadata.label_ids`), NEVER subject/from
+#: heuristics. Always Gmail's own uppercase canonical ids — case-
+#: sensitive exact match. See module docstring's "Label/folder
+#: normalisation" section, point 5.
+_OUTBOUND_EXCLUDED_LABEL_IDS: frozenset[str] = frozenset({"SENT", "DRAFT"})
 
 
 @dataclass(frozen=True)
@@ -222,13 +278,25 @@ class MonitoredFolder:
     `services.mailbox.imap.imap_adapter.MonitoredFolder`'s own shape
     exactly (`folder_id` + `display_name`) — the deliberately
     provider-neutral shape `services/mailbox/sweep.py` is allowed to
-    know about a folder. `folder_id` is the real Gmail label id (e.g.
-    `"INBOX"`) — the actual cursor/query identity key; `display_name` is
-    Gmail's own label `name` (for system labels, identical to the id) —
-    GUI/human-facing rendering only, never used for identity."""
+    know about a folder. For Gmail, `folder_id` is now always
+    :data:`GMAIL_ALL_RECEIVED_STREAM_ID` — BAGMAN's own synthetic
+    cursor/query identity key, NOT a real Gmail label id (see module
+    docstring's "Label/folder normalisation" section); `display_name` is
+    :data:`GMAIL_ALL_RECEIVED_STREAM_DISPLAY_NAME` — GUI/human-facing
+    rendering only, never used for identity."""
 
     folder_id: str
     display_name: str
+
+
+#: The single, fixed monitored-folder list `discover_monitored_folders`
+#: now returns — see module docstring's "Label/folder normalisation"
+#: section for why this no longer needs a `list_labels()` API round-trip
+#: at all. A plain module-level constant, not a function — there is
+#: nothing left to discover FROM real Gmail labels for this purpose.
+_ALL_RECEIVED_MONITORED_FOLDERS: tuple[MonitoredFolder, ...] = (
+    MonitoredFolder(folder_id=GMAIL_ALL_RECEIVED_STREAM_ID, display_name=GMAIL_ALL_RECEIVED_STREAM_DISPLAY_NAME),
+)
 
 
 @dataclass(frozen=True)
@@ -287,18 +355,6 @@ class GmailMessageHeadersResult:
     raw_headers: Sequence[Mapping[str, Optional[str]]] = field(default_factory=tuple)
     retry_after_seconds: Optional[float] = None
     error_detail: Optional[str] = None
-
-
-def compute_monitored_labels(labels: Sequence[GmailLabel]) -> tuple[MonitoredFolder, ...]:
-    """Pure, HTTP-free classification — see module docstring's
-    "Label/folder normalisation" section. Classifies by the label's own
-    `label_type == "system"` field and `label_id`, NEVER by `name`."""
-    by_id = {label.label_id: label for label in labels if label.label_type == _SYSTEM_LABEL_TYPE}
-    return tuple(
-        MonitoredFolder(folder_id=label_id, display_name=by_id[label_id].name)
-        for label_id in MONITORED_SYSTEM_LABEL_IDS
-        if label_id in by_id
-    )
 
 
 def _decode_mime_words(value: Optional[str]) -> Optional[str]:
@@ -540,20 +596,20 @@ class GmailMailboxAdapter:
     # -- folder discovery --------------------------------------------------
 
     def discover_monitored_folders(self, *, mailbox_id: str) -> FolderDiscoveryResult:
+        """See module docstring's "Label/folder normalisation" section —
+        this no longer calls `GmailClient.list_labels()` at all: there is
+        nothing left to discover FROM real Gmail labels for this
+        purpose, since the monitored-folder list is now the single,
+        fixed :data:`_ALL_RECEIVED_MONITORED_FOLDERS` tuple. Still
+        validates/refreshes the access token first, so a genuinely
+        broken/expired connection still surfaces `AUTH_ERROR` at this
+        same whole-sweep-precondition point `sweep.py` already
+        expects."""
         access_token, error_detail = self._ensure_fresh_access_token(mailbox_id)
         if access_token is None:
             return FolderDiscoveryResult(status=GmailOutcomeStatus.AUTH_ERROR, error_detail=error_detail)
 
-        labels_result = self._gmail_client.list_labels(access_token=access_token)
-        if labels_result.status == GmailOutcomeStatus.AUTH_ERROR:
-            retried_token, retry_error = self._reactive_refresh(mailbox_id)
-            if retried_token is None:
-                return FolderDiscoveryResult(status=GmailOutcomeStatus.AUTH_ERROR, error_detail=retry_error)
-            labels_result = self._gmail_client.list_labels(access_token=retried_token)
-        if labels_result.status != GmailOutcomeStatus.OK:
-            return FolderDiscoveryResult(status=labels_result.status, error_detail=labels_result.error_detail)
-
-        return FolderDiscoveryResult(status=GmailOutcomeStatus.OK, folders=compute_monitored_labels(labels_result.labels))
+        return FolderDiscoveryResult(status=GmailOutcomeStatus.OK, folders=_ALL_RECEIVED_MONITORED_FOLDERS)
 
     # -- delta / content / headers fetch, with bounded 401-retry-once -----
 
@@ -566,6 +622,13 @@ class GmailMailboxAdapter:
         next_link: Optional[str] = None,
         bootstrap_timestamp: Optional[datetime] = None,
     ) -> GmailDeltaPageResult:
+        """`folder` is always `sweep.py`'s own `monitored_folder.folder_id`
+        — for Gmail, always :data:`GMAIL_ALL_RECEIVED_STREAM_ID` — but is
+        DELIBERATELY NEVER forwarded to `GmailClient.list_messages` as a
+        real `labelIds` value (it is not a real Gmail label — see module
+        docstring's "Label/folder normalisation" section); this method
+        always calls `list_messages` with `label_id=None,
+        include_spam_trash=True` regardless of `folder`'s own value."""
         access_token, error_detail = self._ensure_fresh_access_token(mailbox_id)
         if access_token is None:
             return GmailDeltaPageResult(status=GmailOutcomeStatus.AUTH_ERROR, error_detail=error_detail)
@@ -589,13 +652,18 @@ class GmailMailboxAdapter:
             running_max = since_epoch
 
         query = f"after:{since_epoch}" if since_epoch else None
-        list_result = self._gmail_client.list_messages(access_token=access_token, label_id=folder, query=query, page_token=page_token)
+        # `label_id=None, include_spam_trash=True` — the `ALL_RECEIVED`
+        # stream's own real request shape (see this method's own
+        # docstring above and module docstring's "Label/folder
+        # normalisation" section). `folder` is deliberately never passed
+        # through here.
+        list_result = self._gmail_client.list_messages(access_token=access_token, label_id=None, include_spam_trash=True, query=query, page_token=page_token)
         if list_result.status == GmailOutcomeStatus.AUTH_ERROR:
             retried_token, retry_error = self._reactive_refresh(mailbox_id)
             if retried_token is None:
                 return GmailDeltaPageResult(status=GmailOutcomeStatus.AUTH_ERROR, error_detail=retry_error)
             access_token = retried_token
-            list_result = self._gmail_client.list_messages(access_token=access_token, label_id=folder, query=query, page_token=page_token)
+            list_result = self._gmail_client.list_messages(access_token=access_token, label_id=None, include_spam_trash=True, query=query, page_token=page_token)
         if list_result.status != GmailOutcomeStatus.OK:
             return GmailDeltaPageResult(
                 status=list_result.status, retry_after_seconds=list_result.retry_after_seconds, error_detail=list_result.error_detail
@@ -628,9 +696,28 @@ class GmailMailboxAdapter:
                     error_detail=metadata_result.error_detail,
                 )
 
-            messages.append(_to_message_summary(metadata_result.metadata))
-            if metadata_result.metadata.internal_date is not None:
-                new_running_max = max(new_running_max, int(metadata_result.metadata.internal_date.timestamp()))
+            metadata = metadata_result.metadata
+
+            # Cursor watermark subtlety (module docstring, "Label/folder
+            # normalisation" point 5) — the watermark MUST advance for
+            # EVERY successfully-fetched message, REGARDLESS of whether
+            # it goes on to be excluded below. If this were conditioned
+            # on inclusion, a page whose newest messages are all outbound
+            # (SENT/DRAFT) would leave `running_max` behind those
+            # messages, and every future sweep would re-enumerate them
+            # forever. This ordering — watermark update, THEN exclusion
+            # decision — is load-bearing; never swap it.
+            if metadata.internal_date is not None:
+                new_running_max = max(new_running_max, int(metadata.internal_date.timestamp()))
+
+            # THEN decide exclusion — SENT/DRAFT always wins, checked
+            # independently of any other label the message also carries
+            # (e.g. SENT + INBOX is still excluded). Based entirely on
+            # Gmail's own real `labelIds`, never subject/from heuristics.
+            if _OUTBOUND_EXCLUDED_LABEL_IDS.intersection(metadata.label_ids):
+                continue
+
+            messages.append(_to_message_summary(metadata))
 
         if list_result.next_page_token:
             return GmailDeltaPageResult(

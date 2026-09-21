@@ -35,8 +35,6 @@ from services.mailbox.domain_rule import InMemoryMailboxDomainRuleRepository
 from services.mailbox.gmail.fake_gmail_client import FakeGmailClient, FakeGmailOAuthClient
 from services.mailbox.gmail.gmail_adapter import GmailMailboxAdapter
 from services.mailbox.gmail.gmail_client import (
-    GmailLabel,
-    GmailLabelListResult,
     GmailMessageListPageResult,
     GmailMessageMetadata,
     GmailMessageMetadataResult,
@@ -78,7 +76,7 @@ class AlwaysCleanScanner(EvidenceSafetyScanner):
         return True
 
 
-def _metadata(message_id: str, *, subject="Invoice", sender="billing@vendor.com", internal_date=None, extra_headers=None):
+def _metadata(message_id: str, *, subject="Invoice", sender="billing@vendor.com", internal_date=None, extra_headers=None, label_ids=("INBOX",)):
     from datetime import datetime, timezone
 
     headers = [
@@ -92,7 +90,7 @@ def _metadata(message_id: str, *, subject="Invoice", sender="billing@vendor.com"
     return GmailMessageMetadata(
         message_id=message_id,
         raw_headers=tuple(headers),
-        label_ids=("INBOX",),
+        label_ids=tuple(label_ids),
         internal_date=internal_date or datetime(2024, 1, 1, 12, 0, tzinfo=timezone.utc),
     )
 
@@ -200,10 +198,13 @@ class Harness:
         self.mailbox = self.mailbox_repo.get_mailbox(self.mailbox.mailbox_id)
         return self.mailbox
 
-    def queue_discovery(self, *, labels=("INBOX",)):
-        self.gmail_client.queue_labels_result(
-            GmailLabelListResult(status=GmailOutcomeStatus.OK, labels=tuple(GmailLabel(label_id=l, name=l, label_type="system") for l in labels))
-        )
+    def queue_discovery(self):
+        """No-op — kept only for call-site compatibility across this
+        file's many tests. `discover_monitored_folders` no longer calls
+        `list_labels()` at all (see `gmail_adapter.py`'s own module
+        docstring, "Label/folder normalisation" section) — it always
+        deterministically returns the single, fixed `ALL_RECEIVED`
+        stream, so there is nothing left to queue."""
 
     def queue_folder_round(self, *, message_ids=(), metadata_by_id=None):
         self.gmail_client.queue_list_messages_result(GmailMessageListPageResult(status=GmailOutcomeStatus.OK, message_ids=tuple(message_ids)))
@@ -406,6 +407,72 @@ def test_unknown_domain_credible_candidate_raises_exactly_one_needs_you_item_nev
     assert "newsupplier.com" not in {r.sender_domain for r in rules}
 
 
+# ---------------------------------------------------------------------
+# ALL_RECEIVED discovery-model fix — provider-neutral sweep proof (WO
+# section 11). Zero Gmail `MailboxDomainRule`s, one mixed `ALL_RECEIVED`
+# page (Inbox + archived + Spam + Sent + Draft — the same shape as
+# `test_mailbox_gmail_adapter.py::test_mixed_page_only_received_family_
+# messages_returned_within_one_stream`), driven through the REAL
+# `run_sweep()`.
+# ---------------------------------------------------------------------
+
+
+def test_all_received_stream_provider_neutral_sweep_proof_mixed_page_zero_domain_rules():
+    """Proves, end-to-end through the real, unmodified provider-neutral
+    sweep engine: Inbox/archived/Spam messages are all discovered as
+    `MailboxMessage` rows; SENT/DRAFT never even reach discovery-only
+    storage (excluded inside the adapter, before `sweep.py` ever sees
+    them as a candidate message at all); the bounded, non-AI
+    `evaluate_discovery_candidate` heuristic still runs normally for
+    every included message; zero MIME fetch, zero `EvidenceItem`, zero
+    scanner invocation, zero entity assignment; and the generic
+    `sweep.py` observed-folder threading produces exactly
+    `observed_folder="ALL_RECEIVED"`/`observed_folder_display_name="All
+    received mail"` on every created row — with ZERO Gmail-specific
+    code added to `sweep.py` itself (see `gmail_adapter.py`'s own module
+    docstring's "Label/folder normalisation" section)."""
+    harness = Harness(allow_default_domain=False)
+    assert harness.domain_rule_repo.list_rules(mailbox_id=harness.mailbox.mailbox_id) == []
+
+    harness.queue_discovery()
+    harness.queue_folder_round(
+        message_ids=("m-inbox", "m-archived", "m-spam", "m-sent", "m-draft"),
+        metadata_by_id={
+            "m-inbox": _metadata("m-inbox", subject="Hello", sender="alice@example.com", label_ids=("INBOX",)),
+            "m-archived": _metadata("m-archived", subject="Hello", sender="bob@example.com", label_ids=()),
+            "m-spam": _metadata("m-spam", subject="Hello", sender="carol@example.com", label_ids=("SPAM",)),
+            "m-sent": _metadata("m-sent", subject="Hello", sender="me@example.com", label_ids=("SENT",)),
+            "m-draft": _metadata("m-draft", subject="Hello", sender="me@example.com", label_ids=("DRAFT",)),
+        },
+    )
+    run = harness.sweep()
+    assert run.status == "SUCCEEDED"
+
+    messages = harness.message_repo.list_messages(mailbox_id=harness.mailbox.mailbox_id)
+    by_id = {m.immutable_provider_message_id: m for m in messages}
+
+    # Inbox/archived/Spam discovered; SENT/DRAFT never reach storage.
+    assert set(by_id.keys()) == {"m-inbox", "m-archived", "m-spam"}
+
+    # The bounded, non-AI discovery-candidate heuristic ran for every
+    # included message — never left unevaluated.
+    for message in by_id.values():
+        assert message.discovery_candidate is not None
+        assert message.discovery_checked_at is not None
+
+    # Generic, provider-neutral sweep.py observed-folder threading —
+    # zero Gmail-specific code in sweep.py itself.
+    for message in by_id.values():
+        assert message.observed_folder == "ALL_RECEIVED"
+        assert message.observed_folder_display_name == "All received mail"
+
+    # Zero deep processing throughout.
+    assert harness.gmail_client.raw_calls == []
+    assert run.evidence_created == 0
+    assert harness.scanner.scan_calls == 0
+    assert harness.refresh_mailbox().default_entity_id is None
+
+
 # -- Gmail `has_attachments` discovery-signal fallback (CD-6 fix) --------
 #
 # Real, end-to-end proof (not the unit-level `discovery_signals` tests
@@ -569,33 +636,34 @@ def test_same_message_content_observed_in_both_gmail_mailboxes_produces_two_sepa
     assert messages_a[0].mailbox_id != messages_b[0].mailbox_id
 
 
-# -- label handling: exactly once per pass, not once per label -----------
+# -- single-stream discovery: no cross-label duplication is possible ------
+#
+# The old three-label model risked the SAME Gmail message being
+# enumerated once per matching monitored label within one sweep round
+# (`test_message_under_two_monitored_labels_is_discovered_exactly_once_
+# not_once_per_label`, REMOVED — it tested exactly this now-impossible
+# scenario: a second, separate `INBOX`/`SPAM` folder pass for the same
+# message id). See `gmail_adapter.py`'s own module docstring, "Label/
+# folder normalisation" section, point 4: with the single `ALL_RECEIVED`
+# stream there is exactly ONE `fetch_folder_delta`/`list_messages` call
+# per sweep round, so a message can never be enumerated twice within one
+# round at all — proven below.
 
 
-def test_message_under_two_monitored_labels_is_discovered_exactly_once_not_once_per_label(h):
-    """`services/mailbox/sweep.py` iterates each monitored label as its
-    own folder pass — the SAME Gmail message id appearing in BOTH the
-    `INBOX` pass and the `SPAM` pass must resolve to exactly ONE
-    `MailboxMessage` row (the second folder's own occurrence is recorded
-    as a cheap 'duplicate' observation, never a second discovery/
-    evidence-creation), never processed/evidenced twice."""
-    metadata = _metadata("dup-message-1", subject="Invoice", sender="new@unknown-domain.com")
-    h.queue_discovery(labels=("INBOX", "SPAM"))
-    # INBOX pass.
-    h.queue_folder_round(message_ids=("dup-message-1",), metadata_by_id={"dup-message-1": metadata})
-    # SPAM pass — the SAME message id observed again.
-    h.queue_folder_round(message_ids=("dup-message-1",), metadata_by_id={"dup-message-1": metadata})
+def test_all_received_stream_discovers_a_message_exactly_once_via_a_single_list_messages_call(h):
+    metadata = _metadata("single-pass-message", subject="Invoice", sender="new@unknown-domain.com")
+    h.queue_discovery()
+    h.queue_folder_round(message_ids=("single-pass-message",), metadata_by_id={"single-pass-message": metadata})
 
     run = h.sweep()
     assert run.status == "SUCCEEDED"
     messages = h.message_repo.list_messages(mailbox_id=h.mailbox.mailbox_id)
     assert len(messages) == 1
-    assert run.duplicates == 1
-    # Metadata was fetched twice (once per folder pass — a real API call
-    # cost this design accepts, see gmail_adapter.py's own module
-    # docstring), but never resulted in a second MailboxMessage/Needs You
-    # item/evidence record.
-    assert h.gmail_client.metadata_calls.count("dup-message-1") == 2
+    assert run.duplicates == 0
+    # Exactly one `list_messages` call this whole sweep round — one
+    # stream, one cursor, never a per-label loop.
+    assert len(h.gmail_client.list_messages_calls) == 1
+    assert h.gmail_client.metadata_calls.count("single-pass-message") == 1
 
 
 # -- idempotency / restart-safety ------------------------------------------

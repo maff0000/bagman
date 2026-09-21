@@ -91,10 +91,11 @@ class FakeGmailOAuthClient:
 
 @dataclass(frozen=True)
 class RecordedListMessagesCall:
-    label_id: str
+    label_id: Optional[str]
     query: Optional[str]
     page_token: Optional[str]
     max_results: int
+    include_spam_trash: bool = False
 
 
 class FakeGmailClient:
@@ -148,13 +149,17 @@ class FakeGmailClient:
         self,
         *,
         access_token: str,
-        label_id: str,
+        label_id: Optional[str] = None,
         query: Optional[str] = None,
         page_token: Optional[str] = None,
         max_results: int = DEFAULT_PAGE_SIZE,
+        include_spam_trash: bool = False,
     ) -> GmailMessageListPageResult:
         self.list_messages_calls.append(
-            RecordedListMessagesCall(label_id=label_id, query=query, page_token=page_token, max_results=max_results)
+            RecordedListMessagesCall(
+                label_id=label_id, query=query, page_token=page_token, max_results=max_results,
+                include_spam_trash=include_spam_trash,
+            )
         )
         if not self._list_messages_queue:
             raise AssertionError("FakeGmailClient.list_messages() called with nothing queued")

@@ -9,13 +9,18 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
 from services.mailbox.gmail.fake_gmail_client import FakeGmailClient, FakeGmailOAuthClient, fake_token_bundle
-from services.mailbox.gmail.gmail_adapter import GmailMailboxAdapter, compute_monitored_labels
+from services.mailbox.gmail.gmail_adapter import (
+    GMAIL_ALL_RECEIVED_STREAM_DISPLAY_NAME,
+    GMAIL_ALL_RECEIVED_STREAM_ID,
+    GmailMailboxAdapter,
+    _decode_delta_link,
+)
 from services.mailbox.gmail.gmail_client import (
     GmailIdentity,
     GmailIdentityResult,
-    GmailLabel,
-    GmailLabelListResult,
     GmailMessageListPageResult,
     GmailMessageMetadata,
     GmailMessageMetadataResult,
@@ -167,30 +172,33 @@ def test_has_attachments_derivation_is_case_insensitive():
     assert _to_message_summary(metadata).has_attachments is True
 
 
-# -- folder (label) discovery --------------------------------------------
+# -- folder discovery: single ALL_RECEIVED synthetic stream --------------
 
 
-def test_compute_monitored_labels_selects_only_system_inbox_spam_trash():
-    labels = (
-        GmailLabel(label_id="INBOX", name="INBOX", label_type="system"),
-        GmailLabel(label_id="SPAM", name="SPAM", label_type="system"),
-        GmailLabel(label_id="TRASH", name="TRASH", label_type="system"),
-        GmailLabel(label_id="SENT", name="SENT", label_type="system"),
-        GmailLabel(label_id="DRAFT", name="DRAFT", label_type="system"),
-        GmailLabel(label_id="Label_1", name="My Custom Label", label_type="user"),
-        GmailLabel(label_id="CATEGORY_PROMOTIONS", name="CATEGORY_PROMOTIONS", label_type="system"),
-    )
-    monitored = compute_monitored_labels(labels)
-    ids = {f.folder_id for f in monitored}
-    assert ids == {"INBOX", "SPAM", "TRASH"}
-    # Canonical, stable order.
-    assert [f.folder_id for f in monitored] == ["INBOX", "SPAM", "TRASH"]
+def test_discovery_returns_exactly_one_all_received_stream():
+    oauth_client, gmail_client, token_store, mailbox_repo, adapter = _adapter()
+    mailbox = _seeded_mailbox(mailbox_repo)
+    token_store.write(mailbox.mailbox_id, access_token="a", refresh_token="r", expires_at=datetime.now(timezone.utc) + timedelta(hours=1))
+
+    result = adapter.discover_monitored_folders(mailbox_id=mailbox.mailbox_id)
+    assert result.status == GmailOutcomeStatus.OK
+    assert [f.folder_id for f in result.folders] == [GMAIL_ALL_RECEIVED_STREAM_ID]
+    assert [f.display_name for f in result.folders] == [GMAIL_ALL_RECEIVED_STREAM_DISPLAY_NAME]
+    assert GMAIL_ALL_RECEIVED_STREAM_ID == "ALL_RECEIVED"
+    assert GMAIL_ALL_RECEIVED_STREAM_DISPLAY_NAME == "All received mail"
 
 
-def test_compute_monitored_labels_omits_missing_ones_without_crashing():
-    labels = (GmailLabel(label_id="INBOX", name="INBOX", label_type="system"),)
-    monitored = compute_monitored_labels(labels)
-    assert [f.folder_id for f in monitored] == ["INBOX"]
+def test_discovery_never_calls_list_labels():
+    """See module docstring's 'Label/folder normalisation' section —
+    the monitored-folder list is now a fixed constant; there is nothing
+    left to discover FROM real Gmail labels for this purpose, so
+    `list_labels()` must never be called by discovery any more."""
+    oauth_client, gmail_client, token_store, mailbox_repo, adapter = _adapter()
+    mailbox = _seeded_mailbox(mailbox_repo)
+    token_store.write(mailbox.mailbox_id, access_token="a", refresh_token="r", expires_at=datetime.now(timezone.utc) + timedelta(hours=1))
+
+    adapter.discover_monitored_folders(mailbox_id=mailbox.mailbox_id)
+    assert gmail_client.labels_calls == 0
 
 
 def test_discovery_config_error_when_credentials_absent():
@@ -203,25 +211,6 @@ def test_discovery_config_error_when_credentials_absent():
     result = adapter.discover_monitored_folders(mailbox_id=mailbox.mailbox_id)
     assert result.status == GmailOutcomeStatus.AUTH_ERROR
     assert gmail_client.labels_calls == 0
-
-
-def test_discovery_ok_with_real_labels():
-    oauth_client, gmail_client, token_store, mailbox_repo, adapter = _adapter()
-    mailbox = _seeded_mailbox(mailbox_repo)
-    token_store.write(mailbox.mailbox_id, access_token="a", refresh_token="r", expires_at=datetime.now(timezone.utc) + timedelta(hours=1))
-    gmail_client.queue_labels_result(
-        GmailLabelListResult(
-            status=GmailOutcomeStatus.OK,
-            labels=(
-                GmailLabel(label_id="INBOX", name="INBOX", label_type="system"),
-                GmailLabel(label_id="SPAM", name="SPAM", label_type="system"),
-                GmailLabel(label_id="TRASH", name="TRASH", label_type="system"),
-            ),
-        )
-    )
-    result = adapter.discover_monitored_folders(mailbox_id=mailbox.mailbox_id)
-    assert result.status == GmailOutcomeStatus.OK
-    assert [f.folder_id for f in result.folders] == ["INBOX", "SPAM", "TRASH"]
 
 
 # -- delta pagination / resumability --------------------------------------
@@ -248,7 +237,12 @@ def test_bootstrap_round_uses_after_query_and_sets_delta_link():
     assert page.next_link is None
     # Query used `after:` with the bootstrap epoch.
     assert gmail_client.list_messages_calls[0].query.startswith("after:")
-    assert gmail_client.list_messages_calls[0].label_id == "INBOX"
+    # `folder` ("INBOX" here) is NEVER forwarded to `list_messages` as a
+    # real `labelIds` value — the ALL_RECEIVED stream always queries with
+    # no label restriction and `include_spam_trash=True` (see module
+    # docstring's "Label/folder normalisation" section).
+    assert gmail_client.list_messages_calls[0].label_id is None
+    assert gmail_client.list_messages_calls[0].include_spam_trash is True
 
 
 def test_pagination_follows_next_page_token_and_threads_running_max():
@@ -359,6 +353,152 @@ def test_attachment_metadata_is_always_empty_for_gmail_metadata_only_discovery()
     )
     page = adapter.fetch_folder_delta(mailbox_id=mailbox.mailbox_id, folder="INBOX", bootstrap_timestamp=datetime(2024, 1, 1, tzinfo=timezone.utc))
     assert page.messages[0].attachment_metadata == ()
+
+
+# ---------------------------------------------------------------------
+# ALL_RECEIVED stream — inclusion/exclusion by real Gmail `labelIds`,
+# and the critical watermark-then-exclude ordering (architect ruling,
+# module docstring's "Label/folder normalisation" section, points 4/5).
+# ---------------------------------------------------------------------
+
+
+def _msg_metadata(message_id: str, *, label_ids=(), internal_date=None) -> GmailMessageMetadata:
+    return GmailMessageMetadata(
+        message_id=message_id,
+        raw_headers=_headers_for(message_id=message_id),
+        label_ids=tuple(label_ids),
+        internal_date=internal_date or datetime(2024, 1, 2, tzinfo=timezone.utc),
+    )
+
+
+def _single_message_page(gmail_client, adapter, mailbox, *, message_id="m1", label_ids=()):
+    gmail_client.queue_list_messages_result(GmailMessageListPageResult(status=GmailOutcomeStatus.OK, message_ids=(message_id,)))
+    gmail_client.queue_metadata_result(GmailMessageMetadataResult(status=GmailOutcomeStatus.OK, metadata=_msg_metadata(message_id, label_ids=label_ids)))
+    return adapter.fetch_folder_delta(
+        mailbox_id=mailbox.mailbox_id, folder=GMAIL_ALL_RECEIVED_STREAM_ID, bootstrap_timestamp=datetime(2024, 1, 1, tzinfo=timezone.utc)
+    )
+
+
+@pytest.mark.parametrize(
+    "label_ids",
+    [
+        ("INBOX",),  # 1. Inbox received message.
+        (),  # 2. Archived (no labels at all is also covered by test 11, but this is the "no monitored labels" archived case).
+        ("UNREAD",),  # 2b. Archived, carrying only a non-outbound, non-system label.
+        ("Label_123",),  # 3. User-labelled archived message.
+        ("SPAM",),  # 4. Spam.
+        ("TRASH",),  # 5. Trash.
+        ("CATEGORY_UPDATES",),  # 10. Category-labelled inbound message.
+    ],
+)
+def test_all_received_stream_includes_every_non_outbound_disposition(label_ids):
+    oauth_client, gmail_client, token_store, mailbox_repo, adapter = _adapter()
+    mailbox = _seeded_mailbox(mailbox_repo)
+    token_store.write(mailbox.mailbox_id, access_token="a", refresh_token="r", expires_at=datetime.now(timezone.utc) + timedelta(hours=1))
+
+    page = _single_message_page(gmail_client, adapter, mailbox, label_ids=label_ids)
+    assert page.status == GmailOutcomeStatus.OK
+    assert [m.immutable_id for m in page.messages] == ["m1"]
+
+
+def test_all_received_stream_includes_message_with_no_labels_at_all():
+    """11. `label_ids = ()` — no explicit outbound-exclusion signal
+    present -> included."""
+    oauth_client, gmail_client, token_store, mailbox_repo, adapter = _adapter()
+    mailbox = _seeded_mailbox(mailbox_repo)
+    token_store.write(mailbox.mailbox_id, access_token="a", refresh_token="r", expires_at=datetime.now(timezone.utc) + timedelta(hours=1))
+
+    page = _single_message_page(gmail_client, adapter, mailbox, label_ids=())
+    assert page.status == GmailOutcomeStatus.OK
+    assert [m.immutable_id for m in page.messages] == ["m1"]
+
+
+@pytest.mark.parametrize(
+    "label_ids",
+    [
+        ("SENT",),  # 6. Sent.
+        ("DRAFT",),  # 7. Draft.
+        ("SENT", "INBOX"),  # 8. SENT + INBOX together -> excluded (SENT wins even with INBOX present).
+        ("SENT", "TRASH"),  # 9. SENT + TRASH together -> excluded.
+        ("DRAFT", "INBOX"),
+    ],
+)
+def test_all_received_stream_excludes_outbound_messages_regardless_of_other_labels(label_ids):
+    oauth_client, gmail_client, token_store, mailbox_repo, adapter = _adapter()
+    mailbox = _seeded_mailbox(mailbox_repo)
+    token_store.write(mailbox.mailbox_id, access_token="a", refresh_token="r", expires_at=datetime.now(timezone.utc) + timedelta(hours=1))
+
+    page = _single_message_page(gmail_client, adapter, mailbox, label_ids=label_ids)
+    assert page.status == GmailOutcomeStatus.OK
+    assert page.messages == ()
+
+
+def test_watermark_advances_past_an_excluded_sent_message_even_though_it_is_never_returned():
+    """16. The critical watermark test (architect's own explicit ordering
+    requirement). A page whose NEWEST message (highest `internalDate`) is
+    SENT: (a) it is excluded from the returned summaries; (b) it
+    NEVERTHELESS advances `running_max`/the resulting `delta_link`'s
+    `since_epoch`; (c) the final cursor genuinely advances beyond that
+    excluded message's timestamp, not stuck at the last INCLUDED
+    message's earlier timestamp — asserted on the actual decoded cursor
+    value, never merely 'some cursor was returned'."""
+    oauth_client, gmail_client, token_store, mailbox_repo, adapter = _adapter()
+    mailbox = _seeded_mailbox(mailbox_repo)
+    token_store.write(mailbox.mailbox_id, access_token="a", refresh_token="r", expires_at=datetime.now(timezone.utc) + timedelta(hours=1))
+
+    included_at = datetime(2024, 1, 2, tzinfo=timezone.utc)
+    excluded_sent_at = datetime(2024, 1, 5, tzinfo=timezone.utc)  # the NEWEST message in the page.
+
+    gmail_client.queue_list_messages_result(GmailMessageListPageResult(status=GmailOutcomeStatus.OK, message_ids=("m-included", "m-sent")))
+    gmail_client.queue_metadata_result(
+        GmailMessageMetadataResult(status=GmailOutcomeStatus.OK, metadata=_msg_metadata("m-included", label_ids=("INBOX",), internal_date=included_at))
+    )
+    gmail_client.queue_metadata_result(
+        GmailMessageMetadataResult(status=GmailOutcomeStatus.OK, metadata=_msg_metadata("m-sent", label_ids=("SENT",), internal_date=excluded_sent_at))
+    )
+
+    page = adapter.fetch_folder_delta(
+        mailbox_id=mailbox.mailbox_id, folder=GMAIL_ALL_RECEIVED_STREAM_ID, bootstrap_timestamp=datetime(2024, 1, 1, tzinfo=timezone.utc)
+    )
+    assert page.status == GmailOutcomeStatus.OK
+    # (a) excluded from the returned summaries.
+    assert [m.immutable_id for m in page.messages] == ["m-included"]
+    # (b) + (c) the cursor genuinely advanced past the EXCLUDED message's
+    # own timestamp (minus the documented one-second safety margin),
+    # never merely up to the last INCLUDED message's earlier timestamp.
+    assert page.delta_link is not None
+    decoded_since_epoch = _decode_delta_link(page.delta_link)
+    assert decoded_since_epoch == int(excluded_sent_at.timestamp()) - 1
+    assert decoded_since_epoch > int(included_at.timestamp())
+
+
+def test_mixed_page_only_received_family_messages_returned_within_one_stream():
+    """17. One page containing an Inbox-received message, an archived
+    message, a Spam message, a Sent message, and a Draft message
+    together -> only the three received-family messages appear in the
+    returned summaries, within ONE stream/cursor (no duplicate
+    enumeration, no separate per-label rounds — only one `list_messages`
+    call total)."""
+    oauth_client, gmail_client, token_store, mailbox_repo, adapter = _adapter()
+    mailbox = _seeded_mailbox(mailbox_repo)
+    token_store.write(mailbox.mailbox_id, access_token="a", refresh_token="r", expires_at=datetime.now(timezone.utc) + timedelta(hours=1))
+
+    message_ids = ("m-inbox", "m-archived", "m-spam", "m-sent", "m-draft")
+    gmail_client.queue_list_messages_result(GmailMessageListPageResult(status=GmailOutcomeStatus.OK, message_ids=message_ids))
+    gmail_client.queue_metadata_result(GmailMessageMetadataResult(status=GmailOutcomeStatus.OK, metadata=_msg_metadata("m-inbox", label_ids=("INBOX",))))
+    gmail_client.queue_metadata_result(GmailMessageMetadataResult(status=GmailOutcomeStatus.OK, metadata=_msg_metadata("m-archived", label_ids=())))
+    gmail_client.queue_metadata_result(GmailMessageMetadataResult(status=GmailOutcomeStatus.OK, metadata=_msg_metadata("m-spam", label_ids=("SPAM",))))
+    gmail_client.queue_metadata_result(GmailMessageMetadataResult(status=GmailOutcomeStatus.OK, metadata=_msg_metadata("m-sent", label_ids=("SENT",))))
+    gmail_client.queue_metadata_result(GmailMessageMetadataResult(status=GmailOutcomeStatus.OK, metadata=_msg_metadata("m-draft", label_ids=("DRAFT",))))
+
+    page = adapter.fetch_folder_delta(
+        mailbox_id=mailbox.mailbox_id, folder=GMAIL_ALL_RECEIVED_STREAM_ID, bootstrap_timestamp=datetime(2024, 1, 1, tzinfo=timezone.utc)
+    )
+    assert page.status == GmailOutcomeStatus.OK
+    assert {m.immutable_id for m in page.messages} == {"m-inbox", "m-archived", "m-spam"}
+    # Exactly ONE `list_messages` call — one stream/cursor, never a
+    # separate per-label round.
+    assert len(gmail_client.list_messages_calls) == 1
 
 
 # -- refresh-on-401 retry-once behaviour ----------------------------------
