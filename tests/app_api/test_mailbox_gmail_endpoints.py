@@ -65,7 +65,7 @@ def _connect_and_complete(client, mailbox_id: str, *, email: str) -> None:
     state = _begin_connect(client, mailbox_id)
     comp = get_composition()
     comp.gmail_oauth_client.queue_exchange_result(GmailTokenResult(status=GmailOutcomeStatus.OK, tokens=fake_token_bundle()))
-    comp.gmail_oauth_client.queue_identity_result(GmailIdentityResult(status=GmailOutcomeStatus.OK, identity=GmailIdentity(email=email)))
+    comp.gmail_client.queue_profile_result(GmailIdentityResult(status=GmailOutcomeStatus.OK, identity=GmailIdentity(email=email)))
     r = client.get("/internal/mailboxes/gmail/oauth/callback", params={"code": "abc", "state": state}, follow_redirects=False)
     assert r.status_code == 303
     assert "ok=true" in r.headers["location"]
@@ -143,7 +143,7 @@ def test_callback_wrong_account_never_connects_and_never_persists_tokens(dev_cli
     state = _begin_connect(dev_client, mailbox_id)
     comp = get_composition()
     comp.gmail_oauth_client.queue_exchange_result(GmailTokenResult(status=GmailOutcomeStatus.OK, tokens=fake_token_bundle()))
-    comp.gmail_oauth_client.queue_identity_result(GmailIdentityResult(status=GmailOutcomeStatus.OK, identity=GmailIdentity(email="someone.else@gmail.com")))
+    comp.gmail_client.queue_profile_result(GmailIdentityResult(status=GmailOutcomeStatus.OK, identity=GmailIdentity(email="someone.else@gmail.com")))
 
     r = dev_client.get("/internal/mailboxes/gmail/oauth/callback", params={"code": "abc", "state": state}, follow_redirects=False)
     assert r.status_code == 303
@@ -152,6 +152,83 @@ def test_callback_wrong_account_never_connects_and_never_persists_tokens(dev_cli
     mailbox = dev_client.get(f"/internal/mailboxes/{mailbox_id}").json()
     assert mailbox["connection_state"] == "AUTH_REQUIRED"  # never CONNECTED
     assert comp.gmail_token_store.read(mailbox_id) is None
+
+
+def test_callback_profile_lookup_401_never_connects_and_never_persists_tokens(dev_client):
+    mailbox_id = _create_gmail_mailbox(dev_client, email="mgs241171@gmail.com")
+    state = _begin_connect(dev_client, mailbox_id)
+    comp = get_composition()
+    comp.gmail_oauth_client.queue_exchange_result(GmailTokenResult(status=GmailOutcomeStatus.OK, tokens=fake_token_bundle()))
+    comp.gmail_client.queue_profile_result(GmailIdentityResult(status=GmailOutcomeStatus.AUTH_ERROR, error_detail="HTTP 401: unauthorized"))
+
+    r = dev_client.get("/internal/mailboxes/gmail/oauth/callback", params={"code": "abc", "state": state}, follow_redirects=False)
+    assert r.status_code == 303
+    assert "reason=identity_lookup_failed" in r.headers["location"]
+
+    mailbox = dev_client.get(f"/internal/mailboxes/{mailbox_id}").json()
+    assert mailbox["connection_state"] != "CONNECTED"
+    assert comp.gmail_token_store.read(mailbox_id) is None
+
+
+def test_callback_profile_lookup_403_never_connects_and_never_persists_tokens(dev_client):
+    mailbox_id = _create_gmail_mailbox(dev_client, email="mgs241171@gmail.com")
+    state = _begin_connect(dev_client, mailbox_id)
+    comp = get_composition()
+    comp.gmail_oauth_client.queue_exchange_result(GmailTokenResult(status=GmailOutcomeStatus.OK, tokens=fake_token_bundle()))
+    comp.gmail_client.queue_profile_result(GmailIdentityResult(status=GmailOutcomeStatus.PERMISSION_ERROR, error_detail="HTTP 403: forbidden"))
+
+    r = dev_client.get("/internal/mailboxes/gmail/oauth/callback", params={"code": "abc", "state": state}, follow_redirects=False)
+    assert r.status_code == 303
+    assert "reason=identity_lookup_failed" in r.headers["location"]
+
+    mailbox = dev_client.get(f"/internal/mailboxes/{mailbox_id}").json()
+    assert mailbox["connection_state"] != "CONNECTED"
+    assert comp.gmail_token_store.read(mailbox_id) is None
+
+
+def test_callback_malformed_profile_response_never_connects_and_never_persists_tokens(dev_client):
+    mailbox_id = _create_gmail_mailbox(dev_client, email="mgs241171@gmail.com")
+    state = _begin_connect(dev_client, mailbox_id)
+    comp = get_composition()
+    comp.gmail_oauth_client.queue_exchange_result(GmailTokenResult(status=GmailOutcomeStatus.OK, tokens=fake_token_bundle()))
+    comp.gmail_client.queue_profile_result(
+        GmailIdentityResult(status=GmailOutcomeStatus.MALFORMED_RESPONSE, error_detail="could not parse users.getProfile response")
+    )
+
+    r = dev_client.get("/internal/mailboxes/gmail/oauth/callback", params={"code": "abc", "state": state}, follow_redirects=False)
+    assert r.status_code == 303
+    assert "reason=identity_lookup_failed" in r.headers["location"]
+
+    mailbox = dev_client.get(f"/internal/mailboxes/{mailbox_id}").json()
+    assert mailbox["connection_state"] != "CONNECTED"
+    assert comp.gmail_token_store.read(mailbox_id) is None
+
+
+def test_callback_failure_audit_event_carries_bounded_diagnostics_never_raw_detail(dev_client):
+    """Section H proof: the audit payload gets the ALREADY-BOUNDED
+    `GmailOutcomeStatus` vocabulary (`provider`/`provider_operation`/
+    `provider_status`), never the free-text `detail` string (which, for
+    a real Google error, could embed an arbitrary raw response body)."""
+    mailbox_id = _create_gmail_mailbox(dev_client, email="mgs241171@gmail.com")
+    state = _begin_connect(dev_client, mailbox_id)
+    comp = get_composition()
+    comp.gmail_oauth_client.queue_exchange_result(GmailTokenResult(status=GmailOutcomeStatus.OK, tokens=fake_token_bundle()))
+    raw_detail_marker = "UNVETTED_RAW_GOOGLE_RESPONSE_BODY_MUST_NEVER_BE_PERSISTED"
+    comp.gmail_client.queue_profile_result(GmailIdentityResult(status=GmailOutcomeStatus.AUTH_ERROR, error_detail=raw_detail_marker))
+
+    r = dev_client.get("/internal/mailboxes/gmail/oauth/callback", params={"code": "abc", "state": state}, follow_redirects=False)
+    assert r.status_code == 303
+
+    events = comp.api.audit_repository.list_by_subject("MailboxSource", mailbox_id)
+    failed_events = [e for e in events if e.event_type == "MAILBOX_AUTH_FAILED"]
+    assert len(failed_events) == 1
+    payload = failed_events[0].payload
+    assert payload["reason"] == "identity_lookup_failed"
+    assert payload["provider"] == "GOOGLE_GMAIL"
+    assert payload["provider_operation"] == "users.getProfile"
+    assert payload["provider_status"] == GmailOutcomeStatus.AUTH_ERROR.value
+    assert "detail" not in payload
+    assert raw_detail_marker not in str(payload)
 
 
 def test_two_independent_gmail_mailboxes_can_be_in_flight_at_once_and_route_correctly(dev_client):
@@ -167,12 +244,12 @@ def test_two_independent_gmail_mailboxes_can_be_in_flight_at_once_and_route_corr
 
     comp = get_composition()
     comp.gmail_oauth_client.queue_exchange_result(GmailTokenResult(status=GmailOutcomeStatus.OK, tokens=fake_token_bundle(access_token="token-a")))
-    comp.gmail_oauth_client.queue_identity_result(GmailIdentityResult(status=GmailOutcomeStatus.OK, identity=GmailIdentity(email="mgs241171@gmail.com")))
+    comp.gmail_client.queue_profile_result(GmailIdentityResult(status=GmailOutcomeStatus.OK, identity=GmailIdentity(email="mgs241171@gmail.com")))
     r_a = dev_client.get("/internal/mailboxes/gmail/oauth/callback", params={"code": "code-a", "state": state_a}, follow_redirects=False)
     assert "ok=true" in r_a.headers["location"]
 
     comp.gmail_oauth_client.queue_exchange_result(GmailTokenResult(status=GmailOutcomeStatus.OK, tokens=fake_token_bundle(access_token="token-b")))
-    comp.gmail_oauth_client.queue_identity_result(GmailIdentityResult(status=GmailOutcomeStatus.OK, identity=GmailIdentity(email="matt.george.scott@gmail.com")))
+    comp.gmail_client.queue_profile_result(GmailIdentityResult(status=GmailOutcomeStatus.OK, identity=GmailIdentity(email="matt.george.scott@gmail.com")))
     r_b = dev_client.get("/internal/mailboxes/gmail/oauth/callback", params={"code": "code-b", "state": state_b}, follow_redirects=False)
     assert "ok=true" in r_b.headers["location"]
 

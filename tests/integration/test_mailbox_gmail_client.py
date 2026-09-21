@@ -15,7 +15,9 @@ import pytest
 
 from services.mailbox.gmail.gmail_client import (
     DEFAULT_METADATA_HEADERS,
+    GMAIL_PROFILE_URL,
     GmailClient,
+    GmailClientProtocol,
     GmailOAuthClient,
     GmailOutcomeStatus,
     _decode_base64url,
@@ -120,6 +122,64 @@ def test_build_authorize_url_never_leaks_client_secret():
     client = GmailOAuthClient(credentials_provider=lambda: GmailAppCredentials(client_id="id", client_secret="super-secret-value"))
     url = client.build_authorize_url(state="s", redirect_uri="https://localhost:8543/cb")
     assert "super-secret-value" not in url
+
+
+def _authorize_scope_tokens(client: GmailOAuthClient) -> list[str]:
+    url = client.build_authorize_url(state="s", redirect_uri="https://localhost:8543/cb")
+    params = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
+    return params["scope"][0].split(" ")
+
+
+def _gmail_oauth_client() -> GmailOAuthClient:
+    return GmailOAuthClient(credentials_provider=lambda: GmailAppCredentials(client_id="id", client_secret="s"))
+
+
+def test_authorize_url_scope_excludes_openid():
+    """Identity verification now goes through Gmail's own
+    `users.getProfile` (covered by `gmail.readonly`) — the authorize URL
+    must never request the generic OAuth2 `openid` scope."""
+    assert "openid" not in _authorize_scope_tokens(_gmail_oauth_client())
+
+
+def test_authorize_url_scope_excludes_email():
+    assert "email" not in _authorize_scope_tokens(_gmail_oauth_client())
+
+
+def test_authorize_url_scope_excludes_profile():
+    assert "profile" not in _authorize_scope_tokens(_gmail_oauth_client())
+
+
+# -- identity verification: users.getProfile, never the old userinfo URL --
+
+
+def test_identity_verification_targets_gmail_users_me_profile():
+    """The ONE identity-verification endpoint this module calls —
+    replaces the old generic `https://www.googleapis.com/oauth2/v2/userinfo`
+    (removed entirely — see below)."""
+    assert GMAIL_PROFILE_URL == "https://www.googleapis.com/gmail/v1/users/me/profile"
+
+
+def test_userinfo_url_constant_no_longer_exists():
+    from services.mailbox.gmail import gmail_client as module
+
+    assert not hasattr(module, "USERINFO_URL")
+
+
+def test_gmail_client_implements_get_profile():
+    """`get_profile` — not `GmailOAuthClientProtocol.get_identity` (which
+    no longer exists at all, see module docstring's "ONE identity-
+    verification code path" doctrine) — lives on `GmailClientProtocol`/
+    `GmailClient`, the Gmail-API-authenticated read surface, since
+    `users.getProfile` is a Gmail API call, not an OAuth-identity call."""
+    assert hasattr(GmailClient, "get_profile")
+    assert hasattr(GmailClientProtocol, "get_profile")
+
+
+def test_gmail_oauth_client_protocol_no_longer_declares_get_identity():
+    from services.mailbox.gmail.gmail_client import GmailOAuthClientProtocol
+
+    assert not hasattr(GmailOAuthClientProtocol, "get_identity")
+    assert not hasattr(GmailOAuthClient, "get_identity")
 
 
 def test_default_metadata_headers_include_the_fields_the_adapter_needs():

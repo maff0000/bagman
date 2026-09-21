@@ -43,16 +43,18 @@ class RecordedTokenCall:
 
 class FakeGmailOAuthClient:
     """Deterministic `GmailOAuthClientProtocol` implementation. Script
-    outcomes with `queue_exchange_result`/`queue_refresh_result`/
-    `queue_identity_result`; each call pops the next queued outcome for
-    that method, or raises `AssertionError` if nothing was queued
-    (mirrors `services.mailbox.microsoft.fake_client
-    .FakeMicrosoftOAuthClient` exactly)."""
+    outcomes with `queue_exchange_result`/`queue_refresh_result`; each
+    call pops the next queued outcome for that method, or raises
+    `AssertionError` if nothing was queued (mirrors
+    `services.mailbox.microsoft.fake_client.FakeMicrosoftOAuthClient`
+    exactly). Identity verification is NOT this class's job — see
+    `FakeGmailClient.queue_profile_result`/`get_profile` below (the real
+    `GmailClient.get_profile` is a Gmail API call, not an OAuth-identity
+    call — see `gmail_client.py`'s own module docstring)."""
 
     def __init__(self, *, configured: bool = True) -> None:
         self._exchange_queue: Deque[GmailTokenResult] = deque()
         self._refresh_queue: Deque[GmailTokenResult] = deque()
-        self._identity_queue: Deque[GmailIdentityResult] = deque()
         self.token_calls: list[RecordedTokenCall] = []
         self.authorize_urls: list[str] = []
         self.configured = configured
@@ -65,9 +67,6 @@ class FakeGmailOAuthClient:
 
     def queue_refresh_result(self, result: GmailTokenResult) -> None:
         self._refresh_queue.append(result)
-
-    def queue_identity_result(self, result: GmailIdentityResult) -> None:
-        self._identity_queue.append(result)
 
     def build_authorize_url(self, *, state: str, redirect_uri: str) -> str:
         url = (
@@ -89,11 +88,6 @@ class FakeGmailOAuthClient:
             raise AssertionError("FakeGmailOAuthClient.refresh() called with nothing queued")
         return self._refresh_queue.popleft()
 
-    def get_identity(self, *, access_token: str) -> GmailIdentityResult:
-        if not self._identity_queue:
-            raise AssertionError("FakeGmailOAuthClient.get_identity() called with nothing queued")
-        return self._identity_queue.popleft()
-
 
 @dataclass(frozen=True)
 class RecordedListMessagesCall:
@@ -105,21 +99,26 @@ class RecordedListMessagesCall:
 
 class FakeGmailClient:
     """Deterministic `GmailClientProtocol` implementation. Script
-    outcomes with `queue_labels_result`/`queue_list_messages_result`/
-    `queue_metadata_result`/`queue_raw_result`; each call pops the next
-    queued outcome for that method, or raises `AssertionError` if
-    nothing was queued."""
+    outcomes with `queue_profile_result`/`queue_labels_result`/
+    `queue_list_messages_result`/`queue_metadata_result`/
+    `queue_raw_result`; each call pops the next queued outcome for that
+    method, or raises `AssertionError` if nothing was queued."""
 
     def __init__(self) -> None:
+        self._profile_queue: Deque[GmailIdentityResult] = deque()
         self._labels_queue: Deque[GmailLabelListResult] = deque()
         self._list_messages_queue: Deque[GmailMessageListPageResult] = deque()
         self._metadata_queue: Deque[GmailMessageMetadataResult] = deque()
         self._raw_queue: Deque[GmailMessageRawResult] = deque()
 
+        self.profile_calls: int = 0
         self.labels_calls: int = 0
         self.list_messages_calls: list[RecordedListMessagesCall] = []
         self.metadata_calls: list[str] = []
         self.raw_calls: list[str] = []
+
+    def queue_profile_result(self, result: GmailIdentityResult) -> None:
+        self._profile_queue.append(result)
 
     def queue_labels_result(self, result: GmailLabelListResult) -> None:
         self._labels_queue.append(result)
@@ -132,6 +131,12 @@ class FakeGmailClient:
 
     def queue_raw_result(self, result: GmailMessageRawResult) -> None:
         self._raw_queue.append(result)
+
+    def get_profile(self, *, access_token: str) -> GmailIdentityResult:
+        self.profile_calls += 1
+        if not self._profile_queue:
+            raise AssertionError("FakeGmailClient.get_profile() called with nothing queued")
+        return self._profile_queue.popleft()
 
     def list_labels(self, *, access_token: str) -> GmailLabelListResult:
         self.labels_calls += 1

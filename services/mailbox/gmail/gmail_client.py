@@ -43,20 +43,26 @@ Endpoints
 ------------------------------------------------------------------------
 * Authorization: ``https://accounts.google.com/o/oauth2/v2/auth``
 * Token exchange/refresh: ``https://oauth2.googleapis.com/token``
-* Identity verification: ``GET https://www.googleapis.com/oauth2/v2/userinfo``
-  — mirrors Microsoft's own ``GET /me`` identity-confirmation call
-  exactly: a plain authenticated GET returning JSON, used to confirm
-  which real Gmail address was actually authorized (never trusted from
-  which mailbox row initiated the flow). A documented judgment call over
-  decoding the ``id_token`` JWT's own ``email`` claim: the userinfo
-  endpoint needs no base64url-padding-correction/JSON-segment-splitting
-  logic and no "is this token even a JWT" defensive parsing — it is a
-  plain, already-authenticated GET, the same shape as every other call
-  this module makes, so it is the more robust and more consistent choice
-  for a stdlib-only client (Google does not cryptographically verify
-  anything for us either way — trust here rests entirely on the token
-  having come from Google's own token endpoint over TLS, matching
-  Microsoft's own identical trust model for ``/me``).
+* Identity verification: ``GET https://www.googleapis.com/gmail/v1/users/me/profile``
+  (Gmail API's own ``users.getProfile`` — mirrors Microsoft's own
+  ``GET /me`` identity-confirmation call in spirit: a plain
+  authenticated GET returning JSON, used to confirm which real Gmail
+  address was actually authorized (never trusted from which mailbox row
+  initiated the flow). This endpoint is used, rather than Google's
+  generic OAuth2 ``userinfo`` endpoint, because it is fully covered by
+  this module's own ``gmail.readonly`` scope — no additional
+  ``openid``/``email``/``profile`` scope grant is ever needed, and the
+  response's own ``emailAddress`` field is exactly as authoritative a
+  server-verified claim as ``/me``'s ``mail``/``userPrincipalName``
+  (Google does not cryptographically verify anything for us either
+  way — trust here rests entirely on the token having come from
+  Google's own token endpoint over TLS, matching Microsoft's own
+  identical trust model). Historical note for future maintainers: an
+  earlier version of this module used the generic userinfo endpoint;
+  that failed this delivery's first live acceptance attempt because
+  userinfo needs ``openid``/``email``/``profile`` scope, which BAGMAN
+  deliberately does not request (see "Scope" below) — ``users.getProfile``
+  is the corrected, deliberate design, not a stopgap.
 * Labels: ``GET https://www.googleapis.com/gmail/v1/users/me/labels``
 * Message list (paginated, per-label): ``GET https://www.googleapis.com/gmail/v1/users/me/messages``
 * Message metadata (headers-only, bounded): ``GET https://www.googleapis.com/gmail/v1/users/me/messages/{id}?format=metadata&metadataHeaders=...``
@@ -78,7 +84,8 @@ it, delete it, or send mail" doctrine, and
 read-only guarantee" doctrine)
 ------------------------------------------------------------------------
 This module exposes ONLY: build an authorize URL, exchange/refresh a
-token, read userinfo, list labels, list message ids for one label
+token, read the authenticated mailbox's own profile identity
+(`users.getProfile`), list labels, list message ids for one label
 (paginated), read one message's metadata headers, read one message's
 raw RFC822 bytes. There is NO ``messages.send``, NO ``messages.modify``
 (label changes), NO ``messages.trash``, NO ``messages.delete``, NO
@@ -138,7 +145,11 @@ from typing import Mapping, Optional, Protocol, Sequence
 
 AUTHORIZE_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 TOKEN_URL = "https://oauth2.googleapis.com/token"
-USERINFO_URL = "https://www.googleapis.com/oauth2/v2/userinfo"
+#: Gmail API's own `users.getProfile` — the identity-verification
+#: endpoint (see module docstring's "Endpoints" section for why this
+#: replaced Google's generic OAuth2 userinfo endpoint). Same host
+#: convention as every other `GMAIL_*_URL` constant below.
+GMAIL_PROFILE_URL = "https://www.googleapis.com/gmail/v1/users/me/profile"
 GMAIL_LABELS_URL = "https://www.googleapis.com/gmail/v1/users/me/labels"
 GMAIL_MESSAGES_LIST_URL = "https://www.googleapis.com/gmail/v1/users/me/messages"
 GMAIL_MESSAGE_GET_URL_TEMPLATE = "https://www.googleapis.com/gmail/v1/users/me/messages/{message_id}"
@@ -249,9 +260,9 @@ class GmailTokenResult:
 @dataclass(frozen=True)
 class GmailIdentity:
     """The real, server-verified identity claim from `GET
-    /oauth2/v2/userinfo` — architect spec: "confirm which Gmail address
-    was actually authorized... never silently trust which mailbox row
-    initiated the flow"."""
+    /gmail/v1/users/me/profile` (`emailAddress`) — architect spec:
+    "confirm which Gmail address was actually authorized... never
+    silently trust which mailbox row initiated the flow"."""
 
     email: Optional[str]
 
@@ -342,10 +353,10 @@ class GmailOAuthClientProtocol(Protocol):
 
     def refresh(self, *, refresh_token: str) -> GmailTokenResult: ...
 
-    def get_identity(self, *, access_token: str) -> GmailIdentityResult: ...
-
 
 class GmailClientProtocol(Protocol):
+    def get_profile(self, *, access_token: str) -> GmailIdentityResult: ...
+
     def list_labels(self, *, access_token: str) -> GmailLabelListResult: ...
 
     def list_messages(
@@ -486,33 +497,6 @@ class GmailOAuthClient:
             {"grant_type": "refresh_token", "refresh_token": refresh_token}, require_refresh_token=False
         )
 
-    def get_identity(self, *, access_token: str) -> GmailIdentityResult:
-        request = urllib.request.Request(
-            USERINFO_URL, method="GET", headers={"Authorization": f"Bearer {access_token}", "Accept": "application/json"}
-        )
-        try:
-            with urllib.request.urlopen(request, timeout=self._timeout_seconds) as response:
-                raw = response.read()
-        except urllib.error.HTTPError as exc:
-            if exc.code == 401:
-                return GmailIdentityResult(status=GmailOutcomeStatus.AUTH_ERROR, error_detail=f"HTTP 401: {_read_body(exc)}")
-            return GmailIdentityResult(
-                status=GmailOutcomeStatus.PROVIDER_ERROR, error_detail=f"HTTP {exc.code}: {_read_body(exc)}"
-            )
-        except Exception as exc:  # noqa: BLE001
-            is_timeout = isinstance(exc, TimeoutError) or "timed out" in str(exc).lower()
-            status = GmailOutcomeStatus.TIMEOUT if is_timeout else GmailOutcomeStatus.TRANSPORT_ERROR
-            return GmailIdentityResult(status=status, error_detail=str(exc)[:500])
-
-        try:
-            payload = json.loads(raw.decode("utf-8"))
-            identity = GmailIdentity(email=payload.get("email"))
-        except (json.JSONDecodeError, TypeError) as exc:
-            return GmailIdentityResult(
-                status=GmailOutcomeStatus.MALFORMED_RESPONSE, error_detail=f"could not parse userinfo response: {exc}"
-            )
-        return GmailIdentityResult(status=GmailOutcomeStatus.OK, identity=identity)
-
 
 class GmailClient:
     """The real adapter for the Gmail API v1 read-only endpoints (labels/
@@ -529,6 +513,32 @@ class GmailClient:
         )
         with urllib.request.urlopen(request, timeout=self._timeout_seconds) as response:
             return json.loads(response.read().decode("utf-8"))
+
+    def get_profile(self, *, access_token: str) -> GmailIdentityResult:
+        """`GET /gmail/v1/users/me/profile` — the ONE identity-
+        verification code path (see module docstring's "Endpoints"
+        section for why this replaced Google's generic userinfo
+        endpoint). A plain authenticated GET, same pattern/error
+        handling as every other read call on this class."""
+        try:
+            payload = self._get_json(GMAIL_PROFILE_URL, access_token)
+        except urllib.error.HTTPError as exc:
+            return GmailIdentityResult(status=_status_for_http_error(exc), error_detail=f"HTTP {exc.code}: {_read_body(exc)}")
+        except Exception as exc:  # noqa: BLE001
+            return GmailIdentityResult(status=_status_for_transport_error(exc), error_detail=str(exc)[:500])
+
+        try:
+            if not isinstance(payload, Mapping):
+                raise TypeError(f"users.getProfile response was not a JSON object: {payload!r}")
+            email = payload.get("emailAddress")
+            if email is not None and not isinstance(email, str):
+                raise TypeError(f"emailAddress was not a string: {email!r}")
+            identity = GmailIdentity(email=email)
+        except (AttributeError, TypeError) as exc:
+            return GmailIdentityResult(
+                status=GmailOutcomeStatus.MALFORMED_RESPONSE, error_detail=f"could not parse users.getProfile response: {exc}"
+            )
+        return GmailIdentityResult(status=GmailOutcomeStatus.OK, identity=identity)
 
     def list_labels(self, *, access_token: str) -> GmailLabelListResult:
         try:

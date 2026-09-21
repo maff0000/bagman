@@ -426,7 +426,7 @@ def test_exchange_code_and_verify_identity_succeeds_and_persists_tokens():
     mailbox_repo.begin_microsoft_connect(mailbox.mailbox_id)  # NOT_CONFIGURED -> AUTH_REQUIRED (mirrors the real connect endpoint)
 
     oauth_client.queue_exchange_result(GmailTokenResult(status=GmailOutcomeStatus.OK, tokens=fake_token_bundle()))
-    oauth_client.queue_identity_result(GmailIdentityResult(status=GmailOutcomeStatus.OK, identity=GmailIdentity(email="mgs241171@gmail.com")))
+    gmail_client.queue_profile_result(GmailIdentityResult(status=GmailOutcomeStatus.OK, identity=GmailIdentity(email="mgs241171@gmail.com")))
 
     outcome = adapter.exchange_code_and_verify_identity(
         mailbox_id=mailbox.mailbox_id, expected_email_address=mailbox.email_address, code="abc", redirect_uri="https://localhost:8543/cb"
@@ -436,12 +436,41 @@ def test_exchange_code_and_verify_identity_succeeds_and_persists_tokens():
     assert mailbox_repo.get_mailbox(mailbox.mailbox_id).connection_state == "CONNECTED"
 
 
+def test_exchange_code_and_verify_identity_calls_profile_then_writes_token_then_connects():
+    """Proves the ordering the architect spec requires: the profile
+    lookup happens, matches, THEN the token is persisted, THEN the
+    mailbox is marked CONNECTED — never any of those before a genuine
+    positive identity match. `gmail_client.profile_calls` proves exactly
+    one profile lookup happened; the token-store/connection-state
+    assertions (only reachable this way given `FakeGmailClient`'s own
+    "queued exactly once, popped exactly once" discipline) prove it
+    happened before the write/CONNECTED side effects."""
+    oauth_client, gmail_client, token_store, mailbox_repo, adapter = _adapter()
+    mailbox = _seeded_mailbox(mailbox_repo, email="mgs241171@gmail.com")
+    mailbox_repo.begin_microsoft_connect(mailbox.mailbox_id)
+
+    assert gmail_client.profile_calls == 0
+    assert token_store.read(mailbox.mailbox_id) is None
+    assert mailbox_repo.get_mailbox(mailbox.mailbox_id).connection_state != "CONNECTED"
+
+    oauth_client.queue_exchange_result(GmailTokenResult(status=GmailOutcomeStatus.OK, tokens=fake_token_bundle()))
+    gmail_client.queue_profile_result(GmailIdentityResult(status=GmailOutcomeStatus.OK, identity=GmailIdentity(email="mgs241171@gmail.com")))
+
+    outcome = adapter.exchange_code_and_verify_identity(
+        mailbox_id=mailbox.mailbox_id, expected_email_address=mailbox.email_address, code="abc", redirect_uri="https://localhost:8543/cb"
+    )
+    assert outcome.ok is True
+    assert gmail_client.profile_calls == 1  # the profile call genuinely happened
+    assert token_store.read(mailbox.mailbox_id) is not None  # ... then the token was written
+    assert mailbox_repo.get_mailbox(mailbox.mailbox_id).connection_state == "CONNECTED"  # ... then CONNECTED
+
+
 def test_exchange_code_and_verify_identity_rejects_a_wrong_account():
     oauth_client, gmail_client, token_store, mailbox_repo, adapter = _adapter()
     mailbox = _seeded_mailbox(mailbox_repo, email="mgs241171@gmail.com")
 
     oauth_client.queue_exchange_result(GmailTokenResult(status=GmailOutcomeStatus.OK, tokens=fake_token_bundle()))
-    oauth_client.queue_identity_result(GmailIdentityResult(status=GmailOutcomeStatus.OK, identity=GmailIdentity(email="someone.else@gmail.com")))
+    gmail_client.queue_profile_result(GmailIdentityResult(status=GmailOutcomeStatus.OK, identity=GmailIdentity(email="someone.else@gmail.com")))
 
     outcome = adapter.exchange_code_and_verify_identity(
         mailbox_id=mailbox.mailbox_id, expected_email_address=mailbox.email_address, code="abc", redirect_uri="https://localhost:8543/cb"
@@ -450,6 +479,88 @@ def test_exchange_code_and_verify_identity_rejects_a_wrong_account():
     assert outcome.reason == "wrong_account"
     assert token_store.read(mailbox.mailbox_id) is None  # never persisted on a mismatch
     assert mailbox_repo.get_mailbox(mailbox.mailbox_id).connection_state == "NOT_CONFIGURED"
+
+
+def test_exchange_code_and_verify_identity_fails_safely_on_profile_401():
+    """Gmail's `users.getProfile` returning 401 (AUTH_ERROR) must fail
+    exactly like any other identity-lookup failure: no token persisted,
+    mailbox never CONNECTED."""
+    oauth_client, gmail_client, token_store, mailbox_repo, adapter = _adapter()
+    mailbox = _seeded_mailbox(mailbox_repo, email="mgs241171@gmail.com")
+
+    oauth_client.queue_exchange_result(GmailTokenResult(status=GmailOutcomeStatus.OK, tokens=fake_token_bundle()))
+    gmail_client.queue_profile_result(GmailIdentityResult(status=GmailOutcomeStatus.AUTH_ERROR, error_detail="HTTP 401: unauthorized"))
+
+    outcome = adapter.exchange_code_and_verify_identity(
+        mailbox_id=mailbox.mailbox_id, expected_email_address=mailbox.email_address, code="abc", redirect_uri="https://localhost:8543/cb"
+    )
+    assert outcome.ok is False
+    assert outcome.reason == "identity_lookup_failed"
+    assert outcome.provider_operation == "users.getProfile"
+    assert outcome.provider_status == GmailOutcomeStatus.AUTH_ERROR.value
+    assert token_store.read(mailbox.mailbox_id) is None
+    assert mailbox_repo.get_mailbox(mailbox.mailbox_id).connection_state != "CONNECTED"
+
+
+def test_exchange_code_and_verify_identity_fails_safely_on_profile_403():
+    """A genuine permission error (PERMISSION_ERROR) must fail exactly
+    like any other identity-lookup failure — no token persisted, never
+    CONNECTED."""
+    oauth_client, gmail_client, token_store, mailbox_repo, adapter = _adapter()
+    mailbox = _seeded_mailbox(mailbox_repo, email="mgs241171@gmail.com")
+
+    oauth_client.queue_exchange_result(GmailTokenResult(status=GmailOutcomeStatus.OK, tokens=fake_token_bundle()))
+    gmail_client.queue_profile_result(GmailIdentityResult(status=GmailOutcomeStatus.PERMISSION_ERROR, error_detail="HTTP 403: forbidden"))
+
+    outcome = adapter.exchange_code_and_verify_identity(
+        mailbox_id=mailbox.mailbox_id, expected_email_address=mailbox.email_address, code="abc", redirect_uri="https://localhost:8543/cb"
+    )
+    assert outcome.ok is False
+    assert outcome.reason == "identity_lookup_failed"
+    assert outcome.provider_operation == "users.getProfile"
+    assert outcome.provider_status == GmailOutcomeStatus.PERMISSION_ERROR.value
+    assert token_store.read(mailbox.mailbox_id) is None
+    assert mailbox_repo.get_mailbox(mailbox.mailbox_id).connection_state != "CONNECTED"
+
+
+def test_exchange_code_and_verify_identity_fails_safely_on_malformed_profile_response():
+    """A malformed/unparseable `users.getProfile` body (MALFORMED_RESPONSE)
+    must fail exactly like any other identity-lookup failure."""
+    oauth_client, gmail_client, token_store, mailbox_repo, adapter = _adapter()
+    mailbox = _seeded_mailbox(mailbox_repo, email="mgs241171@gmail.com")
+
+    oauth_client.queue_exchange_result(GmailTokenResult(status=GmailOutcomeStatus.OK, tokens=fake_token_bundle()))
+    gmail_client.queue_profile_result(
+        GmailIdentityResult(status=GmailOutcomeStatus.MALFORMED_RESPONSE, error_detail="could not parse users.getProfile response")
+    )
+
+    outcome = adapter.exchange_code_and_verify_identity(
+        mailbox_id=mailbox.mailbox_id, expected_email_address=mailbox.email_address, code="abc", redirect_uri="https://localhost:8543/cb"
+    )
+    assert outcome.ok is False
+    assert outcome.reason == "identity_lookup_failed"
+    assert outcome.provider_operation == "users.getProfile"
+    assert outcome.provider_status == GmailOutcomeStatus.MALFORMED_RESPONSE.value
+    assert token_store.read(mailbox.mailbox_id) is None
+    assert mailbox_repo.get_mailbox(mailbox.mailbox_id).connection_state != "CONNECTED"
+
+
+def test_exchange_code_and_verify_identity_token_exchange_failure_carries_bounded_diagnostics():
+    oauth_client, gmail_client, token_store, mailbox_repo, adapter = _adapter()
+    mailbox = _seeded_mailbox(mailbox_repo, email="mgs241171@gmail.com")
+
+    oauth_client.queue_exchange_result(GmailTokenResult(status=GmailOutcomeStatus.AUTH_ERROR, error_detail="HTTP 400: invalid_grant"))
+
+    outcome = adapter.exchange_code_and_verify_identity(
+        mailbox_id=mailbox.mailbox_id, expected_email_address=mailbox.email_address, code="abc", redirect_uri="https://localhost:8543/cb"
+    )
+    assert outcome.ok is False
+    assert outcome.reason == "token_exchange_failed"
+    assert outcome.provider_operation == "token_exchange"
+    assert outcome.provider_status == GmailOutcomeStatus.AUTH_ERROR.value
+    assert token_store.read(mailbox.mailbox_id) is None
+    assert mailbox_repo.get_mailbox(mailbox.mailbox_id).connection_state != "CONNECTED"
+    assert gmail_client.profile_calls == 0  # never reached — token exchange failed first
 
 
 def test_exchange_code_and_verify_identity_routes_tokens_to_the_right_mailbox_of_two_in_flight():
@@ -463,11 +574,11 @@ def test_exchange_code_and_verify_identity_routes_tokens_to_the_right_mailbox_of
     mailbox_repo.begin_microsoft_connect(mailbox_b.mailbox_id)
 
     oauth_client.queue_exchange_result(GmailTokenResult(status=GmailOutcomeStatus.OK, tokens=fake_token_bundle(access_token="token-for-a")))
-    oauth_client.queue_identity_result(GmailIdentityResult(status=GmailOutcomeStatus.OK, identity=GmailIdentity(email="mgs241171@gmail.com")))
+    gmail_client.queue_profile_result(GmailIdentityResult(status=GmailOutcomeStatus.OK, identity=GmailIdentity(email="mgs241171@gmail.com")))
     adapter.exchange_code_and_verify_identity(mailbox_id=mailbox_a.mailbox_id, expected_email_address=mailbox_a.email_address, code="code-a", redirect_uri="https://localhost:8543/cb")
 
     oauth_client.queue_exchange_result(GmailTokenResult(status=GmailOutcomeStatus.OK, tokens=fake_token_bundle(access_token="token-for-b")))
-    oauth_client.queue_identity_result(GmailIdentityResult(status=GmailOutcomeStatus.OK, identity=GmailIdentity(email="matt.george.scott@gmail.com")))
+    gmail_client.queue_profile_result(GmailIdentityResult(status=GmailOutcomeStatus.OK, identity=GmailIdentity(email="matt.george.scott@gmail.com")))
     adapter.exchange_code_and_verify_identity(mailbox_id=mailbox_b.mailbox_id, expected_email_address=mailbox_b.email_address, code="code-b", redirect_uri="https://localhost:8543/cb")
 
     assert token_store.read(mailbox_a.mailbox_id).access_token == "token-for-a"

@@ -663,21 +663,39 @@ class GmailMailboxAdapter:
         """
         token_result = self._oauth_client.exchange_code(code=code, redirect_uri=redirect_uri)
         if token_result.status != GmailOutcomeStatus.OK or token_result.tokens is None:
-            return _CallbackOutcome(ok=False, reason="token_exchange_failed", detail=token_result.error_detail or token_result.status.value)
+            return _CallbackOutcome(
+                ok=False,
+                reason="token_exchange_failed",
+                detail=token_result.error_detail or token_result.status.value,
+                provider_operation="token_exchange",
+                provider_status=token_result.status.value,
+            )
 
-        identity_result = self._oauth_client.get_identity(access_token=token_result.tokens.access_token)
-        if identity_result.status != GmailOutcomeStatus.OK or identity_result.identity is None:
-            return _CallbackOutcome(ok=False, reason="identity_lookup_failed", detail=identity_result.error_detail or identity_result.status.value)
+        # Identity is verified via the Gmail API's own `users.getProfile`
+        # (a `GmailClientProtocol` call, not an OAuth-identity call — see
+        # `gmail_client.py`'s own module docstring for why) — the ONE
+        # identity-verification code path.
+        profile_result = self._gmail_client.get_profile(access_token=token_result.tokens.access_token)
+        if profile_result.status != GmailOutcomeStatus.OK or profile_result.identity is None:
+            return _CallbackOutcome(
+                ok=False,
+                reason="identity_lookup_failed",
+                detail=profile_result.error_detail or profile_result.status.value,
+                provider_operation="users.getProfile",
+                provider_status=profile_result.status.value,
+            )
 
-        identity_email = (identity_result.identity.email or "").strip().lower()
+        identity_email = (profile_result.identity.email or "").strip().lower()
         if not identity_email or identity_email != expected_email_address.strip().lower():
             return _CallbackOutcome(
                 ok=False,
                 reason="wrong_account",
                 detail=(
-                    f"authenticated Gmail identity ({identity_result.identity.email!r}) does not match "
+                    f"authenticated Gmail identity ({profile_result.identity.email!r}) does not match "
                     f"this mailbox's own address ({expected_email_address!r})"
                 ),
+                provider_operation="users.getProfile",
+                provider_status=GmailOutcomeStatus.OK.value,
             )
 
         # Identity verified — persist tokens and mark CONNECTED.
@@ -688,7 +706,9 @@ class GmailMailboxAdapter:
             expires_at=token_result.tokens.expires_at,
         )
         self._mailbox_repository.mark_microsoft_connected(mailbox_id)
-        return _CallbackOutcome(ok=True, reason="connected", detail="")
+        return _CallbackOutcome(
+            ok=True, reason="connected", detail="", provider_operation="users.getProfile", provider_status=GmailOutcomeStatus.OK.value
+        )
 
 
 @dataclass(frozen=True)
@@ -696,3 +716,13 @@ class _CallbackOutcome:
     ok: bool
     reason: str
     detail: str
+    #: The Gmail API/OAuth call this outcome concerns (a small closed
+    #: set, e.g. `"token_exchange"`/`"users.getProfile"`) and its
+    #: already-bounded `GmailOutcomeStatus` value — threaded through to
+    #: `app/api/routers/mailboxes_gmail.py`'s own audit-event payload
+    #: INSTEAD OF the free-text `detail` above (which stays for the
+    #: operator-facing HTML result page's own wording only, never for
+    #: durable storage — see that router's own module docstring, section
+    #: H of this delivery's own instructions).
+    provider_operation: Optional[str] = None
+    provider_status: Optional[str] = None

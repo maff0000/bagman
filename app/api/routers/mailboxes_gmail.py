@@ -252,7 +252,22 @@ async def gmail_oauth_callback(code: Optional[str] = None, state: Optional[str] 
     except NotFoundError:
         return _redirect_to_result(ok=False, reason="no_pending_connection")
 
-    def _fail(reason_key: str, detail: str) -> RedirectResponse:
+    def _fail(
+        reason_key: str, detail: str, *, provider_operation: Optional[str] = None, provider_status: Optional[str] = None
+    ) -> RedirectResponse:
+        # Bounded, closed-vocabulary audit diagnostics ONLY — `detail`
+        # (free text; may embed a raw upstream Google error body) is
+        # used for the operator-facing HTML result page's own wording
+        # (via `_redirect_to_result`/`_RESULT_REASONS`) and NEVER passed
+        # into this payload. `provider_operation`/`provider_status` are
+        # the already-bounded `GmailOutcomeStatus` vocabulary threaded
+        # through from `GmailMailboxAdapter.exchange_code_and_verify_identity`'s
+        # own `_CallbackOutcome` — see that dataclass's own docstring.
+        payload: dict[str, Any] = {"mailbox_id": mailbox_id, "reason": reason_key, "provider": "GOOGLE_GMAIL"}
+        if provider_operation is not None:
+            payload["provider_operation"] = provider_operation
+        if provider_status is not None:
+            payload["provider_status"] = provider_status
         composition.api.record_audit_event(
             event_type="MAILBOX_AUTH_FAILED",
             actor_type="EXTERNAL_SYSTEM",
@@ -261,7 +276,7 @@ async def gmail_oauth_callback(code: Optional[str] = None, state: Optional[str] 
             subject_id=mailbox.mailbox_id,
             correlation_id=mailbox.mailbox_id,
             causation_id=None,
-            payload={"mailbox_id": mailbox_id, "reason": reason_key},
+            payload=payload,
         )
         return _redirect_to_result(ok=False, reason=reason_key)
 
@@ -273,7 +288,9 @@ async def gmail_oauth_callback(code: Optional[str] = None, state: Optional[str] 
     )
 
     if not outcome.ok:
-        return _fail(outcome.reason, outcome.detail)
+        return _fail(
+            outcome.reason, outcome.detail, provider_operation=outcome.provider_operation, provider_status=outcome.provider_status
+        )
 
     composition.api.record_audit_event(
         event_type="MAILBOX_CONNECTED",

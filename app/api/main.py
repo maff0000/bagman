@@ -8,7 +8,12 @@ Responsibilities of this module, and only this module:
   at import time, before anything else runs;
 * attach one request-scoped correlation-id (PID §27) to every request/
   response, generating a fresh one when a caller does not supply
-  ``X-Correlation-Id``;
+  ``X-Correlation-Id``, and emit ONE sanitized, generic request-
+  completion log line per request (method + URL path ONLY, status,
+  duration — NEVER the query string, for any route: see
+  ``correlation_id_middleware``'s own inline comment and
+  ``app/api/logging_config.py``'s own docstring for the access-log leak
+  this replaces);
 * serve the first BAGMAN Documents GUI (CD-4 WI-4) as plain static
   assets (HTML/CSS/vanilla-JS — no framework, no build step, no Node
   runtime; PID §42) from ``app/api/static/``, mounted at ``/`` via
@@ -68,6 +73,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 import uuid
 from pathlib import Path
 
@@ -227,8 +233,31 @@ def _status_for(exc: BagmanError) -> int:
 async def correlation_id_middleware(request: Request, call_next):
     correlation_id = request.headers.get("x-correlation-id") or str(uuid.uuid4())
     request.state.correlation_id = correlation_id
+    started_at = time.monotonic()
     response = await call_next(request)
+    duration_ms = (time.monotonic() - started_at) * 1000.0
     response.headers["X-Correlation-Id"] = correlation_id
+
+    # BAGMAN's own sanitized, generic (never Gmail-only) request-
+    # completion log line — method + URL PATH ONLY + status + duration.
+    # NEVER `request.url.query`/the raw query string in any form, for
+    # ANY route: a query string may carry an OAuth `code`/`state`
+    # (Gmail's, Microsoft's, and Xero's own callbacks all pass these
+    # through this exact middleware) and must never reach a log line.
+    # This replaces uvicorn's own "uvicorn.access" logger, which is
+    # disabled entirely (not merely reformatted) in
+    # `app/api/logging_config.py::configure_logging` — see that
+    # module's own docstring for why re-routing it through the JSON
+    # formatter alone would not have been a real fix.
+    logger.info(
+        f"{request.method} {request.url.path} -> {response.status_code}",
+        extra={
+            "component": "bagman.runtime.http",
+            "correlation_id": correlation_id,
+            "event_type": "REQUEST_COMPLETED",
+            "duration_ms": round(duration_ms, 1),
+        },
+    )
     return response
 
 
