@@ -14,7 +14,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from core.api import BagmanCanonicalAPI
-from core.errors import ConflictError
+from core.errors import ConflictError, PersistenceError
 from persistence.objects.memory_store import InMemoryObjectStore
 from services.evidence.intake.scanner import EvidenceSafetyScanner, ScanResult, ScanVerdict
 from services.mailbox.cursor import InMemoryMailboxFolderCursorRepository
@@ -2281,3 +2281,168 @@ def test_fixed_destination_never_inferred_from_mailbox_default_entity_id(h):
     evidence = h.api.get_evidence(message.evidence_id)
     assert evidence.entity_id == h.entity.entity_id
     assert evidence.entity_id != hint_entity.entity_id
+
+
+# ---------------------------------------------------------------------
+# Defect B: an unexpected exception inside `run_sweep` must terminalize
+# the run FAILED (never escape as an unhandled 500, never leave the
+# `MailboxSweepRun` row stuck RUNNING forever).
+# ---------------------------------------------------------------------
+
+
+class _CountingMessageRepository(InMemoryMailboxMessageRepository):
+    """Test-only wrapper: the first `succeed_calls` invocations of
+    `record_observation` behave normally (delegate to the real in-memory
+    implementation, so the message is genuinely durably recorded); every
+    call after that raises `exc` instead. Used to simulate an unexpected
+    exception hitting partway through a sweep's per-message loop, after
+    at least one message has already been durably recorded."""
+
+    def __init__(self, *, succeed_calls: int, exc: Exception):
+        super().__init__()
+        self._succeed_calls = succeed_calls
+        self._exc = exc
+        self.record_observation_calls = 0
+
+    def record_observation(self, **kwargs):
+        self.record_observation_calls += 1
+        if self.record_observation_calls > self._succeed_calls:
+            raise self._exc
+        return super().record_observation(**kwargs)
+
+
+def test_unexpected_exception_before_any_message_terminalizes_failed(h):
+    """Inject a plain `ValueError` at the very first call inside
+    `run_sweep`'s own try block (`adapter.discover_monitored_folders`)
+    — before any folder/message is ever processed. Must not escape as
+    an unhandled exception: the `MailboxSweepRun` durably terminalizes
+    FAILED with `UNEXPECTED_ERROR`, no folder was ever attempted (so no
+    cursor could possibly have advanced), and the sweep lock was
+    released (a fresh `try_acquire` on the same mailbox succeeds
+    immediately rather than raising `MailboxSweepLockError`)."""
+
+    def _boom(**kwargs):
+        raise ValueError("simulated unexpected failure before any folder")
+
+    h.adapter.discover_monitored_folders = _boom
+
+    run = h.sweep()
+
+    assert run.status == "FAILED"
+    assert run.completed_at is not None
+    assert run.error_code == SweepFailureReason.UNEXPECTED_ERROR
+    assert run.folders_attempted == ()
+
+    # No folder round ever started, so no cursor was ever bootstrapped
+    # for it — `get_or_bootstrap` sees a genuinely fresh folder.
+    cursor = h.cursor_repo.get_or_bootstrap(
+        mailbox_id=h.mailbox.mailbox_id,
+        provider_kind=h.mailbox.provider_kind,
+        folder=h.INBOX_FOLDER_ID,
+        bootstrap_timestamp=datetime.now(timezone.utc),
+    )
+    assert cursor.delta_link is None
+
+    # Lock released on the way out — a fresh acquire succeeds cleanly.
+    token = h.lock.try_acquire(h.mailbox.mailbox_id)
+    h.lock.release(h.mailbox.mailbox_id, token)
+
+
+def test_unexpected_exception_after_one_durable_message_terminalizes_failed(h):
+    """The fake message repository succeeds on its first
+    `record_observation` call (message `m1`, durably persisted) then
+    raises an unexpected `ValueError` on the second (`m2`) — both
+    observed in the SAME delta page of the SAME (Inbox) folder, on an
+    ungoverned/unknown sender domain so each takes the simple
+    discovery-only `record_observation` path (no MIME fetch needed).
+    Proves: `m1` stays durably persisted; the run terminalizes FAILED
+    with `UNEXPECTED_ERROR`; the folder's cursor is never advanced past
+    this crashed round; the lock is released."""
+    h.message_repo = _CountingMessageRepository(succeed_calls=1, exc=ValueError("simulated failure on second message"))
+
+    unknown_domain_sender = "person@unknown-ungoverned-domain.example"
+    h.graph_client.queue_delta_result(
+        GraphDeltaPageResult(
+            status=GraphOutcomeStatus.OK,
+            messages=(
+                _msg("m1", sender_address=unknown_domain_sender),
+                _msg("m2", sender_address=unknown_domain_sender),
+            ),
+            delta_link="d-inbox",
+        )
+    )
+    # Junk folder is never reached (the exception aborts the whole
+    # sweep from inside the Inbox folder's own per-message loop) — no
+    # second delta result needs to be queued for it.
+
+    run = h.sweep()
+
+    assert run.status == "FAILED"
+    assert run.completed_at is not None
+    assert run.error_code == SweepFailureReason.UNEXPECTED_ERROR
+
+    # The first message is genuinely durably persisted...
+    persisted_m1 = h.message_repo.find_by_provider_id(h.mailbox.mailbox_id, "m1")
+    assert persisted_m1 is not None
+    # ...the second never reached durable storage at all.
+    assert h.message_repo.find_by_provider_id(h.mailbox.mailbox_id, "m2") is None
+
+    # Counters honestly reflect in-memory progress at the moment of the
+    # crash — both messages were OBSERVED (Stage A always runs first),
+    # but only one was durably recorded.
+    assert run.messages_seen == 2
+    assert h.message_repo.record_observation_calls == 2
+
+    # The Inbox folder's cursor was never advanced past this crashed
+    # round (no whole-folder success was ever reached).
+    cursor = h.cursor_repo.get_or_bootstrap(
+        mailbox_id=h.mailbox.mailbox_id,
+        provider_kind=h.mailbox.provider_kind,
+        folder=h.INBOX_FOLDER_ID,
+        bootstrap_timestamp=datetime.now(timezone.utc),
+    )
+    assert cursor.delta_link is None
+
+    token = h.lock.try_acquire(h.mailbox.mailbox_id)
+    h.lock.release(h.mailbox.mailbox_id, token)
+
+
+def test_unexpected_persistence_error_uses_persistence_error_code_and_sanitized_detail(h):
+    """A `core.errors.PersistenceError` (rather than some other
+    unexpected exception type) must be classified distinctly —
+    `SweepFailureReason.PERSISTENCE_ERROR`, never the generic
+    `UNEXPECTED_ERROR` — and the durable `error_detail` must be
+    bounded/sanitized: never the raw exception message, never any
+    provider/sender/SQL content."""
+    raw_message_with_sensitive_shape = (
+        "duplicate key value violates unique constraint; DETAIL: Key (mailbox_id, "
+        "immutable_provider_message_id)=(mb-1, secret-token-abc123) already exists."
+    )
+    h.message_repo = _CountingMessageRepository(succeed_calls=0, exc=PersistenceError(raw_message_with_sensitive_shape))
+
+    # An UNGOVERNED/unknown sender domain takes the simple
+    # discovery-only `record_observation` path (no MIME fetch, no
+    # queued headers/content needed) — isolates the injected
+    # `PersistenceError` as the ONLY unusual thing that can happen here.
+    h.graph_client.queue_delta_result(
+        GraphDeltaPageResult(
+            status=GraphOutcomeStatus.OK,
+            messages=(_msg("m1", sender_address="person@unknown-ungoverned-domain.example"),),
+            delta_link="d-inbox",
+        )
+    )
+
+    run = h.sweep()
+
+    assert run.status == "FAILED"
+    assert run.error_code == SweepFailureReason.PERSISTENCE_ERROR
+    assert run.error_detail is not None
+    assert "PersistenceError" in run.error_detail
+    # Bounded/sanitized: never the raw exception text or anything it
+    # carried (mailbox id, provider message id, SQL constraint detail).
+    assert raw_message_with_sensitive_shape not in run.error_detail
+    assert "secret-token-abc123" not in run.error_detail
+    assert "unique constraint" not in run.error_detail
+
+    token = h.lock.try_acquire(h.mailbox.mailbox_id)
+    h.lock.release(h.mailbox.mailbox_id, token)

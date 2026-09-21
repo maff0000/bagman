@@ -54,6 +54,12 @@ class SweepFailureReason:
     PARTIAL_FAILURES = "PARTIAL_FAILURES"
     CONCURRENT_SWEEP_IN_PROGRESS = "CONCURRENT_SWEEP_IN_PROGRESS"
     PERSISTENCE_ERROR = "PERSISTENCE_ERROR"
+    #: An exception outside the closed vocabulary above escaped the
+    #: sweep loop's own known-failure handling (see the final
+    #: `except Exception` clause in `services/mailbox/sweep.py::run_sweep`).
+    #: Distinct from `PERSISTENCE_ERROR`, which is reserved for
+    #: `core.errors.PersistenceError` specifically.
+    UNEXPECTED_ERROR = "UNEXPECTED_ERROR"
     #: CD-6 architect amendment (recursive folder discovery) — the
     #: mailbox's own folder tree/well-known-folder resolution itself
     #: could not be completed this round (a whole-sweep precondition

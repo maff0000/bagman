@@ -367,7 +367,9 @@ def _extract_message_summary(
         try:
             parsed = parsedate_to_datetime(date_header)
             if parsed is not None:
-                received_at = parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+                received_at = (
+                    parsed.astimezone(timezone.utc) if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+                )
         except (TypeError, ValueError):
             received_at = None
 

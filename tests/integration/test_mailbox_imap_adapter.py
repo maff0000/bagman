@@ -7,10 +7,12 @@ behaviour. All driven by `FakeImapClient` — zero real network/TLS.
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 
 from services.mailbox.imap.fake_imap_client import FakeImapClient
 from services.mailbox.imap.imap_adapter import (
     ImapMailboxAdapter,
+    _extract_message_summary,
     compose_immutable_message_id,
     decompose_immutable_message_id,
 )
@@ -63,6 +65,42 @@ def test_two_different_uidvalidity_epochs_never_collide_for_the_same_uid():
     id_epoch_1 = compose_immutable_message_id(folder="INBOX", uidvalidity=1, uid=5)
     id_epoch_2 = compose_immutable_message_id(folder="INBOX", uidvalidity=2, uid=5)
     assert id_epoch_1 != id_epoch_2
+
+
+# -- Defect A: non-UTC `Date`-header offsets must normalize to UTC ------
+#
+# Mirrors the Gmail adapter's own coverage in
+# `tests/integration/test_mailbox_gmail_adapter.py` — `imap_adapter.py`'s
+# `_extract_message_summary` has the exact same code shape/defect as
+# `gmail_adapter.py`'s `_to_message_summary` and the exact same fix.
+
+
+def test_non_utc_date_header_offset_normalizes_to_utc_same_instant():
+    date_header = "Mon, 21 Sep 2026 16:10:52 -0400 (EDT)"
+    raw_headers = [h for h in _headers_for(1, date=date_header).raw_headers]
+    summary = _extract_message_summary(folder="INBOX", uidvalidity=100, uid=1, raw_headers=raw_headers)
+
+    assert summary.received_at is not None
+    assert summary.received_at.utcoffset().total_seconds() == 0
+    expected = parsedate_to_datetime(date_header).astimezone(timezone.utc)
+    assert summary.received_at == expected
+    assert summary.received_at == datetime(2026, 9, 21, 20, 10, 52, tzinfo=timezone.utc)
+
+
+def test_utc_date_header_is_unchanged_regression():
+    date_header = "Mon, 21 Sep 2026 16:10:52 +0000"
+    raw_headers = [h for h in _headers_for(1, date=date_header).raw_headers]
+    summary = _extract_message_summary(folder="INBOX", uidvalidity=100, uid=1, raw_headers=raw_headers)
+
+    assert summary.received_at.utcoffset().total_seconds() == 0
+    assert summary.received_at == parsedate_to_datetime(date_header).astimezone(timezone.utc)
+    assert summary.received_at == datetime(2026, 9, 21, 16, 10, 52, tzinfo=timezone.utc)
+
+
+def test_missing_date_header_leaves_received_at_none_regression():
+    raw_headers = [h for h in _headers_for(1).raw_headers if h["name"] != "Date"]
+    summary = _extract_message_summary(folder="INBOX", uidvalidity=100, uid=1, raw_headers=raw_headers)
+    assert summary.received_at is None
 
 
 # -- folder discovery ---------------------------------------------------
@@ -153,12 +191,12 @@ def test_discovery_tls_validation_failure_surfaces_distinctly():
 # -- fetch_folder_delta / pagination / UIDVALIDITY epoch -----------------
 
 
-def _headers_for(uid: int, *, subject: str = "Invoice", sender: str = "billing@vendor.com") -> ImapMessageHeaders:
+def _headers_for(uid: int, *, subject: str = "Invoice", sender: str = "billing@vendor.com", date: str = "Mon, 01 Jan 2024 12:00:00 +0000") -> ImapMessageHeaders:
     raw = (
         {"name": "Subject", "value": subject},
         {"name": "From", "value": f"Vendor <{sender}>"},
         {"name": "Message-ID", "value": f"<msg-{uid}@vendor.com>"},
-        {"name": "Date", "value": "Mon, 01 Jan 2024 12:00:00 +0000"},
+        {"name": "Date", "value": date},
     )
     return ImapMessageHeaders(uid=uid, raw_headers=raw)
 

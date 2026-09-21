@@ -13,6 +13,9 @@ from core import identity
 from persistence.postgres.mailbox_message_models import MailboxMessageRow
 from persistence.postgres.mailbox_message_repository import PostgresMailboxMessageRepository
 from persistence.postgres.session import get_engine, session_scope
+from services.mailbox.gmail.gmail_adapter import _to_message_summary
+from services.mailbox.gmail.gmail_client import GmailMessageMetadata
+from services.mailbox.mailbox import PROVIDER_GOOGLE_GMAIL
 from services.mailbox.message import FOLDER_INBOX, FOLDER_JUNK, INGESTION_STATUS_INGESTED, INGESTION_STATUS_VANISHED
 
 
@@ -273,3 +276,76 @@ def test_sender_address_observed_is_scoped_to_the_mailbox(fresh_engine):
 
     fresh_repo = PostgresMailboxMessageRepository(engine=fresh_engine)
     assert fresh_repo.sender_address_observed(other_mailbox_id, "billing@vendor.com") is False
+
+
+# -- Defect A: full crash-reproduction end-to-end, against real Postgres -
+
+
+def test_non_utc_date_header_message_records_cleanly_end_to_end(fresh_engine):
+    """Reproduces the exact PL-proven live crash scenario end-to-end:
+    a real Gmail message whose `Date` header carries a non-UTC numeric
+    offset (extremely common in real email — the sender's own local
+    timezone) must flow all the way through `_to_message_summary` →
+    `services/mailbox/sweep.py`'s own `msg.received_at or resolved_now`
+    resolution → `PostgresMailboxMessageRepository.record_observation`
+    → `MailboxMessage.to_dict()` (which calls
+    `core.timestamps.ensure_utc` and previously raised `ValueError` for
+    exactly this input) WITHOUT raising. Before the fix in
+    `services/mailbox/gmail/gmail_adapter.py::_to_message_summary`, this
+    test would fail with `ValueError: canonical BAGMAN time must be UTC
+    (zero offset); got offset -1 day, 20:00:00` (or similar)."""
+    date_header = "Mon, 21 Sep 2026 16:10:52 -0400 (EDT)"
+    raw_headers = [
+        {"name": "Subject", "value": "Invoice #4471"},
+        {"name": "From", "value": "Vendor <billing@vendor.com>"},
+        {"name": "Message-ID", "value": "<crash-repro@vendor.com>"},
+        {"name": "Date", "value": date_header},
+    ]
+    metadata = GmailMessageMetadata(
+        message_id="18abcrash1234",
+        raw_headers=raw_headers,
+        label_ids=("INBOX",),
+        internal_date=datetime(2026, 9, 21, 20, 15, 0, tzinfo=timezone.utc),
+    )
+
+    # Step 1: adapter-level parse (this is where the defect lived).
+    summary = _to_message_summary(metadata)
+    assert summary.received_at is not None
+
+    # Step 2: the SAME resolution `services/mailbox/sweep.py` applies at
+    # every `record_observation` call site — `msg.received_at or
+    # resolved_now`. `summary.received_at` is truthy here (not None), so
+    # the `or resolved_now` fallback never triggers, exactly mirroring
+    # production.
+    resolved_now = datetime.now(timezone.utc)
+    received_at = summary.received_at or resolved_now
+    assert received_at == summary.received_at
+
+    # Step 3: durable persistence + `to_dict()`'s own `ensure_utc` gate —
+    # against a REAL, disposable Postgres instance, not a mock.
+    repo = PostgresMailboxMessageRepository()
+    mailbox_id = _mailbox_id()
+    message, created = repo.record_observation(
+        mailbox_id=mailbox_id,
+        provider_kind=PROVIDER_GOOGLE_GMAIL,
+        immutable_provider_message_id=summary.immutable_id,
+        internet_message_id=summary.internet_message_id,
+        observed_folder=FOLDER_INBOX,
+        subject=summary.subject,
+        sender_address=summary.sender_address,
+        sender_display_name=summary.sender_display_name,
+        received_at=received_at,
+        has_attachments=summary.has_attachments,
+        ingestion_status=INGESTION_STATUS_INGESTED,
+    )
+    assert created is True
+
+    # No ValueError — proves the exact crash scenario is closed
+    # end-to-end, not just at the adapter-unit level.
+    rendered = message.to_dict()
+    assert rendered["received_at"].endswith("Z")
+
+    fresh_repo = PostgresMailboxMessageRepository(engine=fresh_engine)
+    fetched = fresh_repo.get_message(message.mailbox_message_id)
+    assert fetched.received_at.utcoffset().total_seconds() == 0
+    fetched.to_dict()  # must not raise

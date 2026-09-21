@@ -360,7 +360,7 @@ from datetime import datetime
 from typing import Any, Mapping, Optional, Protocol, Sequence
 
 from core.entity import EntityRepository
-from core.errors import ConflictError
+from core.errors import ConflictError, PersistenceError
 from core.timestamps import to_contract_string, utc_now
 from services.evidence.intake.scanner import EvidenceSafetyScanner
 from services.mailbox.authentication_assessment import AUTH_ASSESSMENT_PASS, AuthenticationAssessment
@@ -1496,6 +1496,55 @@ def run_sweep(
                 graph_throttle_retries=graph_throttle_retries,
                 error_code=stopped.error_code,
                 error_detail=stopped.error_detail,
+            )
+            return completed
+
+        except Exception as exc:
+            # An unexpected exception NOT already turned into a
+            # `_SweepStopped` by a known-failure path above (e.g. this
+            # delivery's own now-proven non-UTC `Date`-header defect, or
+            # a genuine database/persistence failure) must still
+            # terminalize this run's `MailboxSweepRun` row rather than
+            # leave it stuck `RUNNING` forever behind an unhandled HTTP
+            # 500 — see module/PID discussion of this defect. Never
+            # `except BaseException` here: `KeyboardInterrupt`/
+            # `SystemExit` must keep propagating uncaught.
+            error_code = (
+                SweepFailureReason.PERSISTENCE_ERROR
+                if isinstance(exc, PersistenceError)
+                else SweepFailureReason.UNEXPECTED_ERROR
+            )
+            # Sanitized, bounded detail ONLY — never `str(exc)` or any
+            # raw exception message/provider response/sender data/SQL
+            # value/credential; see this delivery's own hard constraint.
+            error_detail = f"unexpected internal exception during mailbox sweep ({type(exc).__name__})"
+            failures += 1
+            # Deliberately NOT wrapped in its own try/except — if
+            # `complete_run` itself raises (the sweep-run repository/
+            # persistence layer being unavailable), that exception must
+            # propagate naturally (architect's own explicit ruling: no
+            # recursive recovery, no retry). The existing top-level
+            # unhandled-exception handling in `app/api/main.py` already
+            # sanitizes anything that does escape this far.
+            completed = sweep_run_repository.complete_run(
+                run.sweep_run_id,
+                new_status="FAILED",
+                folders_attempted=folders_attempted,
+                messages_seen=messages_seen,
+                messages_new=messages_new,
+                evidence_created=evidence_created,
+                duplicates=duplicates,
+                quarantined=quarantined,
+                failures=failures,
+                unique_sender_domains=len(sender_domains_seen),
+                allowed_domain_messages=allowed_domain_messages,
+                ignored_domain_messages=ignored_domain_messages,
+                unknown_domain_messages=unknown_domain_messages,
+                likely_financial_candidates=likely_financial_candidates,
+                messages_with_attachments=messages_with_attachments,
+                graph_throttle_retries=graph_throttle_retries,
+                error_code=error_code,
+                error_detail=error_detail,
             )
             return completed
 

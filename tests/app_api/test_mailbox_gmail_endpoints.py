@@ -303,6 +303,37 @@ def test_sweep_after_connect_returns_a_terminal_run(dev_client):
     assert body["messages_seen"] == 0
 
 
+def test_sweep_encountering_an_unexpected_exception_returns_200_with_a_terminal_failed_run(dev_client, monkeypatch):
+    """Defect B (proven live: an orphaned `MailboxSweepRun` row was
+    found stuck RUNNING forever in production) — an unexpected
+    exception occurring inside `run_sweep` (injected here at the very
+    first call `run_sweep` makes: `adapter.discover_monitored_folders`)
+    must NEVER surface as an unhandled HTTP 500. The router must return
+    a normal 200 carrying a terminal FAILED `MailboxSweepRun` in its
+    JSON body."""
+    mailbox_id = _create_gmail_mailbox(dev_client)
+    _connect_and_complete(dev_client, mailbox_id, email="mgs241171@gmail.com")
+    comp = get_composition()
+
+    comp.api.register_entity(
+        entity_type="COMPANY", canonical_name="TEST_ENTITY_GMAIL_UNEXPECTED", display_name="Test Entity", status="ACTIVE",
+        actor_type="SYSTEM", actor_id="test", fiscal_year_start_month_day="01-01",
+    )
+
+    def _boom(**kwargs):
+        raise ValueError("simulated unexpected failure injected for router-level Defect B coverage")
+
+    monkeypatch.setattr(comp.gmail_mailbox_adapter, "discover_monitored_folders", _boom)
+
+    r = dev_client.post(f"/internal/mailboxes/{mailbox_id}/gmail/sweep", json={"actor_type": "USER", "actor_id": ACTOR_ID})
+
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["status"] == "FAILED"
+    assert body["completed_at"] is not None
+    assert body["error_code"] == "UNEXPECTED_ERROR"
+
+
 def test_a_gmail_only_endpoint_rejects_a_microsoft_mailbox(dev_client):
     r = dev_client.post(
         "/internal/mailboxes",

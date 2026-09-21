@@ -8,6 +8,7 @@ and refresh-token preservation. All driven by `FakeGmailClient`/
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 
 import pytest
 
@@ -88,6 +89,68 @@ def test_message_identity_falls_back_to_internal_date_when_no_usable_date_header
     internal_date = datetime(2024, 3, 5, 9, 30, tzinfo=timezone.utc)
     metadata = GmailMessageMetadata(message_id="m1", raw_headers=[{"name": "Subject", "value": "No date header"}], label_ids=(), internal_date=internal_date)
     summary = _to_message_summary(metadata)
+    assert summary.received_at == internal_date
+
+
+# -- Defect A: non-UTC `Date`-header offsets must normalize to UTC ------
+#
+# Root cause (PL-reproduced against real production data via disposable
+# Postgres, not a guess): `parsedate_to_datetime` correctly parses a
+# real-world non-UTC `Date` header into a timezone-AWARE datetime whose
+# `tzinfo` is already set — to that NON-UTC offset. The old code took
+# the `parsed if parsed.tzinfo else ...` branch and used it AS-IS,
+# never normalizing to UTC, producing a non-None, non-UTC `received_at`
+# that later crashed `core.timestamps.ensure_utc` deep inside
+# `MailboxMessage.to_dict()`. The fix (`.astimezone(timezone.utc)`)
+# completes the already-present normalization step losslessly.
+
+
+def test_non_utc_date_header_offset_normalizes_to_utc_same_instant():
+    from services.mailbox.gmail.gmail_adapter import _to_message_summary
+
+    date_header = "Mon, 21 Sep 2026 16:10:52 -0400 (EDT)"
+    # The shared `_headers_for` helper always uses a UTC `+0000` Date —
+    # this test needs a non-UTC offset, so swap it out explicitly.
+    headers = [h for h in _headers_for() if h["name"] != "Date"]
+    headers.append({"name": "Date", "value": date_header})
+    metadata = GmailMessageMetadata(message_id="m1", raw_headers=headers, label_ids=(), internal_date=datetime(2026, 9, 21, tzinfo=timezone.utc))
+
+    summary = _to_message_summary(metadata)
+
+    assert summary.received_at is not None
+    assert summary.received_at.utcoffset() is not None
+    assert summary.received_at.utcoffset().total_seconds() == 0
+    expected = parsedate_to_datetime(date_header).astimezone(timezone.utc)
+    assert summary.received_at == expected
+    # Correctness of the CONVERSION, not merely "some UTC value" — the
+    # exact same instant in time, expressed in UTC.
+    assert summary.received_at == datetime(2026, 9, 21, 20, 10, 52, tzinfo=timezone.utc)
+
+
+def test_utc_date_header_is_unchanged_regression():
+    from services.mailbox.gmail.gmail_adapter import _to_message_summary
+
+    date_header = "Mon, 21 Sep 2026 16:10:52 +0000"
+    headers = [h for h in _headers_for() if h["name"] != "Date"]
+    headers.append({"name": "Date", "value": date_header})
+    metadata = GmailMessageMetadata(message_id="m1", raw_headers=headers, label_ids=(), internal_date=datetime(2026, 9, 21, tzinfo=timezone.utc))
+
+    summary = _to_message_summary(metadata)
+
+    assert summary.received_at.utcoffset().total_seconds() == 0
+    assert summary.received_at == parsedate_to_datetime(date_header).astimezone(timezone.utc)
+    assert summary.received_at == datetime(2026, 9, 21, 16, 10, 52, tzinfo=timezone.utc)
+
+
+def test_missing_date_header_still_falls_back_to_internal_date_regression():
+    from services.mailbox.gmail.gmail_adapter import _to_message_summary
+
+    internal_date = datetime(2026, 9, 21, 8, 0, 0, tzinfo=timezone.utc)
+    headers = [h for h in _headers_for() if h["name"] != "Date"]
+    metadata = GmailMessageMetadata(message_id="m1", raw_headers=headers, label_ids=(), internal_date=internal_date)
+
+    summary = _to_message_summary(metadata)
+
     assert summary.received_at == internal_date
 
 
