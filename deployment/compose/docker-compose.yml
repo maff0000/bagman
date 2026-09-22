@@ -132,32 +132,42 @@ services:
     # for Evidence Intake — a real `clamd` daemon, BAGMAN-owned,
     # internal-only.
     #
-    # CD-4 PR #4 Architect delta (2026-09-13): PR #4 originally pinned
-    # this to `clamav/clamav:stable` alone, on the reasoning that
-    # ClamAV publishes no per-build immutable version tag the way
-    # postgres/minio above do, so tracking the `stable` *release
-    # channel* was "the documented, deliberate choice ... not an
-    # oversight of the 'no :latest' rule." The Architect overrode that:
-    # a release channel is still a MOVING tag — the bytes behind
-    # `clamav/clamav:stable` can change upstream at any time without
-    # this file changing — which is not acceptable identity for a
-    # runtime dependency, regardless of how deliberately it was chosen.
+    # CD-4 PR #4 Architect delta (2026-09-13): pinned by immutable
+    # digest rather than a moving release-channel tag (`:stable`) — see
+    # git history for that original rationale. Superseded below.
     #
-    # This is now pinned by immutable digest: the `@sha256:...` suffix,
-    # not the `stable` tag, is what actually fixes the exact image
-    # bytes BAGMAN runs (and the exact image this delivery's
-    # ClamAV-dependent tests were built/verified against — resolved
-    # independently on the host that ran those tests, via
-    # `docker inspect --format='{{index .RepoDigests 0}}'
-    # clamav/clamav:stable`, immediately before pinning here). Docker
-    # treats `repo@digest` as the canonical, immutable reference
-    # regardless of any tag also present; `:stable` is kept here purely
-    # as a human-readable release-channel label for operators reading
-    # this file, not as part of the pinning mechanism — if ClamAV's
-    # `stable` channel is ever intentionally moved forward, this digest
-    # (and this comment) must be updated deliberately, exactly like any
-    # other version bump, never implicitly by a background image pull.
-    image: clamav/clamav:stable@sha256:1fdfd24c6f0a0fb60788481487459a6d4eda8a9b448641594e04db8410d34422
+    # CD-6 ClamAV reliability hardening (2026-09-22, Architect WO):
+    # RCA on the live Mac mini M4 (arm64) appliance found the prior
+    # `clamav/clamav:stable@sha256:1fdfd24c6f...` digest resolves to an
+    # amd64-ONLY manifest. Docker's platform-negotiation therefore ran
+    # it under Colima's transparent QEMU user-mode emulation on this
+    # host (proven directly: `docker exec bagman-scan ps aux` showed
+    # `/usr/bin/qemu-x86_64` wrapping every process; `uname -m` reported
+    # `x86_64` despite the VM kernel itself being `aarch64`). Emulated
+    # execution measurably inflated the container's own memory
+    # footprint under load; `docker inspect bagman-scan --format
+    # '{{.State.OOMKilled}}'` returned `true` — definitive (cgroup-level)
+    # proof of a real OOM-kill event, not merely circumstantial.
+    #
+    # Fix: moved to the official `clamav/clamav-debian` image (the
+    # ClamAV project's current recommended/maintained image family,
+    # multi-arch), pinned to the linux/arm64 PLATFORM-SPECIFIC manifest
+    # digest — not the multi-arch index digest — so this production
+    # service can never silently fall back to an emulated platform
+    # regardless of any future pull/negotiation behaviour change; this
+    # is the one real deployment target (Mac mini M4, arm64) and the
+    # pin should say so explicitly. (Contrast: tests/app_api/conftest.py
+    # pins the INDEX digest instead, deliberately, so the disposable CI
+    # fixture container resolves correctly on GitHub's amd64 runners —
+    # see that file's own comment. Both digests are equally immutable;
+    # they differ only in whether platform resolution is pinned shut or
+    # left to negotiate, which is a deliberate, documented difference,
+    # not an accidental drift between the two.) Verified natively on
+    # this appliance post-deploy: `uname -m` = `aarch64`, no qemu
+    # wrapper present in `ps aux`, and a disposable comparison run
+    # handled a harder workload at ~1GB peak RSS — comfortably under
+    # even the prior 1.5GiB limit, before the further bump below.
+    image: clamav/clamav-debian@sha256:32770534ece41601bed0005be5d1e1b7a76d734255c0ad02ad52f9281eb30418
     container_name: bagman-scan
     networks:
       - bagman-net
@@ -167,13 +177,20 @@ services:
     environment:
       TZ: UTC
     healthcheck:
-      # clamd's own PING/PONG protocol, spoken directly over the port
-      # it already listens on, via `nc` — verified present in the
-      # `clamav/clamav:stable` image (Alpine-based; NO `bash`, so a
-      # `/dev/tcp` redirection trick does not work here, unlike a
-      # Debian/Ubuntu-based image — checked directly against this exact
-      # image during this delivery, not assumed).
-      test: ["CMD-SHELL", "echo -n 'PING' | nc -w 5 127.0.0.1 3310 | grep -q PONG"]
+      # `clamdcheck.sh` is this image's OWN official, maintained
+      # healthcheck helper (baked in at `/usr/local/bin/clamdcheck.sh`,
+      # and in fact the image's own default `HEALTHCHECK` instruction)
+      # rather than a hand-rolled `nc`/`grep` pipeline — it speaks the
+      # exact same clamd PING/PONG wire protocol we tested directly
+      # against this image, but tracking the project's own supported
+      # script means any future protocol/behaviour change they ship
+      # is picked up automatically instead of silently going stale
+      # here. Our own interval/timeout/retries/start_period are kept
+      # (tighter than the image's own 360s default start_period, which
+      # assumes a cold `freshclam` download from empty — this image
+      # ships definitions baked in at build time, verified during this
+      # delivery, so clamd is reachable within seconds of starting).
+      test: ["CMD-SHELL", "clamdcheck.sh"]
       interval: 10s
       timeout: 10s
       retries: 20

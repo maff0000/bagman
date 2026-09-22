@@ -24,31 +24,32 @@ explicit in your tests about which is which"):
 Disposable `clamd` container used to build/verify this module
 ------------------------------------------------------------------
     docker run -d --name bagman-test-clamav-wi2 \\
-        -p 33100:3310 clamav/clamav:stable
+        -p 33100:3310 clamav/clamav-debian:latest
 
-The `clamav/clamav:stable` image ships with virus definitions already
+The `clamav/clamav-debian` image ships with virus definitions already
 baked in at image-build time, so `clamd` becomes reachable and able to
 recognise EICAR within seconds of starting even with no further
 network access for `freshclam` updates (verified during this delivery
 — see the delivery report). Tear down with
 `docker rm -f bagman-test-clamav-wi2`.
 
-CD-4 PR #4 Architect delta (2026-09-13) note: `deployment/compose
-/docker-compose.yml`'s real `bagman-scan` service, and
+CD-4 PR #4 / CD-6 (2026-09-22) Architect delta note: `deployment
+/compose/docker-compose.yml`'s real `bagman-scan` service, and
 `tests/app_api/conftest.py`'s automated `CLAMAV_IMAGE` fixture
-constant, are now both pinned to an immutable
-`clamav/clamav@sha256:...` digest rather than the bare `:stable` tag
-— see those files for why. This command is deliberately left as-is,
-still on the plain `:stable` tag, rather than updated to the same
-digest: it is a manual, human-typed convenience a developer runs
-interactively at their own terminal when they want a real daemon to
-point `requires_live_clamav`/this file's real-daemon tests at locally
-— it is not itself executed by any automated test, CI job, or fixture,
-so an unpinned tag here can never cause the two automated things
-(production and the WI-3 HTTP-level fixture) to silently drift apart
-from each other, which was the actual risk being closed elsewhere.
-Keeping the short, memorable `:stable` form here is a readability
-convenience for that manual/occasional use, not a gap in the pin.
+constant, are pinned to immutable `clamav/clamav-debian@sha256:...`
+digests (a platform-specific one in production, a multi-arch index
+one in the CI fixture — see those files for why they deliberately
+differ). This command is left as-is, on the plain `:latest` tag,
+rather than pinned to either digest: it is a manual, human-typed
+convenience a developer runs interactively at their own terminal when
+they want a real daemon to point `requires_live_clamav`/this file's
+real-daemon tests at locally — it is not itself executed by any
+automated test, CI job, or fixture, so an unpinned tag here can never
+cause the two automated things (production and the WI-3 HTTP-level
+fixture) to silently drift apart from each other, which was the
+actual risk being closed elsewhere. Keeping the short, memorable
+`:latest` form here is a readability convenience for that
+manual/occasional use, not a gap in the pin.
 """
 from __future__ import annotations
 

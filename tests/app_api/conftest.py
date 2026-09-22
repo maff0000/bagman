@@ -52,26 +52,37 @@ MINIO_BUCKET = "bagman-test-wi3-objects"
 #: avoid any collision when both test modules happen to run in the
 #: same CI environment.
 CLAMAV_CONTAINER = "bagman-test-clamav-wi3"
-#: CD-4 PR #4 Architect delta (2026-09-13): pinned to the SAME
-#: immutable digest as ``deployment/compose/docker-compose.yml``'s
-#: ``bagman-scan`` service, not merely the same ``:stable`` tag. This
-#: disposable fixture container is genuinely torn down after every test
-#: module run, so it is not itself the "proven CD-4 runtime" the
-#: Architect's delta is about — a case could be made that a
-#: throwaway, per-run container never needs an immutable identity the
-#: way a long-lived production service does. The call made here is to
-#: pin it anyway, for one concrete reason beyond "just match
-#: production": without a shared digest, this fixture and the real
-#: `bagman-scan` service could silently drift onto two different
-#: ClamAV builds (this one whenever `:stable` next moves upstream)
-#: without any test ever catching it — an intake test could then keep
-#: passing against a different scanner build than production actually
-#: runs, which defeats the point of these being real, non-mocked
-#: ClamAV tests at all. Keep this constant equal to
-#: docker-compose.yml's digest; update both together, deliberately,
-#: whenever the pin is intentionally moved forward.
+#: CD-4 PR #4 Architect delta (2026-09-13): pinned by immutable digest
+#: (not a moving tag) so this disposable fixture and the real
+#: `bagman-scan` service can never silently drift onto two different
+#: ClamAV builds without any test catching it.
+#:
+#: CD-6 ClamAV reliability hardening (2026-09-22): the image moved to
+#: `clamav/clamav-debian` (see docker-compose.yml's `bagman-scan`
+#: comment for the full RCA — the prior amd64-only manifest was running
+#: under QEMU emulation on the arm64 production appliance and hit a
+#: proven cgroup OOM-kill). Production now pins the linux/arm64
+#: PLATFORM-SPECIFIC manifest digest, since that is the one real
+#: deployment target and the pin should say so explicitly.
+#:
+#: This fixture deliberately pins a DIFFERENT digest instead: the
+#: multi-arch INDEX digest (`docker buildx imagetools inspect
+#: clamav/clamav-debian:latest`'s own top-level `Digest:`, distinct
+#: from any one platform's manifest digest inside it). CI
+#: (`.github/workflows/security.yml`) runs on GitHub's `ubuntu-latest`
+#: (amd64) runners, which cannot run an arm64-only manifest without
+#: QEMU setup this workflow doesn't configure — but an index digest is
+#: still a single immutable, content-addressed reference (any change to
+#: ANY platform's build changes the index digest too, so drift is still
+#: caught); Docker resolves it to the correct platform automatically on
+#: whichever host pulls it, amd64 CI runner or arm64 Mac alike. So: two
+#: different digest values below/in docker-compose.yml is intentional,
+#: not a broken "keep both equal" invariant — what must stay true is
+#: that both point at the SAME upstream image family and the same
+#: underlying release, updated together, deliberately, whenever the pin
+#: is intentionally moved forward.
 CLAMAV_IMAGE = (
-    "clamav/clamav:stable@sha256:1fdfd24c6f0a0fb60788481487459a6d4eda8a9b448641594e04db8410d34422"
+    "clamav/clamav-debian@sha256:df80497be841a8ad57f95e04f978216241457f8f8ad608f1f682e3cd0fe63c45"
 )
 CLAMAV_HOST_PORT = "33101"
 
