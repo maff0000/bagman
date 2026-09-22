@@ -240,15 +240,28 @@ class GmailOutcomeStatus(str, enum.Enum):
     TIMEOUT = "TIMEOUT"
     #: 401 — the access token was rejected/expired.
     AUTH_ERROR = "AUTH_ERROR"
-    #: 403 — a genuine permission/quota error this app's own grant
-    #: lacks — distinct from AUTH_ERROR: a token refresh will never fix
-    #: this.
+    #: 403 whose body carries no recognized transient-quota `reason` (see
+    #: `_status_from_code_and_body`'s own decision table) — a genuine
+    #: permission/scope/policy error this app's own grant lacks —
+    #: distinct from AUTH_ERROR: a token refresh will never fix this.
+    #: NEVER produced for a 403 whose structured
+    #: `error.errors[].reason` is `rateLimitExceeded`/
+    #: `userRateLimitExceeded` — that is `RATE_LIMITED` (see below), a
+    #: CD-6 fix: a real production sweep once hit Google's own per-user
+    #: quota mid-round, which this module misclassified as
+    #: `PERMISSION_ERROR` and caused `services/mailbox/sweep.py` to mark
+    #: the mailbox `connection_state -> ERROR` over nothing more than
+    #: transient quota exhaustion.
     PERMISSION_ERROR = "PERMISSION_ERROR"
     #: 404 — the specific message no longer exists (vanished between
     #: list and get).
     NOT_FOUND = "NOT_FOUND"
-    #: 429 — rate limited; `retry_after_seconds` carries Gmail's own
-    #: `Retry-After` header when present.
+    #: 429, OR a 403 whose structured `error.errors[].reason` is
+    #: `rateLimitExceeded`/`userRateLimitExceeded` (Google's own real
+    #: shape for per-user/per-project quota exhaustion — see
+    #: `_status_from_code_and_body`'s own decision table);
+    #: `retry_after_seconds` carries Gmail's own `Retry-After` header
+    #: when present (either shape).
     RATE_LIMITED = "RATE_LIMITED"
     #: Kept only for vocabulary parity with `GraphOutcomeStatus` — this
     #: module has no Graph-style expiring delta token (see module
@@ -558,7 +571,8 @@ class GmailClient:
         try:
             payload = self._get_json(GMAIL_PROFILE_URL, access_token)
         except urllib.error.HTTPError as exc:
-            return GmailIdentityResult(status=_status_for_http_error(exc), error_detail=f"HTTP {exc.code}: {_read_body(exc)}")
+            classified = _classify_http_error(exc)
+            return GmailIdentityResult(status=classified.status, error_detail=classified.error_detail)
         except Exception as exc:  # noqa: BLE001
             return GmailIdentityResult(status=_status_for_transport_error(exc), error_detail=str(exc)[:500])
 
@@ -579,7 +593,8 @@ class GmailClient:
         try:
             payload = self._get_json(GMAIL_LABELS_URL, access_token)
         except urllib.error.HTTPError as exc:
-            return GmailLabelListResult(status=_status_for_http_error(exc), error_detail=f"HTTP {exc.code}: {_read_body(exc)}")
+            classified = _classify_http_error(exc)
+            return GmailLabelListResult(status=classified.status, error_detail=classified.error_detail)
         except Exception as exc:  # noqa: BLE001
             return GmailLabelListResult(status=_status_for_transport_error(exc), error_detail=str(exc)[:500])
 
@@ -633,10 +648,11 @@ class GmailClient:
         try:
             payload = self._get_json(url, access_token)
         except urllib.error.HTTPError as exc:
+            classified = _classify_http_error(exc)
             return GmailMessageListPageResult(
-                status=_status_for_http_error(exc),
-                retry_after_seconds=_retry_after_seconds(exc),
-                error_detail=f"HTTP {exc.code}: {_read_body(exc)}",
+                status=classified.status,
+                retry_after_seconds=classified.retry_after_seconds,
+                error_detail=classified.error_detail,
             )
         except Exception as exc:  # noqa: BLE001
             return GmailMessageListPageResult(status=_status_for_transport_error(exc), error_detail=str(exc)[:500])
@@ -660,10 +676,11 @@ class GmailClient:
         try:
             payload = self._get_json(url, access_token)
         except urllib.error.HTTPError as exc:
+            classified = _classify_http_error(exc)
             return GmailMessageMetadataResult(
-                status=_status_for_http_error(exc),
-                retry_after_seconds=_retry_after_seconds(exc),
-                error_detail=f"HTTP {exc.code}: {_read_body(exc)}",
+                status=classified.status,
+                retry_after_seconds=classified.retry_after_seconds,
+                error_detail=classified.error_detail,
             )
         except Exception as exc:  # noqa: BLE001
             return GmailMessageMetadataResult(status=_status_for_transport_error(exc), error_detail=str(exc)[:500])
@@ -690,10 +707,11 @@ class GmailClient:
         try:
             payload = self._get_json(url, access_token)
         except urllib.error.HTTPError as exc:
+            classified = _classify_http_error(exc)
             return GmailMessageRawResult(
-                status=_status_for_http_error(exc),
-                retry_after_seconds=_retry_after_seconds(exc),
-                error_detail=f"HTTP {exc.code}: {_read_body(exc)}",
+                status=classified.status,
+                retry_after_seconds=classified.retry_after_seconds,
+                error_detail=classified.error_detail,
             )
         except Exception as exc:  # noqa: BLE001
             return GmailMessageRawResult(status=_status_for_transport_error(exc), error_detail=str(exc)[:500])
@@ -707,16 +725,107 @@ class GmailClient:
         return GmailMessageRawResult(status=GmailOutcomeStatus.OK, content=content)
 
 
-def _status_for_http_error(exc: urllib.error.HTTPError) -> GmailOutcomeStatus:
-    if exc.code == 401:
+#: Google's own structured `error.errors[].reason` values that mean
+#: "this 403 is transient per-user/per-project QUOTA exhaustion, not a
+#: genuine permission/scope/policy failure" — see
+#: :func:`_classify_http_error`'s own docstring for the real body shape
+#: this is matched against. Matched ONLY against the structured `reason`
+#: field, NEVER against the human-readable `message` field (that field's
+#: wording is not a stable, documented contract — see this module's own
+#: CD-6 quota-classification fix history).
+_TRANSIENT_QUOTA_REASONS = frozenset({"rateLimitExceeded", "userRateLimitExceeded"})
+
+
+def _reason_for_403(body_text: str) -> Optional[str]:
+    """Best-effort extraction of Google's own structured
+    `error.errors[].reason` from a 403 response body shaped like:
+    ``{"error": {"errors": [{"domain": "usageLimits", "reason":
+    "rateLimitExceeded", "message": "..."}], "code": 403, "message":
+    "..."}}``. Scans every entry in `errors[]`: if ANY entry carries a
+    known transient-quota reason (:data:`_TRANSIENT_QUOTA_REASONS`),
+    that reason is returned; otherwise the FIRST entry's own `reason` is
+    returned (a genuine, non-quota reason, e.g. `insufficientPermissions`).
+    Returns `None` when the body is not valid JSON, or does not carry
+    the expected `error.errors[]` shape, or `errors[]` is empty/carries
+    no string `reason` at all — the caller treats `None` as "no
+    recognized structured reason", which fails closed to
+    `PERMISSION_ERROR` (never raises on a malformed/unexpected body)."""
+    try:
+        payload = json.loads(body_text)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(payload, Mapping):
+        return None
+    error = payload.get("error")
+    if not isinstance(error, Mapping):
+        return None
+    errors = error.get("errors")
+    if not isinstance(errors, list):
+        return None
+
+    reasons = [entry.get("reason") for entry in errors if isinstance(entry, Mapping) and isinstance(entry.get("reason"), str)]
+    if not reasons:
+        return None
+    for reason in reasons:
+        if reason in _TRANSIENT_QUOTA_REASONS:
+            return reason
+    return reasons[0]
+
+
+def _status_from_code_and_body(code: int, body_text: str) -> GmailOutcomeStatus:
+    """The full HTTP-status (+ body, for 403 only) -> `GmailOutcomeStatus`
+    decision table — see module-level CD-6 quota-classification fix:
+    ``401 -> AUTH_ERROR``; ``403`` + a structured `reason` of
+    `rateLimitExceeded`/`userRateLimitExceeded` -> `RATE_LIMITED`; any
+    other/no recognized structured `reason` on a 403 (including a
+    malformed/unparseable body) -> `PERMISSION_ERROR` (fail-closed,
+    architect's own explicit instruction); ``404 -> NOT_FOUND``;
+    ``429 -> RATE_LIMITED``; anything else -> `PROVIDER_ERROR`."""
+    if code == 401:
         return GmailOutcomeStatus.AUTH_ERROR
-    if exc.code == 403:
+    if code == 403:
+        reason = _reason_for_403(body_text)
+        if reason in _TRANSIENT_QUOTA_REASONS:
+            return GmailOutcomeStatus.RATE_LIMITED
         return GmailOutcomeStatus.PERMISSION_ERROR
-    if exc.code == 404:
+    if code == 404:
         return GmailOutcomeStatus.NOT_FOUND
-    if exc.code == 429:
+    if code == 429:
         return GmailOutcomeStatus.RATE_LIMITED
     return GmailOutcomeStatus.PROVIDER_ERROR
+
+
+@dataclass(frozen=True)
+class _ClassifiedHttpError:
+    """The full result of classifying one `urllib.error.HTTPError` —
+    produced by reading its body EXACTLY ONCE (see
+    :func:`_classify_http_error`'s own docstring for why this dataclass
+    exists at all: `HTTPError.read()` consumes a stream and can only be
+    read once, so every field a call site needs from one exception must
+    be derived in ONE place, never re-read at each call site)."""
+
+    status: GmailOutcomeStatus
+    retry_after_seconds: Optional[float]
+    error_detail: str
+
+
+def _classify_http_error(exc: urllib.error.HTTPError) -> _ClassifiedHttpError:
+    """The ONE place a Gmail `HTTPError`'s body is ever read — every call
+    site below (`get_profile`/`list_labels`/`list_messages`/
+    `fetch_message_metadata`/`fetch_message_raw`) calls this exactly
+    once per exception and uses its three fields, instead of separately
+    calling a status-classifier + `_retry_after_seconds` + `_read_body`
+    (which, now that classifying a 403 needs to inspect the body,
+    would exhaust `exc`'s stream on the first read and leave every
+    later `_read_body(exc)` call at that same call site returning an
+    empty string — silently breaking `error_detail` for every Gmail
+    HTTP error path in this client, not just 403s). `_read_body`/
+    `_retry_after_seconds` remain small internal helpers, but are now
+    called ONLY from here."""
+    body_text = _read_body(exc)
+    retry_after_seconds = _retry_after_seconds(exc)
+    status = _status_from_code_and_body(exc.code, body_text)
+    return _ClassifiedHttpError(status=status, retry_after_seconds=retry_after_seconds, error_detail=f"HTTP {exc.code}: {body_text}")
 
 
 def _status_for_transport_error(exc: Exception) -> GmailOutcomeStatus:

@@ -966,3 +966,174 @@ def test_default_metadata_headers_production_path_reaches_pass_via_fetch_message
     assert assessment.verdict == AUTH_ASSESSMENT_PASS
     assert assessment.evidence["eligible_candidate_count"] == 1
     assert assessment.evidence["selected_header_tokens"]["dmarc"] == "pass"
+
+
+# ---------------------------------------------------------------------
+# CD-6 follow-on fix — proactive Gmail quota pacing
+# (`_GmailMetadataFetchGovernor`). A real production historical sweep hit
+# Google's own per-user `messages.get` quota mid-round; these tests prove
+# the adapter now paces itself PROACTIVELY (a minimum interval between
+# sequential `fetch_message_metadata` calls), scoped per mailbox_id,
+# using a fake monotonic clock + fake sleep so NO test here ever
+# actually blocks.
+# ---------------------------------------------------------------------
+
+
+class _FakeMonotonicClock:
+    """A deterministic stand-in for `time.monotonic` — starts at an
+    arbitrary fixed value (never 0, to prove nothing in the governor
+    secretly assumes a zero epoch) and only ever advances when told to
+    (by `advance()`, or implicitly via `_FakeSleep.__call__` below)."""
+
+    def __init__(self, start: float = 1_000.0) -> None:
+        self.now = start
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+class _FakeSleep:
+    """Records every `(seconds,)` it was called with — proves the
+    governor's own sleep-duration math — and advances the paired fake
+    clock by that same amount (mirrors what a REAL `time.sleep` would
+    accomplish to elapsed monotonic time, deterministically, with zero
+    real blocking)."""
+
+    def __init__(self, clock: _FakeMonotonicClock) -> None:
+        self.calls: list[float] = []
+        self._clock = clock
+
+    def __call__(self, seconds: float) -> None:
+        self.calls.append(seconds)
+        self._clock.advance(seconds)
+
+
+def _paced_adapter(*, min_interval_seconds: float = 0.30, start: float = 1_000.0):
+    clock = _FakeMonotonicClock(start=start)
+    sleep = _FakeSleep(clock)
+    oauth_client = FakeGmailOAuthClient()
+    gmail_client = FakeGmailClient()
+    token_store = InMemoryGmailTokenStore()
+    mailbox_repo = InMemoryMailboxSourceRepository()
+    adapter = GmailMailboxAdapter(
+        oauth_client=oauth_client, gmail_client=gmail_client, token_store=token_store, mailbox_repository=mailbox_repo,
+        metadata_fetch_min_interval_seconds=min_interval_seconds, monotonic_fn=clock, sleep_fn=sleep,
+    )
+    return oauth_client, gmail_client, token_store, mailbox_repo, adapter, clock, sleep
+
+
+def test_governor_first_metadata_fetch_needs_no_sleep_subsequent_calls_do():
+    """8. Several sequential `fetch_message_metadata` calls, driven via
+    `fetch_folder_delta`'s own per-page loop against ONE page carrying
+    three message ids. The FIRST call must trigger no sleep at all (no
+    prior timestamp for this mailbox_id yet); the SECOND and THIRD must
+    each sleep, and the recorded duration must equal the configured
+    minimum interval (the fake clock never advances on its own between
+    calls, so the full interval is always "remaining")."""
+    oauth_client, gmail_client, token_store, mailbox_repo, adapter, clock, sleep = _paced_adapter(min_interval_seconds=0.30)
+    mailbox = _seeded_mailbox(mailbox_repo)
+    token_store.write(mailbox.mailbox_id, access_token="a", refresh_token="r", expires_at=datetime.now(timezone.utc) + timedelta(hours=1))
+
+    gmail_client.queue_list_messages_result(GmailMessageListPageResult(status=GmailOutcomeStatus.OK, message_ids=("m1", "m2", "m3")))
+    for mid in ("m1", "m2", "m3"):
+        gmail_client.queue_metadata_result(
+            GmailMessageMetadataResult(status=GmailOutcomeStatus.OK, metadata=_msg_metadata(mid, label_ids=("INBOX",)))
+        )
+
+    page = adapter.fetch_folder_delta(mailbox_id=mailbox.mailbox_id, folder=GMAIL_ALL_RECEIVED_STREAM_ID, bootstrap_timestamp=datetime(2024, 1, 1, tzinfo=timezone.utc))
+
+    assert page.status == GmailOutcomeStatus.OK
+    assert len(page.messages) == 3
+    # Exactly 2 sleeps for 3 sequential calls — the first never sleeps.
+    assert sleep.calls == pytest.approx([0.30, 0.30])
+    # Zero real blocking — proven by the fake clock's own final value:
+    # exactly `start + 2 * min_interval_seconds`, nothing more.
+    assert clock.now == pytest.approx(1_000.0 + 0.60)
+
+
+def test_governor_pagination_persists_pacing_state_across_pages():
+    """9. A second page, fetched via `next_link`, must NOT reset this
+    mailbox's own pacing state — the governor's "last call" timestamp is
+    adapter-instance-scoped, never page-scoped. Page 1 ends immediately
+    after its own (unsleeped) first call; page 2's own first call must
+    therefore still need to sleep, spaced from page 1's own last call,
+    not from a reset zero state."""
+    oauth_client, gmail_client, token_store, mailbox_repo, adapter, clock, sleep = _paced_adapter(min_interval_seconds=0.30)
+    mailbox = _seeded_mailbox(mailbox_repo)
+    token_store.write(mailbox.mailbox_id, access_token="a", refresh_token="r", expires_at=datetime.now(timezone.utc) + timedelta(hours=1))
+
+    gmail_client.queue_list_messages_result(GmailMessageListPageResult(status=GmailOutcomeStatus.OK, message_ids=("m1",), next_page_token="page-2"))
+    gmail_client.queue_metadata_result(GmailMessageMetadataResult(status=GmailOutcomeStatus.OK, metadata=_msg_metadata("m1", label_ids=("INBOX",))))
+    first = adapter.fetch_folder_delta(mailbox_id=mailbox.mailbox_id, folder=GMAIL_ALL_RECEIVED_STREAM_ID, bootstrap_timestamp=datetime(2024, 1, 1, tzinfo=timezone.utc))
+    assert first.status == GmailOutcomeStatus.OK
+    assert sleep.calls == []  # page 1's own single message never sleeps
+
+    gmail_client.queue_list_messages_result(GmailMessageListPageResult(status=GmailOutcomeStatus.OK, message_ids=("m2",)))
+    gmail_client.queue_metadata_result(GmailMessageMetadataResult(status=GmailOutcomeStatus.OK, metadata=_msg_metadata("m2", label_ids=("INBOX",))))
+    second = adapter.fetch_folder_delta(mailbox_id=mailbox.mailbox_id, folder=GMAIL_ALL_RECEIVED_STREAM_ID, next_link=first.next_link)
+    assert second.status == GmailOutcomeStatus.OK
+    # Page 2's own first (and only) metadata call DID sleep — proving the
+    # governor's own "last call" state persisted across the page
+    # boundary rather than resetting when a new `fetch_folder_delta` call
+    # began.
+    assert sleep.calls == pytest.approx([0.30])
+
+
+def test_governor_cross_mailbox_isolation():
+    """10. Pacing mailbox_id_A many times must NEVER throttle a
+    completely independent mailbox_id_B — a first call for B, issued
+    right after A's own pacing history, must need no sleep at all."""
+    oauth_client, gmail_client, token_store, mailbox_repo, adapter, clock, sleep = _paced_adapter(min_interval_seconds=0.30)
+    mailbox_a = _seeded_mailbox(mailbox_repo, email="mgs241171@gmail.com")
+    mailbox_b = _seeded_mailbox(mailbox_repo, email="matt.george.scott@gmail.com")
+    for mailbox in (mailbox_a, mailbox_b):
+        token_store.write(mailbox.mailbox_id, access_token="a", refresh_token="r", expires_at=datetime.now(timezone.utc) + timedelta(hours=1))
+
+    # Pace mailbox A across several sequential calls first.
+    gmail_client.queue_list_messages_result(GmailMessageListPageResult(status=GmailOutcomeStatus.OK, message_ids=("a1", "a2", "a3")))
+    for mid in ("a1", "a2", "a3"):
+        gmail_client.queue_metadata_result(GmailMessageMetadataResult(status=GmailOutcomeStatus.OK, metadata=_msg_metadata(mid, label_ids=("INBOX",))))
+    page_a = adapter.fetch_folder_delta(mailbox_id=mailbox_a.mailbox_id, folder=GMAIL_ALL_RECEIVED_STREAM_ID, bootstrap_timestamp=datetime(2024, 1, 1, tzinfo=timezone.utc))
+    assert page_a.status == GmailOutcomeStatus.OK
+    calls_after_a = len(sleep.calls)
+    assert calls_after_a == 2  # 3 sequential calls for A -> 2 sleeps
+
+    # Mailbox B's very first metadata fetch, issued immediately
+    # afterwards on the SAME governor/adapter instance, must need no
+    # sleep — it has no prior timestamp of its OWN, and A's own history
+    # must never leak into B's own pacing state.
+    gmail_client.queue_list_messages_result(GmailMessageListPageResult(status=GmailOutcomeStatus.OK, message_ids=("b1",)))
+    gmail_client.queue_metadata_result(GmailMessageMetadataResult(status=GmailOutcomeStatus.OK, metadata=_msg_metadata("b1", label_ids=("INBOX",))))
+    page_b = adapter.fetch_folder_delta(mailbox_id=mailbox_b.mailbox_id, folder=GMAIL_ALL_RECEIVED_STREAM_ID, bootstrap_timestamp=datetime(2024, 1, 1, tzinfo=timezone.utc))
+    assert page_b.status == GmailOutcomeStatus.OK
+    assert len(sleep.calls) == calls_after_a  # zero NEW sleeps triggered by B's own first call
+
+
+def test_governor_wait_directly_zero_real_sleeping_proof():
+    """11. A direct, white-box proof against `_GmailMetadataFetchGovernor`
+    itself (mirrors this file's own established pattern of testing
+    private helpers like `_to_message_summary`/`_decode_delta_link`
+    directly): the first `wait()` for a mailbox_id never sleeps; a
+    second `wait()` for the SAME mailbox_id, issued with zero elapsed
+    fake-clock time, sleeps for exactly the configured minimum interval;
+    at no point does this test block in real wall-clock time (proven by
+    only ever asserting on `sleep.calls`, never timing the test itself)."""
+    from services.mailbox.gmail.gmail_adapter import _GmailMetadataFetchGovernor
+
+    clock = _FakeMonotonicClock(start=500.0)
+    sleep = _FakeSleep(clock)
+    governor = _GmailMetadataFetchGovernor(min_interval_seconds=0.30, monotonic_fn=clock, sleep_fn=sleep)
+
+    governor.wait("mailbox-x")
+    assert sleep.calls == []
+
+    governor.wait("mailbox-x")
+    assert sleep.calls == pytest.approx([0.30])
+
+    # A fully independent mailbox_id, waited on immediately afterwards,
+    # still needs no sleep at all.
+    governor.wait("mailbox-y")
+    assert sleep.calls == pytest.approx([0.30])

@@ -12,6 +12,7 @@ import json
 import urllib.error
 import urllib.parse
 import urllib.request
+from typing import Optional
 
 import pytest
 
@@ -23,17 +24,33 @@ from services.mailbox.gmail.gmail_client import (
     GmailClientProtocol,
     GmailOAuthClient,
     GmailOutcomeStatus,
+    _classify_http_error,
     _decode_base64url,
-    _status_for_http_error,
     _status_for_transport_error,
 )
 from services.mailbox.gmail.secrets import GmailAppCredentials
 
 
-def _fake_http_error(code: int) -> urllib.error.HTTPError:
+def _fake_http_error(code: int, *, body: bytes = b"{}", headers: Optional[dict] = None) -> urllib.error.HTTPError:
+    import email.message
     import io
 
-    return urllib.error.HTTPError(url="https://example.com", code=code, msg="err", hdrs=None, fp=io.BytesIO(b"{}"))
+    hdrs = None
+    if headers:
+        hdrs = email.message.Message()
+        for key, value in headers.items():
+            hdrs[key] = value
+    return urllib.error.HTTPError(url="https://example.com", code=code, msg="err", hdrs=hdrs, fp=io.BytesIO(body))
+
+
+def _quota_body(reason: str) -> bytes:
+    """A real Google-shaped 403 JSON body carrying `reason` — the exact
+    shape Google's own Gmail API returns for both transient quota
+    exhaustion (`rateLimitExceeded`/`userRateLimitExceeded`) and genuine
+    permission failures (any other `reason`)."""
+    return json.dumps(
+        {"error": {"errors": [{"domain": "usageLimits", "reason": reason, "message": "Quota exceeded for..."}], "code": 403, "message": "..."}}
+    ).encode("utf-8")
 
 
 # -- base64url decode ------------------------------------------------------
@@ -58,15 +75,108 @@ def test_decode_base64url_handles_full_padding():
     "code,expected",
     [
         (401, GmailOutcomeStatus.AUTH_ERROR),
-        (403, GmailOutcomeStatus.PERMISSION_ERROR),
+        (403, GmailOutcomeStatus.PERMISSION_ERROR),  # plain `{}` body -> no recognized structured reason -> fail-closed
         (404, GmailOutcomeStatus.NOT_FOUND),
         (429, GmailOutcomeStatus.RATE_LIMITED),
         (500, GmailOutcomeStatus.PROVIDER_ERROR),
         (503, GmailOutcomeStatus.PROVIDER_ERROR),
     ],
 )
-def test_status_for_http_error_mapping(code, expected):
-    assert _status_for_http_error(_fake_http_error(code)) == expected
+def test_classify_http_error_status_mapping(code, expected):
+    assert _classify_http_error(_fake_http_error(code)).status == expected
+
+
+# -- CD-6 structured-403 quota classification -----------------------------
+#
+# A real Gmail historical sweep once hit Google's own per-user API quota
+# mid-round (HTTP 403, structured `usageLimits`/`rateLimitExceeded`
+# body) — the old `_status_for_http_error` classified EVERY 403 as
+# `PERMISSION_ERROR` regardless of body content, which caused
+# `services/mailbox/sweep.py` to mark a genuinely healthy mailbox's
+# `connection_state -> ERROR` over nothing more than transient quota
+# exhaustion. These tests prove the fix's full decision table, and the
+# single-body-read refactor that makes it safe.
+
+
+def test_403_rate_limit_exceeded_reason_classified_as_rate_limited_not_permission_error():
+    classified = _classify_http_error(_fake_http_error(403, body=_quota_body("rateLimitExceeded")))
+    assert classified.status == GmailOutcomeStatus.RATE_LIMITED
+    assert classified.status != GmailOutcomeStatus.PERMISSION_ERROR
+
+
+def test_403_user_rate_limit_exceeded_reason_classified_as_rate_limited():
+    classified = _classify_http_error(_fake_http_error(403, body=_quota_body("userRateLimitExceeded")))
+    assert classified.status == GmailOutcomeStatus.RATE_LIMITED
+
+
+def test_403_genuine_permission_reason_classified_as_permission_error():
+    classified = _classify_http_error(_fake_http_error(403, body=_quota_body("insufficientPermissions")))
+    assert classified.status == GmailOutcomeStatus.PERMISSION_ERROR
+
+
+def test_403_forbidden_reason_classified_as_permission_error():
+    classified = _classify_http_error(_fake_http_error(403, body=_quota_body("forbidden")))
+    assert classified.status == GmailOutcomeStatus.PERMISSION_ERROR
+
+
+@pytest.mark.parametrize(
+    "malformed_body",
+    [
+        b"not json at all",
+        b"",
+        json.dumps({"error": "not the expected shape"}).encode("utf-8"),
+        json.dumps({"error": {"errors": "not a list"}}).encode("utf-8"),
+        json.dumps({"error": {"errors": []}}).encode("utf-8"),
+        json.dumps({"unexpected": "shape"}).encode("utf-8"),
+    ],
+)
+def test_403_malformed_or_unexpected_body_shape_fails_closed_to_permission_error(malformed_body):
+    """Malformed/unparseable/unexpected-shape 403 bodies must never
+    raise, and must fail closed to `PERMISSION_ERROR` (architect's own
+    explicit instruction) — never silently treated as transient."""
+    classified = _classify_http_error(_fake_http_error(403, body=malformed_body))
+    assert classified.status == GmailOutcomeStatus.PERMISSION_ERROR
+
+
+def test_429_still_classified_rate_limited_unchanged():
+    classified = _classify_http_error(_fake_http_error(429, body=b"{}"))
+    assert classified.status == GmailOutcomeStatus.RATE_LIMITED
+
+
+@pytest.mark.parametrize(
+    "code,body",
+    [
+        (403, _quota_body("rateLimitExceeded")),
+        (429, b"{}"),
+    ],
+)
+def test_retry_after_header_preserved_when_present(code, body):
+    classified = _classify_http_error(_fake_http_error(code, body=body, headers={"Retry-After": "17"}))
+    assert classified.retry_after_seconds == 17.0
+
+
+@pytest.mark.parametrize(
+    "code,body",
+    [
+        (403, _quota_body("rateLimitExceeded")),
+        (429, b"{}"),
+    ],
+)
+def test_retry_after_none_when_header_absent(code, body):
+    classified = _classify_http_error(_fake_http_error(code, body=body))
+    assert classified.retry_after_seconds is None
+
+
+def test_error_detail_still_populated_after_single_read_refactor():
+    """The exact trap the PL flagged: `_classify_http_error` reads the
+    body exactly ONCE and derives `error_detail` from that same read —
+    proving the single-read refactor didn't silently break the existing
+    diagnostic string (previously produced by a SEPARATE `_read_body`
+    call at each call site, which would now see an exhausted, already-
+    consumed stream and return an empty string)."""
+    classified = _classify_http_error(_fake_http_error(403, body=_quota_body("rateLimitExceeded")))
+    assert "403" in classified.error_detail
+    assert "rateLimitExceeded" in classified.error_detail
 
 
 def test_status_for_transport_error_classifies_timeout():

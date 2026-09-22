@@ -224,15 +224,40 @@ concept Gmail does not have:
   vanishing between two Gmail API calls (e.g. a concurrent delete) must
   never fail an entire folder round for every OTHER message already
   successfully observed this page.
+
+Proactive Gmail quota pacing (CD-6 follow-on fix) — a shared governor,
+never a reactive-only backoff
+--------------------------------------------------------------------------
+A real Gmail historical sweep once hit Google's own per-user/per-project
+`messages.get` quota mid-round; `gmail_client.py`'s own CD-6 fix now
+correctly classifies that condition as `GmailOutcomeStatus.RATE_LIMITED`
+(never `PERMISSION_ERROR` — see that module's own docstring) so
+`services/mailbox/sweep.py`'s existing bounded retry-then-fail policy
+handles it REACTIVELY, but this adapter additionally paces itself
+PROACTIVELY: :class:`_GmailMetadataFetchGovernor` enforces a minimum
+interval (`_DEFAULT_METADATA_FETCH_MIN_INTERVAL_SECONDS`, ~0.30s) between
+sequential `fetch_message_metadata` (`messages.get`) calls, scoped PER
+`mailbox_id` (BAGMAN's two independent Gmail mailboxes pace completely
+independently — never a globally shared governor). ONE governor instance
+lives on `GmailMailboxAdapter`, consulted from BOTH
+:meth:`fetch_folder_delta`'s own per-message loop (the PRIMARY pacing
+point) and :meth:`fetch_message_headers` (the SECONDARY pacing point,
+used by historical-candidate reprocessing) — never two separate
+mechanisms. Pacing is applied ONLY to `fetch_message_metadata` — never to
+`list_messages`/`list_labels`/`get_profile`/OAuth token exchange/refresh/
+`fetch_message_raw`. This never touches page/cursor semantics
+(`after:`/`pageToken`/`running_max`/`bootstrap_timestamp`/`delta_link`) —
+the governor only inserts a `sleep_fn` call before an existing API call.
 """
 from __future__ import annotations
 
 import json as _json
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from email.header import decode_header, make_header
 from email.utils import parseaddr, parsedate_to_datetime
-from typing import Mapping, Optional, Sequence
+from typing import Callable, Mapping, Optional, Sequence
 
 from core.timestamps import utc_now
 from services.mailbox.gmail.gmail_client import (
@@ -248,6 +273,20 @@ from services.mailbox.mailbox import MailboxSourceRepository
 #: Same safety-margin reasoning as
 #: `services.mailbox.microsoft.adapter._REFRESH_SKEW_SECONDS`.
 _REFRESH_SKEW_SECONDS = 120.0
+
+#: Proactive Gmail quota pacing (CD-6 follow-on fix) — Google's real
+#: quota for this project is 6,000 units/minute/user/project;
+#: `messages.get` (`GmailClient.fetch_message_metadata`) costs 20 units.
+#: Target: no more than ~200 `messages.get` calls per minute per Gmail
+#: mailbox -> a minimum interval of ~0.30s between sequential
+#: `fetch_message_metadata` calls, enforced PER MAILBOX (never globally
+#: shared across the two connected Gmail accounts — see
+#: `_GmailMetadataFetchGovernor`'s own docstring). This is proactive
+#: SPACING between calls this adapter was always going to make, never a
+#: retry mechanism — the existing bounded single-retry-then-fail policy
+#: in `services/mailbox/sweep.py` (`_MAX_RATE_LIMIT_BACKOFF_SECONDS`)
+#: remains the only retry mechanism, untouched by this constant.
+_DEFAULT_METADATA_FETCH_MIN_INTERVAL_SECONDS = 0.30
 
 #: See module docstring's "Label/folder normalisation" section —
 #: BAGMAN's own single, synthetic, BAGMAN-logical discovery stream
@@ -517,6 +556,53 @@ def _decode_next_link(value: Optional[str]) -> Optional[tuple[int, str, int]]:
         return None
 
 
+class _GmailMetadataFetchGovernor:
+    """Enforces a minimum interval between sequential Gmail
+    `messages.get` (`fetch_message_metadata`) calls, scoped PER
+    `mailbox_id` — see module-level `_DEFAULT_METADATA_FETCH_MIN_INTERVAL_SECONDS`
+    for the quota reasoning this paces against.
+
+    Uses a monotonic clock (never wall-clock — immune to system clock
+    adjustments) and injectable `monotonic_fn`/`sleep_fn` so tests can
+    drive this deterministically with zero real sleeping. State is
+    `mailbox_id`-scoped and instance-scoped (persists across pages
+    within one `GmailMailboxAdapter` instance, never reset per-page) —
+    this is what gives BAGMAN's two independent Gmail mailboxes
+    (`mgs241171@gmail.com`/`matt.george.scott@gmail.com`) fully
+    independent pacing: a call for one `mailbox_id` never consults or
+    mutates another `mailbox_id`'s own last-call timestamp."""
+
+    def __init__(
+        self,
+        *,
+        min_interval_seconds: float = _DEFAULT_METADATA_FETCH_MIN_INTERVAL_SECONDS,
+        monotonic_fn: Callable[[], float] = time.monotonic,
+        sleep_fn: Callable[[float], None] = time.sleep,
+    ) -> None:
+        self._min_interval_seconds = min_interval_seconds
+        self._monotonic_fn = monotonic_fn
+        self._sleep_fn = sleep_fn
+        self._last_call_at: dict[str, float] = {}
+
+    def wait(self, mailbox_id: str) -> None:
+        """Blocks (via `sleep_fn`) only long enough to keep this
+        `mailbox_id`'s own calls at least `min_interval_seconds` apart.
+        The FIRST call for a given `mailbox_id` never sleeps (no prior
+        timestamp exists yet). Always records `mailbox_id`'s own
+        last-call timestamp AFTER any sleep, so the next call's own
+        elapsed-time measurement starts from here, not from before the
+        sleep."""
+        now = self._monotonic_fn()
+        last = self._last_call_at.get(mailbox_id)
+        if last is not None:
+            elapsed = now - last
+            remaining = self._min_interval_seconds - elapsed
+            if remaining > 0:
+                self._sleep_fn(remaining)
+                now = self._monotonic_fn()
+        self._last_call_at[mailbox_id] = now
+
+
 class GmailMailboxAdapter:
     def __init__(
         self,
@@ -525,11 +611,21 @@ class GmailMailboxAdapter:
         gmail_client: GmailClientProtocol,
         token_store: GmailTokenStoreProtocol,
         mailbox_repository: MailboxSourceRepository,
+        metadata_fetch_min_interval_seconds: float = _DEFAULT_METADATA_FETCH_MIN_INTERVAL_SECONDS,
+        monotonic_fn: Callable[[], float] = time.monotonic,
+        sleep_fn: Callable[[float], None] = time.sleep,
     ) -> None:
         self._oauth_client = oauth_client
         self._gmail_client = gmail_client
         self._token_store = token_store
         self._mailbox_repository = mailbox_repository
+        # See module docstring's own "Proactive Gmail quota pacing"
+        # section: ONE shared governor object, consulted from BOTH
+        # `fetch_folder_delta`'s per-message loop AND
+        # `fetch_message_headers` — never two separate mechanisms.
+        self._metadata_fetch_governor = _GmailMetadataFetchGovernor(
+            min_interval_seconds=metadata_fetch_min_interval_seconds, monotonic_fn=monotonic_fn, sleep_fn=sleep_fn
+        )
 
     # -- token lifecycle -------------------------------------------------
 
@@ -680,12 +776,20 @@ class GmailMailboxAdapter:
         messages: list[GmailMessageSummary] = []
         new_running_max = running_max
         for message_id in unique_message_ids:
+            # Proactive quota pacing (see module docstring's "Proactive
+            # Gmail quota pacing" section) — ONE governor.wait() call
+            # immediately before every `fetch_message_metadata` call,
+            # including the reactive-refresh retry below (a retried call
+            # is still one more `messages.get` round trip against the
+            # SAME mailbox's own quota).
+            self._metadata_fetch_governor.wait(mailbox_id)
             metadata_result = self._gmail_client.fetch_message_metadata(access_token=access_token, message_id=message_id)
             if metadata_result.status == GmailOutcomeStatus.AUTH_ERROR:
                 retried_token, retry_error = self._reactive_refresh(mailbox_id)
                 if retried_token is None:
                     return GmailDeltaPageResult(status=GmailOutcomeStatus.AUTH_ERROR, error_detail=retry_error)
                 access_token = retried_token
+                self._metadata_fetch_governor.wait(mailbox_id)
                 metadata_result = self._gmail_client.fetch_message_metadata(access_token=access_token, message_id=message_id)
             if metadata_result.status == GmailOutcomeStatus.NOT_FOUND:
                 # Vanished between list and get — skip this ONE message,
@@ -758,6 +862,12 @@ class GmailMailboxAdapter:
         if access_token is None:
             return GmailMessageHeadersResult(status=GmailOutcomeStatus.AUTH_ERROR, error_detail=error_detail)
 
+        # Proactive quota pacing (see module docstring's "Proactive Gmail
+        # quota pacing" section) — the SAME shared governor
+        # `fetch_folder_delta`'s own per-message loop uses, not a second
+        # unrelated mechanism (historical-candidate reprocessing's own
+        # secondary pacing point).
+        self._metadata_fetch_governor.wait(mailbox_id)
         result = self._gmail_client.fetch_message_metadata(
             access_token=access_token, message_id=immutable_message_id, metadata_headers=DEFAULT_METADATA_HEADERS
         )
@@ -765,6 +875,7 @@ class GmailMailboxAdapter:
             retried_token, retry_error = self._reactive_refresh(mailbox_id)
             if retried_token is None:
                 return GmailMessageHeadersResult(status=GmailOutcomeStatus.AUTH_ERROR, error_detail=retry_error)
+            self._metadata_fetch_governor.wait(mailbox_id)
             result = self._gmail_client.fetch_message_metadata(
                 access_token=retried_token, message_id=immutable_message_id, metadata_headers=DEFAULT_METADATA_HEADERS
             )

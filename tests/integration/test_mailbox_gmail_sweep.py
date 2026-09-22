@@ -957,3 +957,61 @@ def test_429_rate_limited_existing_cursor_preserves_after_bound_on_retry_gmail_e
     assert calls[0].query == expected_query
     assert calls[1].query == expected_query
     assert all(call.query is not None for call in calls)
+
+
+# ---------------------------------------------------------------------
+# CD-6 quota-classification fix — connection-state invariant.
+#
+# The headline production incident this delivery fixes: a real Gmail
+# historical sweep once hit Google's own per-user quota mid-round, which
+# the OLD `_status_for_http_error` misclassified as `PERMISSION_ERROR`
+# (ALL 403s, regardless of body) — causing `services/mailbox/sweep.py`'s
+# own `if page.status == GraphOutcomeStatus.PERMISSION_ERROR:
+# adapter.report_connection_error(...)` branch to mark a genuinely
+# healthy mailbox's `connection_state -> ERROR` over nothing more than
+# transient quota exhaustion. Now that `gmail_client.py`'s own fix routes
+# a quota-shaped 403 to `RATE_LIMITED` instead, this scenario is
+# equivalent to Gmail's plain `429` case — the run terminalizes
+# PARTIAL/FAILED after `sweep.py`'s existing bounded single-retry-then-
+# fail policy is exhausted, but the mailbox itself is NEVER touched.
+# ---------------------------------------------------------------------
+
+
+def test_quota_rate_limited_exhausted_retry_never_poisons_connection_state():
+    """12. Two consecutive `RATE_LIMITED` page results (the shape a
+    quota-exhaustion 403, correctly classified by the CD-6 fix, now
+    surfaces as — exactly mirroring the existing plain-429-exhausted
+    exploit tests above) exhaust `sweep.py`'s own bounded single retry.
+    Headline proof: the `MailboxSource` remains `CONNECTED` — queried
+    directly from the repository, never merely inferred from the run's
+    own fields. Also asserts the run terminalizes PARTIAL/FAILED, the
+    folder cursor never advances (`delta_link` stays `None`), and zero
+    `EvidenceItem`/zero `MailboxMessage` deep processing occurred."""
+    from services.mailbox.gmail.gmail_adapter import GMAIL_ALL_RECEIVED_STREAM_ID
+
+    h = Harness()
+    h.queue_discovery()
+    h.gmail_client.queue_list_messages_result(GmailMessageListPageResult(status=GmailOutcomeStatus.RATE_LIMITED, retry_after_seconds=0.01))
+    h.gmail_client.queue_list_messages_result(GmailMessageListPageResult(status=GmailOutcomeStatus.RATE_LIMITED, retry_after_seconds=0.01))
+
+    run = h.sweep()
+
+    # The run itself terminalizes PARTIAL/FAILED — never SUCCEEDED — once
+    # the bounded retry is exhausted.
+    assert run.status in ("PARTIAL", "FAILED")
+
+    # Headline proof: the mailbox's own `connection_state` was NEVER
+    # touched by a RATE_LIMITED outcome — queried directly from the
+    # repository, not inferred from the run.
+    assert h.mailbox_repo.get_mailbox(h.mailbox.mailbox_id).connection_state == "CONNECTED"
+
+    # The cursor was never advanced — no delta round ever succeeded.
+    cursor = h.cursor_repo.get_or_bootstrap(
+        mailbox_id=h.mailbox.mailbox_id, provider_kind=PROVIDER_GOOGLE_GMAIL, folder=GMAIL_ALL_RECEIVED_STREAM_ID,
+        bootstrap_timestamp=h.mailbox_repo.get_mailbox(h.mailbox.mailbox_id).created_at,
+    )
+    assert cursor.delta_link is None
+
+    # Zero deep processing: no MailboxMessage rows, no EvidenceItem rows.
+    assert h.message_repo.list_messages(mailbox_id=h.mailbox.mailbox_id) == []
+    assert h.api.evidence_repository.list_evidence() == []
