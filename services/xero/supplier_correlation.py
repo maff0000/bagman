@@ -52,7 +52,7 @@ table anywhere. Correlation RESULTS are attached to the EXISTING open
 Needs You items' own ``metadata`` via the narrow
 ``NeedsYouRepository.update_item_metadata`` method (the exact same
 mechanism ``services/mailbox/sweep.py
-._create_or_reuse_domain_review_item`` already uses to accumulate
+._synchronize_domain_review_aggregate`` already uses to recompute
 ``candidate_message_count``/``first_seen_at``/etc.). Because nothing
 here is persisted/API-boundary-crossing, :class:`XeroSupplierCorrelationSummary`
 has no contract schema either — a documented judgment call, not an

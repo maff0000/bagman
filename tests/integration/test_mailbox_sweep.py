@@ -15,6 +15,7 @@ import pytest
 
 from core.api import BagmanCanonicalAPI
 from core.errors import ConflictError, PersistenceError
+from core.timestamps import to_contract_string
 from persistence.objects.memory_store import InMemoryObjectStore
 from services.evidence.intake.scanner import EvidenceSafetyScanner, ScanResult, ScanVerdict
 from services.mailbox.cursor import InMemoryMailboxFolderCursorRepository
@@ -1994,6 +1995,258 @@ def test_domain_review_item_accumulates_aggregate_stats_across_repeat_candidates
     assert item.metadata["candidate_message_count"] == 3
     assert item.metadata["first_seen_at"] == first_seen  # STILL unchanged
     assert item.metadata["attachment_bearing_count"] == 2
+
+
+# =======================================================================
+# Real, confirmed production defect fix — `first_seen_at`/`last_seen_at`
+# are now a DETERMINISTIC PROJECTION of canonical `MailboxMessage.
+# received_at` values (via `MailboxMessageRepository
+# .list_candidate_messages_for_domain`), never an incremental
+# accumulation that trusted provider PROCESSING order to also be
+# chronological order. A real Gmail historical sweep produced a
+# `MAILBOX_DOMAIN_REVIEW` item for `idealista.pt` with `last_seen_at`
+# (2026-09-19T08:20:28Z) chronologically EARLIER than `first_seen_at`
+# (2026-09-20T08:15:14Z) — Gmail's historical enumeration commonly
+# presents newer messages before older ones within one sweep round, and
+# the old code's `last_seen_at` just held whatever candidate was
+# PROCESSED most recently, not the latest in TIME. Tests below prove
+# the fix is genuinely order-independent, idempotent, and self-healing
+# — never a `min()`/`max()` patch bolted onto the old incremental logic.
+# =======================================================================
+
+
+def test_domain_review_first_last_seen_correct_when_newer_processed_before_older():
+    """Ordering proof #1 — mirrors the real confirmed defect exactly:
+    the chronologically NEWER candidate is processed FIRST, the OLDER
+    one second. `first_seen_at`/`last_seen_at` must still land on the
+    true chronological min/max, never on "whichever was processed
+    first/last"."""
+    h = Harness(allow_default_domain=False)
+    newer = _msg("m-newer", subject="Invoice", received_at=datetime(2026, 9, 20, 8, 15, 14, tzinfo=timezone.utc))
+    older = _msg("m-older", subject="Invoice", received_at=datetime(2026, 9, 19, 8, 20, 28, tzinfo=timezone.utc))
+    h.graph_client.queue_delta_result(
+        GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(newer, older), delta_link="d1")
+    )
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link="d-junk"))
+    run = h.sweep()
+    assert run.status == "SUCCEEDED"
+
+    items = h.needs_you_repo.list_needs_you_items(item_type=ITEM_TYPE_MAILBOX_DOMAIN_REVIEW)
+    assert len(items) == 1
+    item = items[0]
+    assert item.metadata["candidate_message_count"] == 2
+    assert item.metadata["first_seen_at"] == to_contract_string(older.received_at)
+    assert item.metadata["last_seen_at"] == to_contract_string(newer.received_at)
+
+
+def test_domain_review_first_last_seen_identical_result_regardless_of_presentation_order():
+    """Ordering proof #2 — the SAME two dates, presentation order
+    REVERSED (older processed first, newer second) relative to the
+    previous test. Must produce a chronologically IDENTICAL result —
+    the headline order-independence proof."""
+    h = Harness(allow_default_domain=False)
+    newer_at = datetime(2026, 9, 20, 8, 15, 14, tzinfo=timezone.utc)
+    older_at = datetime(2026, 9, 19, 8, 20, 28, tzinfo=timezone.utc)
+    older = _msg("m-older", subject="Invoice", received_at=older_at)
+    newer = _msg("m-newer", subject="Invoice", received_at=newer_at)
+    h.graph_client.queue_delta_result(
+        GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(older, newer), delta_link="d1")
+    )
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link="d-junk"))
+    run = h.sweep()
+    assert run.status == "SUCCEEDED"
+
+    items = h.needs_you_repo.list_needs_you_items(item_type=ITEM_TYPE_MAILBOX_DOMAIN_REVIEW)
+    assert len(items) == 1
+    item = items[0]
+    assert item.metadata["candidate_message_count"] == 2
+    assert item.metadata["first_seen_at"] == to_contract_string(older_at)
+    assert item.metadata["last_seen_at"] == to_contract_string(newer_at)
+
+
+def test_domain_review_first_last_seen_correct_across_three_shuffled_candidates():
+    """Ordering proof #3 — three distinct dates presented in a shuffled
+    (neither chronological nor reverse-chronological) order. The final
+    `first_seen_at`/`last_seen_at` must be the true min/max, independent
+    of presentation order."""
+    h = Harness(allow_default_domain=False)
+    middle_at = datetime(2026, 6, 15, 12, 0, 0, tzinfo=timezone.utc)
+    earliest_at = datetime(2026, 1, 3, 9, 30, 0, tzinfo=timezone.utc)
+    latest_at = datetime(2026, 9, 20, 8, 15, 14, tzinfo=timezone.utc)
+    middle = _msg("m-middle", subject="Invoice", received_at=middle_at)
+    earliest = _msg("m-earliest", subject="Invoice", received_at=earliest_at)
+    latest = _msg("m-latest", subject="Invoice", received_at=latest_at)
+    # Shuffled: middle, latest, earliest — neither ascending nor
+    # descending chronological order.
+    h.graph_client.queue_delta_result(
+        GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(middle, latest, earliest), delta_link="d1")
+    )
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link="d-junk"))
+    run = h.sweep()
+    assert run.status == "SUCCEEDED"
+
+    items = h.needs_you_repo.list_needs_you_items(item_type=ITEM_TYPE_MAILBOX_DOMAIN_REVIEW)
+    assert len(items) == 1
+    item = items[0]
+    assert item.metadata["candidate_message_count"] == 3
+    assert item.metadata["first_seen_at"] == to_contract_string(earliest_at)
+    assert item.metadata["last_seen_at"] == to_contract_string(latest_at)
+
+
+def test_domain_review_synchronize_twice_with_no_canonical_change_is_byte_identical():
+    """Idempotency proof #1 — calling the deterministic synchronization
+    function directly, twice in a row, against UNCHANGED canonical
+    candidate rows must produce byte-identical aggregate metadata both
+    times, and never a second/duplicate Needs You item."""
+    from services.mailbox.sweep import _synchronize_domain_review_aggregate
+
+    h = Harness(allow_default_domain=False)
+    msg1 = _msg(
+        "m1", subject="Invoice",
+        attachment_metadata=({"filename": "invoice.pdf", "content_type": "application/pdf", "size_bytes": 10},),
+    )
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(msg1,), delta_link="d1"))
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link="d-junk"))
+    run = h.sweep()
+    assert run.status == "SUCCEEDED"
+
+    message = h.message_repo.find_by_provider_id(h.mailbox.mailbox_id, "m1")
+    assert message is not None
+
+    first_result = _synchronize_domain_review_aggregate(
+        h.needs_you_repo, h.message_repo,
+        mailbox=h.mailbox, sender_domain="vendor.com", triggering_message=message, reason=message.discovery_reason,
+    )
+    second_result = _synchronize_domain_review_aggregate(
+        h.needs_you_repo, h.message_repo,
+        mailbox=h.mailbox, sender_domain="vendor.com", triggering_message=message, reason=message.discovery_reason,
+    )
+
+    assert dict(first_result.metadata) == dict(second_result.metadata)
+    items = h.needs_you_repo.list_needs_you_items(item_type=ITEM_TYPE_MAILBOX_DOMAIN_REVIEW)
+    assert len(items) == 1  # never a duplicate item
+    assert items[0].metadata["candidate_message_count"] == 1
+    assert items[0].metadata["attachment_bearing_count"] == 1
+
+
+def test_domain_review_duplicate_replay_through_ordinary_sweep_never_double_counts():
+    """Idempotency proof #2 — a candidate MailboxMessage already exists
+    (`CHECKED_NOT_CANDIDATE`, `discovery_candidate=True`) with its
+    domain-review item already correctly synchronized; a later sweep
+    round re-observes the SAME message (same immutable provider id).
+    `duplicates` behaves normally, but the domain-review aggregate must
+    remain EXACTLY the same — no counter inflation — and there must
+    still be exactly one Needs You item."""
+    h = Harness(allow_default_domain=False)
+    msg1 = _msg("m1", subject="Invoice")
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(msg1,), delta_link="d1"))
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link="d-junk"))
+    first = h.sweep()
+    assert first.status == "SUCCEEDED"
+    assert first.duplicates == 0
+
+    items = h.needs_you_repo.list_needs_you_items(item_type=ITEM_TYPE_MAILBOX_DOMAIN_REVIEW)
+    assert len(items) == 1
+    metadata_before = dict(items[0].metadata)
+    assert metadata_before["candidate_message_count"] == 1
+
+    # A second sweep round re-observes the exact same immutable message
+    # id (e.g. it is still present in the same folder).
+    msg1_replay = _msg("m1", subject="Invoice")
+    h.graph_client.queue_delta_result(
+        GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(msg1_replay,), delta_link="d2")
+    )
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link="d-junk-2"))
+    second = h.sweep()
+    assert second.status == "SUCCEEDED"
+    assert second.duplicates == 1
+
+    items = h.needs_you_repo.list_needs_you_items(item_type=ITEM_TYPE_MAILBOX_DOMAIN_REVIEW)
+    assert len(items) == 1  # still exactly one item
+    assert dict(items[0].metadata) == metadata_before  # byte-identical — never inflated
+    assert items[0].metadata["candidate_message_count"] == 1
+
+
+class _RaiseOnceThenDelegateNeedsYouRepository:
+    """Test-only wrapper around a real `InMemoryNeedsYouRepository` that
+    raises on its FIRST `create_needs_you_item` call only (simulating a
+    crash between a candidate `MailboxMessage` being durably persisted
+    and its `MAILBOX_DOMAIN_REVIEW` item being created/updated — the
+    exact scenario the CD-6 lifecycle-hardening `except Exception` in
+    `run_sweep` exists to terminalize safely), then delegates every
+    subsequent call (including this and every other method) straight
+    through to the real inner repository."""
+
+    def __init__(self, inner):
+        self._inner = inner
+        self._create_calls = 0
+
+    def create_needs_you_item(self, **kwargs):
+        self._create_calls += 1
+        if self._create_calls == 1:
+            raise RuntimeError("simulated Needs You item creation failure")
+        return self._inner.create_needs_you_item(**kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+def test_domain_review_self_heals_after_persisted_candidate_but_failed_item_creation():
+    """Failure-recovery proof — the architect's own named scenario: (a)
+    a candidate `MailboxMessage` is durably persisted; (b) the Needs You
+    create step is made to raise; (c) the sweep terminalizes `FAILED`
+    under the CD-6 lifecycle hardening (never an unhandled crash); (d) a
+    SECOND sweep round replays the same message, hits the duplicate
+    branch, and the self-heal there synchronizes/creates the missing
+    review item — with `candidate_message_count == 1` (never 2, proving
+    the SAME canonical message is never double-counted across this
+    failure/replay sequence), no reclassification (the item's own
+    `reason`/`confidence_reason` still reflects the ORIGINALLY-persisted
+    `discovery_reason`), and zero `EvidenceItem` created throughout
+    (this is an UNKNOWN-domain candidate — never a MIME fetch)."""
+    h = Harness(allow_default_domain=False)
+    h.needs_you_repo = _RaiseOnceThenDelegateNeedsYouRepository(h.needs_you_repo)
+
+    msg1 = _msg("m1", subject="Invoice")
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(msg1,), delta_link="d1"))
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link="d-junk"))
+    first = h.sweep()
+    assert first.status == "FAILED"
+    assert first.error_code == SweepFailureReason.UNEXPECTED_ERROR
+
+    # (a) The candidate MailboxMessage row IS durably persisted despite
+    # the whole-sweep failure.
+    message = h.message_repo.find_by_provider_id(h.mailbox.mailbox_id, "m1")
+    assert message is not None
+    assert message.ingestion_status == INGESTION_STATUS_CHECKED_NOT_CANDIDATE
+    assert message.discovery_candidate is True
+    original_reason = message.discovery_reason
+    assert original_reason is not None
+
+    # No review item exists yet — the create call that would have made
+    # one raised.
+    assert h.needs_you_repo._inner.list_needs_you_items(item_type=ITEM_TYPE_MAILBOX_DOMAIN_REVIEW) == []
+    # Zero EvidenceItem created throughout — an UNKNOWN-domain candidate
+    # never reaches a MIME fetch/evidence-create path at all.
+    assert h.api.evidence_repository.list_evidence() == []
+
+    # (d) Second sweep round replays the SAME immutable message id.
+    msg1_replay = _msg("m1", subject="Invoice")
+    h.graph_client.queue_delta_result(
+        GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(msg1_replay,), delta_link="d2")
+    )
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link="d-junk-2"))
+    second = h.sweep()
+    assert second.status == "SUCCEEDED"
+    assert second.duplicates == 1
+
+    items = h.needs_you_repo._inner.list_needs_you_items(item_type=ITEM_TYPE_MAILBOX_DOMAIN_REVIEW)
+    assert len(items) == 1  # self-healed — exactly one item, never zero, never two
+    item = items[0]
+    assert item.metadata["candidate_message_count"] == 1  # the SAME canonical message, never double-counted
+    assert item.metadata["reason"] == original_reason  # never reclassified
+    assert item.metadata["confidence_reason"] == original_reason
+    assert h.api.evidence_repository.list_evidence() == []  # still zero, end to end
 
 
 # =======================================================================

@@ -418,8 +418,8 @@ class NeedsYouRepository(abc.ABC):
         .set_accounting_period_configuration``'s own "narrow,
         single-purpose update, not a general PATCH" pattern: this method
         exists for exactly one real caller
-        (``services.mailbox.sweep._create_or_reuse_domain_review_item``'s
-        own aggregate-stats accumulation on a REUSED, still-``OPEN``
+        (``services.mailbox.sweep._synchronize_domain_review_aggregate``'s
+        own deterministic aggregate-recomputation on a still-``OPEN``
         ``MAILBOX_DOMAIN_REVIEW`` item — see that function's own
         docstring), not a general-purpose metadata PATCH endpoint.
 

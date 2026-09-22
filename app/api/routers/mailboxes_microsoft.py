@@ -553,8 +553,8 @@ async def list_microsoft_domain_rules(mailbox_id: str) -> dict[str, Any]:
 def _parse_metadata_timestamp(value: Optional[str]) -> Optional[datetime]:
     """`item.metadata["first_seen_at"]`/`["last_seen_at"]` are stored as
     contract (RFC 3339, `Z`-suffixed) strings — see
-    `services/mailbox/sweep.py::_create_or_reuse_domain_review_item`'s
-    own `received_at_str` writes. Mirrors the established
+    `services/mailbox/sweep.py::_synchronize_domain_review_aggregate`'s
+    own `to_contract_string(...)` writes. Mirrors the established
     `datetime.fromisoformat(value.replace("Z", "+00:00"))` parse-back
     convention this codebase already uses elsewhere for the identical
     shape (e.g. `services/xero/client.py`,

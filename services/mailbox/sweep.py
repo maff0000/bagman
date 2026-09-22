@@ -694,82 +694,123 @@ def _find_open_domain_review_item(
     return None
 
 
-def _create_or_reuse_domain_review_item(
+def _synchronize_domain_review_aggregate(
     needs_you_repository: NeedsYouRepository,
+    message_repository: MailboxMessageRepository,
     *,
     mailbox: MailboxSource,
     sender_domain: str,
-    message: MailboxMessage,
+    triggering_message: MailboxMessage,
     reason: str,
 ):
-    """Create a fresh ``MAILBOX_DOMAIN_REVIEW`` item for the first
-    candidate seen from ``(mailbox_id, sender_domain)``, or — operational
-    addendum, ahead of the first real large historical sweep — accumulate
-    live aggregate stats on the SAME still-``OPEN`` item when a second,
-    third, ... candidate from the same still-unresolved domain is seen
-    (previously this reuse path returned the existing item completely
-    unchanged, so a domain with 40 candidate messages looked identical,
-    in the item's own metadata, to one with exactly 1 — the architect's
-    own operational addendum requires the item to say honestly how many
-    candidates are actually waiting behind it).
+    """Deterministic projection of canonical, currently-eligible
+    candidate ``MailboxMessage`` rows for ``(mailbox.mailbox_id,
+    sender_domain)`` — via ``MailboxMessageRepository
+    .list_candidate_messages_for_domain``, the SAME canonical query
+    :func:`reprocess_all_historical_candidates_for_domain` already uses
+    — onto that domain's OPEN ``MAILBOX_DOMAIN_REVIEW`` item's aggregate
+    metadata (or a freshly-created item, if none is currently OPEN — see
+    "Missing-item self-heal" below). Never increments a stored counter
+    and never assumes processing/presentation order reflects
+    chronological order — every call recomputes the FULL aggregate from
+    canonical persisted state, so calling this function twice against
+    UNCHANGED canonical rows produces byte-identical metadata both
+    times.
 
-    Accumulated fields (see ``services.needs_you.needs_you.NeedsYouItem
-    .metadata``'s own now-open-ended shape):
+    **Supersedes the old incremental-accumulation design** (formerly
+    ``_create_or_reuse_domain_review_item``), which updated a REUSED
+    item by incrementing a stored counter and blindly overwriting
+    ``last_seen_at`` with whatever candidate happened to be PROCESSED
+    on this particular call — silently wrong whenever a provider's own
+    historical enumeration order is not itself chronological. This was
+    a real, confirmed production defect: a real Gmail historical sweep
+    produced a domain-review item with ``last_seen_at`` chronologically
+    EARLIER than ``first_seen_at``, because Gmail's historical
+    enumeration commonly presents newer messages before older ones
+    within a single sweep round — the old code's ``last_seen_at`` held
+    whatever was processed most recently in PROCESSING order, never the
+    latest in TIME order.
 
-    * ``candidate_message_count`` — how many candidate messages from
-      this domain have been seen so far, this and prior sweeps.
-    * ``first_seen_at`` — the EARLIEST candidate's ``received_at``, set
-      once at creation, never changed on reuse.
-    * ``last_seen_at`` — the LATEST candidate's ``received_at``, updated
-      on every reuse.
-    * ``attachment_bearing_count`` — how many of the candidates so far
-      had an attachment.
+    Recomputed fields — unambiguous semantics (the architect's own
+    explicit correction: these are the candidate MESSAGES' own
+    timestamps, nothing else):
 
-    Populated once, at creation only, never changed on reuse (a REUSE
-    call never re-derives these — they describe the domain/mailbox
-    itself, not the individual candidate that triggered a reuse):
+    * ``candidate_message_count`` — ``len(candidates)``, the count of
+      every currently-eligible candidate on record for this domain.
+    * ``first_seen_at`` — the MINIMUM ``received_at`` across every
+      candidate ``MailboxMessage`` currently on record for this domain
+      — the earliest candidate MESSAGE's own receipt time. NOT BAGMAN's
+      own discovery/observation time, NOT this Needs You item's own
+      creation/update time, and NOT provider enumeration order.
+    * ``last_seen_at`` — the MAXIMUM ``received_at`` across the same
+      set — identical semantics, latest instead of earliest.
+    * ``attachment_bearing_count`` — how many of those candidates have
+      ``has_attachments``.
+
+    Populated only when creating a fresh item, never re-derived on a
+    later synchronize call (they describe the domain/mailbox itself,
+    not any one candidate):
 
     * ``proposed_destination_entity_id`` — the mailbox's own
       ``default_entity_id`` HINT, if set, else ``None``. Deliberately
       labelled here as a non-authoritative HINT ONLY — mirrors
       ``services.mailbox.mailbox``'s own established "``default_entity_id``
       is only ever an optional DISPLAY hint... never ownership
-      assertion" doctrine (see that module's own docstring): this is
-      never a recommendation or a pre-filled answer BAGMAN is confident
-      in, purely "this mailbox happens to have this hint set, for
-      whatever it is worth to the operator reviewing this item".
-    * ``proposed_processor_hint`` — always ``None``. Nothing in this
-      slice informs a real processor hint for an unresolved domain; this
-      key exists so a future producer that DOES know one has a place to
-      put it without a contract/metadata-shape change, but this
-      delivery must never invent one.
-    * ``confidence_reason`` — a short, plain string reusing
+      assertion" doctrine (see that module's own docstring).
+    * ``proposed_processor_hint`` — always ``None`` (see the old
+      docstring's identical note — unchanged by this correction).
+    * ``confidence_reason`` — ``reason``, as supplied by the caller —
+      for the ordinary discovery call site, this is
       ``services.mailbox.discovery_signals.evaluate_discovery_candidate``'s
-      own ``DiscoverySignalResult.reason`` (the bounded, non-AI,
-      keyword-level heuristic's own real, honest explanation of what it
-      matched — e.g. "subject contains keyword 'invoice'") — never a
-      fabricated or more specific claim than that bounded heuristic
-      actually determined.
-    """
-    existing = _find_open_domain_review_item(needs_you_repository, mailbox_id=mailbox.mailbox_id, sender_domain=sender_domain)
-    received_at_str = to_contract_string(message.received_at)
+      own real, honest explanation; for the duplicate/self-heal call
+      site (see :func:`run_sweep`'s own duplicate-branch handling), this
+      is the ALREADY-PERSISTED ``discovery_reason`` off the existing
+      ``MailboxMessage`` row — never a freshly-reclassified value.
 
+    Missing-item self-heal: if no OPEN item currently exists for this
+    domain — either a genuinely new domain, or a prior sweep that
+    durably persisted a candidate ``MailboxMessage`` row but crashed
+    before ever creating/updating its Needs You item (the CD-6
+    lifecycle-hardening ``except Exception`` in :func:`run_sweep`
+    catches exactly this) — a fresh item is created here, using
+    ``triggering_message`` as its source object. Safe specifically
+    because this is a pure recomputation from canonical rows, never an
+    increment: creating the item late (on a replay) still yields the
+    exact same aggregate a timely creation would have.
+    """
+    candidates = message_repository.list_candidate_messages_for_domain(
+        mailbox_id=mailbox.mailbox_id, sender_domain=sender_domain
+    )
+    # `triggering_message` is itself always a member of `candidates` by
+    # construction — it was just persisted (or re-observed) as
+    # `discovery_candidate is True` / `CHECKED_NOT_CANDIDATE` before
+    # this function is ever called — so `candidates` should never
+    # genuinely be empty here. Defended anyway: never a bare
+    # `min()`/`max()` crash on a surprising empty sequence.
+    if not candidates:
+        candidates = [triggering_message]
+
+    candidate_count = len(candidates)
+    first_seen_at = min(m.received_at for m in candidates)
+    last_seen_at = max(m.received_at for m in candidates)
+    attachment_bearing_count = sum(1 for m in candidates if m.has_attachments)
+
+    existing = _find_open_domain_review_item(needs_you_repository, mailbox_id=mailbox.mailbox_id, sender_domain=sender_domain)
     if existing is not None:
-        current_count = existing.metadata.get("candidate_message_count") or 1
-        current_attachment_count = existing.metadata.get("attachment_bearing_count") or 0
         return needs_you_repository.update_item_metadata(
             existing.item_id,
             metadata_updates={
-                "candidate_message_count": current_count + 1,
-                "last_seen_at": received_at_str,
-                "attachment_bearing_count": current_attachment_count + (1 if message.has_attachments else 0),
+                "candidate_message_count": candidate_count,
+                "first_seen_at": to_contract_string(first_seen_at),
+                "last_seen_at": to_contract_string(last_seen_at),
+                "attachment_bearing_count": attachment_bearing_count,
             },
         )
 
     return needs_you_repository.create_needs_you_item(
         item_type=ITEM_TYPE_MAILBOX_DOMAIN_REVIEW,
         domain="MAILBOX",
-        source_object_reference=message.mailbox_message_id,
+        source_object_reference=triggering_message.mailbox_message_id,
         question=(
             f"New invoice/accounting-document source detected — {mailbox.display_name} "
             f"({mailbox.email_address}), domain '{sender_domain}'"
@@ -780,14 +821,14 @@ def _create_or_reuse_domain_review_item(
             "mailbox_id": mailbox.mailbox_id,
             "email_address": mailbox.email_address,
             "sender_domain": sender_domain,
-            "triggering_mailbox_message_id": message.mailbox_message_id,
+            "triggering_mailbox_message_id": triggering_message.mailbox_message_id,
             "reason": reason,
-            "candidate_message_count": 1,
-            "first_seen_at": received_at_str,
-            "last_seen_at": received_at_str,
-            "attachment_bearing_count": 1 if message.has_attachments else 0,
+            "candidate_message_count": candidate_count,
+            "first_seen_at": to_contract_string(first_seen_at),
+            "last_seen_at": to_contract_string(last_seen_at),
+            "attachment_bearing_count": attachment_bearing_count,
             # Non-authoritative HINT only — see this function's own
-            # docstring's "Populated once" section above.
+            # docstring's "Populated only when creating" section above.
             "proposed_destination_entity_id": mailbox.default_entity_id,
             "proposed_processor_hint": None,
             "confidence_reason": reason,
@@ -1108,7 +1149,7 @@ def run_sweep(
                         existing = message_repository.find_by_provider_id(mailbox.mailbox_id, msg.immutable_id)
                         if existing is not None and existing.ingestion_status in FINAL_INGESTION_STATUSES:
                             duplicates += 1
-                            message_repository.record_observation(
+                            reobserved_message, _ = message_repository.record_observation(
                                 mailbox_id=mailbox.mailbox_id,
                                 provider_kind=mailbox.provider_kind,
                                 immutable_provider_message_id=msg.immutable_id,
@@ -1126,6 +1167,43 @@ def run_sweep(
                                 attachment_metadata=_attachment_metadata_dicts(msg.attachment_metadata),
                                 auth_signals=dict(msg.auth_signals),
                             )
+                            # Missing-review-item self-heal (architect
+                            # ruling, section 7): a replayed candidate
+                            # message short-circuits here on every
+                            # ordinary re-observation (`CHECKED_NOT_
+                            # CANDIDATE` is itself a member of
+                            # `FINAL_INGESTION_STATUSES`), so if the
+                            # ORIGINAL sweep persisted this candidate row
+                            # successfully but then failed to create/
+                            # update its `MAILBOX_DOMAIN_REVIEW` item
+                            # (e.g. a crash between those two steps, now
+                            # correctly caught by the CD-6 lifecycle-
+                            # hardening `except Exception` in this
+                            # function), a replay must not leave that
+                            # aggregate permanently missing/stale. Safe
+                            # to call unconditionally on every duplicate
+                            # of an eligible candidate — never re-runs
+                            # `evaluate_discovery_candidate`, never
+                            # reclassifies (`existing.discovery_reason`
+                            # is the ALREADY-PERSISTED reason), and is a
+                            # no-op in effect on a genuine duplicate
+                            # (the synchronize function recomputes from
+                            # canonical rows, which already included this
+                            # message, not from a "seen this sweep round"
+                            # counter).
+                            if (
+                                existing.ingestion_status == INGESTION_STATUS_CHECKED_NOT_CANDIDATE
+                                and existing.discovery_candidate is True
+                                and sender_domain
+                            ):
+                                _synchronize_domain_review_aggregate(
+                                    needs_you_repository,
+                                    message_repository,
+                                    mailbox=mailbox,
+                                    sender_domain=sender_domain,
+                                    triggering_message=reobserved_message,
+                                    reason=existing.discovery_reason,
+                                )
                             continue
 
                         # -- Stage A (always) + Stage B (the domain gate) --
@@ -1227,11 +1305,12 @@ def run_sweep(
                                 discovery_checked_at=resolved_now,
                             )
                             if signal.is_candidate and sender_domain:
-                                _create_or_reuse_domain_review_item(
+                                _synchronize_domain_review_aggregate(
                                     needs_you_repository,
+                                    message_repository,
                                     mailbox=mailbox,
                                     sender_domain=sender_domain,
-                                    message=message,
+                                    triggering_message=message,
                                     reason=signal.reason,
                                 )
                             continue
