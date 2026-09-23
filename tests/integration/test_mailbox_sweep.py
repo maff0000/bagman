@@ -4922,3 +4922,266 @@ def test_subject_blacklist_repeat_with_different_processor_hint_is_a_genuine_sec
     # is the SECOND call's own event.
     assert matching[0].payload["previous_policy"] == "BLACKLIST"
     assert matching[0].payload["new_policy"] == "BLACKLIST"
+
+
+# =======================================================================
+# CD-6 GUI-operations-foundation follow-on hardening delta — item 4:
+# eligible-candidate guard ordering fix. The guard must never fire for
+# an idempotent REPLAY of an ALLOW decision already durably applied
+# (RESOLVED self-heal, or an OPEN resume/retry of an identical rule),
+# only for a genuine create (no exact rule yet) or change (an exact
+# rule exists with different semantics) of a subject rule.
+# =======================================================================
+
+
+def test_subject_allow_resolved_identical_vantage_replay_self_heals_without_422():
+    """Item 4 — the real observed production defect: the Vantage
+    "Monthly Statement" subject rule processes all 5 of its own
+    candidates, the item resolves to RESOLVED, and zero eligible
+    candidates remain (all 5 left the "currently eligible" pool by
+    being ingested). Submitting the EXACT SAME ALLOW resolution again
+    must succeed as the pre-existing legacy self-heal no-op — before
+    this fix, the eligible-candidate guard incorrectly ran first and
+    raised `ValidationError` (422) here, since zero currently-eligible
+    candidates match the predicate any more."""
+    from services.mailbox.review_resolution import resolve_domain_review
+
+    h = Harness(allow_default_domain=False)
+    domain = "vantage-replay.example"
+    entity_id = h.entity.entity_id
+    statement_messages = tuple(
+        _msg(
+            f"vr-statement-{i}", subject="Monthly Statement", sender_address=f"statements@{domain}",
+            received_at=datetime(2024, 5, i, 12, 0, tzinfo=timezone.utc),
+        )
+        for i in range(1, 6)
+    )
+    h.graph_client.queue_delta_result(
+        GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=statement_messages, delta_link="d1")
+    )
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link="d-junk"))
+    h.sweep()
+    item = _open_domain_review_item(h, domain)
+
+    for _ in range(5):
+        h.graph_client.queue_headers_result(_headers_ok())
+        h.graph_client.queue_content_result(_content())
+
+    kwargs = dict(
+        needs_you_repository=h.needs_you_repo, mailbox_message_repository=h.message_repo,
+        mailbox_domain_rule_repository=h.domain_rule_repo, entity_repository=h.api.entity_repository,
+        api=h.api, object_store=h.object_store, scanner=h.scanner, adapter=h.adapter, mailbox=h.mailbox,
+        mailbox_id=h.mailbox.mailbox_id, mailbox_source_id=h.source_id, item_id=item.item_id,
+        actor_type="SYSTEM", actor_id="test", decision="ALLOW", destination_entity_id=entity_id,
+        destination_mode="FIXED", match_mode="EXACT_DOMAIN_SUBJECT", processor_hint=None, sender_address=None,
+        subject_predicate_type="EXACT", subject_predicate_value="Monthly Statement",
+    )
+    first = resolve_domain_review(**kwargs)
+    assert first["needs_you_item"]["status"] == "RESOLVED"
+    assert len(first["reprocessed_messages"]) == 5
+    assert len(h.api.evidence_repository.list_evidence()) == 5
+    rule_id = first["mailbox_domain_rule"]["rule_id"]
+    must_read_events_before = h.api.audit_repository.list_recent(limit=50, event_type_prefix="MAILBOX_DOMAIN_RULE_MUST_READ")
+    assert len(must_read_events_before) == 1
+
+    # Zero currently-eligible candidates remain — every one of the 5 was
+    # ingested and left the "eligible" pool.
+    remaining_eligible = h.message_repo.list_candidate_messages_for_domain(
+        mailbox_id=h.mailbox.mailbox_id, sender_domain=domain
+    )
+    assert remaining_eligible == []
+
+    # The EXACT SAME ALLOW resolution again.
+    second = resolve_domain_review(**kwargs)
+
+    assert second["needs_you_item"]["status"] == "RESOLVED"
+    assert second["needs_you_item"]["resolved_at"] == first["needs_you_item"]["resolved_at"]
+    assert second["mailbox_domain_rule"]["rule_id"] == rule_id
+    assert second["mailbox_domain_rule"]["created_at"] == first["mailbox_domain_rule"]["created_at"]
+    assert second["mailbox_domain_rule"]["updated_at"] == first["mailbox_domain_rule"]["updated_at"]
+    assert second["mailbox_domain_rule"]["approved_at"] == first["mailbox_domain_rule"]["approved_at"]
+    assert second["reprocessed_messages"] == []
+    assert len(h.graph_client.headers_calls) == 5  # unchanged — zero new provider calls
+    assert len(h.graph_client.content_calls) == 5
+    assert len(h.api.evidence_repository.list_evidence()) == 5  # unchanged — zero new EvidenceItem
+    must_read_events_after = h.api.audit_repository.list_recent(limit=50, event_type_prefix="MAILBOX_DOMAIN_RULE_MUST_READ")
+    assert len(must_read_events_after) == 1  # never duplicated
+
+
+def test_subject_allow_open_identical_replay_with_zero_current_matches_resumes_without_422():
+    """Item 4 — the load-bearing partial-residual case: after a subject
+    ALLOW processes its own single matching candidate (m1) while a
+    non-matching candidate (m2) keeps the item OPEN as residual, a
+    replay of the EXACT SAME decision hits zero currently-eligible
+    matching candidates (m1 already consumed, m2 never matched in the
+    first place) — this must NOT 422; it is a legitimate resume/reuse of
+    the existing rule with residual correctly recomputed."""
+    from services.mailbox.domain_rule import subject_matches_predicate
+    from services.mailbox.review_resolution import resolve_domain_review
+
+    h = Harness(allow_default_domain=False)
+    domain = "open-replay-zero-match.example"
+    pdf_attachment = ({"filename": "order.pdf", "content_type": "application/pdf"},)
+    m1 = _msg(
+        "orzm-m1", subject="Order confirmed: iPad", sender_address=f"ebay@{domain}", attachment_metadata=pdf_attachment,
+        received_at=datetime(2024, 5, 1, 9, 0, tzinfo=timezone.utc),
+    )
+    m2 = _msg(
+        "orzm-m2", subject="Order delivered: iPad", sender_address=f"ebay@{domain}", attachment_metadata=pdf_attachment,
+        received_at=datetime(2024, 5, 1, 9, 1, tzinfo=timezone.utc),
+    )
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(m1, m2), delta_link="d1"))
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link="d-junk"))
+    h.sweep()
+    item = _open_domain_review_item(h, domain)
+
+    h.graph_client.queue_headers_result(_headers_ok())
+    h.graph_client.queue_content_result(_content())
+
+    kwargs = dict(
+        needs_you_repository=h.needs_you_repo, mailbox_message_repository=h.message_repo,
+        mailbox_domain_rule_repository=h.domain_rule_repo, entity_repository=h.api.entity_repository,
+        api=h.api, object_store=h.object_store, scanner=h.scanner, adapter=h.adapter, mailbox=h.mailbox,
+        mailbox_id=h.mailbox.mailbox_id, mailbox_source_id=h.source_id, item_id=item.item_id,
+        actor_type="SYSTEM", actor_id="test", decision="ALLOW", destination_entity_id=None,
+        destination_mode="REVIEW_REQUIRED", match_mode="EXACT_DOMAIN_SUBJECT", processor_hint=None,
+        sender_address=None, subject_predicate_type="STARTS_WITH", subject_predicate_value="Order confirmed:",
+    )
+    first = resolve_domain_review(**kwargs)
+    assert first["needs_you_item"]["status"] == "OPEN"
+    assert first["needs_you_item"]["metadata"]["remaining_candidate_message_count"] == 1
+    m1_after_first = h.message_repo.find_by_provider_id(h.mailbox.mailbox_id, "orzm-m1")
+    assert m1_after_first.ingestion_status == "INGESTED"
+    rule_id = first["mailbox_domain_rule"]["rule_id"]
+    must_read_events_before = h.api.audit_repository.list_recent(limit=50, event_type_prefix="MAILBOX_DOMAIN_RULE_MUST_READ")
+    assert len(must_read_events_before) == 1
+
+    # Zero currently-eligible candidates match the predicate any more —
+    # m1 was consumed by the first call, m2 never matched in the first
+    # place.
+    eligible = h.message_repo.list_candidate_messages_for_domain(mailbox_id=h.mailbox.mailbox_id, sender_domain=domain)
+    assert len(eligible) == 1
+    assert eligible[0].immutable_provider_message_id == "orzm-m2"
+    assert not any(
+        subject_matches_predicate(c.subject, predicate_type="STARTS_WITH", predicate_value="order confirmed:")
+        for c in eligible
+    )
+
+    # Exact replay of the same decision — must succeed, not 422.
+    second = resolve_domain_review(**kwargs)
+
+    assert second["mailbox_domain_rule"]["rule_id"] == rule_id
+    assert second["mailbox_domain_rule"]["created_at"] == first["mailbox_domain_rule"]["created_at"]
+    assert second["mailbox_domain_rule"]["updated_at"] == first["mailbox_domain_rule"]["updated_at"]
+    assert second["mailbox_domain_rule"]["approved_at"] == first["mailbox_domain_rule"]["approved_at"]
+    assert h.graph_client.headers_calls == ["orzm-m1"]  # m1 never re-fetched
+    assert h.graph_client.content_calls == ["orzm-m1"]
+    assert second["reprocessed_messages"] == []
+    must_read_events_after = h.api.audit_repository.list_recent(limit=50, event_type_prefix="MAILBOX_DOMAIN_RULE_MUST_READ")
+    assert len(must_read_events_after) == 1  # never duplicated
+    assert second["needs_you_item"]["status"] == "OPEN"
+    assert second["needs_you_item"]["metadata"]["remaining_candidate_message_count"] == 1
+
+
+def test_subject_allow_new_decision_zero_match_rejected_before_any_mutation():
+    """Item 4 — case C proof (safety-guard-preserved): a genuinely NEW
+    subject-rule identity (no exact rule exists yet at this identity)
+    with zero currently-eligible matching candidates must still be
+    rejected BEFORE any mutation — the guard remains fully enforced for
+    a genuine create. Directly proves repository state is byte-
+    identical to before the call, not merely that an exception was
+    raised."""
+    from core.errors import ValidationError as _ValidationError
+    from services.mailbox.review_resolution import resolve_domain_review
+
+    h = Harness(allow_default_domain=False)
+    domain = "new-decision-zero-match.example"
+    h.graph_client.queue_delta_result(
+        GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(_msg("ndzm-1", subject="Invoice #1", sender_address=f"billing@{domain}"),), delta_link="d1")
+    )
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link="d-junk"))
+    h.sweep()
+    item = _open_domain_review_item(h, domain)
+    item_before = h.needs_you_repo.get_needs_you_item(item.item_id)
+    rules_before = h.domain_rule_repo.list_rules(mailbox_id=h.mailbox.mailbox_id)
+    audit_before = h.api.audit_repository.list_recent(limit=50, event_type_prefix="MAILBOX_DOMAIN_RULE_MUST_READ")
+
+    with pytest.raises(_ValidationError):
+        resolve_domain_review(
+            needs_you_repository=h.needs_you_repo, mailbox_message_repository=h.message_repo,
+            mailbox_domain_rule_repository=h.domain_rule_repo, entity_repository=h.api.entity_repository,
+            api=h.api, object_store=h.object_store, scanner=h.scanner, adapter=h.adapter, mailbox=h.mailbox,
+            mailbox_id=h.mailbox.mailbox_id, mailbox_source_id=h.source_id, item_id=item.item_id,
+            actor_type="SYSTEM", actor_id="test", decision="ALLOW", destination_entity_id=None,
+            destination_mode="REVIEW_REQUIRED", match_mode="EXACT_DOMAIN_SUBJECT", processor_hint=None,
+            sender_address=None, subject_predicate_type="EXACT", subject_predicate_value="never observed at all",
+        )
+
+    item_after = h.needs_you_repo.get_needs_you_item(item.item_id)
+    assert item_after.status == item_before.status == "OPEN"
+    assert item_after.metadata == item_before.metadata
+    rules_after = h.domain_rule_repo.list_rules(mailbox_id=h.mailbox.mailbox_id)
+    assert len(rules_after) == len(rules_before) == 0
+    audit_after = h.api.audit_repository.list_recent(limit=50, event_type_prefix="MAILBOX_DOMAIN_RULE_MUST_READ")
+    assert len(audit_after) == len(audit_before) == 0
+    assert h.graph_client.headers_calls == []
+    assert h.graph_client.content_calls == []
+
+
+def test_subject_allow_transition_zero_match_rejected_existing_blacklist_untouched():
+    """Item 4 — case D proof (safety-guard-preserved): an existing exact
+    subject rule at BLACKLIST, with the operator attempting a genuine
+    transition to ALLOW/MUST_READ at the SAME predicate identity, but
+    zero currently-eligible candidates match that predicate — the guard
+    remains fully enforced for a genuine transition. The pre-existing
+    BLACKLIST rule must be completely untouched afterward (same policy,
+    same timestamps)."""
+    from core.errors import ValidationError as _ValidationError
+    from services.mailbox.review_resolution import resolve_domain_review
+
+    h = Harness(allow_default_domain=False)
+    domain = "transition-zero-match.example"
+    noise_attachment = ({"filename": "flyer.pdf", "content_type": "application/pdf"},)
+    h.graph_client.queue_delta_result(
+        GraphDeltaPageResult(
+            status=GraphOutcomeStatus.OK,
+            messages=(_msg("tzm-1", subject="Weekly Newsletter", sender_address=f"news@{domain}", attachment_metadata=noise_attachment),),
+            delta_link="d1",
+        )
+    )
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link="d-junk"))
+    h.sweep()
+    item = _open_domain_review_item(h, domain)
+
+    # A pre-existing BLACKLIST rule at a subject identity that no
+    # currently eligible candidate at this domain matches — injected
+    # directly at the repository, mirroring this file's own established
+    # "simulate a pre-existing rule state" pattern (see e.g.
+    # `test_resolve_domain_review_allow_open_item_conflicts_on_a_pre_existing_differently_configured_exact_rule`).
+    existing_rule = h.domain_rule_repo.upsert_rule(
+        mailbox_id=h.mailbox.mailbox_id, sender_domain=domain, match_mode="EXACT_DOMAIN_SUBJECT",
+        policy="BLACKLIST", destination_entity_id=None, destination_mode=None, source="OPERATOR",
+        subject_predicate_type="EXACT", subject_predicate_value="never observed at all",
+    )
+
+    with pytest.raises(_ValidationError):
+        resolve_domain_review(
+            needs_you_repository=h.needs_you_repo, mailbox_message_repository=h.message_repo,
+            mailbox_domain_rule_repository=h.domain_rule_repo, entity_repository=h.api.entity_repository,
+            api=h.api, object_store=h.object_store, scanner=h.scanner, adapter=h.adapter, mailbox=h.mailbox,
+            mailbox_id=h.mailbox.mailbox_id, mailbox_source_id=h.source_id, item_id=item.item_id,
+            actor_type="SYSTEM", actor_id="test", decision="ALLOW", destination_entity_id=None,
+            destination_mode="REVIEW_REQUIRED", match_mode="EXACT_DOMAIN_SUBJECT", processor_hint=None,
+            sender_address=None, subject_predicate_type="EXACT", subject_predicate_value="never observed at all",
+        )
+
+    refreshed_rule = h.domain_rule_repo.get_rule(existing_rule.rule_id)
+    assert refreshed_rule.policy == "BLACKLIST"
+    assert refreshed_rule.updated_at == existing_rule.updated_at
+    assert refreshed_rule.created_at == existing_rule.created_at
+    assert h.needs_you_repo.get_needs_you_item(item.item_id).status == "OPEN"
+    audit_events = h.api.audit_repository.list_recent(limit=50, event_type_prefix="MAILBOX_DOMAIN_RULE_MUST_READ")
+    matching = [e for e in audit_events if e.payload.get("needs_you_item_id") == item.item_id]
+    assert len(matching) == 0
+    assert h.graph_client.headers_calls == []
+    assert h.graph_client.content_calls == []

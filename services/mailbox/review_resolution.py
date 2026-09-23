@@ -519,6 +519,67 @@ def resolve_domain_review(
       NORMALLY is the item finally resolved
       (``needs_you_repository.resolve_needs_you_item(..., new_status="RESOLVED", ...)``)
       — never before.
+
+    ``decision="ALLOW"`` with ``match_mode == "EXACT_DOMAIN_SUBJECT"``
+    — eligible-candidate guard ordering fix (CD-6 GUI-operations-
+    foundation follow-on hardening delta, item 4). The eligible-
+    candidate guard below (the "no currently eligible candidate matches
+    this subject predicate" check) exists to stop a subject rule being
+    CREATED or CHANGED on zero current evidence — it must never fire for
+    an idempotent REPLAY of a decision already durably applied, or a
+    genuinely stranded ``RESOLVED`` legacy item could never self-heal
+    once its own subject rule had successfully finished processing all
+    of its own matching candidates (they leave the "currently eligible"
+    pool by being ingested), and a genuine OPEN partial-residual
+    resume/retry could spuriously 422 once its own rule's matches were
+    already consumed on an earlier attempt. So, BEFORE the guard runs,
+    this reuses ``previous_rule`` (already fetched above, via
+    ``find_exact`` at this EXACT identity, for audit purposes — no
+    mutation happens between that lookup and this one, so re-querying
+    would only ever return the identical row) to classify the request
+    into exactly one of four cases:
+
+    * ``item.status == "RESOLVED"`` — the guard is skipped
+      unconditionally, whether or not the resolution actually matches.
+      A matching resolution falls straight through to the legacy
+      self-heal path below (requiring zero currently-eligible matching
+      candidates would defeat the entire point of self-heal — a
+      candidate this exact rule already finished governing is, by
+      definition, no longer "eligible"). A DIFFERING resolution is
+      already a ``ConflictError`` via the unchanged check immediately
+      below this one — the guard must never preempt that with a
+      misleading ``ValidationError`` instead.
+    * ``item.status == "OPEN"`` and ``previous_rule`` already exists,
+      is ``POLICY_MUST_READ``, and is semantically IDENTICAL to this
+      request (mirrors the ``identical`` comparison the OPEN-item
+      reuse-vs-conflict check below already performs, field-for-field)
+      — a resume/retry of an already-durable decision. The guard is
+      skipped: this reuses the existing rule (never re-``upsert_rule``d)
+      and still runs the governed historical backfill below, which
+      correctly processes any genuinely-matching-but-not-yet-processed
+      candidate (e.g. one that hit a provider interruption on a prior
+      attempt) even though zero OTHER currently-eligible candidates
+      remain.
+    * ``item.status == "OPEN"`` and no rule exists yet at this identity
+      — a genuine first-time approval. The guard applies, exactly as
+      before this fix: reject before any mutation if nothing currently
+      eligible matches.
+    * ``item.status == "OPEN"`` and a rule exists at this identity with
+      DIFFERENT semantics — a genuine transition (e.g. an existing
+      ``BLACKLIST``/``GRAYLIST`` moving to ``MUST_READ``, or the same
+      policy with a different destination/processor_hint). The guard
+      applies, exactly as before this fix — a deliberate policy change
+      must never be made on zero current review evidence through this
+      workflow (the generic policy-rules endpoint's own
+      ``subject_predicate_observed`` — ever-observed, not
+      current-eligibility — check is a separate, different doctrine,
+      untouched by this fix).
+
+    Any OTHER ``item.status`` (neither ``OPEN`` nor ``RESOLVED``) also
+    skips the guard — it always was, and remains, a genuine conflict via
+    the unchanged ``item.status != "OPEN"`` check further below; the
+    guard must never preempt that with a misleading ``ValidationError``
+    either.
     """
     item = needs_you_repository.get_needs_you_item(item_id)
 
@@ -831,35 +892,69 @@ def resolve_domain_review(
         # rejected the same way no matter what state the item is in.
         entity_repository.get_entity(destination_entity_id)
 
-    if match_mode == MATCH_MODE_EXACT_DOMAIN_SUBJECT:
-        # Deterministic subject-aware mailbox domain policy — a
-        # domain-review ALLOW answer must not create a subject rule that
-        # resolves NONE of the question's actual (currently eligible)
-        # candidates. Deliberately runs BEFORE any mutation, regardless
-        # of item.status — mirrors the destination-field validation
-        # above. This is a STRICTER guard than the generic policy-rules
-        # endpoint's own `subject_predicate_observed` check (any
-        # ingestion status, ever observed) — here it must be a message
-        # still `discovery_candidate=True`/`CHECKED_NOT_CANDIDATE` right
-        # now (see `services.mailbox.message.MailboxMessageRepository
-        # .list_candidate_messages_for_domain`'s own docstring).
-        eligible_candidates = mailbox_message_repository.list_candidate_messages_for_domain(
-            mailbox_id=mailbox_id, sender_domain=sender_domain
+    if match_mode == MATCH_MODE_EXACT_DOMAIN_SUBJECT and item.status == "OPEN":
+        # Deterministic subject-aware mailbox domain policy — eligible-
+        # candidate guard ordering fix (CD-6 GUI-operations-foundation
+        # follow-on hardening delta, item 4). See this function's own
+        # docstring for the full four-case rationale. Only an `OPEN`
+        # item can ever reach a genuine create/change of a subject
+        # rule's semantics below (a `RESOLVED` item either self-heals
+        # via an identical resolution or is already a `ConflictError` —
+        # neither of which is a create/change this guard needs to
+        # protect — and any status that is neither `OPEN` nor
+        # `RESOLVED` is already a `ConflictError` further below), so the
+        # guard is scoped to `OPEN` here rather than running
+        # unconditionally.
+        #
+        # `previous_rule` (fetched above, via `find_exact` at this EXACT
+        # identity, for audit purposes) is reused here rather than
+        # calling `find_exact` a second time — no mutation has happened
+        # between that lookup and this one, so the result is guaranteed
+        # identical to a fresh call. Mirrors the field-for-field
+        # `identical` comparison the OPEN-item reuse-vs-conflict check
+        # further below already performs.
+        is_open_identical_replay = (
+            previous_rule is not None
+            and previous_rule.policy == POLICY_MUST_READ
+            and previous_rule.match_mode == match_mode
+            and previous_rule.sender_address == normalized_sender_address
+            and previous_rule.subject_predicate_type == normalized_subject_predicate_type
+            and previous_rule.subject_predicate_value == normalized_subject_predicate_value
+            and previous_rule.destination_mode == destination_mode
+            and previous_rule.destination_entity_id == destination_entity_id
+            and previous_rule.processor_hint == processor_hint
         )
-        if not any(
-            subject_matches_predicate(
-                candidate.subject,
-                predicate_type=normalized_subject_predicate_type,
-                predicate_value=normalized_subject_predicate_value,
+        if not is_open_identical_replay:
+            # Genuinely creating a new subject-rule identity (no exact
+            # rule exists yet) or changing an existing one's semantics
+            # (an exact rule exists but differs) — a domain-review ALLOW
+            # answer must not create/transition a subject rule that
+            # resolves NONE of the question's actual (currently
+            # eligible) candidates. Deliberately runs BEFORE any
+            # mutation. This is a STRICTER guard than the generic
+            # policy-rules endpoint's own `subject_predicate_observed`
+            # check (any ingestion status, ever observed) — here it
+            # must be a message still `discovery_candidate=True`/
+            # `CHECKED_NOT_CANDIDATE` right now (see
+            # `services.mailbox.message.MailboxMessageRepository
+            # .list_candidate_messages_for_domain`'s own docstring).
+            eligible_candidates = mailbox_message_repository.list_candidate_messages_for_domain(
+                mailbox_id=mailbox_id, sender_domain=sender_domain
             )
-            for candidate in eligible_candidates
-        ):
-            raise ValidationError(
-                f"no currently eligible candidate message at domain '{sender_domain}' matches the subject "
-                f"predicate {normalized_subject_predicate_type}={normalized_subject_predicate_value!r} — a "
-                "domain-review ALLOW answer must not create a subject rule that resolves none of the "
-                "question's actual candidates"
-            )
+            if not any(
+                subject_matches_predicate(
+                    candidate.subject,
+                    predicate_type=normalized_subject_predicate_type,
+                    predicate_value=normalized_subject_predicate_value,
+                )
+                for candidate in eligible_candidates
+            ):
+                raise ValidationError(
+                    f"no currently eligible candidate message at domain '{sender_domain}' matches the subject "
+                    f"predicate {normalized_subject_predicate_type}={normalized_subject_predicate_value!r} — a "
+                    "domain-review ALLOW answer must not create a subject rule that resolves none of the "
+                    "question's actual candidates"
+                )
 
     if item.status == "RESOLVED":
         if not _resolution_matches(item.resolution, resolution):
