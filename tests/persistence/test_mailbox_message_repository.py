@@ -223,6 +223,55 @@ def test_list_candidate_messages_for_domain_requires_discovery_candidate_true_at
 
 
 # ---------------------------------------------------------------------
+# `include_subdomains` (historical-candidate-scoping defect fix) — the
+# Postgres repository's own direct proof, mirroring the in-memory
+# repository's own equivalent tests in
+# `tests/integration/test_mailbox_message_domain.py`.
+# ---------------------------------------------------------------------
+
+
+def test_list_candidate_messages_for_domain_default_omitted_include_subdomains_is_exact_only(fresh_engine):
+    repo = PostgresMailboxMessageRepository()
+    mailbox_id = _mailbox_id()
+    _observe_candidate(repo, mailbox_id=mailbox_id, msg_id="exact", sender_domain="example.com")
+    _observe_candidate(repo, mailbox_id=mailbox_id, msg_id="sub", sender_domain="billing.example.com")
+
+    fresh_repo = PostgresMailboxMessageRepository(engine=fresh_engine)
+    results = fresh_repo.list_candidate_messages_for_domain(mailbox_id=mailbox_id, sender_domain="example.com")
+    assert {m.immutable_provider_message_id for m in results} == {"exact"}
+
+
+def test_list_candidate_messages_for_domain_include_subdomains_true_includes_single_and_multi_level(fresh_engine):
+    repo = PostgresMailboxMessageRepository()
+    mailbox_id = _mailbox_id()
+    _observe_candidate(repo, mailbox_id=mailbox_id, msg_id="exact", sender_domain="example.com")
+    _observe_candidate(repo, mailbox_id=mailbox_id, msg_id="single-level", sender_domain="billing.example.com")
+    _observe_candidate(repo, mailbox_id=mailbox_id, msg_id="multi-level", sender_domain="receipts.eu.example.com")
+
+    fresh_repo = PostgresMailboxMessageRepository(engine=fresh_engine)
+    results = fresh_repo.list_candidate_messages_for_domain(
+        mailbox_id=mailbox_id, sender_domain="example.com", include_subdomains=True
+    )
+    assert {m.immutable_provider_message_id for m in results} == {"exact", "single-level", "multi-level"}
+
+
+def test_list_candidate_messages_for_domain_include_subdomains_true_never_matches_lookalike_domain(fresh_engine):
+    """The critical boundary case, proven against the real Postgres
+    repository too: `notexample.com` must never match `example.com`,
+    even with `include_subdomains=True`."""
+    repo = PostgresMailboxMessageRepository()
+    mailbox_id = _mailbox_id()
+    _observe_candidate(repo, mailbox_id=mailbox_id, msg_id="lookalike", sender_domain="notexample.com")
+    _observe_candidate(repo, mailbox_id=mailbox_id, msg_id="exact", sender_domain="example.com")
+
+    fresh_repo = PostgresMailboxMessageRepository(engine=fresh_engine)
+    results = fresh_repo.list_candidate_messages_for_domain(
+        mailbox_id=mailbox_id, sender_domain="example.com", include_subdomains=True
+    )
+    assert {m.immutable_provider_message_id for m in results} == {"exact"}
+
+
+# ---------------------------------------------------------------------
 # CD-6 GUI-operations-foundation follow-on WO (item A) —
 # `sender_address_observed` (the real backstop behind an `EXACT_ADDRESS`
 # `MailboxDomainRule`: an operator must never be able to pre-authorize

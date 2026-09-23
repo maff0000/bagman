@@ -870,7 +870,7 @@ def test_reprocess_all_historical_candidates_ingests_the_triggering_message_imme
     h.graph_client.queue_content_result(_content())
     reprocessed = reprocess_all_historical_candidates_for_domain(
         mailbox=h.mailbox, mailbox_source_id=h.source_id, sender_domain="vendor.com",
-        rule=rule, adapter=h.adapter, message_repository=h.message_repo, needs_you_repository=h.needs_you_repo, api=h.api, object_store=h.object_store,
+        rule=rule, mailbox_domain_rule_repository=h.domain_rule_repo, adapter=h.adapter, message_repository=h.message_repo, needs_you_repository=h.needs_you_repo, api=h.api, object_store=h.object_store,
         scanner=h.scanner, actor_type="SYSTEM", actor_id="test",
     )
     assert len(reprocessed) == 1
@@ -904,7 +904,7 @@ def test_historical_reprocess_fixed_destination_assigns_real_entity_id_to_eviden
     h.graph_client.queue_content_result(_content())
     reprocessed = reprocess_all_historical_candidates_for_domain(
         mailbox=h.mailbox, mailbox_source_id=h.source_id, sender_domain="vendor.com",
-        rule=rule, adapter=h.adapter, message_repository=h.message_repo, needs_you_repository=h.needs_you_repo, api=h.api, object_store=h.object_store,
+        rule=rule, mailbox_domain_rule_repository=h.domain_rule_repo, adapter=h.adapter, message_repository=h.message_repo, needs_you_repository=h.needs_you_repo, api=h.api, object_store=h.object_store,
         scanner=h.scanner, actor_type="SYSTEM", actor_id="test",
     )
     assert len(reprocessed) == 1
@@ -928,7 +928,7 @@ def test_reprocess_all_historical_candidates_is_idempotent_on_a_double_submit_of
     h.graph_client.queue_content_result(_content())
     first = reprocess_all_historical_candidates_for_domain(
         mailbox=h.mailbox, mailbox_source_id=h.source_id, sender_domain="vendor.com",
-        rule=rule, adapter=h.adapter, message_repository=h.message_repo, needs_you_repository=h.needs_you_repo, api=h.api, object_store=h.object_store,
+        rule=rule, mailbox_domain_rule_repository=h.domain_rule_repo, adapter=h.adapter, message_repository=h.message_repo, needs_you_repository=h.needs_you_repo, api=h.api, object_store=h.object_store,
         scanner=h.scanner, actor_type="SYSTEM", actor_id="test",
     )
     assert len(first) == 1
@@ -940,7 +940,7 @@ def test_reprocess_all_historical_candidates_is_idempotent_on_a_double_submit_of
     # second time round.
     second = reprocess_all_historical_candidates_for_domain(
         mailbox=h.mailbox, mailbox_source_id=h.source_id, sender_domain="vendor.com",
-        rule=rule, adapter=h.adapter, message_repository=h.message_repo, needs_you_repository=h.needs_you_repo, api=h.api, object_store=h.object_store,
+        rule=rule, mailbox_domain_rule_repository=h.domain_rule_repo, adapter=h.adapter, message_repository=h.message_repo, needs_you_repository=h.needs_you_repo, api=h.api, object_store=h.object_store,
         scanner=h.scanner, actor_type="SYSTEM", actor_id="test",
     )
     assert second == []
@@ -995,7 +995,7 @@ def test_reprocess_all_historical_candidates_back_processes_every_historical_can
 
     reprocessed = reprocess_all_historical_candidates_for_domain(
         mailbox=h.mailbox, mailbox_source_id=h.source_id, sender_domain="vendor.com",
-        rule=rule, adapter=h.adapter, message_repository=h.message_repo, needs_you_repository=h.needs_you_repo, api=h.api, object_store=h.object_store,
+        rule=rule, mailbox_domain_rule_repository=h.domain_rule_repo, adapter=h.adapter, message_repository=h.message_repo, needs_you_repository=h.needs_you_repo, api=h.api, object_store=h.object_store,
         scanner=h.scanner, actor_type="SYSTEM", actor_id="test",
     )
     assert len(reprocessed) == 3
@@ -1077,7 +1077,7 @@ def test_reprocess_mixed_domain_only_back_processes_actual_candidates_never_ever
 
     reprocessed = reprocess_all_historical_candidates_for_domain(
         mailbox=h.mailbox, mailbox_source_id=h.source_id, sender_domain="vendor.com",
-        rule=rule, adapter=h.adapter, message_repository=h.message_repo, needs_you_repository=h.needs_you_repo, api=h.api, object_store=h.object_store,
+        rule=rule, mailbox_domain_rule_repository=h.domain_rule_repo, adapter=h.adapter, message_repository=h.message_repo, needs_you_repository=h.needs_you_repo, api=h.api, object_store=h.object_store,
         scanner=h.scanner, actor_type="SYSTEM", actor_id="test",
     )
     # Exactly 3 messages returned/reprocessed — NEVER 7.
@@ -1099,11 +1099,466 @@ def test_reprocess_mixed_domain_only_back_processes_actual_candidates_never_ever
     # candidates were never eligible and still aren't.
     second_call = reprocess_all_historical_candidates_for_domain(
         mailbox=h.mailbox, mailbox_source_id=h.source_id, sender_domain="vendor.com",
-        rule=rule, adapter=h.adapter, message_repository=h.message_repo, needs_you_repository=h.needs_you_repo, api=h.api, object_store=h.object_store,
+        rule=rule, mailbox_domain_rule_repository=h.domain_rule_repo, adapter=h.adapter, message_repository=h.message_repo, needs_you_repository=h.needs_you_repo, api=h.api, object_store=h.object_store,
         scanner=h.scanner, actor_type="SYSTEM", actor_id="test",
     )
     assert second_call == []
     assert sorted(h.graph_client.content_calls) == ["cand-1", "cand-2", "cand-3"]
+
+
+# ---------------------------------------------------------------------
+# Effective-rule scoping (PL-escalated architect defect, three parts:
+# EXACT_ADDRESS over-broadening, INCLUDE_SUBDOMAINS under-reach, and
+# specificity — a more-specific EXISTING rule must never be silently
+# overruled by a broader newly-approved one). See
+# `services.mailbox.sweep.reprocess_all_historical_candidates_for_domain`'s
+# own module docstring for the full defect writeup this section proves
+# is fixed.
+# ---------------------------------------------------------------------
+
+
+def test_exact_address_backfill_only_processes_the_approved_address_not_the_whole_domain():
+    """Approving one specific EXACT_ADDRESS (`ap@vendor.com`) must never
+    wrongly sweep in other addresses at the same domain
+    (`marketing@vendor.com`, `newsletter@vendor.com`) — the old, blindly
+    domain-matched query used to do exactly that (defect part 1)."""
+    from services.mailbox.sweep import reprocess_all_historical_candidates_for_domain
+
+    h = Harness(allow_default_domain=False)
+    h.graph_client.queue_delta_result(
+        GraphDeltaPageResult(
+            status=GraphOutcomeStatus.OK,
+            messages=(
+                _msg("ap-1", sender_address="ap@vendor.com"),
+                _msg("mkt-1", sender_address="marketing@vendor.com"),
+                _msg("news-1", sender_address="newsletter@vendor.com"),
+            ),
+            delta_link="d1",
+        )
+    )
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link="d-junk"))
+    h.sweep()
+
+    rule = h.domain_rule_repo.upsert_rule(
+        mailbox_id=h.mailbox.mailbox_id, sender_domain="vendor.com", match_mode="EXACT_ADDRESS", policy="MUST_READ",
+        destination_entity_id=None, destination_mode="REVIEW_REQUIRED", source="OPERATOR",
+        sender_address="ap@vendor.com",
+    )
+    h.graph_client.queue_headers_result(_headers_ok())
+    h.graph_client.queue_content_result(_content())
+    reprocessed = reprocess_all_historical_candidates_for_domain(
+        mailbox=h.mailbox, mailbox_source_id=h.source_id, sender_domain="vendor.com",
+        rule=rule, mailbox_domain_rule_repository=h.domain_rule_repo, adapter=h.adapter,
+        message_repository=h.message_repo, needs_you_repository=h.needs_you_repo, api=h.api,
+        object_store=h.object_store, scanner=h.scanner, actor_type="SYSTEM", actor_id="test",
+    )
+    assert len(reprocessed) == 1
+    assert reprocessed[0].immutable_provider_message_id == "ap-1"
+    assert h.graph_client.headers_calls == ["ap-1"]
+    assert h.graph_client.content_calls == ["ap-1"]
+
+    remaining = h.message_repo.list_messages(mailbox_id=h.mailbox.mailbox_id)
+    others = [m for m in remaining if m.immutable_provider_message_id in ("mkt-1", "news-1")]
+    assert len(others) == 2
+    assert all(m.ingestion_status == INGESTION_STATUS_CHECKED_NOT_CANDIDATE for m in others)
+
+
+def test_exact_address_backfill_processes_every_candidate_from_the_same_approved_address():
+    from services.mailbox.sweep import reprocess_all_historical_candidates_for_domain
+
+    h = Harness(allow_default_domain=False)
+    h.graph_client.queue_delta_result(
+        GraphDeltaPageResult(
+            status=GraphOutcomeStatus.OK,
+            messages=(
+                _msg("ap-1", sender_address="ap@vendor.com"),
+                _msg("ap-2", sender_address="ap@vendor.com"),
+            ),
+            delta_link="d1",
+        )
+    )
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link="d-junk"))
+    h.sweep()
+
+    rule = h.domain_rule_repo.upsert_rule(
+        mailbox_id=h.mailbox.mailbox_id, sender_domain="vendor.com", match_mode="EXACT_ADDRESS", policy="MUST_READ",
+        destination_entity_id=None, destination_mode="REVIEW_REQUIRED", source="OPERATOR",
+        sender_address="ap@vendor.com",
+    )
+    h.graph_client.queue_headers_result(_headers_ok())
+    h.graph_client.queue_content_result(_content())
+    h.graph_client.queue_headers_result(_headers_ok())
+    h.graph_client.queue_content_result(_content())
+    reprocessed = reprocess_all_historical_candidates_for_domain(
+        mailbox=h.mailbox, mailbox_source_id=h.source_id, sender_domain="vendor.com",
+        rule=rule, mailbox_domain_rule_repository=h.domain_rule_repo, adapter=h.adapter,
+        message_repository=h.message_repo, needs_you_repository=h.needs_you_repo, api=h.api,
+        object_store=h.object_store, scanner=h.scanner, actor_type="SYSTEM", actor_id="test",
+    )
+    assert {m.immutable_provider_message_id for m in reprocessed} == {"ap-1", "ap-2"}
+    assert sorted(h.graph_client.content_calls) == ["ap-1", "ap-2"]
+
+
+def test_exact_domain_approval_skips_a_more_specific_pre_existing_address_override():
+    """Defect part 3 (specificity): a pre-existing, more-specific
+    BLACKLIST/EXACT_ADDRESS rule on one address must never be silently
+    overruled by a broader newly-approved domain-level MUST_READ rule."""
+    from services.mailbox.sweep import reprocess_all_historical_candidates_for_domain
+
+    h = Harness(allow_default_domain=False)
+    h.graph_client.queue_delta_result(
+        GraphDeltaPageResult(
+            status=GraphOutcomeStatus.OK,
+            messages=(
+                _msg("inv-1", sender_address="invoice@vendor.com"),
+                _msg("mkt-1", sender_address="marketing@vendor.com"),
+            ),
+            delta_link="d1",
+        )
+    )
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link="d-junk"))
+    h.sweep()
+
+    # A more-specific override, set up AFTER the historical sweep
+    # discovered both candidates (reflects a LATER, separate operator
+    # decision about this one address specifically).
+    h.domain_rule_repo.upsert_rule(
+        mailbox_id=h.mailbox.mailbox_id, sender_domain="vendor.com", match_mode="EXACT_ADDRESS", policy="BLACKLIST",
+        destination_entity_id=None, destination_mode=None, source="OPERATOR",
+        sender_address="marketing@vendor.com",
+    )
+
+    rule = h.domain_rule_repo.upsert_rule(
+        mailbox_id=h.mailbox.mailbox_id, sender_domain="vendor.com", match_mode="EXACT", policy="MUST_READ",
+        destination_entity_id=None, destination_mode="REVIEW_REQUIRED", source="OPERATOR",
+    )
+    h.graph_client.queue_headers_result(_headers_ok())
+    h.graph_client.queue_content_result(_content())
+    reprocessed = reprocess_all_historical_candidates_for_domain(
+        mailbox=h.mailbox, mailbox_source_id=h.source_id, sender_domain="vendor.com",
+        rule=rule, mailbox_domain_rule_repository=h.domain_rule_repo, adapter=h.adapter,
+        message_repository=h.message_repo, needs_you_repository=h.needs_you_repo, api=h.api,
+        object_store=h.object_store, scanner=h.scanner, actor_type="SYSTEM", actor_id="test",
+    )
+    assert len(reprocessed) == 1
+    assert reprocessed[0].immutable_provider_message_id == "inv-1"
+    assert h.graph_client.headers_calls == ["inv-1"]
+    assert h.graph_client.content_calls == ["inv-1"]
+
+    marketing_msg = h.message_repo.find_by_provider_id(h.mailbox.mailbox_id, "mkt-1")
+    assert marketing_msg.ingestion_status == INGESTION_STATUS_CHECKED_NOT_CANDIDATE
+
+
+def test_include_subdomains_backfill_reaches_subdomain_candidates_and_excludes_lookalike():
+    """Defect part 2 (INCLUDE_SUBDOMAINS under-reach): approving a
+    domain with INCLUDE_SUBDOMAINS must reach real subdomain candidates
+    too, while `notexample.com` (no dot boundary) is structurally
+    excluded by the query itself, never even reaching the adapter."""
+    from services.mailbox.sweep import reprocess_all_historical_candidates_for_domain
+
+    h = Harness(allow_default_domain=False)
+    h.graph_client.queue_delta_result(
+        GraphDeltaPageResult(
+            status=GraphOutcomeStatus.OK,
+            messages=(
+                _msg("a-1", sender_address="a@example.com"),
+                _msg("b-1", sender_address="b@billing.example.com"),
+                _msg("c-1", sender_address="c@receipts.eu.example.com"),
+                _msg("d-1", sender_address="d@notexample.com"),
+            ),
+            delta_link="d1",
+        )
+    )
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link="d-junk"))
+    h.sweep()
+
+    rule = h.domain_rule_repo.upsert_rule(
+        mailbox_id=h.mailbox.mailbox_id, sender_domain="example.com", match_mode="INCLUDE_SUBDOMAINS",
+        policy="MUST_READ", destination_entity_id=None, destination_mode="REVIEW_REQUIRED", source="OPERATOR",
+    )
+    for _ in range(3):
+        h.graph_client.queue_headers_result(_headers_ok())
+        h.graph_client.queue_content_result(_content())
+    reprocessed = reprocess_all_historical_candidates_for_domain(
+        mailbox=h.mailbox, mailbox_source_id=h.source_id, sender_domain="example.com",
+        rule=rule, mailbox_domain_rule_repository=h.domain_rule_repo, adapter=h.adapter,
+        message_repository=h.message_repo, needs_you_repository=h.needs_you_repo, api=h.api,
+        object_store=h.object_store, scanner=h.scanner, actor_type="SYSTEM", actor_id="test",
+    )
+    assert {m.immutable_provider_message_id for m in reprocessed} == {"a-1", "b-1", "c-1"}
+    assert sorted(h.graph_client.headers_calls) == ["a-1", "b-1", "c-1"]
+    assert sorted(h.graph_client.content_calls) == ["a-1", "b-1", "c-1"]
+
+    lookalike = h.message_repo.find_by_provider_id(h.mailbox.mailbox_id, "d-1")
+    assert lookalike.ingestion_status == INGESTION_STATUS_CHECKED_NOT_CANDIDATE
+    assert lookalike.evidence_id is None
+
+
+def test_include_subdomains_skips_a_more_specific_pre_existing_child_domain_override():
+    """Defect part 3 again, combined with part 2: widening the query to
+    reach subdomains must NOT bypass a more-specific existing BLACKLIST
+    rule that already governs one of those child domains."""
+    from services.mailbox.sweep import reprocess_all_historical_candidates_for_domain
+
+    h = Harness(allow_default_domain=False)
+    h.graph_client.queue_delta_result(
+        GraphDeltaPageResult(
+            status=GraphOutcomeStatus.OK,
+            messages=(
+                _msg("root-1", sender_address="a@example.com"),
+                _msg("other-child-1", sender_address="b@other.example.com"),
+                _msg("spam-1", sender_address="c@spam.example.com"),
+            ),
+            delta_link="d1",
+        )
+    )
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link="d-junk"))
+    h.sweep()
+
+    # A more-specific BLACKLIST override on the child domain, set up
+    # AFTER the historical sweep discovered the candidate under it.
+    h.domain_rule_repo.upsert_rule(
+        mailbox_id=h.mailbox.mailbox_id, sender_domain="spam.example.com", match_mode="EXACT", policy="BLACKLIST",
+        destination_entity_id=None, destination_mode=None, source="OPERATOR",
+    )
+
+    rule = h.domain_rule_repo.upsert_rule(
+        mailbox_id=h.mailbox.mailbox_id, sender_domain="example.com", match_mode="INCLUDE_SUBDOMAINS",
+        policy="MUST_READ", destination_entity_id=None, destination_mode="REVIEW_REQUIRED", source="OPERATOR",
+    )
+    h.graph_client.queue_headers_result(_headers_ok())
+    h.graph_client.queue_content_result(_content())
+    h.graph_client.queue_headers_result(_headers_ok())
+    h.graph_client.queue_content_result(_content())
+    reprocessed = reprocess_all_historical_candidates_for_domain(
+        mailbox=h.mailbox, mailbox_source_id=h.source_id, sender_domain="example.com",
+        rule=rule, mailbox_domain_rule_repository=h.domain_rule_repo, adapter=h.adapter,
+        message_repository=h.message_repo, needs_you_repository=h.needs_you_repo, api=h.api,
+        object_store=h.object_store, scanner=h.scanner, actor_type="SYSTEM", actor_id="test",
+    )
+    assert {m.immutable_provider_message_id for m in reprocessed} == {"root-1", "other-child-1"}
+    assert "spam-1" not in h.graph_client.headers_calls
+    spam_msg = h.message_repo.find_by_provider_id(h.mailbox.mailbox_id, "spam-1")
+    assert spam_msg.ingestion_status == INGESTION_STATUS_CHECKED_NOT_CANDIDATE
+
+
+def test_include_subdomains_skips_a_more_specific_pre_existing_address_override():
+    from services.mailbox.sweep import reprocess_all_historical_candidates_for_domain
+
+    h = Harness(allow_default_domain=False)
+    h.graph_client.queue_delta_result(
+        GraphDeltaPageResult(
+            status=GraphOutcomeStatus.OK,
+            messages=(
+                _msg("root-1", sender_address="a@example.com"),
+                _msg("child-1", sender_address="ap@billing.example.com"),
+                _msg("blocked-1", sender_address="marketing@billing.example.com"),
+            ),
+            delta_link="d1",
+        )
+    )
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link="d-junk"))
+    h.sweep()
+
+    h.domain_rule_repo.upsert_rule(
+        mailbox_id=h.mailbox.mailbox_id, sender_domain="billing.example.com", match_mode="EXACT_ADDRESS",
+        policy="BLACKLIST", destination_entity_id=None, destination_mode=None, source="OPERATOR",
+        sender_address="marketing@billing.example.com",
+    )
+
+    rule = h.domain_rule_repo.upsert_rule(
+        mailbox_id=h.mailbox.mailbox_id, sender_domain="example.com", match_mode="INCLUDE_SUBDOMAINS",
+        policy="MUST_READ", destination_entity_id=None, destination_mode="REVIEW_REQUIRED", source="OPERATOR",
+    )
+    h.graph_client.queue_headers_result(_headers_ok())
+    h.graph_client.queue_content_result(_content())
+    h.graph_client.queue_headers_result(_headers_ok())
+    h.graph_client.queue_content_result(_content())
+    reprocessed = reprocess_all_historical_candidates_for_domain(
+        mailbox=h.mailbox, mailbox_source_id=h.source_id, sender_domain="example.com",
+        rule=rule, mailbox_domain_rule_repository=h.domain_rule_repo, adapter=h.adapter,
+        message_repository=h.message_repo, needs_you_repository=h.needs_you_repo, api=h.api,
+        object_store=h.object_store, scanner=h.scanner, actor_type="SYSTEM", actor_id="test",
+    )
+    assert {m.immutable_provider_message_id for m in reprocessed} == {"root-1", "child-1"}
+    assert "blocked-1" not in h.graph_client.headers_calls
+    blocked_msg = h.message_repo.find_by_provider_id(h.mailbox.mailbox_id, "blocked-1")
+    assert blocked_msg.ingestion_status == INGESTION_STATUS_CHECKED_NOT_CANDIDATE
+
+
+def test_include_subdomains_skips_a_more_specific_pre_existing_graylist_override():
+    """GRAYLIST is still "under review", never an implicit approval — a
+    parent-domain MUST_READ/INCLUDE_SUBDOMAINS approval must not sweep
+    in a child domain a GRAYLIST rule already, more specifically,
+    governs."""
+    from services.mailbox.sweep import reprocess_all_historical_candidates_for_domain
+
+    h = Harness(allow_default_domain=False)
+    # GRAYLIST behaves identically to "no rule at all" at the live
+    # Stage-B gate (still runs ordinary discovery) — set up FIRST, then
+    # swept normally.
+    h.domain_rule_repo.upsert_rule(
+        mailbox_id=h.mailbox.mailbox_id, sender_domain="billing.example.com", match_mode="EXACT",
+        policy="GRAYLIST", destination_entity_id=None, destination_mode=None, source="OPERATOR",
+    )
+    h.graph_client.queue_delta_result(
+        GraphDeltaPageResult(
+            status=GraphOutcomeStatus.OK,
+            messages=(
+                _msg("root-1", sender_address="a@example.com"),
+                _msg("gray-1", sender_address="b@billing.example.com"),
+            ),
+            delta_link="d1",
+        )
+    )
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link="d-junk"))
+    h.sweep()
+
+    rule = h.domain_rule_repo.upsert_rule(
+        mailbox_id=h.mailbox.mailbox_id, sender_domain="example.com", match_mode="INCLUDE_SUBDOMAINS",
+        policy="MUST_READ", destination_entity_id=None, destination_mode="REVIEW_REQUIRED", source="OPERATOR",
+    )
+    h.graph_client.queue_headers_result(_headers_ok())
+    h.graph_client.queue_content_result(_content())
+    reprocessed = reprocess_all_historical_candidates_for_domain(
+        mailbox=h.mailbox, mailbox_source_id=h.source_id, sender_domain="example.com",
+        rule=rule, mailbox_domain_rule_repository=h.domain_rule_repo, adapter=h.adapter,
+        message_repository=h.message_repo, needs_you_repository=h.needs_you_repo, api=h.api,
+        object_store=h.object_store, scanner=h.scanner, actor_type="SYSTEM", actor_id="test",
+    )
+    assert {m.immutable_provider_message_id for m in reprocessed} == {"root-1"}
+    assert "gray-1" not in h.graph_client.headers_calls
+    gray_msg = h.message_repo.find_by_provider_id(h.mailbox.mailbox_id, "gray-1")
+    assert gray_msg.ingestion_status == INGESTION_STATUS_CHECKED_NOT_CANDIDATE
+
+
+def test_reprocess_results_ordering_is_received_at_ascending_among_processed_only():
+    """A mix of processed and skipped candidates spanning several
+    `received_at` timestamps — the returned list stays strictly
+    `received_at`-ascending among the PROCESSED candidates only; skipped
+    ones never appear and never disturb that ordering."""
+    from services.mailbox.sweep import reprocess_all_historical_candidates_for_domain
+
+    h = Harness(allow_default_domain=False)
+    t1 = datetime(2025, 1, 1, tzinfo=timezone.utc)
+    t2 = datetime(2025, 1, 2, tzinfo=timezone.utc)
+    t3 = datetime(2025, 1, 3, tzinfo=timezone.utc)
+    t4 = datetime(2025, 1, 4, tzinfo=timezone.utc)
+    t5 = datetime(2025, 1, 5, tzinfo=timezone.utc)
+    h.graph_client.queue_delta_result(
+        GraphDeltaPageResult(
+            status=GraphOutcomeStatus.OK,
+            messages=(
+                _msg("skip-1", sender_address="skip@vendor.com", received_at=t1),
+                _msg("keep-2", sender_address="keep@vendor.com", received_at=t2),
+                _msg("keep-3", sender_address="keep@vendor.com", received_at=t3),
+                _msg("skip-4", sender_address="skip@vendor.com", received_at=t4),
+                _msg("keep-5", sender_address="keep@vendor.com", received_at=t5),
+            ),
+            delta_link="d1",
+        )
+    )
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link="d-junk"))
+    h.sweep()
+
+    h.domain_rule_repo.upsert_rule(
+        mailbox_id=h.mailbox.mailbox_id, sender_domain="vendor.com", match_mode="EXACT_ADDRESS", policy="BLACKLIST",
+        destination_entity_id=None, destination_mode=None, source="OPERATOR",
+        sender_address="skip@vendor.com",
+    )
+    rule = h.domain_rule_repo.upsert_rule(
+        mailbox_id=h.mailbox.mailbox_id, sender_domain="vendor.com", match_mode="EXACT", policy="MUST_READ",
+        destination_entity_id=None, destination_mode="REVIEW_REQUIRED", source="OPERATOR",
+    )
+    for _ in range(3):
+        h.graph_client.queue_headers_result(_headers_ok())
+        h.graph_client.queue_content_result(_content())
+    reprocessed = reprocess_all_historical_candidates_for_domain(
+        mailbox=h.mailbox, mailbox_source_id=h.source_id, sender_domain="vendor.com",
+        rule=rule, mailbox_domain_rule_repository=h.domain_rule_repo, adapter=h.adapter,
+        message_repository=h.message_repo, needs_you_repository=h.needs_you_repo, api=h.api,
+        object_store=h.object_store, scanner=h.scanner, actor_type="SYSTEM", actor_id="test",
+    )
+    assert [m.immutable_provider_message_id for m in reprocessed] == ["keep-2", "keep-3", "keep-5"]
+
+
+def test_reprocess_idempotency_holds_with_effective_rule_filtering_and_skipped_candidates_stay_open():
+    """Idempotency backstop, re-verified now that effective-rule
+    filtering exists: a second call re-fetches nothing already final,
+    AND a candidate skipped by effective-rule filtering stays
+    `CHECKED_NOT_CANDIDATE` — never a new intermediate state — remaining
+    eligible for a LATER, explicit decision about it specifically."""
+    from services.mailbox.sweep import reprocess_all_historical_candidates_for_domain
+
+    h = Harness(allow_default_domain=False)
+    h.graph_client.queue_delta_result(
+        GraphDeltaPageResult(
+            status=GraphOutcomeStatus.OK,
+            messages=(
+                _msg("keep-1", sender_address="keep@vendor.com"),
+                _msg("skip-1", sender_address="skip@vendor.com"),
+            ),
+            delta_link="d1",
+        )
+    )
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link="d-junk"))
+    h.sweep()
+
+    h.domain_rule_repo.upsert_rule(
+        mailbox_id=h.mailbox.mailbox_id, sender_domain="vendor.com", match_mode="EXACT_ADDRESS", policy="BLACKLIST",
+        destination_entity_id=None, destination_mode=None, source="OPERATOR",
+        sender_address="skip@vendor.com",
+    )
+    rule = h.domain_rule_repo.upsert_rule(
+        mailbox_id=h.mailbox.mailbox_id, sender_domain="vendor.com", match_mode="EXACT", policy="MUST_READ",
+        destination_entity_id=None, destination_mode="REVIEW_REQUIRED", source="OPERATOR",
+    )
+    h.graph_client.queue_headers_result(_headers_ok())
+    h.graph_client.queue_content_result(_content())
+    first = reprocess_all_historical_candidates_for_domain(
+        mailbox=h.mailbox, mailbox_source_id=h.source_id, sender_domain="vendor.com",
+        rule=rule, mailbox_domain_rule_repository=h.domain_rule_repo, adapter=h.adapter,
+        message_repository=h.message_repo, needs_you_repository=h.needs_you_repo, api=h.api,
+        object_store=h.object_store, scanner=h.scanner, actor_type="SYSTEM", actor_id="test",
+    )
+    assert [m.immutable_provider_message_id for m in first] == ["keep-1"]
+
+    skip_msg = h.message_repo.find_by_provider_id(h.mailbox.mailbox_id, "skip-1")
+    assert skip_msg.ingestion_status == INGESTION_STATUS_CHECKED_NOT_CANDIDATE
+
+    # Re-running for the same domain must not re-fetch keep-1 (already
+    # INGESTED) — and skip-1 remains skipped (still governed by the
+    # more-specific BLACKLIST address rule).
+    second = reprocess_all_historical_candidates_for_domain(
+        mailbox=h.mailbox, mailbox_source_id=h.source_id, sender_domain="vendor.com",
+        rule=rule, mailbox_domain_rule_repository=h.domain_rule_repo, adapter=h.adapter,
+        message_repository=h.message_repo, needs_you_repository=h.needs_you_repo, api=h.api,
+        object_store=h.object_store, scanner=h.scanner, actor_type="SYSTEM", actor_id="test",
+    )
+    assert second == []
+    assert h.graph_client.content_calls == ["keep-1"]  # only one content fetch, ever
+
+    skip_msg_still = h.message_repo.find_by_provider_id(h.mailbox.mailbox_id, "skip-1")
+    assert skip_msg_still.ingestion_status == INGESTION_STATUS_CHECKED_NOT_CANDIDATE
+
+    # skip-1 stays eligible for a LATER, explicit decision about it
+    # specifically — e.g. the operator later reverses that address's
+    # own rule to MUST_READ.
+    address_rule = h.domain_rule_repo.upsert_rule(
+        mailbox_id=h.mailbox.mailbox_id, sender_domain="vendor.com", match_mode="EXACT_ADDRESS", policy="MUST_READ",
+        destination_entity_id=None, destination_mode="REVIEW_REQUIRED", source="OPERATOR",
+        sender_address="skip@vendor.com",
+    )
+    h.graph_client.queue_headers_result(_headers_ok())
+    h.graph_client.queue_content_result(_content())
+    third = reprocess_all_historical_candidates_for_domain(
+        mailbox=h.mailbox, mailbox_source_id=h.source_id, sender_domain="vendor.com",
+        rule=address_rule, mailbox_domain_rule_repository=h.domain_rule_repo, adapter=h.adapter,
+        message_repository=h.message_repo, needs_you_repository=h.needs_you_repo, api=h.api,
+        object_store=h.object_store, scanner=h.scanner, actor_type="SYSTEM", actor_id="test",
+    )
+    assert [m.immutable_provider_message_id for m in third] == ["skip-1"]
+    assert third[0].ingestion_status == "INGESTED"
 
 
 # ---------------------------------------------------------------------
@@ -1135,7 +1590,7 @@ def test_historical_reprocess_fetches_headers_before_any_mime_fetch_and_passes_t
     h.graph_client.queue_content_result(_content())
     reprocessed = reprocess_all_historical_candidates_for_domain(
         mailbox=h.mailbox, mailbox_source_id=h.source_id, sender_domain="vendor.com",
-        rule=rule, adapter=h.adapter, message_repository=h.message_repo, needs_you_repository=h.needs_you_repo, api=h.api, object_store=h.object_store,
+        rule=rule, mailbox_domain_rule_repository=h.domain_rule_repo, adapter=h.adapter, message_repository=h.message_repo, needs_you_repository=h.needs_you_repo, api=h.api, object_store=h.object_store,
         scanner=h.scanner, actor_type="SYSTEM", actor_id="test",
     )
     assert len(reprocessed) == 1
@@ -1175,7 +1630,7 @@ def test_historical_reprocess_auth_fail_never_fetches_mime_and_marks_security_re
     )
     reprocessed = reprocess_all_historical_candidates_for_domain(
         mailbox=h.mailbox, mailbox_source_id=h.source_id, sender_domain="vendor.com",
-        rule=rule, adapter=h.adapter, message_repository=h.message_repo, needs_you_repository=h.needs_you_repo, api=h.api, object_store=h.object_store,
+        rule=rule, mailbox_domain_rule_repository=h.domain_rule_repo, adapter=h.adapter, message_repository=h.message_repo, needs_you_repository=h.needs_you_repo, api=h.api, object_store=h.object_store,
         scanner=h.scanner, actor_type="SYSTEM", actor_id="test",
     )
     assert len(reprocessed) == 1
@@ -1203,7 +1658,7 @@ def test_historical_reprocess_auth_unknown_never_fetches_mime_and_marks_security
     h.graph_client.queue_headers_result(GraphMessageHeadersResult(status=GraphOutcomeStatus.OK, raw_headers=()))
     reprocessed = reprocess_all_historical_candidates_for_domain(
         mailbox=h.mailbox, mailbox_source_id=h.source_id, sender_domain="vendor.com",
-        rule=rule, adapter=h.adapter, message_repository=h.message_repo, needs_you_repository=h.needs_you_repo, api=h.api, object_store=h.object_store,
+        rule=rule, mailbox_domain_rule_repository=h.domain_rule_repo, adapter=h.adapter, message_repository=h.message_repo, needs_you_repository=h.needs_you_repo, api=h.api, object_store=h.object_store,
         scanner=h.scanner, actor_type="SYSTEM", actor_id="test",
     )
     assert len(reprocessed) == 1
@@ -1252,7 +1707,7 @@ def test_historical_back_process_splits_passed_and_failed_auth_within_the_same_r
 
     reprocessed = reprocess_all_historical_candidates_for_domain(
         mailbox=h.mailbox, mailbox_source_id=h.source_id, sender_domain="vendor.com",
-        rule=rule, adapter=h.adapter, message_repository=h.message_repo, needs_you_repository=h.needs_you_repo, api=h.api, object_store=h.object_store,
+        rule=rule, mailbox_domain_rule_repository=h.domain_rule_repo, adapter=h.adapter, message_repository=h.message_repo, needs_you_repository=h.needs_you_repo, api=h.api, object_store=h.object_store,
         scanner=h.scanner, actor_type="SYSTEM", actor_id="test",
     )
     assert len(reprocessed) == 3

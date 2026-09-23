@@ -787,7 +787,7 @@ def test_historical_reprocess_with_fixed_metadata_headers_reaches_real_dmarc_pas
 
     reprocessed = reprocess_all_historical_candidates_for_domain(
         mailbox=h.mailbox, mailbox_source_id=h.source_id, sender_domain="newsupplier.com",
-        rule=rule, adapter=h.adapter, message_repository=h.message_repo, needs_you_repository=h.needs_you_repo,
+        rule=rule, mailbox_domain_rule_repository=h.domain_rule_repo, adapter=h.adapter, message_repository=h.message_repo, needs_you_repository=h.needs_you_repo,
         api=h.api, object_store=h.object_store, scanner=h.scanner, actor_type="SYSTEM", actor_id="test",
     )
     assert len(reprocessed) == 1
@@ -835,7 +835,7 @@ def test_historical_reprocess_still_fails_closed_when_refreshed_headers_omit_rec
     )
     reprocessed = reprocess_all_historical_candidates_for_domain(
         mailbox=h.mailbox, mailbox_source_id=h.source_id, sender_domain="newsupplier.com",
-        rule=rule, adapter=h.adapter, message_repository=h.message_repo, needs_you_repository=h.needs_you_repo,
+        rule=rule, mailbox_domain_rule_repository=h.domain_rule_repo, adapter=h.adapter, message_repository=h.message_repo, needs_you_repository=h.needs_you_repo,
         api=h.api, object_store=h.object_store, scanner=h.scanner, actor_type="SYSTEM", actor_id="test",
     )
     assert len(reprocessed) == 1
@@ -847,6 +847,127 @@ def test_historical_reprocess_still_fails_closed_when_refreshed_headers_omit_rec
         if i.metadata.get("mailbox_id") == h.mailbox.mailbox_id
     ]
     assert len(escalation_items) == 1
+
+
+# ---------------------------------------------------------------------
+# Effective-rule scoping x Gmail quota pacing regression — the new
+# per-candidate `find_for_sender` re-resolution must never trigger the
+# proactive `_GmailMetadataFetchGovernor` pacing for a candidate that
+# effective-rule filtering skips (see
+# `tests/integration/test_mailbox_gmail_adapter.py`'s own dedicated
+# governor test section for the governor's direct unit coverage; this
+# proves the INTEGRATION invariant — the governor is only ever consulted
+# for messages that actually reach `adapter.fetch_message_headers`).
+# ---------------------------------------------------------------------
+
+
+class _FakeMonotonicClock:
+    """Deterministic stand-in for `time.monotonic` (mirrors
+    `test_mailbox_gmail_adapter.py`'s own identical fixture) — only ever
+    advances via `_FakeSleep.__call__`, never on its own, so this test
+    proves the exact NUMBER of governor `wait()` calls with zero real
+    sleeping."""
+
+    def __init__(self, start: float = 1_000.0) -> None:
+        self.now = start
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+class _FakeSleep:
+    def __init__(self, clock: _FakeMonotonicClock) -> None:
+        self.calls: list[float] = []
+        self._clock = clock
+
+    def __call__(self, seconds: float) -> None:
+        self.calls.append(seconds)
+        self._clock.advance(seconds)
+
+
+def test_reprocess_gmail_quota_governor_paces_only_actually_processed_candidates_never_skipped_ones():
+    """Two historical candidates from `newsupplier.com`
+    (`keep@newsupplier.com`, `skip@newsupplier.com`) are discovered
+    while the domain is ungoverned — TWO `fetch_message_metadata` calls
+    during discovery, so the shared governor's `wait()` is called twice
+    (the second one sleeps, since the fake clock never advances on its
+    own). A more-specific BLACKLIST/EXACT_ADDRESS override is then set
+    on `skip@newsupplier.com`, and `newsupplier.com` MUST_READ/EXACT is
+    approved. Only `keep@newsupplier.com` is eligible after effective-
+    rule filtering, so exactly ONE further governor `wait()` (from its
+    own headers refresh) occurs — never a fourth call for the skipped
+    candidate. Total: 3 governor `wait()` invocations -> exactly 2
+    sleeps (the first invocation for this mailbox_id never sleeps)."""
+    from services.mailbox.sweep import reprocess_all_historical_candidates_for_domain
+
+    h = Harness(allow_default_domain=False)
+    clock = _FakeMonotonicClock()
+    sleep = _FakeSleep(clock)
+    # Replace the Harness's own adapter with an identically-configured
+    # one carrying an injectable fake clock/sleep — same collaborators
+    # (oauth_client/gmail_client/token_store/mailbox_repository)
+    # otherwise, so nothing else about the harness's behaviour changes.
+    h.adapter = GmailMailboxAdapter(
+        oauth_client=h.oauth_client, gmail_client=h.gmail_client, token_store=h.token_store,
+        mailbox_repository=h.mailbox_repo, monotonic_fn=clock, sleep_fn=sleep,
+    )
+
+    h.queue_discovery()
+    h.queue_folder_round(
+        message_ids=("keep-1", "skip-1"),
+        metadata_by_id={
+            "keep-1": _metadata("keep-1", subject="Your invoice", sender="keep@newsupplier.com"),
+            "skip-1": _metadata("skip-1", subject="Your invoice", sender="skip@newsupplier.com"),
+        },
+    )
+    h.sweep()
+    # Two sequential metadata fetches during discovery -> the SECOND one
+    # sleeps (fake clock hasn't moved on its own); the first never does.
+    assert sleep.calls == pytest.approx([0.30])
+
+    h.domain_rule_repo.upsert_rule(
+        mailbox_id=h.mailbox.mailbox_id, sender_domain="newsupplier.com", match_mode="EXACT_ADDRESS",
+        policy="BLACKLIST", destination_entity_id=None, destination_mode=None, source="OPERATOR",
+        sender_address="skip@newsupplier.com",
+    )
+    rule = h.domain_rule_repo.upsert_rule(
+        mailbox_id=h.mailbox.mailbox_id, sender_domain="newsupplier.com", match_mode="EXACT", policy="MUST_READ",
+        destination_entity_id=None, destination_mode="REVIEW_REQUIRED", source="OPERATOR",
+    )
+    # Only ONE headers-refresh result queued — if the skipped candidate
+    # wrongly reached the adapter too, this test would fail with an
+    # empty-queue error rather than silently passing.
+    h.gmail_client.queue_metadata_result(
+        GmailMessageMetadataResult(
+            status=GmailOutcomeStatus.OK,
+            metadata=_metadata(
+                "keep-1", subject="Your invoice", sender="keep@newsupplier.com",
+                extra_headers=_genuine_trusted_gmail_headers(domain="newsupplier.com"),
+            ),
+        )
+    )
+    h.queue_content(body=b"From: keep@newsupplier.com\r\nSubject: Your invoice\r\n\r\nBody")
+
+    reprocessed = reprocess_all_historical_candidates_for_domain(
+        mailbox=h.mailbox, mailbox_source_id=h.source_id, sender_domain="newsupplier.com",
+        rule=rule, mailbox_domain_rule_repository=h.domain_rule_repo, adapter=h.adapter,
+        message_repository=h.message_repo, needs_you_repository=h.needs_you_repo,
+        api=h.api, object_store=h.object_store, scanner=h.scanner, actor_type="SYSTEM", actor_id="test",
+    )
+    assert [m.immutable_provider_message_id for m in reprocessed] == ["keep-1"]
+    assert reprocessed[0].ingestion_status == INGESTION_STATUS_INGESTED
+
+    skip_msg = h.message_repo.find_by_provider_id(h.mailbox.mailbox_id, "skip-1")
+    assert skip_msg.ingestion_status == INGESTION_STATUS_CHECKED_NOT_CANDIDATE
+
+    # Exactly 3 total governor `wait()` invocations for this mailbox_id
+    # (2 discovery + 1 reprocess-headers-refresh for `keep-1` only) ->
+    # exactly 2 sleeps. A 3rd sleep entry would mean the governor was
+    # wrongly consulted a 4th time — i.e. for the skipped candidate.
+    assert sleep.calls == pytest.approx([0.30, 0.30])
 
 
 # -- precondition -----------------------------------------------------------

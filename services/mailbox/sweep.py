@@ -370,6 +370,7 @@ from services.mailbox.discovery_signals import evaluate_discovery_candidate
 from services.mailbox.domain_rule import (
     DESTINATION_MODE_FIXED,
     DESTINATION_MODE_REVIEW_REQUIRED,
+    MATCH_MODE_INCLUDE_SUBDOMAINS,
     POLICY_BLACKLIST,
     POLICY_MUST_READ,
     MailboxDomainRule,
@@ -2004,6 +2005,7 @@ def reprocess_all_historical_candidates_for_domain(
     mailbox_source_id: str,
     sender_domain: str,
     rule: MailboxDomainRule,
+    mailbox_domain_rule_repository: MailboxDomainRuleRepository,
     adapter: _AdapterProtocol,
     message_repository: MailboxMessageRepository,
     needs_you_repository: NeedsYouRepository,
@@ -2034,7 +2036,45 @@ def reprocess_all_historical_candidates_for_domain(
     (see that method's own docstring), ALWAYS includes the one item-
     triggering message too, since it is also
     ``CHECKED_NOT_CANDIDATE`` — so there is no need to special-case it
-    separately from the rest.
+    separately from the rest. When ``rule.match_mode`` is
+    ``MATCH_MODE_INCLUDE_SUBDOMAINS`` this candidate query is ALSO
+    widened (``include_subdomains=True``) to reach candidates from real
+    subdomains of ``sender_domain`` (e.g. approving ``example.com``
+    INCLUDE_SUBDOMAINS must reach ``billing.example.com`` candidates
+    too) — see :func:`services.mailbox.domain_rule.domain_in_scope`.
+
+    Effective-rule re-resolution — the real defect this function used to
+    have, and the fix (PL-escalated architect defect, three parts):
+    candidates matching the broadened domain query are NOT simply
+    handed the caller's own ``rule`` unconditionally. Historically this
+    function did exactly that, which was wrong in three distinct ways:
+    (1) approving one specific ``EXACT_ADDRESS`` (e.g. ``ap@vendor.com``)
+    would wrongly sweep in every OTHER address at ``vendor.com`` too
+    (``marketing@vendor.com``, ...) since the old query only ever
+    matched on domain; (2) approving a domain with
+    ``INCLUDE_SUBDOMAINS`` never reached subdomain candidates at all
+    (fixed by the widened query above); (3) most importantly, a
+    candidate the widened query surfaces might actually be governed by
+    a DIFFERENT, MORE SPECIFIC existing rule (e.g. a pre-existing
+    ``BLACKLIST``/``EXACT_ADDRESS`` override on one address, or a
+    ``BLACKLIST``/``GRAYLIST`` override on a child domain) — blindly
+    applying the newly-approved ``rule`` to it would silently overrule
+    that more-specific decision. The fix: for EACH candidate, re-resolve
+    its own TRUE effective governing rule via
+    ``mailbox_domain_rule_repository.find_for_sender`` (the SAME
+    authoritative most-specific-first resolution ``run_sweep`` already
+    uses for live mail — see that function's own domain-gate section),
+    keyed by the candidate's OWN ``sender_domain``/``sender_address``
+    (never the caller's ``sender_domain`` parameter). A candidate is
+    reprocessed ONLY when that effective rule's ``rule_id`` is EXACTLY
+    the just-approved ``rule.rule_id`` — never merely "same policy" or
+    "same domain". Any candidate whose effective rule resolves to
+    something else (a different, more specific rule) — or, in the
+    defensive/unreachable case, to no rule at all — is skipped entirely:
+    zero header fetch, zero MIME fetch, zero scanner call, zero status
+    mutation, and it does NOT appear in the returned list. This never
+    duplicates ``find_for_sender``'s own three-tier precedence logic —
+    it is called, not reimplemented.
 
     Bounded execution (architect §11 — "no retry storm, no unbounded
     parallel Graph requests"): candidates are reprocessed SEQUENTIALLY,
@@ -2054,12 +2094,19 @@ def reprocess_all_historical_candidates_for_domain(
     message already reprocessed by the first call is no longer
     ``CHECKED_NOT_CANDIDATE`` (it is now ``INGESTED``/``QUARANTINED``/
     ``FAILED``/``VANISHED``), so `list_candidate_messages_for_domain`
-    itself naturally no longer returns it on a second call.
+    itself naturally no longer returns it on a second call. A candidate
+    SKIPPED by effective-rule filtering stays ``CHECKED_NOT_CANDIDATE``
+    — untouched, still eligible for a later, explicit decision about it
+    specifically (e.g. its own domain/address being separately
+    approved) — never stuck in some new intermediate state.
 
-    Returns the list of resulting `MailboxMessage` objects, oldest-
-    received-first (mirrors `list_candidate_messages_for_domain`'s own
-    ordering) — an EMPTY list, never `None`, when no eligible historical
-    candidate exists for this domain.
+    Returns the list of resulting `MailboxMessage` objects for
+    candidates that were ACTUALLY processed, oldest-received-first
+    (mirrors `list_candidate_messages_for_domain`'s own ordering, since
+    skipped candidates are simply omitted rather than reordering
+    anything) — an EMPTY list, never `None`, when no eligible historical
+    candidate exists for this domain, or none of the discovered
+    candidates are actually governed by this rule.
 
     Raises:
         core.errors.ConflictError: `mailbox` is not ACTIVE+CONNECTED
@@ -2072,18 +2119,29 @@ def reprocess_all_historical_candidates_for_domain(
             "candidates (reconnect the mailbox before approving this domain review item)"
         )
 
+    include_subdomains = rule.match_mode == MATCH_MODE_INCLUDE_SUBDOMAINS
     candidates = message_repository.list_candidate_messages_for_domain(
-        mailbox_id=mailbox.mailbox_id, sender_domain=sender_domain
+        mailbox_id=mailbox.mailbox_id, sender_domain=sender_domain, include_subdomains=include_subdomains
     )
 
     results: list[MailboxMessage] = []
     for candidate in candidates:
+        effective_rule = mailbox_domain_rule_repository.find_for_sender(
+            mailbox_id=candidate.mailbox_id,
+            sender_domain=candidate.sender_domain,
+            sender_address=candidate.sender_address,
+        )
+        if effective_rule is None or effective_rule.rule_id != rule.rule_id:
+            # A different, more-specific rule actually governs this
+            # candidate (or, defensively, none does) — skip entirely,
+            # no side effects, and never appear in `results`.
+            continue
         results.append(
             _reprocess_one_message(
                 mailbox=mailbox,
                 mailbox_source_id=mailbox_source_id,
                 message_id=candidate.mailbox_message_id,
-                rule=rule,
+                rule=effective_rule,
                 adapter=adapter,
                 message_repository=message_repository,
                 needs_you_repository=needs_you_repository,

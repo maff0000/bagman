@@ -40,7 +40,7 @@ from core import identity
 from core.contract_validation import validate_against_contract
 from core.errors import NotFoundError, ValidationError
 from core.timestamps import to_contract_string, utc_now
-from services.mailbox.domain_rule import normalize_domain
+from services.mailbox.domain_rule import domain_in_scope, normalize_domain
 
 _SCHEMA = "mailbox/bagman.mailbox_message.v1.schema.json"
 SCHEMA_VERSION = "bagman.mailbox_message.v1"
@@ -321,7 +321,9 @@ class MailboxMessageRepository(abc.ABC):
         raise NotImplementedError
 
     @abc.abstractmethod
-    def list_candidate_messages_for_domain(self, *, mailbox_id: str, sender_domain: str) -> list[MailboxMessage]:
+    def list_candidate_messages_for_domain(
+        self, *, mailbox_id: str, sender_domain: str, include_subdomains: bool = False
+    ) -> list[MailboxMessage]:
         """Operational addendum (ahead of the first real large historical
         sweep) — the query
         ``services.mailbox.sweep.reprocess_all_historical_candidates_for_domain``
@@ -332,10 +334,18 @@ class MailboxMessageRepository(abc.ABC):
         Second CD-6 architect amendment (persisted discovery decision) —
         corrects this method's own original, too-broad filter. Returns
         every ``MailboxMessage`` that: belong to the specified mailbox;
-        match the normalized sender domain (via
+        match ``sender_domain`` — by default (``include_subdomains=
+        False``) an exact, normalized-equality match (via
         :func:`services.mailbox.domain_rule.normalize_domain`, the SAME
-        normalisation a governing ``MailboxDomainRule`` uses); were
-        explicitly identified as financial discovery candidates
+        normalisation a governing ``MailboxDomainRule`` uses); when
+        ``include_subdomains=True``, ALSO any real subdomain of
+        ``sender_domain`` (via
+        :func:`services.mailbox.domain_rule.domain_in_scope` — the SAME
+        dot-boundary suffix semantics
+        ``MailboxDomainRuleRepository.find_for_sender``'s own Tier-3
+        parent-domain check uses, so e.g. ``"notexample.com"`` never
+        matches ``"example.com"`` even with ``include_subdomains=True``);
+        were explicitly identified as financial discovery candidates
         (``discovery_candidate is True`` — the literal boolean ``True``,
         never merely "not ``None``"/"not ``False``"); remain eligible
         for deep processing (``ingestion_status ==
@@ -350,6 +360,16 @@ class MailboxMessageRepository(abc.ABC):
         ``_reprocess_one_message``/former
         ``reprocess_message_after_domain_rule_approval`` idempotency
         check, which this filter mirrors exactly).
+
+        ``include_subdomains`` defaults to ``False`` so every existing
+        caller that does not pass it sees IDENTICAL behavior to before
+        this parameter was added (exact-domain matching only) — this
+        default is load-bearing, never change it. The real caller,
+        :func:`services.mailbox.sweep.reprocess_all_historical_candidates_for_domain`,
+        passes ``include_subdomains=True`` only when the newly-approved
+        rule's own ``match_mode`` is ``MATCH_MODE_INCLUDE_SUBDOMAINS`` —
+        this method itself has no opinion on WHY the caller widened the
+        query, it only implements the widened query once asked.
 
         The ``discovery_candidate is True`` gate is what makes this
         method safe for the real operator-approval flow: an
@@ -537,14 +557,18 @@ class InMemoryMailboxMessageRepository(MailboxMessageRepository):
             return items[offset:]
         return items[offset : offset + limit]
 
-    def list_candidate_messages_for_domain(self, *, mailbox_id: str, sender_domain: str) -> list[MailboxMessage]:
+    def list_candidate_messages_for_domain(
+        self, *, mailbox_id: str, sender_domain: str, include_subdomains: bool = False
+    ) -> list[MailboxMessage]:
         normalized_domain = normalize_domain(sender_domain)
         items = [
             m
             for m in self._by_id.values()
             if m.mailbox_id == mailbox_id
             and m.sender_domain is not None
-            and normalize_domain(m.sender_domain) == normalized_domain
+            and domain_in_scope(
+                normalize_domain(m.sender_domain), normalized_domain, include_subdomains=include_subdomains
+            )
             and m.ingestion_status == INGESTION_STATUS_CHECKED_NOT_CANDIDATE
             and m.discovery_candidate is True
         ]

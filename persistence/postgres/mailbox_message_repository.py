@@ -18,7 +18,7 @@ from core.contract_validation import validate_against_contract
 from core.timestamps import utc_now
 from persistence.postgres.mailbox_message_models import MailboxMessageRow
 from persistence.postgres.session import get_engine, session_scope
-from services.mailbox.domain_rule import normalize_domain
+from services.mailbox.domain_rule import domain_in_scope, normalize_domain
 from services.mailbox.message import (
     INGESTION_STATUS_CHECKED_NOT_CANDIDATE,
     MailboxMessage,
@@ -245,7 +245,9 @@ class PostgresMailboxMessageRepository(MailboxMessageRepository):
         except SQLAlchemyError as exc:
             raise PersistenceError(f"could not list MailboxMessage rows: {exc}") from exc
 
-    def list_candidate_messages_for_domain(self, *, mailbox_id: str, sender_domain: str) -> list[MailboxMessage]:
+    def list_candidate_messages_for_domain(
+        self, *, mailbox_id: str, sender_domain: str, include_subdomains: bool = False
+    ) -> list[MailboxMessage]:
         normalized_domain = normalize_domain(sender_domain)
         try:
             with session_scope(self._engine) as session:
@@ -280,5 +282,9 @@ class PostgresMailboxMessageRepository(MailboxMessageRepository):
         except SQLAlchemyError as exc:
             raise PersistenceError(f"could not list candidate MailboxMessage rows for domain: {exc}") from exc
         return [
-            _row_to_domain(row) for row in rows if normalize_domain(row.sender_domain) == normalized_domain
+            _row_to_domain(row)
+            for row in rows
+            if domain_in_scope(
+                normalize_domain(row.sender_domain), normalized_domain, include_subdomains=include_subdomains
+            )
         ]

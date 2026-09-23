@@ -369,6 +369,7 @@ def resolve_domain_review(
             mailbox_source_id=mailbox_source_id,
             sender_domain=sender_domain,
             rule=rule,
+            mailbox_domain_rule_repository=mailbox_domain_rule_repository,
             adapter=adapter,
             message_repository=mailbox_message_repository,
             needs_you_repository=needs_you_repository,

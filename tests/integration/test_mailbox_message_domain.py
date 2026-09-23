@@ -287,6 +287,59 @@ def test_list_candidate_messages_ordered_oldest_received_first(repo, mailbox_id)
 
 
 # ---------------------------------------------------------------------
+# `include_subdomains` (historical-candidate-scoping defect fix) — the
+# in-memory repository's own direct proof, independent of the full
+# reprocess flow. See `services.mailbox.domain_rule.domain_in_scope`'s
+# own docstring for the shared boundary semantics this mirrors.
+# ---------------------------------------------------------------------
+
+
+def test_list_candidate_messages_default_omitted_include_subdomains_is_exact_domain_only(repo, mailbox_id):
+    """`include_subdomains` defaults to `False` — a caller that never
+    passes it (every pre-existing caller) sees IDENTICAL exact-domain-
+    only behavior to before this parameter existed."""
+    _observe_candidate(repo, mailbox_id=mailbox_id, msg_id="exact", sender_domain="example.com")
+    _observe_candidate(repo, mailbox_id=mailbox_id, msg_id="sub", sender_domain="billing.example.com")
+
+    results = repo.list_candidate_messages_for_domain(mailbox_id=mailbox_id, sender_domain="example.com")
+    assert [m.immutable_provider_message_id for m in results] == ["exact"]
+
+
+def test_list_candidate_messages_include_subdomains_false_explicit_is_exact_domain_only(repo, mailbox_id):
+    _observe_candidate(repo, mailbox_id=mailbox_id, msg_id="exact", sender_domain="example.com")
+    _observe_candidate(repo, mailbox_id=mailbox_id, msg_id="sub", sender_domain="billing.example.com")
+
+    results = repo.list_candidate_messages_for_domain(
+        mailbox_id=mailbox_id, sender_domain="example.com", include_subdomains=False
+    )
+    assert [m.immutable_provider_message_id for m in results] == ["exact"]
+
+
+def test_list_candidate_messages_include_subdomains_true_includes_single_and_multi_level_subdomains(repo, mailbox_id):
+    _observe_candidate(repo, mailbox_id=mailbox_id, msg_id="exact", sender_domain="example.com")
+    _observe_candidate(repo, mailbox_id=mailbox_id, msg_id="single-level", sender_domain="billing.example.com")
+    _observe_candidate(repo, mailbox_id=mailbox_id, msg_id="multi-level", sender_domain="receipts.eu.example.com")
+
+    results = repo.list_candidate_messages_for_domain(
+        mailbox_id=mailbox_id, sender_domain="example.com", include_subdomains=True
+    )
+    assert {m.immutable_provider_message_id for m in results} == {"exact", "single-level", "multi-level"}
+
+
+def test_list_candidate_messages_include_subdomains_true_never_matches_a_lookalike_domain(repo, mailbox_id):
+    """The critical boundary case: `notexample.com` is NOT a subdomain of
+    `example.com` (no dot boundary) and must never match, even with
+    `include_subdomains=True`."""
+    _observe_candidate(repo, mailbox_id=mailbox_id, msg_id="lookalike", sender_domain="notexample.com")
+    _observe_candidate(repo, mailbox_id=mailbox_id, msg_id="exact", sender_domain="example.com")
+
+    results = repo.list_candidate_messages_for_domain(
+        mailbox_id=mailbox_id, sender_domain="example.com", include_subdomains=True
+    )
+    assert [m.immutable_provider_message_id for m in results] == ["exact"]
+
+
+# ---------------------------------------------------------------------
 # CD-6 GUI-operations-foundation follow-on WO (item A) —
 # `sender_address_observed`.
 # ---------------------------------------------------------------------

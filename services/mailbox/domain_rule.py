@@ -274,6 +274,47 @@ def normalize_domain(sender_domain: str) -> str:
     return sender_domain.strip().lower()
 
 
+def domain_in_scope(candidate_domain: str, target_domain: str, *, include_subdomains: bool) -> bool:
+    """The ONE shared boundary check for "is this candidate's domain
+    ``target_domain`` itself, or (only when ``include_subdomains`` is
+    True) a genuine subdomain of it?" — both inputs are assumed ALREADY
+    normalised (lowercase, stripped) by the caller via
+    :func:`normalize_domain`, exactly like every other function in this
+    module.
+
+    This exists purely for
+    ``services.mailbox.message.MailboxMessageRepository
+    .list_candidate_messages_for_domain``'s own historical-candidate
+    query (both the in-memory and Postgres implementations) — the
+    historical-backfill query needs to widen to "this domain and its
+    subdomains" for an ``INCLUDE_SUBDOMAINS`` rule the SAME way
+    :meth:`MailboxDomainRuleRepository.find_for_sender`'s own Tier-3
+    parent-domain check already does for live mail. This function
+    reuses that EXACT SAME suffix-boundary semantics
+    (``candidate_domain.endswith(f".{target_domain}")``) rather than
+    re-deriving it independently — see ``find_for_sender``'s own Tier-3
+    comment. It is deliberately a new, additional, narrow helper: it
+    does NOT replace or touch either ``find_for_sender`` implementation,
+    which keeps its own inline copy of this same check (duplicating the
+    one-line boundary test is cheaper and safer here than introducing a
+    shared-code dependency between the message-repository layer and the
+    domain-rule-repository layer for a single ``.endswith`` call).
+
+    Boundary rule: exact equality always matches, regardless of
+    ``include_subdomains``. ``candidate_domain.endswith("." +
+    target_domain)`` is checked ONLY when ``include_subdomains`` is
+    True — this is a real dot-boundary suffix check, not a bare string
+    suffix check, so e.g. ``"notexample.com"`` does NOT match
+    ``"example.com"`` (no trailing-dot boundary), while
+    ``"billing.example.com"`` and multi-level
+    ``"receipts.eu.example.com"`` both correctly match."""
+    if candidate_domain == target_domain:
+        return True
+    if not include_subdomains:
+        return False
+    return candidate_domain.endswith(f".{target_domain}")
+
+
 def normalize_address(sender_address: str) -> str:
     """The ONE place every caller normalises a full sender email address
     before either a match/uniqueness comparison or storage (CD-6
