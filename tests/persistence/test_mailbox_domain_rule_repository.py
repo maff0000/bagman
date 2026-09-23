@@ -11,6 +11,7 @@ import sqlalchemy as sa
 from sqlalchemy.exc import IntegrityError
 
 from core import identity
+from core.contract_validation import validate_against_contract
 from core.errors import ConflictError, NotFoundError, ValidationError
 from core.timestamps import utc_now
 from persistence.postgres.mailbox_domain_rule_models import MailboxDomainRuleRow
@@ -596,3 +597,31 @@ def test_postgres_find_for_sender_ambiguous_exact_predicates_raise_conflict_erro
                     "WHERE match_mode = 'EXACT_DOMAIN_SUBJECT'"
                 )
             )
+
+
+# ---------------------------------------------------------------------
+# Contract-layer conditional validity (CD-6 GUI-operations-foundation
+# follow-on hardening delta, item 1) — the REAL code path, not just the
+# schema in isolation, must produce a schema-valid dict. The in-memory
+# repository's own equivalent proof lives in
+# `tests/contract/test_mailbox_domain_rule_contract.py::test_in_memory_repository_upsert_produces_a_schema_valid_exact_domain_subject_snapshot`
+# — this is the SAME proof for the PostgreSQL-backed implementation,
+# against a real, disposable PostgreSQL container.
+# ---------------------------------------------------------------------
+
+
+def test_postgres_repository_upsert_produces_a_schema_valid_exact_domain_subject_snapshot():
+    _SCHEMA = "mailbox/bagman.mailbox_domain_rule.v1.schema.json"
+    repo = PostgresMailboxDomainRuleRepository()
+    mailbox_id = _mailbox_id()
+    rule = repo.upsert_rule(
+        mailbox_id=mailbox_id, sender_domain="vendor.com", match_mode=MATCH_MODE_EXACT_DOMAIN_SUBJECT,
+        policy=POLICY_MUST_READ, destination_entity_id=None, destination_mode=DESTINATION_MODE_REVIEW_REQUIRED,
+        source=SOURCE_OPERATOR, subject_predicate_type=SUBJECT_PREDICATE_EXACT,
+        subject_predicate_value="Monthly Statement",
+    )
+    # A second, independent, direct validation of the produced dict —
+    # never merely trusting that `upsert_rule`'s own internal
+    # `validate_against_contract` call (which already ran once, inside
+    # the repository, before this line) happened to pass.
+    validate_against_contract(rule.to_dict(), _SCHEMA)

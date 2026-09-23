@@ -4556,3 +4556,369 @@ def test_allow_subject_rule_rejected_when_no_currently_eligible_candidate_matche
         )
     assert h.needs_you_repo.get_needs_you_item(item.item_id).status == "OPEN"
     assert h.graph_client.content_calls == []
+
+
+# =======================================================================
+# CD-6 GUI-operations-foundation follow-on hardening delta — item 2:
+# corrected previous-rule audit lookup (`find_exact`, never
+# `find_for_sender`, for the audit "previous state" snapshot).
+# =======================================================================
+
+
+def test_subject_rule_previous_policy_audit_is_none_under_a_broader_domain_blacklist_rule():
+    """Item 2 — a NEW EXACT_DOMAIN_SUBJECT rule created underneath an
+    existing broader EXACT-domain BLACKLIST rule must report
+    `previous_policy=None` in its own audit payload — never the broader
+    BLACKLIST rule's own policy, which `find_for_sender`'s most-
+    specific-wins resolution would have incorrectly surfaced before this
+    fix (it is asking "what governs this domain right now", not "what
+    was THIS subject identity's own prior state")."""
+    from services.mailbox.review_resolution import resolve_domain_review
+
+    h = Harness(allow_default_domain=False)
+    domain = "audit-previous-under-broad-blacklist.example"
+    h.graph_client.queue_delta_result(
+        GraphDeltaPageResult(
+            status=GraphOutcomeStatus.OK,
+            messages=(_msg("apub-1", subject="Monthly Statement", sender_address=f"billing@{domain}"),),
+            delta_link="d1",
+        )
+    )
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link="d-junk"))
+    h.sweep()
+    item = _open_domain_review_item(h, domain)
+
+    # Simulate an already-governed broader domain-level BLACKLIST rule
+    # for this SAME domain, in a DIFFERENT identity space from the
+    # subject rule about to be created — the message's own
+    # ingestion_status stays CHECKED_NOT_CANDIDATE (untouched by this
+    # direct repository call), so it remains a currently eligible
+    # candidate for the subject approval below.
+    h.domain_rule_repo.upsert_rule(
+        mailbox_id=h.mailbox.mailbox_id, sender_domain=domain, match_mode="EXACT", policy="BLACKLIST",
+        destination_entity_id=None, destination_mode=None, source="OPERATOR",
+    )
+
+    h.graph_client.queue_headers_result(_headers_ok())
+    h.graph_client.queue_content_result(_content())
+    result = resolve_domain_review(
+        needs_you_repository=h.needs_you_repo, mailbox_message_repository=h.message_repo,
+        mailbox_domain_rule_repository=h.domain_rule_repo, entity_repository=h.api.entity_repository,
+        api=h.api, object_store=h.object_store, scanner=h.scanner, adapter=h.adapter, mailbox=h.mailbox,
+        mailbox_id=h.mailbox.mailbox_id, mailbox_source_id=h.source_id, item_id=item.item_id,
+        actor_type="SYSTEM", actor_id="test", decision="ALLOW", destination_entity_id=None,
+        destination_mode="REVIEW_REQUIRED", match_mode="EXACT_DOMAIN_SUBJECT", processor_hint=None,
+        sender_address=None, subject_predicate_type="EXACT", subject_predicate_value="Monthly Statement",
+    )
+    assert result["mailbox_domain_rule"]["policy"] == "MUST_READ"
+
+    must_read_events = h.api.audit_repository.list_recent(limit=50, event_type_prefix="MAILBOX_DOMAIN_RULE_MUST_READ")
+    matching = [e for e in must_read_events if e.payload.get("needs_you_item_id") == item.item_id]
+    assert len(matching) == 1
+    assert matching[0].payload["previous_policy"] is None
+
+
+def test_subject_rule_transition_blacklist_to_must_read_reports_truthful_previous_policy():
+    """Item 2 — an existing subject rule transitioning BLACKLIST ->
+    MUST_READ (via the ALLOW branch's own pre-existing "existing rule at
+    a different, non-MUST_READ policy is a legitimate transition" path)
+    reports `previous_policy == "BLACKLIST"` — the subject identity's
+    OWN prior state, correctly resolved via `find_exact`."""
+    from services.mailbox.review_resolution import resolve_domain_review
+
+    h = Harness(allow_default_domain=False)
+    domain = "subject-transition-b2m.example"
+    pdf_attachment = ({"filename": "flyer.pdf", "content_type": "application/pdf"},)
+    m1 = _msg(
+        "t-m1", subject="Marketing blast", sender_address=f"promo@{domain}", attachment_metadata=pdf_attachment,
+        received_at=datetime(2024, 3, 1, 9, 0, tzinfo=timezone.utc),
+    )
+    m2 = _msg(
+        "t-m2", subject="Monthly Statement", sender_address=f"billing@{domain}",
+        received_at=datetime(2024, 3, 1, 9, 1, tzinfo=timezone.utc),
+    )
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(m1, m2), delta_link="d1"))
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link="d-junk"))
+    h.sweep()
+    item = _open_domain_review_item(h, domain)
+
+    base_kwargs = dict(
+        needs_you_repository=h.needs_you_repo, mailbox_message_repository=h.message_repo,
+        mailbox_domain_rule_repository=h.domain_rule_repo, entity_repository=h.api.entity_repository,
+        api=h.api, object_store=h.object_store, scanner=h.scanner, adapter=h.adapter, mailbox=h.mailbox,
+        mailbox_id=h.mailbox.mailbox_id, mailbox_source_id=h.source_id, item_id=item.item_id,
+        actor_type="SYSTEM", actor_id="test", processor_hint=None, sender_address=None,
+        match_mode="EXACT_DOMAIN_SUBJECT", subject_predicate_type="STARTS_WITH", subject_predicate_value="Marketing",
+    )
+
+    # Step 1: subject BLACKLIST for "Marketing" (matches m1 only) — item
+    # stays OPEN (m2 is residual).
+    ignore_result = resolve_domain_review(
+        decision="IGNORE", destination_entity_id=None, destination_mode=None, **base_kwargs
+    )
+    assert ignore_result["needs_you_item"]["status"] == "OPEN"
+    assert ignore_result["mailbox_domain_rule"]["policy"] == "BLACKLIST"
+
+    # Step 2: transition the SAME subject identity to MUST_READ.
+    h.graph_client.queue_headers_result(_headers_ok())
+    h.graph_client.queue_content_result(_content())
+    allow_result = resolve_domain_review(
+        decision="ALLOW", destination_entity_id=None, destination_mode="REVIEW_REQUIRED", **base_kwargs
+    )
+    assert allow_result["mailbox_domain_rule"]["policy"] == "MUST_READ"
+    assert allow_result["mailbox_domain_rule"]["rule_id"] == ignore_result["mailbox_domain_rule"]["rule_id"]
+
+    must_read_events = h.api.audit_repository.list_recent(limit=50, event_type_prefix="MAILBOX_DOMAIN_RULE_MUST_READ")
+    matching = [e for e in must_read_events if e.payload.get("needs_you_item_id") == item.item_id]
+    assert len(matching) == 1
+    assert matching[0].payload["previous_policy"] == "BLACKLIST"
+    assert matching[0].payload["new_policy"] == "MUST_READ"
+
+
+def test_subject_rule_transition_must_read_to_blacklist_reports_truthful_previous_policy():
+    """Item 2 — an existing subject rule transitioning MUST_READ ->
+    BLACKLIST reports `previous_policy == "MUST_READ"`. This ALSO
+    exercises item 3's own "genuine decision change" path within the new
+    subject-BLACKLIST branch (the existing rule's policy is MUST_READ,
+    not BLACKLIST, so this is never mistaken for an idempotent repeat —
+    a real `upsert_rule` mutation occurs and a truthful audit event is
+    recorded, using the item-2-corrected `previous_policy`)."""
+    from services.mailbox.review_resolution import resolve_domain_review
+
+    h = Harness(allow_default_domain=False)
+    domain = "subject-transition-m2b.example"
+    pdf_attachment = ({"filename": "flyer.pdf", "content_type": "application/pdf"},)
+    m1 = _msg(
+        "u-m1", subject="Order confirmed: Widget", sender_address=f"orders@{domain}",
+        attachment_metadata=pdf_attachment, received_at=datetime(2024, 3, 2, 9, 0, tzinfo=timezone.utc),
+    )
+    m2 = _msg(
+        "u-m2", subject="Monthly Statement", sender_address=f"billing@{domain}",
+        received_at=datetime(2024, 3, 2, 9, 1, tzinfo=timezone.utc),
+    )
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(m1, m2), delta_link="d1"))
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link="d-junk"))
+    h.sweep()
+    item = _open_domain_review_item(h, domain)
+
+    base_kwargs = dict(
+        needs_you_repository=h.needs_you_repo, mailbox_message_repository=h.message_repo,
+        mailbox_domain_rule_repository=h.domain_rule_repo, entity_repository=h.api.entity_repository,
+        api=h.api, object_store=h.object_store, scanner=h.scanner, adapter=h.adapter, mailbox=h.mailbox,
+        mailbox_id=h.mailbox.mailbox_id, mailbox_source_id=h.source_id, item_id=item.item_id,
+        actor_type="SYSTEM", actor_id="test", processor_hint=None, sender_address=None,
+        match_mode="EXACT_DOMAIN_SUBJECT", subject_predicate_type="STARTS_WITH",
+        subject_predicate_value="Order confirmed:",
+    )
+
+    # Step 1: ALLOW subject MUST_READ for "Order confirmed:" (matches m1
+    # only) — item stays OPEN (m2 is residual).
+    h.graph_client.queue_headers_result(_headers_ok())
+    h.graph_client.queue_content_result(_content())
+    allow_result = resolve_domain_review(
+        decision="ALLOW", destination_entity_id=None, destination_mode="REVIEW_REQUIRED", **base_kwargs
+    )
+    assert allow_result["needs_you_item"]["status"] == "OPEN"
+    assert allow_result["mailbox_domain_rule"]["policy"] == "MUST_READ"
+
+    # Step 2: transition the SAME subject identity to BLACKLIST.
+    ignore_result = resolve_domain_review(
+        decision="IGNORE", destination_entity_id=None, destination_mode=None, **base_kwargs
+    )
+    assert ignore_result["mailbox_domain_rule"]["policy"] == "BLACKLIST"
+    assert ignore_result["mailbox_domain_rule"]["rule_id"] == allow_result["mailbox_domain_rule"]["rule_id"]
+
+    blacklist_events = h.api.audit_repository.list_recent(limit=50, event_type_prefix="MAILBOX_DOMAIN_RULE_BLACKLIST")
+    matching = [e for e in blacklist_events if e.payload.get("needs_you_item_id") == item.item_id]
+    assert len(matching) == 1
+    assert matching[0].payload["previous_policy"] == "MUST_READ"
+    assert matching[0].payload["new_policy"] == "BLACKLIST"
+
+
+def test_plain_domain_level_rule_previous_policy_audit_remains_truthful_after_find_exact_switch():
+    """Item 2 regression — switching the audit "previous state" lookup
+    from `find_for_sender` to `find_exact` must not change this value
+    for a plain domain-level (EXACT) decision: for the domain BEING
+    DECIDED, `find_exact` and `find_for_sender` agree in the ordinary
+    case (this decision's own identity has no more-specific override to
+    fall behind, since it IS the identity being decided)."""
+    from services.mailbox.review_resolution import resolve_domain_review
+
+    h = Harness(allow_default_domain=False)
+    domain = "plain-domain-previous-policy.example"
+    h.graph_client.queue_delta_result(
+        GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(_msg("pd-1", sender_address=f"billing@{domain}"),), delta_link="d1")
+    )
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link="d-junk"))
+    h.sweep()
+    item = _open_domain_review_item(h, domain)
+
+    base_kwargs = dict(
+        needs_you_repository=h.needs_you_repo, mailbox_message_repository=h.message_repo,
+        mailbox_domain_rule_repository=h.domain_rule_repo, entity_repository=h.api.entity_repository,
+        api=h.api, object_store=h.object_store, scanner=h.scanner, adapter=h.adapter, mailbox=h.mailbox,
+        mailbox_id=h.mailbox.mailbox_id, mailbox_source_id=h.source_id, item_id=item.item_id,
+        actor_type="SYSTEM", actor_id="test", match_mode="EXACT", processor_hint=None, sender_address=None,
+    )
+
+    # KEEP_GRAY first — previous_policy must be None (nothing governed
+    # this domain before).
+    resolve_domain_review(decision="KEEP_GRAY", destination_entity_id=None, destination_mode=None, **base_kwargs)
+    gray_events = h.api.audit_repository.list_recent(limit=50, event_type_prefix="MAILBOX_DOMAIN_RULE_GRAYLIST")
+    matching_gray = [e for e in gray_events if e.payload.get("needs_you_item_id") == item.item_id]
+    assert len(matching_gray) == 1
+    assert matching_gray[0].payload["previous_policy"] is None
+
+    # Now IGNORE (BLACKLIST) on the SAME still-OPEN item — previous_policy
+    # must truthfully be GRAYLIST, exactly as it was before this fix.
+    ignore_result = resolve_domain_review(
+        decision="IGNORE", destination_entity_id=None, destination_mode=None, **base_kwargs
+    )
+    blacklist_events = h.api.audit_repository.list_recent(limit=50, event_type_prefix="MAILBOX_DOMAIN_RULE_BLACKLIST")
+    matching_blacklist = [e for e in blacklist_events if e.payload.get("needs_you_item_id") == item.item_id]
+    assert len(matching_blacklist) == 1
+    assert matching_blacklist[0].payload["previous_policy"] == "GRAYLIST"
+    assert ignore_result["needs_you_item"]["status"] == "RESOLVED"
+
+
+# =======================================================================
+# CD-6 GUI-operations-foundation follow-on hardening delta — item 3:
+# subject-BLACKLIST partial-residual idempotent retry.
+# =======================================================================
+
+
+def test_subject_blacklist_partial_residual_idempotent_retry():
+    """Item 3 — the core scenario: an EXACT_DOMAIN_SUBJECT BLACKLIST
+    decision that only partially resolves residual work (the item stays
+    OPEN) must be safely retryable: an EXACT repeat of the same decision
+    reuses the SAME rule byte-identically (never refreshing timestamps),
+    never emits a second audit event, and never issues a provider call
+    (BLACKLIST never fetches, retry or not) — yet residual state is
+    still correctly recomputed on every call, and a later, SEPARATE
+    governance of the residual candidate resolves this SAME item."""
+    from services.mailbox.review_resolution import resolve_domain_review
+
+    h = Harness(allow_default_domain=False)
+    domain = "subject-blacklist-partial-retry.example"
+    pdf_attachment = ({"filename": "flyer.pdf", "content_type": "application/pdf"},)
+    m1 = _msg(
+        "pbr-m1", subject="Marketing offer", sender_address=f"promo@{domain}", attachment_metadata=pdf_attachment,
+        received_at=datetime(2024, 4, 1, 9, 0, tzinfo=timezone.utc),
+    )
+    m2 = _msg(
+        "pbr-m2", subject="Monthly Statement", sender_address=f"billing@{domain}",
+        received_at=datetime(2024, 4, 1, 9, 1, tzinfo=timezone.utc),
+    )
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(m1, m2), delta_link="d1"))
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link="d-junk"))
+    h.sweep()
+    item = _open_domain_review_item(h, domain)
+
+    kwargs = dict(
+        needs_you_repository=h.needs_you_repo, mailbox_message_repository=h.message_repo,
+        mailbox_domain_rule_repository=h.domain_rule_repo, entity_repository=h.api.entity_repository,
+        api=h.api, object_store=h.object_store, scanner=h.scanner, adapter=h.adapter, mailbox=h.mailbox,
+        mailbox_id=h.mailbox.mailbox_id, mailbox_source_id=h.source_id, item_id=item.item_id,
+        actor_type="SYSTEM", actor_id="test", decision="IGNORE", destination_entity_id=None,
+        destination_mode=None, match_mode="EXACT_DOMAIN_SUBJECT", processor_hint=None, sender_address=None,
+        subject_predicate_type="STARTS_WITH", subject_predicate_value="Marketing",
+    )
+
+    first = resolve_domain_review(**kwargs)
+    assert h.graph_client.content_calls == []
+    assert first["mailbox_domain_rule"]["policy"] == "BLACKLIST"
+    assert first["needs_you_item"]["status"] == "OPEN"
+    assert first["needs_you_item"]["metadata"]["remaining_candidate_message_count"] == 1
+
+    blacklist_events = h.api.audit_repository.list_recent(limit=50, event_type_prefix="MAILBOX_DOMAIN_RULE_BLACKLIST")
+    matching = [e for e in blacklist_events if e.payload.get("needs_you_item_id") == item.item_id]
+    assert len(matching) == 1
+
+    # Exact retry of the same decision.
+    second = resolve_domain_review(**kwargs)
+    assert h.graph_client.content_calls == []  # BLACKLIST never fetches, retry or not
+    assert second["mailbox_domain_rule"]["rule_id"] == first["mailbox_domain_rule"]["rule_id"]
+    assert second["mailbox_domain_rule"]["created_at"] == first["mailbox_domain_rule"]["created_at"]
+    assert second["mailbox_domain_rule"]["updated_at"] == first["mailbox_domain_rule"]["updated_at"]
+    assert second["mailbox_domain_rule"]["approved_at"] == first["mailbox_domain_rule"]["approved_at"]
+    assert second["needs_you_item"]["status"] == "OPEN"
+    assert second["needs_you_item"]["metadata"]["remaining_candidate_message_count"] == 1
+
+    blacklist_events_after = h.api.audit_repository.list_recent(limit=50, event_type_prefix="MAILBOX_DOMAIN_RULE_BLACKLIST")
+    matching_after = [e for e in blacklist_events_after if e.payload.get("needs_you_item_id") == item.item_id]
+    assert len(matching_after) == 1  # never duplicated
+
+    # Separately govern m2 (a plain domain-level decision on the SAME
+    # item — mirrors item 37's own "a broad domain decision on the same
+    # still-open item resolves it unconditionally" pattern) — residual
+    # reaches zero and the SAME original review item resolves.
+    third = resolve_domain_review(
+        needs_you_repository=h.needs_you_repo, mailbox_message_repository=h.message_repo,
+        mailbox_domain_rule_repository=h.domain_rule_repo, entity_repository=h.api.entity_repository,
+        api=h.api, object_store=h.object_store, scanner=h.scanner, adapter=h.adapter, mailbox=h.mailbox,
+        mailbox_id=h.mailbox.mailbox_id, mailbox_source_id=h.source_id, item_id=item.item_id,
+        actor_type="SYSTEM", actor_id="test", decision="IGNORE", destination_entity_id=None,
+        destination_mode=None, match_mode="EXACT", processor_hint=None, sender_address=None,
+    )
+    assert third["needs_you_item"]["status"] == "RESOLVED"
+
+
+def test_subject_blacklist_repeat_with_different_processor_hint_is_a_genuine_second_mutation():
+    """Item 3 — a repeat BLACKLIST submission at the SAME subject
+    identity but with a DIFFERENT `processor_hint` is a genuine decision
+    change, never silently treated as an idempotent retry: a real second
+    `upsert_rule` mutation occurs (same `rule_id`, reused identity, but a
+    genuine replace) and a truthful second
+    `MAILBOX_DOMAIN_RULE_BLACKLIST` audit event is recorded — proving
+    the idempotent-repeat check in the new subject-BLACKLIST branch
+    genuinely compares semantics (`policy` + `processor_hint`), never
+    just "a rule already exists here"."""
+    from services.mailbox.review_resolution import resolve_domain_review
+
+    h = Harness(allow_default_domain=False)
+    domain = "subject-blacklist-hint-change.example"
+    pdf_attachment = ({"filename": "flyer.pdf", "content_type": "application/pdf"},)
+    m1 = _msg(
+        "hc-m1", subject="Marketing offer", sender_address=f"promo@{domain}", attachment_metadata=pdf_attachment,
+        received_at=datetime(2024, 4, 2, 9, 0, tzinfo=timezone.utc),
+    )
+    m2 = _msg(
+        "hc-m2", subject="Monthly Statement", sender_address=f"billing@{domain}",
+        received_at=datetime(2024, 4, 2, 9, 1, tzinfo=timezone.utc),
+    )
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(m1, m2), delta_link="d1"))
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link="d-junk"))
+    h.sweep()
+    item = _open_domain_review_item(h, domain)
+
+    base_kwargs = dict(
+        needs_you_repository=h.needs_you_repo, mailbox_message_repository=h.message_repo,
+        mailbox_domain_rule_repository=h.domain_rule_repo, entity_repository=h.api.entity_repository,
+        api=h.api, object_store=h.object_store, scanner=h.scanner, adapter=h.adapter, mailbox=h.mailbox,
+        mailbox_id=h.mailbox.mailbox_id, mailbox_source_id=h.source_id, item_id=item.item_id,
+        actor_type="SYSTEM", actor_id="test", decision="IGNORE", destination_entity_id=None,
+        destination_mode=None, match_mode="EXACT_DOMAIN_SUBJECT", sender_address=None,
+        subject_predicate_type="STARTS_WITH", subject_predicate_value="Marketing",
+    )
+
+    # m2 (nonmatching) keeps the item OPEN across both calls below — the
+    # essential precondition for reaching the new subject-BLACKLIST
+    # branch's own idempotent-vs-conflict logic at all (an already-
+    # RESOLVED item with an identical `resolution` dict would otherwise
+    # short-circuit as a no-op BEFORE this logic is ever reached, since
+    # `resolution` itself does not carry `processor_hint`).
+    first = resolve_domain_review(processor_hint=None, **base_kwargs)
+    assert first["needs_you_item"]["status"] == "OPEN"
+    first_rule_id = first["mailbox_domain_rule"]["rule_id"]
+
+    second = resolve_domain_review(processor_hint="MARKETING_VENDOR", **base_kwargs)
+    assert second["mailbox_domain_rule"]["rule_id"] == first_rule_id  # same identity, real replace
+    assert second["mailbox_domain_rule"]["processor_hint"] == "MARKETING_VENDOR"
+
+    blacklist_events = h.api.audit_repository.list_recent(limit=50, event_type_prefix="MAILBOX_DOMAIN_RULE_BLACKLIST")
+    matching = [e for e in blacklist_events if e.payload.get("needs_you_item_id") == item.item_id]
+    assert len(matching) == 2  # a genuine second mutation → a second, truthful audit event
+    # `list_recent` orders newest-first (`occurred_at` DESC) — index 0
+    # is the SECOND call's own event.
+    assert matching[0].payload["previous_policy"] == "BLACKLIST"
+    assert matching[0].payload["new_policy"] == "BLACKLIST"

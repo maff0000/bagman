@@ -122,5 +122,49 @@
     "subject_predicate_value",
     "schema_version"
   ],
-  "additionalProperties": false
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "description": "match_mode-conditional validity (CD-6 GUI-operations-foundation follow-on hardening delta) — structurally enforces, at the SCHEMA layer itself, the exact same match_mode/sender_address/subject_predicate_* correspondence `services.mailbox.domain_rule.validate_match_fields_or_raise` already enforces in Python. Defense-in-depth, not a replacement for that function: a malformed dict reaching this contract from ANY source (not only the two governed repository implementations) must be rejected here too, never merely by the domain layer above it. `EXACT_ADDRESS` is the one match_mode requiring a real `sender_address` and forbidding both subject-predicate fields — mirrors `bagman.ai_invocation.v1`'s own `role`-conditioned `allOf`/`if`/`then` style for a closed-set cross-field correspondence.",
+      "if": {
+        "properties": { "match_mode": { "const": "EXACT_ADDRESS" } },
+        "required": ["match_mode"]
+      },
+      "then": {
+        "properties": {
+          "sender_address": { "type": "string", "minLength": 3, "pattern": "^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$" },
+          "subject_predicate_type": { "type": "null" },
+          "subject_predicate_value": { "type": "null" }
+        }
+      }
+    },
+    {
+      "description": "`EXACT_DOMAIN_SUBJECT` is the one match_mode requiring a real, closed-set subject predicate and forbidding `sender_address` — the schema-level mirror of `validate_match_fields_or_raise`'s own `MATCH_MODE_EXACT_DOMAIN_SUBJECT` branch. Deliberately does NOT encode subject NORMALISATION (NFKC/casefold/whitespace-collapse) here — that remains Python-only domain logic (`services.mailbox.domain_rule.normalize_subject_for_policy`); this only pins the STRUCTURAL shape (non-null, non-empty, closed predicate-type enum).",
+      "if": {
+        "properties": { "match_mode": { "const": "EXACT_DOMAIN_SUBJECT" } },
+        "required": ["match_mode"]
+      },
+      "then": {
+        "properties": {
+          "sender_address": { "type": "null" },
+          "subject_predicate_type": { "type": "string", "enum": ["EXACT", "STARTS_WITH"] },
+          "subject_predicate_value": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    {
+      "description": "`EXACT`/`INCLUDE_SUBDOMAINS` are the two plain domain-level match modes — neither `sender_address` nor either subject-predicate field may ever be present, mirroring `validate_match_fields_or_raise`'s own final `else` branch.",
+      "if": {
+        "properties": { "match_mode": { "enum": ["EXACT", "INCLUDE_SUBDOMAINS"] } },
+        "required": ["match_mode"]
+      },
+      "then": {
+        "properties": {
+          "sender_address": { "type": "null" },
+          "subject_predicate_type": { "type": "null" },
+          "subject_predicate_value": { "type": "null" }
+        }
+      }
+    }
+  ]
 }

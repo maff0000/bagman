@@ -219,6 +219,46 @@ def make_ai_invocation(new_id, now_str) -> Callable[..., dict]:
 
 
 @pytest.fixture
+def make_mailbox_domain_rule(new_id, now_str) -> Callable[..., dict]:
+    """Factory for a minimal valid `bagman.mailbox_domain_rule.v1`
+    instance dict (CD-6 architect amendment; extended by the CD-6
+    GUI-operations-foundation follow-on WO's three-state policy model +
+    `EXACT_ADDRESS`/`EXACT_DOMAIN_SUBJECT` match modes, and hardened by
+    this delivery's own match_mode-conditional `allOf`/`if`/`then`
+    schema rules). Defaults to the simplest valid shape — a plain
+    domain-level `EXACT`/`BLACKLIST` rule, `sender_address` and both
+    subject-predicate fields `None` — callers pass `match_mode`-specific
+    overrides (`sender_address`, `subject_predicate_type`,
+    `subject_predicate_value`, `policy`, `destination_*`) to build any
+    of the other three match-mode shapes."""
+
+    def _make(**overrides: Any) -> dict:
+        instance = {
+            "rule_id": new_id(),
+            "mailbox_id": new_id(),
+            "sender_domain": "vendor.com",
+            "sender_address": None,
+            "match_mode": "EXACT",
+            "policy": "BLACKLIST",
+            "destination_entity_id": None,
+            "destination_mode": None,
+            "source": "OPERATOR",
+            "processor_hint": None,
+            "approved_at": now_str(),
+            "created_at": now_str(),
+            "updated_at": now_str(),
+            "last_seen_at": now_str(),
+            "subject_predicate_type": None,
+            "subject_predicate_value": None,
+            "schema_version": "bagman.mailbox_domain_rule.v1",
+        }
+        instance.update(overrides)
+        return instance
+
+    return _make
+
+
+@pytest.fixture
 def make_audit_event(new_id, now_str) -> Callable[..., dict]:
     """Factory for a minimal valid `bagman.audit_event.v1` instance dict."""
 

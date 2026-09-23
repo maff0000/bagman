@@ -73,7 +73,14 @@ the original behaviour is preserved exactly:
   original ordering/idempotency shape byte-for-byte (upsert rule ->
   resolve item -> audit -> never a backfill call, and the plain
   already-``RESOLVED``-with-identical-resolution no-op vs.
-  genuine-conflict ``ConflictError`` check unchanged). ``ALLOW`` was
+  genuine-conflict ``ConflictError`` check unchanged) for every
+  match_mode OTHER than ``EXACT_DOMAIN_SUBJECT`` — a later CD-6
+  hardening delta (item 3) adds a subject-BLACKLIST-specific idempotent-
+  retry-vs-genuine-change check ahead of the upsert for that one
+  match_mode ONLY (see :func:`resolve_domain_review`'s own docstring),
+  because the residual lifecycle means an OPEN item no longer implies
+  "no prior successful IGNORE" once a subject predicate is involved.
+  ``ALLOW`` was
   RESTRUCTURED (CD-6 GUI-operations-foundation follow-on WO — resumable
   MUST_READ backfill) so a genuine mid-backfill provider failure can be
   RETRIED to completion rather than stranding candidates forever behind
@@ -364,7 +371,8 @@ def resolve_domain_review(
     ``ALLOW`` shape below is even considered.
 
     ``decision="IGNORE"`` keeps its ORIGINAL, simple shape, byte-for-byte
-    unchanged: a real ``item.status != "OPEN"`` check up front (an
+    unchanged for every match_mode OTHER than ``EXACT_DOMAIN_SUBJECT``
+    (see below): a real ``item.status != "OPEN"`` check up front (an
     already-``RESOLVED`` item carrying this EXACT ``IGNORE`` resolution
     is a harmless idempotent no-op returning early with
     ``mailbox_domain_rule: None``; any other non-``OPEN`` status, or a
@@ -376,6 +384,36 @@ def resolve_domain_review(
     is never even called. There is nothing to make resumable here: an
     ``IGNORE`` never touches the backfill function at all, so it can
     never be interrupted mid-backfill.
+
+    ``decision="IGNORE"`` with ``match_mode == "EXACT_DOMAIN_SUBJECT"``
+    (CD-6 GUI-operations-foundation follow-on hardening delta, item 3) —
+    the ONE genuinely different shape within ``IGNORE``: the residual
+    lifecycle means the triggering item can legitimately stay ``OPEN``
+    after a subject BLACKLIST already fully, successfully applied (other
+    residual candidates at the same domain remain ungoverned), so
+    ``item.status == OPEN`` no longer implies "no prior successful
+    IGNORE occurred" for this specific subject identity the way it still
+    does for every other match_mode. Before mutating, the exact identity
+    is looked up via ``find_exact`` (the SAME call shape the ``ALLOW``
+    path's own retry/reuse check above already uses). If a rule already
+    exists there AND is semantically identical to this request (same
+    ``policy=BLACKLIST``/``processor_hint`` — a BLACKLIST rule carries no
+    destination fields, so nothing else to compare), this is a pure
+    idempotent retry: the SAME rule is reused as-is, ``upsert_rule`` is
+    never called again (it would silently refresh
+    ``created_at``/``updated_at``/``approved_at``), and no second
+    ``MAILBOX_DOMAIN_RULE_BLACKLIST`` audit event is emitted. Either way
+    (idempotent reuse OR a genuine new/changed decision, the latter
+    going through the ordinary ``upsert_rule`` + audit-event path exactly
+    as before), residual state is ALWAYS recomputed via
+    :func:`_resolve_or_keep_open_for_residual` afterwards — residual can
+    change between calls if other candidates were separately governed in
+    the meantime. ``EXACT``/``INCLUDE_SUBDOMAINS``/``EXACT_ADDRESS``
+    BLACKLIST are completely unaffected by this branch — for those match
+    modes a successful IGNORE always fully resolves the item, so this
+    residual-partial scenario is structurally impossible, and the
+    already-``RESOLVED``-item idempotent-vs-conflict check above already
+    correctly handles their own retry case.
 
     ``decision="ALLOW"`` — RESTRUCTURED (CD-6 GUI-operations-foundation
     follow-on WO) so the historical-candidate backfill
@@ -535,14 +573,39 @@ def resolve_domain_review(
         "subject_predicate_value": normalized_subject_predicate_value,
     }
 
-    # Audit trail — snapshot whatever governs this domain BEFORE this
-    # action, so the audit event below can carry a real
+    # Audit trail — snapshot whatever governs THIS EXACT identity BEFORE
+    # this action, so the audit event below can carry a real
     # previous_policy/previous_destination_* alongside the new values.
-    # `find_for_sender` (never a raw domain-only dict lookup) is reused
-    # deliberately — this IS the exact resolution a real message from
-    # this domain would hit right now.
-    previous_rule = mailbox_domain_rule_repository.find_for_sender(
-        mailbox_id=mailbox_id, sender_domain=sender_domain, sender_address=normalized_sender_address
+    #
+    # Corrected (CD-6 GUI-operations-foundation follow-on hardening
+    # delta, item 2): this USED to call `find_for_sender` — the
+    # most-specific-wins resolution a real INCOMING MESSAGE would hit —
+    # which is the wrong question to ask here. This decision is about
+    # ONE SPECIFIC identity (`match_mode`/`sender_domain`/
+    # `sender_address`/`subject_predicate_type`/`subject_predicate_value`),
+    # never "whatever happens to govern this domain most specifically
+    # right now" — a brand-new EXACT_DOMAIN_SUBJECT rule created
+    # underneath an already-governed EXACT domain, for example, must
+    # report `previous_policy=None` (nothing has ever governed THIS
+    # subject identity before), never the broader domain rule's own
+    # policy. `find_exact` (never `find_for_sender`) is the correct
+    # "what was THIS identity's own prior state" lookup — the exact same
+    # discipline `find_exact`'s own docstring documents, and the exact
+    # same call shape already used a few lines below for the ALLOW
+    # path's own retry/reuse-vs-conflict check. For the three
+    # pre-existing match modes (`EXACT`/`INCLUDE_SUBDOMAINS`/
+    # `EXACT_ADDRESS`) this returns the IDENTICAL value `find_for_sender`
+    # always returned in the ordinary case (this decision's own identity
+    # has no more-specific override to fall behind, since it IS the
+    # identity being decided) — except where `find_for_sender` was
+    # ALREADY wrong for the same reason (e.g. a brand-new EXACT_ADDRESS
+    # rule created underneath an existing broader domain rule), which
+    # `find_exact` now also correctly fixes.
+    previous_rule = mailbox_domain_rule_repository.find_exact(
+        mailbox_id=mailbox_id, sender_domain=sender_domain, match_mode=match_mode,
+        sender_address=normalized_sender_address,
+        subject_predicate_type=normalized_subject_predicate_type,
+        subject_predicate_value=normalized_subject_predicate_value,
     )
     previous_policy = previous_rule.policy if previous_rule is not None else None
     previous_destination_entity_id = previous_rule.destination_entity_id if previous_rule is not None else None
@@ -602,20 +665,103 @@ def resolve_domain_review(
             )
 
         policy = POLICY_BLACKLIST
-        rule = mailbox_domain_rule_repository.upsert_rule(
-            mailbox_id=mailbox_id,
-            sender_domain=sender_domain,
-            match_mode=match_mode,
-            policy=policy,
-            destination_entity_id=None,
-            destination_mode=None,
-            source=SOURCE_OPERATOR,
-            processor_hint=processor_hint,
-            approved_at=utc_now(),
-            sender_address=normalized_sender_address,
-            subject_predicate_type=normalized_subject_predicate_type,
-            subject_predicate_value=normalized_subject_predicate_value,
-        )
+
+        # Subject-BLACKLIST partial-residual idempotent retry (CD-6
+        # GUI-operations-foundation follow-on hardening delta, item 3).
+        #
+        # With the residual lifecycle above, an EXACT_DOMAIN_SUBJECT
+        # IGNORE can succeed while the item stays OPEN (other residual
+        # candidates at the same domain remain ungoverned) — so, unlike
+        # every OTHER match_mode (where a successful IGNORE always fully
+        # resolves the item, making `item.status == OPEN` a reliable
+        # "no prior successful IGNORE occurred yet" signal), OPEN no
+        # longer implies that here. Mirrors the ALLOW path's own
+        # `find_exact`-based reuse-vs-conflict discipline above (see
+        # that branch's own comments) rather than inventing a new shape:
+        # look up the exact identity FIRST, and only actually mutate the
+        # rule (`upsert_rule`, which refreshes `updated_at`/`approved_at`
+        # and would wrongly look like a fresh decision) when this is
+        # genuinely a NEW or CHANGED decision, never a byte-identical
+        # repeat of one already durably applied.
+        if match_mode == MATCH_MODE_EXACT_DOMAIN_SUBJECT:
+            existing_rule = mailbox_domain_rule_repository.find_exact(
+                mailbox_id=mailbox_id, sender_domain=sender_domain, match_mode=match_mode,
+                sender_address=normalized_sender_address,
+                subject_predicate_type=normalized_subject_predicate_type,
+                subject_predicate_value=normalized_subject_predicate_value,
+            )
+            # BLACKLIST rules never carry destination fields (enforced by
+            # `validate_policy_fields_or_raise`), so there is nothing
+            # destination-shaped to compare here — `policy` +
+            # `processor_hint` is the complete semantic identity of a
+            # BLACKLIST decision. `existing_rule`'s own match_mode/
+            # sender_address/subject_predicate_type/subject_predicate_value
+            # are guaranteed equal to this request's already, by
+            # construction of the `find_exact` lookup key above — no
+            # need to re-compare them.
+            is_idempotent_repeat = (
+                existing_rule is not None
+                and existing_rule.policy == POLICY_BLACKLIST
+                and existing_rule.processor_hint == processor_hint
+            )
+            if is_idempotent_repeat:
+                # A pure retry of an already-applied decision — reuse
+                # the SAME rule AS-IS. Deliberately never call
+                # `upsert_rule` again here (it would silently refresh
+                # `created_at`/`updated_at`/`approved_at`, exactly the
+                # unwanted refresh side effect a pure resume must
+                # avoid), and never emit a second
+                # `MAILBOX_DOMAIN_RULE_BLACKLIST` audit event (the first
+                # attempt's own event already stands as the true
+                # decision record).
+                rule = existing_rule
+                emit_blacklist_audit_event = False
+            else:
+                # A genuine new decision, or a genuine CHANGE of an
+                # existing decision's semantics (e.g. an existing
+                # MUST_READ transitioning to BLACKLIST, or a repeat
+                # BLACKLIST with a different `processor_hint`) — a real
+                # mutation, never silently treated as idempotent.
+                rule = mailbox_domain_rule_repository.upsert_rule(
+                    mailbox_id=mailbox_id,
+                    sender_domain=sender_domain,
+                    match_mode=match_mode,
+                    policy=policy,
+                    destination_entity_id=None,
+                    destination_mode=None,
+                    source=SOURCE_OPERATOR,
+                    processor_hint=processor_hint,
+                    approved_at=utc_now(),
+                    sender_address=normalized_sender_address,
+                    subject_predicate_type=normalized_subject_predicate_type,
+                    subject_predicate_value=normalized_subject_predicate_value,
+                )
+                emit_blacklist_audit_event = True
+        else:
+            # EXACT / INCLUDE_SUBDOMAINS / EXACT_ADDRESS — completely
+            # untouched: for these match modes a successful IGNORE
+            # ALWAYS fully resolves the item (this residual-partial
+            # scenario is structurally impossible), so the existing
+            # idempotent-vs-conflict check further up (the
+            # `item.status != "OPEN"` guard) already correctly handles
+            # their own retry case; every OPEN submit here is still a
+            # genuine, unconditional fresh mutation exactly as before.
+            rule = mailbox_domain_rule_repository.upsert_rule(
+                mailbox_id=mailbox_id,
+                sender_domain=sender_domain,
+                match_mode=match_mode,
+                policy=policy,
+                destination_entity_id=None,
+                destination_mode=None,
+                source=SOURCE_OPERATOR,
+                processor_hint=processor_hint,
+                approved_at=utc_now(),
+                sender_address=normalized_sender_address,
+                subject_predicate_type=normalized_subject_predicate_type,
+                subject_predicate_value=normalized_subject_predicate_value,
+            )
+            emit_blacklist_audit_event = True
+
         # Deterministic subject-aware mailbox domain policy — a subject-
         # scoped BLACKLIST requires NO historical provider fetch
         # (mirrors plain domain BLACKLIST's own discovery-only
@@ -625,7 +771,10 @@ def resolve_domain_review(
         # domain is governed by MUST_READ/BLACKLIST (this new subject
         # rule, or any other existing rule) — never for any OTHER
         # match_mode, which keeps its exact original unconditional-
-        # resolve behaviour.
+        # resolve behaviour. This recomputation always runs, even on the
+        # idempotent-retry path above — residual state can change
+        # between calls if OTHER candidates were separately governed in
+        # between.
         if match_mode == MATCH_MODE_EXACT_DOMAIN_SUBJECT:
             updated_item = _resolve_or_keep_open_for_residual(
                 needs_you_repository=needs_you_repository,
@@ -642,29 +791,30 @@ def resolve_domain_review(
             updated_item = needs_you_repository.resolve_needs_you_item(
                 item_id, new_status="RESOLVED", resolution=resolution, actor_type=actor_type, actor_id=actor_id
             )
-        api.record_audit_event(
-            event_type="MAILBOX_DOMAIN_RULE_BLACKLIST",
-            actor_type=actor_type,
-            actor_id=actor_id,
-            subject_type="MailboxDomainRule",
-            subject_id=rule.rule_id,
-            correlation_id=updated_item.correlation_id,
-            causation_id=None,
-            payload={
-                "mailbox_id": mailbox_id,
-                "sender_domain": sender_domain,
-                "needs_you_item_id": item_id,
-                "previous_policy": previous_policy,
-                "new_policy": policy,
-                "previous_destination_entity_id": previous_destination_entity_id,
-                "new_destination_entity_id": None,
-                "previous_destination_mode": previous_destination_mode,
-                "new_destination_mode": None,
-                "match_mode": match_mode,
-                "subject_predicate_type": normalized_subject_predicate_type,
-                "subject_predicate_value": normalized_subject_predicate_value,
-            },
-        )
+        if emit_blacklist_audit_event:
+            api.record_audit_event(
+                event_type="MAILBOX_DOMAIN_RULE_BLACKLIST",
+                actor_type=actor_type,
+                actor_id=actor_id,
+                subject_type="MailboxDomainRule",
+                subject_id=rule.rule_id,
+                correlation_id=updated_item.correlation_id,
+                causation_id=None,
+                payload={
+                    "mailbox_id": mailbox_id,
+                    "sender_domain": sender_domain,
+                    "needs_you_item_id": item_id,
+                    "previous_policy": previous_policy,
+                    "new_policy": policy,
+                    "previous_destination_entity_id": previous_destination_entity_id,
+                    "new_destination_entity_id": None,
+                    "previous_destination_mode": previous_destination_mode,
+                    "new_destination_mode": None,
+                    "match_mode": match_mode,
+                    "subject_predicate_type": normalized_subject_predicate_type,
+                    "subject_predicate_value": normalized_subject_predicate_value,
+                },
+            )
         return {"needs_you_item": updated_item.to_dict(), "mailbox_domain_rule": rule.to_dict(), "reprocessed_messages": []}
 
     # decision == "ALLOW" — see this function's own docstring above for
