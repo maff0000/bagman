@@ -848,6 +848,12 @@ class ResolveMailboxDomainReviewRequest(BaseModel):
     #: (relocated there, out of this router, by the CD-6 policy-rules-
     #: endpoint WO — see that function's own docstring for why).
     sender_address: Optional[str] = None
+    #: Deterministic subject-aware mailbox domain policy — required, and
+    #: ONLY accepted, when `match_mode == "EXACT_DOMAIN_SUBJECT"`. See
+    #: `services.mailbox.review_resolution.resolve_domain_review`'s own
+    #: docstring.
+    subject_predicate_type: Optional[str] = None
+    subject_predicate_value: Optional[str] = None
 
 
 def _resolve_mailbox_domain_review_core(
@@ -894,6 +900,8 @@ def _resolve_mailbox_domain_review_core(
         match_mode=payload.match_mode,
         processor_hint=payload.processor_hint,
         sender_address=payload.sender_address,
+        subject_predicate_type=payload.subject_predicate_type,
+        subject_predicate_value=payload.subject_predicate_value,
     )
 
 
@@ -957,6 +965,8 @@ class BatchResolveMailboxDomainReviewItem(BaseModel):
     #: resolved through the identical `_resolve_mailbox_domain_review_core`
     #: governed path — no cheaper "bulk mode").
     sender_address: Optional[str] = None
+    subject_predicate_type: Optional[str] = None
+    subject_predicate_value: Optional[str] = None
 
 
 class BatchResolveMailboxDomainReviewRequest(BaseModel):
@@ -1028,6 +1038,8 @@ async def batch_resolve_mailbox_domain_review(mailbox_id: str, payload: BatchRes
                 match_mode=entry.match_mode,
                 processor_hint=entry.processor_hint,
                 sender_address=entry.sender_address,
+                subject_predicate_type=entry.subject_predicate_type,
+                subject_predicate_value=entry.subject_predicate_value,
             )
             outcome = _resolve_mailbox_domain_review_core(
                 composition, mailbox_id=mailbox_id, mailbox=mailbox, item_id=entry.item_id, payload=single_payload

@@ -83,11 +83,13 @@ from services.mailbox.domain_rule import (
     DESTINATION_MODE_FIXED,
     DESTINATION_MODE_REVIEW_REQUIRED,
     DESTINATION_MODES,
+    MATCH_MODE_EXACT_DOMAIN_SUBJECT,
     MATCH_MODES,
     POLICIES,
     POLICY_MUST_READ,
     SOURCE_OPERATOR,
     validate_and_normalize_sender_address,
+    validate_and_normalize_subject_predicate,
 )
 
 router = APIRouter(prefix="/internal/mailboxes")
@@ -272,9 +274,17 @@ class UpsertMailboxPolicyRuleRequest(BaseModel):
 
     actor_type: str
     actor_id: str
-    match_mode: str  # "EXACT" | "INCLUDE_SUBDOMAINS" | "EXACT_ADDRESS"
+    match_mode: str  # "EXACT" | "INCLUDE_SUBDOMAINS" | "EXACT_ADDRESS" | "EXACT_DOMAIN_SUBJECT"
     sender_domain: str
     sender_address: Optional[str] = None
+    #: Deterministic subject-aware mailbox domain policy — required, and
+    #: ONLY accepted, when `match_mode == "EXACT_DOMAIN_SUBJECT"` (see
+    #: `services.mailbox.domain_rule.validate_and_normalize_subject_predicate`'s
+    #: own docstring for the structural validation this goes through,
+    #: plus this endpoint's own `subject_predicate_observed` creation-
+    #: time guard below).
+    subject_predicate_type: Optional[str] = None  # "EXACT" | "STARTS_WITH"
+    subject_predicate_value: Optional[str] = None
     policy: str  # "MUST_READ" | "GRAYLIST" | "BLACKLIST"
     destination_mode: Optional[str] = None  # "FIXED" | "REVIEW_REQUIRED" — only meaningful for MUST_READ
     destination_entity_id: Optional[str] = None
@@ -414,6 +424,31 @@ async def upsert_mailbox_policy_rule(mailbox_id: str, payload: UpsertMailboxPoli
         match_mode=payload.match_mode,
         sender_address=payload.sender_address,
     )
+    normalized_subject_predicate_type, normalized_subject_predicate_value = validate_and_normalize_subject_predicate(
+        match_mode=payload.match_mode,
+        subject_predicate_type=payload.subject_predicate_type,
+        subject_predicate_value=payload.subject_predicate_value,
+    )
+    if payload.match_mode == MATCH_MODE_EXACT_DOMAIN_SUBJECT:
+        # Creation-time observed guard (item 12, first paragraph) — a
+        # NEW EXACT_DOMAIN_SUBJECT rule created via this generic,
+        # provider-neutral endpoint requires proof the predicate matches
+        # AT LEAST ONE persisted message (ANY ingestion status — this is
+        # "has this predicate EVER matched a real message here", not
+        # about current eligibility; contrast with
+        # `services.mailbox.review_resolution.resolve_domain_review`'s
+        # OWN, stricter "currently eligible candidate" guard for the
+        # domain-review ALLOW workflow specifically) for
+        # `(mailbox_id, sender_domain)` before allowing creation.
+        if not composition.mailbox_message_repository.subject_predicate_observed(
+            mailbox_id=mailbox_id, sender_domain=payload.sender_domain,
+            predicate_type=normalized_subject_predicate_type, predicate_value=normalized_subject_predicate_value,
+        ):
+            raise ValidationError(
+                f"subject predicate {normalized_subject_predicate_type}={normalized_subject_predicate_value!r} "
+                f"has never matched a persisted message at domain '{payload.sender_domain}' for mailbox "
+                f"'{mailbox_id}' — refusing to pre-authorize a predicate BAGMAN has never seen matching mail for"
+            )
 
     if payload.policy == POLICY_MUST_READ:
         if payload.destination_mode not in DESTINATION_MODES:
@@ -442,12 +477,16 @@ async def upsert_mailbox_policy_rule(mailbox_id: str, payload: UpsertMailboxPoli
         sender_domain=payload.sender_domain,
         match_mode=payload.match_mode,
         sender_address=normalized_sender_address,
+        subject_predicate_type=normalized_subject_predicate_type,
+        subject_predicate_value=normalized_subject_predicate_value,
     )
     previous_match_mode = previous_rule.match_mode if previous_rule is not None else None
     previous_policy = previous_rule.policy if previous_rule is not None else None
     previous_destination_mode = previous_rule.destination_mode if previous_rule is not None else None
     previous_destination_entity_id = previous_rule.destination_entity_id if previous_rule is not None else None
     previous_processor_hint = previous_rule.processor_hint if previous_rule is not None else None
+    previous_subject_predicate_type = previous_rule.subject_predicate_type if previous_rule is not None else None
+    previous_subject_predicate_value = previous_rule.subject_predicate_value if previous_rule is not None else None
 
     was_no_op = (
         previous_rule is not None
@@ -456,6 +495,8 @@ async def upsert_mailbox_policy_rule(mailbox_id: str, payload: UpsertMailboxPoli
         and previous_destination_mode == resolved_destination_mode
         and previous_destination_entity_id == resolved_destination_entity_id
         and previous_processor_hint == payload.processor_hint
+        and previous_subject_predicate_type == normalized_subject_predicate_type
+        and previous_subject_predicate_value == normalized_subject_predicate_value
     )
 
     if was_no_op:
@@ -475,6 +516,8 @@ async def upsert_mailbox_policy_rule(mailbox_id: str, payload: UpsertMailboxPoli
             processor_hint=payload.processor_hint,
             approved_at=utc_now(),
             sender_address=normalized_sender_address,
+            subject_predicate_type=normalized_subject_predicate_type,
+            subject_predicate_value=normalized_subject_predicate_value,
         )
 
         composition.api.record_audit_event(
@@ -500,6 +543,10 @@ async def upsert_mailbox_policy_rule(mailbox_id: str, payload: UpsertMailboxPoli
                 "new_destination_entity_id": rule.destination_entity_id,
                 "previous_processor_hint": previous_processor_hint,
                 "new_processor_hint": rule.processor_hint,
+                "previous_subject_predicate_type": previous_subject_predicate_type,
+                "new_subject_predicate_type": rule.subject_predicate_type,
+                "previous_subject_predicate_value": previous_subject_predicate_value,
+                "new_subject_predicate_value": rule.subject_predicate_value,
                 "reason": payload.reason,
             },
         )

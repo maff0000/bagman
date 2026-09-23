@@ -107,20 +107,24 @@ from typing import Any, Callable, Optional, Protocol
 
 from core.entity import EntityRepository
 from core.errors import ConflictError, ValidationError
-from core.timestamps import utc_now
+from core.timestamps import to_contract_string, utc_now
 from services.evidence.intake.scanner import EvidenceSafetyScanner
 from services.mailbox.domain_rule import (
     DESTINATION_MODE_FIXED,
     DESTINATION_MODE_REVIEW_REQUIRED,
     MATCH_MODE_EXACT,
     MATCH_MODE_EXACT_ADDRESS,
+    MATCH_MODE_EXACT_DOMAIN_SUBJECT,
     MATCH_MODE_INCLUDE_SUBDOMAINS,
     POLICY_BLACKLIST,
     POLICY_GRAYLIST,
     POLICY_MUST_READ,
     SOURCE_OPERATOR,
     MailboxDomainRuleRepository,
+    normalize_domain,
+    subject_matches_predicate,
     validate_and_normalize_sender_address,
+    validate_and_normalize_subject_predicate,
 )
 from services.mailbox.mailbox import MailboxSource
 from services.mailbox.message import MailboxMessageRepository
@@ -171,6 +175,145 @@ class _ObjectStoreProtocol(Protocol):
 
 _SECURITY_REVIEW_DECISIONS = ("PROCESS_THIS_MESSAGE_ONCE", "DO_NOT_PROCESS_THIS_MESSAGE")
 
+#: Domain-review `resolution` dicts recorded BEFORE this delivery (real
+#: pre-existing stored rows, and every pre-existing test's own literal
+#: "legacy" fixture — see
+#: `tests/integration/test_mailbox_sweep.py::test_resolve_domain_review_allow_legacy_stranded_state_self_heals_without_reresolving_or_reauditing`)
+#: never carried `subject_predicate_type`/`subject_predicate_value` at
+#: all — those keys did not exist yet. A stored resolution missing them
+#: entirely is semantically IDENTICAL to one that carries them as
+#: explicit `None` (no subject predicate was ever part of that older
+#: decision), so every "is this the same resolution" comparison below
+#: pads a stored resolution with those two keys defaulting to `None`
+#: before comparing, rather than a raw dict `==` that would otherwise
+#: treat missing-vs-`None` as a spurious mismatch.
+_LEGACY_RESOLUTION_DEFAULTS = {"subject_predicate_type": None, "subject_predicate_value": None}
+
+
+def _resolution_matches(stored: Optional[dict], resolution: dict) -> bool:
+    if not stored:
+        return False
+    return {**_LEGACY_RESOLUTION_DEFAULTS, **stored} == resolution
+
+
+def _resolve_or_keep_open_for_residual(
+    *,
+    needs_you_repository: NeedsYouRepository,
+    mailbox_message_repository: MailboxMessageRepository,
+    mailbox_domain_rule_repository: MailboxDomainRuleRepository,
+    mailbox_id: str,
+    sender_domain: str,
+    item_id: str,
+    resolution: dict,
+    actor_type: str,
+    actor_id: str,
+):
+    """Deterministic subject-aware mailbox domain policy — the corrected
+    residual-based domain-review lifecycle rule for a SUBJECT-SCOPED
+    (``match_mode == MATCH_MODE_EXACT_DOMAIN_SUBJECT``) ALLOW/IGNORE
+    decision ONLY (never called for any other match_mode — see
+    :func:`resolve_domain_review`'s own docstring for why: a plain
+    domain-level/address-level decision must retain its EXACT prior
+    "always fully resolves the item" behaviour, unmodified by this
+    function's own existence).
+
+    Recomputes, from canonical persisted state, the domain's RESIDUAL
+    review-eligible candidates: every remaining
+    ``discovery_candidate=True``/``CHECKED_NOT_CANDIDATE`` message at
+    this domain (via :meth:`MailboxMessageRepository
+    .list_candidate_messages_for_domain`) whose CURRENT effective rule —
+    resolved via the SAME authoritative
+    :meth:`MailboxDomainRuleRepository.find_for_sender` every other
+    caller in this codebase uses (mailbox/sender_address/sender_domain/
+    subject) — is EITHER ``None`` OR still ``POLICY_GRAYLIST``. A
+    candidate already governed by ``MUST_READ`` or ``BLACKLIST``
+    (whether via the just-created subject rule or any OTHER existing
+    rule) is NOT residual, even if its own ``ingestion_status`` still
+    happens to read ``CHECKED_NOT_CANDIDATE`` (a ``BLACKLIST``-governed
+    candidate is never processed/never changes status, by design).
+
+    * residual > 0 -> the item stays ``OPEN``; its ``metadata`` is
+      recomputed from the RESIDUAL set only (never the original full
+      set) — ``candidate_message_count``/``first_seen_at``/
+      ``last_seen_at``/``attachment_bearing_count`` (mirrors
+      ``services.mailbox.sweep._synchronize_domain_review_aggregate``'s
+      own recomputed-fields semantics exactly, applied here to the
+      residual subset), PLUS two new bounded fields:
+      ``governed_subject_rule_count`` and
+      ``remaining_candidate_message_count`` (identical value to
+      ``candidate_message_count``, exposed under this explicit name
+      too).
+
+      ``governed_subject_rule_count`` is DELIBERATELY **not** derived
+      from the residual/candidate set at all — a candidate-derived count
+      would be structurally near-useless: the very definition of
+      "residual" (line ~296 below) excludes every candidate the subject
+      rule just successfully governed, so a count taken only over
+      still-eligible candidates would read 0 immediately after a subject
+      rule finishes successfully processing its own candidates (the
+      common case), silently misrepresenting "no subject rule governs
+      anything here" right when one just did. Instead this counts real,
+      persisted ``EXACT_DOMAIN_SUBJECT`` rows at this exact
+      ``(mailbox_id, sender_domain)`` via
+      :meth:`MailboxDomainRuleRepository.list_rules` — a stable "how
+      many subject-specific carve-outs currently exist for this domain"
+      signal, independent of any single candidate's own processing
+      state (an interrupted/partial subject MUST_READ backfill, and a
+      subject BLACKLIST rule — which never processes anything at all —
+      both still correctly count here too).
+    * residual == 0 -> the item resolves NORMALLY (status ->
+      ``RESOLVED``), exactly like today's unconditional full-domain
+      ALLOW/IGNORE resolution — this is the corrected behaviour: subject
+      approval does NOT always keep the item open, only when genuine
+      residual work remains.
+
+    Never creates a new ``MAILBOX_DOMAIN_REVIEW`` item — subsequent
+    narrowing (another subject ALLOW, a subject BLACKLIST, a later
+    broad domain ALLOW/IGNORE, or KEEP_GRAY) always lands on this SAME
+    item via the caller re-supplying the same ``item_id``.
+    """
+    candidates = mailbox_message_repository.list_candidate_messages_for_domain(
+        mailbox_id=mailbox_id, sender_domain=sender_domain
+    )
+    residual = []
+    for candidate in candidates:
+        effective_rule = mailbox_domain_rule_repository.find_for_sender(
+            mailbox_id=candidate.mailbox_id,
+            sender_domain=candidate.sender_domain,
+            sender_address=candidate.sender_address,
+            subject=candidate.subject,
+        )
+        if effective_rule is None or effective_rule.policy == POLICY_GRAYLIST:
+            residual.append(candidate)
+
+    normalized_domain = normalize_domain(sender_domain)
+    governed_subject_rule_count = sum(
+        1
+        for existing_rule in mailbox_domain_rule_repository.list_rules(mailbox_id=mailbox_id)
+        if existing_rule.match_mode == MATCH_MODE_EXACT_DOMAIN_SUBJECT
+        and existing_rule.sender_domain == normalized_domain
+    )
+
+    if not residual:
+        return needs_you_repository.resolve_needs_you_item(
+            item_id, new_status="RESOLVED", resolution=resolution, actor_type=actor_type, actor_id=actor_id
+        )
+
+    first_seen_at = min(m.received_at for m in residual)
+    last_seen_at = max(m.received_at for m in residual)
+    attachment_bearing_count = sum(1 for m in residual if m.has_attachments)
+    return needs_you_repository.update_item_metadata(
+        item_id,
+        metadata_updates={
+            "candidate_message_count": len(residual),
+            "first_seen_at": to_contract_string(first_seen_at),
+            "last_seen_at": to_contract_string(last_seen_at),
+            "attachment_bearing_count": attachment_bearing_count,
+            "governed_subject_rule_count": governed_subject_rule_count,
+            "remaining_candidate_message_count": len(residual),
+        },
+    )
+
 
 def resolve_domain_review(
     *,
@@ -191,9 +334,11 @@ def resolve_domain_review(
     decision: str,  # "ALLOW" | "IGNORE" | "KEEP_GRAY"
     destination_entity_id: Optional[str],
     destination_mode: Optional[str],  # "FIXED" | "REVIEW_REQUIRED" — required when decision == "ALLOW"
-    match_mode: str,  # "EXACT" | "INCLUDE_SUBDOMAINS" | "EXACT_ADDRESS"
+    match_mode: str,  # "EXACT" | "INCLUDE_SUBDOMAINS" | "EXACT_ADDRESS" | "EXACT_DOMAIN_SUBJECT"
     processor_hint: Optional[str],
     sender_address: Optional[str],
+    subject_predicate_type: Optional[str] = None,
+    subject_predicate_value: Optional[str] = None,
     sleep_fn: Callable[[float], None] = time.sleep,
 ) -> dict[str, Any]:
     """Resolve one ``ITEM_TYPE_MAILBOX_DOMAIN_REVIEW`` Needs You item —
@@ -346,18 +491,24 @@ def resolve_domain_review(
 
     if decision not in ("ALLOW", "IGNORE", "KEEP_GRAY"):
         raise ValidationError(f"decision must be 'ALLOW', 'IGNORE' or 'KEEP_GRAY' (got {decision!r})")
-    if match_mode not in (MATCH_MODE_EXACT, MATCH_MODE_INCLUDE_SUBDOMAINS, MATCH_MODE_EXACT_ADDRESS):
+    if match_mode not in (
+        MATCH_MODE_EXACT, MATCH_MODE_INCLUDE_SUBDOMAINS, MATCH_MODE_EXACT_ADDRESS, MATCH_MODE_EXACT_DOMAIN_SUBJECT,
+    ):
         raise ValidationError(
-            f"match_mode must be 'EXACT', 'INCLUDE_SUBDOMAINS' or 'EXACT_ADDRESS' (got {match_mode!r})"
+            "match_mode must be 'EXACT', 'INCLUDE_SUBDOMAINS', 'EXACT_ADDRESS' or 'EXACT_DOMAIN_SUBJECT' "
+            f"(got {match_mode!r})"
         )
-    if decision == "KEEP_GRAY" and match_mode == MATCH_MODE_EXACT_ADDRESS:
+    if decision == "KEEP_GRAY" and match_mode in (MATCH_MODE_EXACT_ADDRESS, MATCH_MODE_EXACT_DOMAIN_SUBJECT):
         # Documented, deliberate out-of-scope judgment call — graylisting
         # is inherently domain-level triage ("Matt looked at this domain
-        # once and deliberately left it under review"); an address-scoped
-        # graylist has no real operator use case this delivery builds
-        # for. Use 'EXACT'/'INCLUDE_SUBDOMAINS' instead.
+        # once and deliberately left it under review"); neither an
+        # address-scoped NOR a subject-scoped graylist has a real
+        # operator use case this delivery builds for (mirrors
+        # `validate_policy_fields_or_raise`'s own EXACT_DOMAIN_SUBJECT +
+        # GRAYLIST rejection one layer down). Use 'EXACT'/
+        # 'INCLUDE_SUBDOMAINS' instead.
         raise ValidationError(
-            "match_mode 'EXACT_ADDRESS' is not supported for decision 'KEEP_GRAY' — graylisting is "
+            f"match_mode '{match_mode}' is not supported for decision 'KEEP_GRAY' — graylisting is "
             "inherently domain-level triage; use 'EXACT' or 'INCLUDE_SUBDOMAINS' instead"
         )
 
@@ -369,12 +520,19 @@ def resolve_domain_review(
         match_mode=match_mode,
         sender_address=sender_address,
     )
+    normalized_subject_predicate_type, normalized_subject_predicate_value = validate_and_normalize_subject_predicate(
+        match_mode=match_mode,
+        subject_predicate_type=subject_predicate_type,
+        subject_predicate_value=subject_predicate_value,
+    )
     resolution = {
         "decision": decision,
         "destination_entity_id": destination_entity_id,
         "destination_mode": destination_mode,
         "match_mode": match_mode,
         "sender_address": normalized_sender_address,
+        "subject_predicate_type": normalized_subject_predicate_type,
+        "subject_predicate_value": normalized_subject_predicate_value,
     }
 
     # Audit trail — snapshot whatever governs this domain BEFORE this
@@ -422,6 +580,9 @@ def resolve_domain_review(
                 "new_destination_entity_id": None,
                 "previous_destination_mode": previous_destination_mode,
                 "new_destination_mode": None,
+                "match_mode": match_mode,
+                "subject_predicate_type": normalized_subject_predicate_type,
+                "subject_predicate_value": normalized_subject_predicate_value,
             },
         )
         return {"needs_you_item": item.to_dict(), "mailbox_domain_rule": rule.to_dict(), "reprocessed_messages": []}
@@ -432,7 +593,7 @@ def resolve_domain_review(
         # that can ever be interrupted mid-batch; the plain idempotent-
         # no-op-or-conflict check is exactly as correct as it always was.
         if item.status != "OPEN":
-            if item.status == "RESOLVED" and (item.resolution or {}) == resolution:
+            if item.status == "RESOLVED" and _resolution_matches(item.resolution, resolution):
                 return {"needs_you_item": item.to_dict(), "mailbox_domain_rule": None, "reprocessed_messages": []}
             raise ConflictError(
                 f"NeedsYouItem '{item_id}' is already '{item.status}' with a different resolution — "
@@ -452,10 +613,35 @@ def resolve_domain_review(
             processor_hint=processor_hint,
             approved_at=utc_now(),
             sender_address=normalized_sender_address,
+            subject_predicate_type=normalized_subject_predicate_type,
+            subject_predicate_value=normalized_subject_predicate_value,
         )
-        updated_item = needs_you_repository.resolve_needs_you_item(
-            item_id, new_status="RESOLVED", resolution=resolution, actor_type=actor_type, actor_id=actor_id
-        )
+        # Deterministic subject-aware mailbox domain policy — a subject-
+        # scoped BLACKLIST requires NO historical provider fetch
+        # (mirrors plain domain BLACKLIST's own discovery-only
+        # behaviour), but DOES trigger the same residual recomputation
+        # an EXACT_DOMAIN_SUBJECT ALLOW does (item 19-23/24): the item
+        # resolves only once every currently-eligible candidate at this
+        # domain is governed by MUST_READ/BLACKLIST (this new subject
+        # rule, or any other existing rule) — never for any OTHER
+        # match_mode, which keeps its exact original unconditional-
+        # resolve behaviour.
+        if match_mode == MATCH_MODE_EXACT_DOMAIN_SUBJECT:
+            updated_item = _resolve_or_keep_open_for_residual(
+                needs_you_repository=needs_you_repository,
+                mailbox_message_repository=mailbox_message_repository,
+                mailbox_domain_rule_repository=mailbox_domain_rule_repository,
+                mailbox_id=mailbox_id,
+                sender_domain=sender_domain,
+                item_id=item_id,
+                resolution=resolution,
+                actor_type=actor_type,
+                actor_id=actor_id,
+            )
+        else:
+            updated_item = needs_you_repository.resolve_needs_you_item(
+                item_id, new_status="RESOLVED", resolution=resolution, actor_type=actor_type, actor_id=actor_id
+            )
         api.record_audit_event(
             event_type="MAILBOX_DOMAIN_RULE_BLACKLIST",
             actor_type=actor_type,
@@ -474,6 +660,9 @@ def resolve_domain_review(
                 "new_destination_entity_id": None,
                 "previous_destination_mode": previous_destination_mode,
                 "new_destination_mode": None,
+                "match_mode": match_mode,
+                "subject_predicate_type": normalized_subject_predicate_type,
+                "subject_predicate_value": normalized_subject_predicate_value,
             },
         )
         return {"needs_you_item": updated_item.to_dict(), "mailbox_domain_rule": rule.to_dict(), "reprocessed_messages": []}
@@ -492,8 +681,38 @@ def resolve_domain_review(
         # rejected the same way no matter what state the item is in.
         entity_repository.get_entity(destination_entity_id)
 
+    if match_mode == MATCH_MODE_EXACT_DOMAIN_SUBJECT:
+        # Deterministic subject-aware mailbox domain policy — a
+        # domain-review ALLOW answer must not create a subject rule that
+        # resolves NONE of the question's actual (currently eligible)
+        # candidates. Deliberately runs BEFORE any mutation, regardless
+        # of item.status — mirrors the destination-field validation
+        # above. This is a STRICTER guard than the generic policy-rules
+        # endpoint's own `subject_predicate_observed` check (any
+        # ingestion status, ever observed) — here it must be a message
+        # still `discovery_candidate=True`/`CHECKED_NOT_CANDIDATE` right
+        # now (see `services.mailbox.message.MailboxMessageRepository
+        # .list_candidate_messages_for_domain`'s own docstring).
+        eligible_candidates = mailbox_message_repository.list_candidate_messages_for_domain(
+            mailbox_id=mailbox_id, sender_domain=sender_domain
+        )
+        if not any(
+            subject_matches_predicate(
+                candidate.subject,
+                predicate_type=normalized_subject_predicate_type,
+                predicate_value=normalized_subject_predicate_value,
+            )
+            for candidate in eligible_candidates
+        ):
+            raise ValidationError(
+                f"no currently eligible candidate message at domain '{sender_domain}' matches the subject "
+                f"predicate {normalized_subject_predicate_type}={normalized_subject_predicate_value!r} — a "
+                "domain-review ALLOW answer must not create a subject rule that resolves none of the "
+                "question's actual candidates"
+            )
+
     if item.status == "RESOLVED":
-        if (item.resolution or {}) != resolution:
+        if not _resolution_matches(item.resolution, resolution):
             raise ConflictError(
                 f"NeedsYouItem '{item_id}' is already '{item.status}' with a different resolution — "
                 "refusing to silently change an already-decided item; this is a genuine conflict, not "
@@ -507,6 +726,8 @@ def resolve_domain_review(
         existing_rule = mailbox_domain_rule_repository.find_exact(
             mailbox_id=mailbox_id, sender_domain=sender_domain, match_mode=match_mode,
             sender_address=normalized_sender_address,
+            subject_predicate_type=normalized_subject_predicate_type,
+            subject_predicate_value=normalized_subject_predicate_value,
         )
         if existing_rule is None:
             raise ConflictError(
@@ -561,11 +782,15 @@ def resolve_domain_review(
     existing_rule = mailbox_domain_rule_repository.find_exact(
         mailbox_id=mailbox_id, sender_domain=sender_domain, match_mode=match_mode,
         sender_address=normalized_sender_address,
+        subject_predicate_type=normalized_subject_predicate_type,
+        subject_predicate_value=normalized_subject_predicate_value,
     )
     if existing_rule is not None and existing_rule.policy == POLICY_MUST_READ:
         identical = (
             existing_rule.match_mode == match_mode
             and existing_rule.sender_address == normalized_sender_address
+            and existing_rule.subject_predicate_type == normalized_subject_predicate_type
+            and existing_rule.subject_predicate_value == normalized_subject_predicate_value
             and existing_rule.destination_mode == destination_mode
             and existing_rule.destination_entity_id == destination_entity_id
             and existing_rule.processor_hint == processor_hint
@@ -606,6 +831,8 @@ def resolve_domain_review(
             processor_hint=processor_hint,
             approved_at=utc_now(),
             sender_address=normalized_sender_address,
+            subject_predicate_type=normalized_subject_predicate_type,
+            subject_predicate_value=normalized_subject_predicate_value,
         )
         api.record_audit_event(
             event_type="MAILBOX_DOMAIN_RULE_MUST_READ",
@@ -628,6 +855,9 @@ def resolve_domain_review(
                 "new_destination_entity_id": rule.destination_entity_id,
                 "previous_destination_mode": previous_destination_mode,
                 "new_destination_mode": rule.destination_mode,
+                "match_mode": match_mode,
+                "subject_predicate_type": normalized_subject_predicate_type,
+                "subject_predicate_value": normalized_subject_predicate_value,
             },
         )
 
@@ -675,9 +905,31 @@ def resolve_domain_review(
     # never before. This is what makes the item's own OPEN status a
     # reliable signal, on retry, that at least one candidate may still
     # be stranded.
-    updated_item = needs_you_repository.resolve_needs_you_item(
-        item_id, new_status="RESOLVED", resolution=resolution, actor_type=actor_type, actor_id=actor_id
-    )
+    #
+    # Deterministic subject-aware mailbox domain policy — a subject-
+    # scoped ALLOW (match_mode == EXACT_DOMAIN_SUBJECT) resolves the
+    # item ONLY once every currently-eligible candidate at this domain
+    # is governed by MUST_READ/BLACKLIST (this new subject rule, or any
+    # other existing rule); otherwise it stays OPEN with recomputed
+    # residual metadata (see `_resolve_or_keep_open_for_residual`'s own
+    # docstring — items 19-23/37). Every OTHER match_mode retains its
+    # EXACT original unconditional-resolve behaviour, unmodified.
+    if match_mode == MATCH_MODE_EXACT_DOMAIN_SUBJECT:
+        updated_item = _resolve_or_keep_open_for_residual(
+            needs_you_repository=needs_you_repository,
+            mailbox_message_repository=mailbox_message_repository,
+            mailbox_domain_rule_repository=mailbox_domain_rule_repository,
+            mailbox_id=mailbox_id,
+            sender_domain=sender_domain,
+            item_id=item_id,
+            resolution=resolution,
+            actor_type=actor_type,
+            actor_id=actor_id,
+        )
+    else:
+        updated_item = needs_you_repository.resolve_needs_you_item(
+            item_id, new_status="RESOLVED", resolution=resolution, actor_type=actor_type, actor_id=actor_id
+        )
 
     return {
         "needs_you_item": updated_item.to_dict(),
@@ -770,7 +1022,8 @@ def resolve_security_review(
     # PROCESS_THIS_MESSAGE_ONCE
     message = mailbox_message_repository.get_message(message_id)
     rule = mailbox_domain_rule_repository.find_for_sender(
-        mailbox_id=mailbox_id, sender_domain=message.sender_domain, sender_address=message.sender_address
+        mailbox_id=mailbox_id, sender_domain=message.sender_domain, sender_address=message.sender_address,
+        subject=message.subject,
     )
     if rule is None or rule.policy != POLICY_MUST_READ:
         raise ConflictError(

@@ -454,6 +454,12 @@ class ResolveGmailDomainReviewRequest(BaseModel):
     match_mode: str = MATCH_MODE_EXACT
     processor_hint: Optional[str] = None
     sender_address: Optional[str] = None
+    #: Deterministic subject-aware mailbox domain policy — required, and
+    #: ONLY accepted, when `match_mode == "EXACT_DOMAIN_SUBJECT"`. See
+    #: `services.mailbox.review_resolution.resolve_domain_review`'s own
+    #: docstring.
+    subject_predicate_type: Optional[str] = None
+    subject_predicate_value: Optional[str] = None
 
 
 def _resolve_gmail_domain_review_core(
@@ -488,6 +494,8 @@ def _resolve_gmail_domain_review_core(
         match_mode=payload.match_mode,
         processor_hint=payload.processor_hint,
         sender_address=payload.sender_address,
+        subject_predicate_type=payload.subject_predicate_type,
+        subject_predicate_value=payload.subject_predicate_value,
     )
 
 
@@ -506,6 +514,8 @@ class BatchResolveGmailDomainReviewItem(BaseModel):
     match_mode: str = MATCH_MODE_EXACT
     processor_hint: Optional[str] = None
     sender_address: Optional[str] = None
+    subject_predicate_type: Optional[str] = None
+    subject_predicate_value: Optional[str] = None
 
 
 class BatchResolveGmailDomainReviewRequest(BaseModel):
@@ -538,6 +548,8 @@ async def batch_resolve_gmail_domain_review(mailbox_id: str, payload: BatchResol
                     match_mode=entry.match_mode,
                     processor_hint=entry.processor_hint,
                     sender_address=entry.sender_address,
+                    subject_predicate_type=entry.subject_predicate_type,
+                    subject_predicate_value=entry.subject_predicate_value,
                 ),
             )
             results.append({"item_id": entry.item_id, "ok": True, **outcome})

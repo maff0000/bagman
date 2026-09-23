@@ -40,7 +40,7 @@ from core import identity
 from core.contract_validation import validate_against_contract
 from core.errors import NotFoundError, ValidationError
 from core.timestamps import to_contract_string, utc_now
-from services.mailbox.domain_rule import domain_in_scope, normalize_domain
+from services.mailbox.domain_rule import domain_in_scope, normalize_domain, subject_matches_predicate
 
 _SCHEMA = "mailbox/bagman.mailbox_message.v1.schema.json"
 SCHEMA_VERSION = "bagman.mailbox_message.v1"
@@ -314,6 +314,38 @@ class MailboxMessageRepository(abc.ABC):
         raise NotImplementedError
 
     @abc.abstractmethod
+    def subject_predicate_observed(
+        self, *, mailbox_id: str, sender_domain: str, predicate_type: str, predicate_value: str
+    ) -> bool:
+        """Deterministic subject-aware mailbox domain policy (CD-6
+        GUI-operations-foundation follow-on WO) — mirrors
+        :meth:`sender_address_observed`'s exact "narrow, cheap existence
+        check" role one tier up: has this mailbox EVER actually seen ANY
+        message (any `ingestion_status` — this is about "has this
+        predicate EVER matched a real message here", not about current
+        eligibility) at EXACTLY ``sender_domain`` whose normalised
+        subject satisfies ``predicate_type``/``predicate_value``
+        (via :func:`services.mailbox.domain_rule.subject_matches_predicate`)?
+        ``predicate_value`` is expected ALREADY normalised (via
+        :func:`services.mailbox.domain_rule.normalize_subject_for_policy`)
+        — this is the real backstop that makes a new
+        `MATCH_MODE_EXACT_DOMAIN_SUBJECT` `MailboxDomainRule` created via
+        the generic policy-rules endpoint
+        (`app/api/routers/mailboxes.py::upsert_mailbox_policy_rule`)
+        trustworthy: an operator must never be able to create a subject
+        predicate BAGMAN has never actually seen matching mail for.
+
+        This is a DIFFERENT, looser guard than the one
+        ``services.mailbox.review_resolution.resolve_domain_review``'s
+        own ALLOW workflow applies for the SAME match mode (which
+        additionally requires the match to be among CURRENTLY ELIGIBLE
+        candidates — see that function's own docstring); that stricter
+        check is implemented directly in `review_resolution.py` by
+        reusing :meth:`list_candidate_messages_for_domain`, not by a
+        second repository method here."""
+        raise NotImplementedError
+
+    @abc.abstractmethod
     def list_messages(
         self, *, mailbox_id: str, limit: Optional[int] = None, offset: int = 0
     ) -> list[MailboxMessage]:
@@ -545,6 +577,18 @@ class InMemoryMailboxMessageRepository(MailboxMessageRepository):
         normalized = sender_address.strip().lower()
         return any(
             m.mailbox_id == mailbox_id and (m.sender_address or "").strip().lower() == normalized
+            for m in self._by_id.values()
+        )
+
+    def subject_predicate_observed(
+        self, *, mailbox_id: str, sender_domain: str, predicate_type: str, predicate_value: str
+    ) -> bool:
+        normalized_domain = normalize_domain(sender_domain)
+        return any(
+            m.mailbox_id == mailbox_id
+            and m.sender_domain is not None
+            and normalize_domain(m.sender_domain) == normalized_domain
+            and subject_matches_predicate(m.subject, predicate_type=predicate_type, predicate_value=predicate_value)
             for m in self._by_id.values()
         )
 

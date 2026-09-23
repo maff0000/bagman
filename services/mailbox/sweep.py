@@ -1256,6 +1256,7 @@ def run_sweep(
                                 mailbox_id=mailbox.mailbox_id,
                                 sender_domain=sender_domain,
                                 sender_address=msg.sender_address,
+                                subject=msg.subject,
                             )
                             if sender_domain
                             else None
@@ -1268,6 +1269,7 @@ def run_sweep(
                                 sender_domain=rule.sender_domain,
                                 seen_at=resolved_now,
                                 sender_address=msg.sender_address,
+                                subject=msg.subject,
                             )
                             messages_new += 1
                             folder_entry["new_discovery_records"] += 1
@@ -1327,6 +1329,7 @@ def run_sweep(
                             sender_domain=rule.sender_domain,
                             seen_at=resolved_now,
                             sender_address=msg.sender_address,
+                            subject=msg.subject,
                         )
 
                         assessment = evaluate_message_authentication(
@@ -2195,6 +2198,7 @@ def reprocess_all_historical_candidates_for_domain(
             mailbox_id=candidate.mailbox_id,
             sender_domain=candidate.sender_domain,
             sender_address=candidate.sender_address,
+            subject=candidate.subject,
         )
         if effective_rule is None or effective_rule.rule_id != rule.rule_id:
             # A different, more-specific rule actually governs this

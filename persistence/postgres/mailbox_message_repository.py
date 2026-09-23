@@ -18,7 +18,7 @@ from core.contract_validation import validate_against_contract
 from core.timestamps import utc_now
 from persistence.postgres.mailbox_message_models import MailboxMessageRow
 from persistence.postgres.session import get_engine, session_scope
-from services.mailbox.domain_rule import domain_in_scope, normalize_domain
+from services.mailbox.domain_rule import domain_in_scope, normalize_domain, subject_matches_predicate
 from services.mailbox.message import (
     INGESTION_STATUS_CHECKED_NOT_CANDIDATE,
     MailboxMessage,
@@ -229,6 +229,33 @@ class PostgresMailboxMessageRepository(MailboxMessageRepository):
                 ).scalar()
         except SQLAlchemyError as exc:
             raise PersistenceError(f"could not check sender_address_observed for MailboxMessage: {exc}") from exc
+
+    def subject_predicate_observed(
+        self, *, mailbox_id: str, sender_domain: str, predicate_type: str, predicate_value: str
+    ) -> bool:
+        """Deliberately queries by (mailbox_id, sender_domain) only in
+        SQL, then checks the subject predicate in Python via
+        `services.mailbox.domain_rule.subject_matches_predicate` — the
+        SAME "never trust a stored value's normalisation blindly at the
+        SQL layer" caution `list_candidate_messages_for_domain` already
+        establishes in this file for `domain_in_scope`."""
+        normalized_domain = normalize_domain(sender_domain)
+        try:
+            with session_scope(self._engine) as session:
+                rows = (
+                    session.query(MailboxMessageRow.subject)
+                    .filter(
+                        MailboxMessageRow.mailbox_id == mailbox_id,
+                        MailboxMessageRow.sender_domain == normalized_domain,
+                    )
+                    .all()
+                )
+                return any(
+                    subject_matches_predicate(row.subject, predicate_type=predicate_type, predicate_value=predicate_value)
+                    for row in rows
+                )
+        except SQLAlchemyError as exc:
+            raise PersistenceError(f"could not check subject_predicate_observed for MailboxMessage: {exc}") from exc
 
     def list_messages(self, *, mailbox_id: str, limit: Optional[int] = None, offset: int = 0):
         try:

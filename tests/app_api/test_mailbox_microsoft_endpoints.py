@@ -2055,3 +2055,72 @@ def test_amazon_style_two_documents_two_destinations_never_reasks_relevance(dev_
     assert rule.policy == "MUST_READ"
     assert rule.destination_mode == "REVIEW_REQUIRED"
     assert rule.destination_entity_id is None  # never silently promoted to FIXED
+
+
+# ---------------------------------------------------------------------
+# Deterministic subject-aware mailbox domain policy (CD-6 GUI-operations-
+# foundation follow-on WO) — provider-neutral request forwarding (item 17)
+# ---------------------------------------------------------------------
+
+
+def test_resolve_microsoft_domain_review_forwards_subject_predicate_fields(dev_client, monkeypatch):
+    """Mirrors `tests/app_api/test_mailbox_gmail_endpoints.py`'s own
+    equivalent proof — the Microsoft router's request model accepts and
+    forwards `subject_predicate_type`/`subject_predicate_value`
+    identically into the SAME shared `resolve_domain_review`."""
+    import app.api.routers.mailboxes_microsoft as microsoft_router
+
+    mailbox_id = _create_mailbox(dev_client)
+
+    captured = {}
+
+    def _fake_resolve_domain_review(**kwargs):
+        captured.update(kwargs)
+        return {"needs_you_item": {"status": "OPEN"}, "mailbox_domain_rule": None, "reprocessed_messages": []}
+
+    monkeypatch.setattr(microsoft_router, "resolve_domain_review", _fake_resolve_domain_review)
+
+    response = dev_client.post(
+        f"/internal/mailboxes/{mailbox_id}/microsoft/domain-review/some-item-id/resolve",
+        json={
+            "actor_type": "USER", "actor_id": ACTOR_ID, "decision": "ALLOW", "destination_mode": "REVIEW_REQUIRED",
+            "match_mode": "EXACT_DOMAIN_SUBJECT", "subject_predicate_type": "EXACT",
+            "subject_predicate_value": "Monthly Statement",
+        },
+    )
+    assert response.status_code == 200, response.text
+    assert captured["match_mode"] == "EXACT_DOMAIN_SUBJECT"
+    assert captured["subject_predicate_type"] == "EXACT"
+    assert captured["subject_predicate_value"] == "Monthly Statement"
+
+
+def test_batch_resolve_microsoft_domain_review_forwards_subject_predicate_fields(dev_client, monkeypatch):
+    import app.api.routers.mailboxes_microsoft as microsoft_router
+
+    mailbox_id = _create_mailbox(dev_client)
+
+    captured = []
+
+    def _fake_resolve_domain_review(**kwargs):
+        captured.append(kwargs)
+        return {"needs_you_item": {"status": "OPEN"}, "mailbox_domain_rule": None, "reprocessed_messages": []}
+
+    monkeypatch.setattr(microsoft_router, "resolve_domain_review", _fake_resolve_domain_review)
+
+    response = dev_client.post(
+        f"/internal/mailboxes/{mailbox_id}/microsoft/domain-review/batch-resolve",
+        json={
+            "actor_type": "USER", "actor_id": ACTOR_ID,
+            "items": [
+                {
+                    "item_id": "batch-item-1", "decision": "ALLOW", "destination_mode": "REVIEW_REQUIRED",
+                    "match_mode": "EXACT_DOMAIN_SUBJECT", "subject_predicate_type": "STARTS_WITH",
+                    "subject_predicate_value": "Order confirmed:",
+                }
+            ],
+        },
+    )
+    assert response.status_code == 200, response.text
+    assert len(captured) == 1
+    assert captured[0]["subject_predicate_type"] == "STARTS_WITH"
+    assert captured[0]["subject_predicate_value"] == "Order confirmed:"

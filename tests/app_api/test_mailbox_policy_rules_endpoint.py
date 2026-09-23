@@ -716,3 +716,147 @@ def test_never_touches_needs_you_and_never_back_processes_history(dev_client):
     # No Needs You item touched/created by this endpoint.
     after_items = comp.needs_you_repository.list_needs_you_items(item_type="MAILBOX_DOMAIN_REVIEW")
     assert len(after_items) == len(before_items)
+
+
+# =======================================================================
+# Deterministic subject-aware mailbox domain policy (CD-6 GUI-operations-
+# foundation follow-on WO) — EXACT_DOMAIN_SUBJECT via the generic,
+# provider-neutral policy-rules endpoint (item 25).
+# =======================================================================
+
+
+def test_subject_rule_rejects_an_unobserved_predicate(dev_client):
+    mailbox_id, comp, _entity = _connected_mailbox_with_entity_seeded(dev_client)
+    _sweep_message_from(dev_client, mailbox_id, sender_address="billing@statements.example", msg_id="AAMk-subj-1", subject="Just chatting")
+
+    r = dev_client.post(
+        f"/internal/mailboxes/{mailbox_id}/policy-rules",
+        json={
+            "actor_type": "USER", "actor_id": ACTOR_ID, "match_mode": "EXACT_DOMAIN_SUBJECT",
+            "sender_domain": "statements.example", "subject_predicate_type": "EXACT",
+            "subject_predicate_value": "Monthly Statement", "policy": "BLACKLIST",
+            "reason": "test",
+        },
+    )
+    assert r.status_code == 422, r.text
+    assert dev_client.get(f"/internal/mailboxes/{mailbox_id}/microsoft/domain-rules").json()["count"] == 0
+
+
+def test_subject_rule_created_when_predicate_was_actually_observed(dev_client):
+    mailbox_id, comp, entity = _connected_mailbox_with_entity_seeded(dev_client)
+    _sweep_message_from(
+        dev_client, mailbox_id, sender_address="billing@statements.example", msg_id="AAMk-subj-2",
+        subject="Monthly Statement",
+    )
+
+    r = dev_client.post(
+        f"/internal/mailboxes/{mailbox_id}/policy-rules",
+        json={
+            "actor_type": "USER", "actor_id": ACTOR_ID, "match_mode": "EXACT_DOMAIN_SUBJECT",
+            "sender_domain": "statements.example", "subject_predicate_type": "EXACT",
+            "subject_predicate_value": "Monthly Statement", "policy": "MUST_READ",
+            "destination_mode": "FIXED", "destination_entity_id": entity.entity_id,
+            "reason": "recurring statement, always route to this entity",
+        },
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["mailbox_domain_rule"]["match_mode"] == "EXACT_DOMAIN_SUBJECT"
+    assert body["mailbox_domain_rule"]["subject_predicate_type"] == "EXACT"
+    assert body["mailbox_domain_rule"]["subject_predicate_value"] == "monthly statement"  # normalised
+    assert body["was_no_op"] is False
+
+    # Never touches Needs You / never back-processes history — same
+    # doctrine as every other match_mode on this endpoint.
+    message = comp.mailbox_message_repository.find_by_provider_id(mailbox_id, "AAMk-subj-2")
+    assert message.ingestion_status == "CHECKED_NOT_CANDIDATE"
+    assert message.evidence_id is None
+    assert comp.microsoft_graph_client.content_calls == []
+
+
+def test_subject_rule_resubmission_is_idempotent(dev_client):
+    mailbox_id, comp, _entity = _connected_mailbox_with_entity_seeded(dev_client)
+    _sweep_message_from(
+        dev_client, mailbox_id, sender_address="billing@statements.example", msg_id="AAMk-subj-3",
+        subject="Monthly Statement",
+    )
+    payload = {
+        "actor_type": "USER", "actor_id": ACTOR_ID, "match_mode": "EXACT_DOMAIN_SUBJECT",
+        "sender_domain": "statements.example", "subject_predicate_type": "EXACT",
+        "subject_predicate_value": "Monthly Statement", "policy": "BLACKLIST",
+        "reason": "noise carve-out",
+    }
+    first = dev_client.post(f"/internal/mailboxes/{mailbox_id}/policy-rules", json=payload)
+    assert first.status_code == 200, first.text
+    rule_id = first.json()["mailbox_domain_rule"]["rule_id"]
+
+    second = dev_client.post(f"/internal/mailboxes/{mailbox_id}/policy-rules", json=payload)
+    assert second.status_code == 200, second.text
+    assert second.json()["was_no_op"] is True
+    assert second.json()["mailbox_domain_rule"]["rule_id"] == rule_id
+
+    rules = dev_client.get(f"/internal/mailboxes/{mailbox_id}/microsoft/domain-rules").json()["items"]
+    assert len([r for r in rules if r["match_mode"] == "EXACT_DOMAIN_SUBJECT"]) == 1
+
+
+def test_subject_rule_graylist_policy_is_rejected(dev_client):
+    mailbox_id, comp, _entity = _connected_mailbox_with_entity_seeded(dev_client)
+    _sweep_message_from(
+        dev_client, mailbox_id, sender_address="billing@statements.example", msg_id="AAMk-subj-4",
+        subject="Monthly Statement",
+    )
+    r = dev_client.post(
+        f"/internal/mailboxes/{mailbox_id}/policy-rules",
+        json={
+            "actor_type": "USER", "actor_id": ACTOR_ID, "match_mode": "EXACT_DOMAIN_SUBJECT",
+            "sender_domain": "statements.example", "subject_predicate_type": "EXACT",
+            "subject_predicate_value": "Monthly Statement", "policy": "GRAYLIST",
+            "reason": "should never be accepted",
+        },
+    )
+    assert r.status_code == 422, r.text
+
+
+def test_subject_rule_coexists_with_domain_level_and_address_level_rules(dev_client):
+    """One domain can simultaneously hold a domain-level fallback, an
+    EXACT_ADDRESS override, and an EXACT_DOMAIN_SUBJECT rule."""
+    mailbox_id, comp, entity = _connected_mailbox_with_entity_seeded(dev_client)
+    _sweep_message_from(
+        dev_client, mailbox_id, sender_address="billing@coexist.example", msg_id="AAMk-subj-5",
+        subject="Monthly Statement",
+    )
+
+    domain_r = dev_client.post(
+        f"/internal/mailboxes/{mailbox_id}/policy-rules",
+        json={
+            "actor_type": "USER", "actor_id": ACTOR_ID, "match_mode": "EXACT",
+            "sender_domain": "coexist.example", "policy": "GRAYLIST", "reason": "keep watching",
+        },
+    )
+    assert domain_r.status_code == 200, domain_r.text
+
+    address_r = dev_client.post(
+        f"/internal/mailboxes/{mailbox_id}/policy-rules",
+        json={
+            "actor_type": "USER", "actor_id": ACTOR_ID, "match_mode": "EXACT_ADDRESS",
+            "sender_domain": "coexist.example", "sender_address": "billing@coexist.example", "policy": "BLACKLIST",
+            "reason": "known spam address",
+        },
+    )
+    assert address_r.status_code == 200, address_r.text
+
+    subject_r = dev_client.post(
+        f"/internal/mailboxes/{mailbox_id}/policy-rules",
+        json={
+            "actor_type": "USER", "actor_id": ACTOR_ID, "match_mode": "EXACT_DOMAIN_SUBJECT",
+            "sender_domain": "coexist.example", "subject_predicate_type": "EXACT",
+            "subject_predicate_value": "Monthly Statement", "policy": "MUST_READ",
+            "destination_mode": "FIXED", "destination_entity_id": entity.entity_id,
+            "reason": "recurring statement",
+        },
+    )
+    assert subject_r.status_code == 200, subject_r.text
+
+    rules = dev_client.get(f"/internal/mailboxes/{mailbox_id}/microsoft/domain-rules").json()["items"]
+    assert len(rules) == 3
+    assert {r["match_mode"] for r in rules} == {"EXACT", "EXACT_ADDRESS", "EXACT_DOMAIN_SUBJECT"}

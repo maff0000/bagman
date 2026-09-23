@@ -398,3 +398,106 @@ def test_non_utc_date_header_message_records_cleanly_end_to_end(fresh_engine):
     fetched = fresh_repo.get_message(message.mailbox_message_id)
     assert fetched.received_at.utcoffset().total_seconds() == 0
     fetched.to_dict()  # must not raise
+
+
+# ---------------------------------------------------------------------
+# Deterministic subject-aware mailbox domain policy (CD-6 GUI-operations-
+# foundation follow-on WO) — `subject_predicate_observed` (the real
+# backstop behind a new EXACT_DOMAIN_SUBJECT MailboxDomainRule created
+# via the generic policy-rules endpoint: an operator must never be able
+# to pre-authorize a predicate BAGMAN has never actually seen matching
+# mail for).
+# ---------------------------------------------------------------------
+
+from services.mailbox.domain_rule import SUBJECT_PREDICATE_EXACT, SUBJECT_PREDICATE_STARTS_WITH  # noqa: E402
+
+
+def test_subject_predicate_observed_true_for_exact_match(fresh_engine):
+    repo = PostgresMailboxMessageRepository()
+    mailbox_id = _mailbox_id()
+    repo.record_observation(
+        mailbox_id=mailbox_id, provider_kind="MICROSOFT_GRAPH", immutable_provider_message_id="msg-1",
+        internet_message_id="<a@b>", observed_folder=FOLDER_INBOX, subject="Monthly  Statement",
+        sender_address="billing@vantage.example", sender_display_name="Vantage",
+        received_at=datetime.now(timezone.utc), has_attachments=False,
+        ingestion_status=INGESTION_STATUS_INGESTED, sender_domain="vantage.example",
+    )
+
+    fresh_repo = PostgresMailboxMessageRepository(engine=fresh_engine)
+    assert fresh_repo.subject_predicate_observed(
+        mailbox_id=mailbox_id, sender_domain="vantage.example",
+        predicate_type=SUBJECT_PREDICATE_EXACT, predicate_value="monthly statement",
+    ) is True
+
+
+def test_subject_predicate_observed_true_for_any_ingestion_status():
+    """"Has this predicate EVER matched a real message here" — not about
+    current eligibility, unlike `list_candidate_messages_for_domain`."""
+    repo = PostgresMailboxMessageRepository()
+    mailbox_id = _mailbox_id()
+    repo.record_observation(
+        mailbox_id=mailbox_id, provider_kind="MICROSOFT_GRAPH", immutable_provider_message_id="msg-1",
+        internet_message_id="<a@b>", observed_folder=FOLDER_INBOX, subject="Monthly Statement",
+        sender_address="billing@vantage.example", sender_display_name="Vantage",
+        received_at=datetime.now(timezone.utc), has_attachments=False,
+        ingestion_status=INGESTION_STATUS_VANISHED, sender_domain="vantage.example",
+    )
+    assert repo.subject_predicate_observed(
+        mailbox_id=mailbox_id, sender_domain="vantage.example",
+        predicate_type=SUBJECT_PREDICATE_EXACT, predicate_value="monthly statement",
+    ) is True
+
+
+def test_subject_predicate_observed_true_for_starts_with_match():
+    repo = PostgresMailboxMessageRepository()
+    mailbox_id = _mailbox_id()
+    repo.record_observation(
+        mailbox_id=mailbox_id, provider_kind="MICROSOFT_GRAPH", immutable_provider_message_id="msg-1",
+        internet_message_id="<a@b>", observed_folder=FOLDER_INBOX, subject="Order confirmed: iPad",
+        sender_address="ebay@ebay.example", sender_display_name="eBay",
+        received_at=datetime.now(timezone.utc), has_attachments=False,
+        ingestion_status=INGESTION_STATUS_INGESTED, sender_domain="ebay.example",
+    )
+    assert repo.subject_predicate_observed(
+        mailbox_id=mailbox_id, sender_domain="ebay.example",
+        predicate_type=SUBJECT_PREDICATE_STARTS_WITH, predicate_value="order confirmed:",
+    ) is True
+
+
+def test_subject_predicate_observed_false_for_never_matching_predicate():
+    repo = PostgresMailboxMessageRepository()
+    mailbox_id = _mailbox_id()
+    repo.record_observation(
+        mailbox_id=mailbox_id, provider_kind="MICROSOFT_GRAPH", immutable_provider_message_id="msg-1",
+        internet_message_id="<a@b>", observed_folder=FOLDER_INBOX, subject="porsche targa, Porsche: 2 NEW!",
+        sender_address="seller@ebay.example", sender_display_name="eBay",
+        received_at=datetime.now(timezone.utc), has_attachments=False,
+        ingestion_status=INGESTION_STATUS_INGESTED, sender_domain="ebay.example",
+    )
+    assert repo.subject_predicate_observed(
+        mailbox_id=mailbox_id, sender_domain="ebay.example",
+        predicate_type=SUBJECT_PREDICATE_STARTS_WITH, predicate_value="order confirmed:",
+    ) is False
+
+
+def test_subject_predicate_observed_scoped_to_exact_domain_and_mailbox():
+    repo = PostgresMailboxMessageRepository()
+    mailbox_id = _mailbox_id()
+    other_mailbox_id = _mailbox_id()
+    repo.record_observation(
+        mailbox_id=mailbox_id, provider_kind="MICROSOFT_GRAPH", immutable_provider_message_id="msg-1",
+        internet_message_id="<a@b>", observed_folder=FOLDER_INBOX, subject="Monthly Statement",
+        sender_address="billing@vantage.example", sender_display_name="Vantage",
+        received_at=datetime.now(timezone.utc), has_attachments=False,
+        ingestion_status=INGESTION_STATUS_INGESTED, sender_domain="vantage.example",
+    )
+    # Different mailbox — never observed there.
+    assert repo.subject_predicate_observed(
+        mailbox_id=other_mailbox_id, sender_domain="vantage.example",
+        predicate_type=SUBJECT_PREDICATE_EXACT, predicate_value="monthly statement",
+    ) is False
+    # Different (sub)domain — subject predicates are exact-domain only.
+    assert repo.subject_predicate_observed(
+        mailbox_id=mailbox_id, sender_domain="mail.vantage.example",
+        predicate_type=SUBJECT_PREDICATE_EXACT, predicate_value="monthly statement",
+    ) is False

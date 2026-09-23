@@ -510,3 +510,74 @@ def test_domain_rules_list_is_reused_from_the_provider_neutral_endpoint(dev_clie
     assert listed.status_code == 200
     assert listed.json()["count"] == 1
     assert listed.json()["items"][0]["sender_domain"] == "vendor.com"
+
+
+# ---------------------------------------------------------------------
+# Deterministic subject-aware mailbox domain policy (CD-6 GUI-operations-
+# foundation follow-on WO) — provider-neutral request forwarding (item 17)
+# ---------------------------------------------------------------------
+
+
+def test_resolve_gmail_domain_review_forwards_subject_predicate_fields(dev_client, monkeypatch):
+    """The Gmail router's own request model accepts
+    `subject_predicate_type`/`subject_predicate_value` and forwards them
+    UNCHANGED into the ONE shared, provider-neutral
+    `resolve_domain_review` — proven here by monkeypatching that shared
+    function and capturing its kwargs, so this test never needs a full
+    sweep-driven domain-review item to exist first."""
+    import app.api.routers.mailboxes_gmail as gmail_router
+
+    mailbox_id = _create_gmail_mailbox(dev_client)
+
+    captured = {}
+
+    def _fake_resolve_domain_review(**kwargs):
+        captured.update(kwargs)
+        return {"needs_you_item": {"status": "OPEN"}, "mailbox_domain_rule": None, "reprocessed_messages": []}
+
+    monkeypatch.setattr(gmail_router, "resolve_domain_review", _fake_resolve_domain_review)
+
+    response = dev_client.post(
+        f"/internal/mailboxes/{mailbox_id}/gmail/domain-review/some-item-id/resolve",
+        json={
+            "actor_type": "USER", "actor_id": ACTOR_ID, "decision": "ALLOW", "destination_mode": "REVIEW_REQUIRED",
+            "match_mode": "EXACT_DOMAIN_SUBJECT", "subject_predicate_type": "EXACT",
+            "subject_predicate_value": "Monthly Statement",
+        },
+    )
+    assert response.status_code == 200, response.text
+    assert captured["match_mode"] == "EXACT_DOMAIN_SUBJECT"
+    assert captured["subject_predicate_type"] == "EXACT"
+    assert captured["subject_predicate_value"] == "Monthly Statement"
+
+
+def test_batch_resolve_gmail_domain_review_forwards_subject_predicate_fields(dev_client, monkeypatch):
+    import app.api.routers.mailboxes_gmail as gmail_router
+
+    mailbox_id = _create_gmail_mailbox(dev_client)
+
+    captured = []
+
+    def _fake_resolve_domain_review(**kwargs):
+        captured.append(kwargs)
+        return {"needs_you_item": {"status": "OPEN"}, "mailbox_domain_rule": None, "reprocessed_messages": []}
+
+    monkeypatch.setattr(gmail_router, "resolve_domain_review", _fake_resolve_domain_review)
+
+    response = dev_client.post(
+        f"/internal/mailboxes/{mailbox_id}/gmail/domain-review/batch-resolve",
+        json={
+            "actor_type": "USER", "actor_id": ACTOR_ID,
+            "items": [
+                {
+                    "item_id": "batch-item-1", "decision": "ALLOW", "destination_mode": "REVIEW_REQUIRED",
+                    "match_mode": "EXACT_DOMAIN_SUBJECT", "subject_predicate_type": "STARTS_WITH",
+                    "subject_predicate_value": "Order confirmed:",
+                }
+            ],
+        },
+    )
+    assert response.status_code == 200, response.text
+    assert len(captured) == 1
+    assert captured[0]["subject_predicate_type"] == "STARTS_WITH"
+    assert captured[0]["subject_predicate_value"] == "Order confirmed:"

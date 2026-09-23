@@ -165,13 +165,15 @@ from __future__ import annotations
 
 import abc
 import dataclasses
+import re
+import unicodedata
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional
 
 from core import identity
 from core.contract_validation import validate_against_contract
-from core.errors import InvalidStateTransitionError, NotFoundError, ValidationError
+from core.errors import ConflictError, InvalidStateTransitionError, NotFoundError, ValidationError
 from core.timestamps import to_contract_string, utc_now
 
 _SCHEMA = "mailbox/bagman.mailbox_domain_rule.v1.schema.json"
@@ -183,7 +185,32 @@ MATCH_MODE_INCLUDE_SUBDOMAINS = "INCLUDE_SUBDOMAINS"
 #: SPECIFIC sender email address, never a whole domain. See module
 #: docstring's "Rule specificity" section.
 MATCH_MODE_EXACT_ADDRESS = "EXACT_ADDRESS"
-MATCH_MODES = frozenset({MATCH_MODE_EXACT, MATCH_MODE_INCLUDE_SUBDOMAINS, MATCH_MODE_EXACT_ADDRESS})
+#: Deterministic subject-aware mailbox domain policy (CD-6 GUI-
+#: operations-foundation follow-on WO) — applies only to messages whose
+#: sender domain EXACTLY equals `sender_domain` (never subdomains — a
+#: subject predicate is deliberately never combined with
+#: INCLUDE_SUBDOMAINS' own broader domain-scope semantics) AND whose
+#: normalised subject satisfies the rule's own stored deterministic
+#: predicate (`subject_predicate_type`/`subject_predicate_value` — see
+#: `SUBJECT_PREDICATES`/`normalize_subject_for_policy` below). Its own
+#: separate identity space (never the domain-level identity space
+#: `EXACT`/`INCLUDE_SUBDOMAINS` share, and never `EXACT_ADDRESS`'s own
+#: address-level identity space) is `(mailbox_id, sender_domain,
+#: subject_predicate_type, subject_predicate_value)` — see
+#: `persistence/postgres/mailbox_domain_rule_models.py`'s own module
+#: docstring for the partial unique index this maps to.
+MATCH_MODE_EXACT_DOMAIN_SUBJECT = "EXACT_DOMAIN_SUBJECT"
+MATCH_MODES = frozenset(
+    {MATCH_MODE_EXACT, MATCH_MODE_INCLUDE_SUBDOMAINS, MATCH_MODE_EXACT_ADDRESS, MATCH_MODE_EXACT_DOMAIN_SUBJECT}
+)
+
+#: Deliberately exactly two predicate types — no CONTAINS, no regex, no
+#: glob, no NLP (CD-6 GUI-operations-foundation follow-on WO's own
+#: explicit "deterministic" requirement: a subject rule must always be
+#: mechanically explainable to Matt, never a fuzzy/probabilistic match).
+SUBJECT_PREDICATE_EXACT = "EXACT"
+SUBJECT_PREDICATE_STARTS_WITH = "STARTS_WITH"
+SUBJECT_PREDICATES = frozenset({SUBJECT_PREDICATE_EXACT, SUBJECT_PREDICATE_STARTS_WITH})
 
 #: Closed policy vocabulary (architect spec §2, CD-6 GUI-operations-
 #: foundation follow-on WO's own three-state operator-learning model) —
@@ -245,6 +272,15 @@ class MailboxDomainRule:
     #: specificity" section). `None` for a domain-level (`EXACT`/
     #: `INCLUDE_SUBDOMAINS`) rule, always normalised lowercase.
     sender_address: Optional[str] = None
+    #: CD-6 GUI-operations-foundation follow-on WO — populated ONLY for
+    #: a `MATCH_MODE_EXACT_DOMAIN_SUBJECT` rule (`SUBJECT_PREDICATES`
+    #: member). `None` for every other match mode.
+    subject_predicate_type: Optional[str] = None
+    #: Always stored in canonical NORMALISED form (see
+    #: `normalize_subject_for_policy`) — matching operates purely on
+    #: normalised-vs-normalised comparison, never raw casing/spacing.
+    #: Populated ONLY for a `MATCH_MODE_EXACT_DOMAIN_SUBJECT` rule.
+    subject_predicate_value: Optional[str] = None
     schema_version: str = SCHEMA_VERSION
 
     def to_dict(self) -> dict:
@@ -263,6 +299,8 @@ class MailboxDomainRule:
             "created_at": to_contract_string(self.created_at),
             "updated_at": to_contract_string(self.updated_at),
             "last_seen_at": to_contract_string(self.last_seen_at),
+            "subject_predicate_type": self.subject_predicate_type,
+            "subject_predicate_value": self.subject_predicate_value,
             "schema_version": self.schema_version,
         }
 
@@ -337,6 +375,117 @@ def domain_from_address(sender_address: str) -> str:
     return domain
 
 
+#: Collapse consecutive internal whitespace to one ASCII space — applied
+#: AFTER casefold/strip in `normalize_subject_for_policy` below.
+_WHITESPACE_RUN = re.compile(r"\s+")
+
+
+def normalize_subject_for_policy(subject: Optional[str]) -> Optional[str]:
+    """The ONE place every caller normalises a message subject before
+    either a `MATCH_MODE_EXACT_DOMAIN_SUBJECT` predicate comparison or
+    storage (CD-6 GUI-operations-foundation follow-on WO — deterministic
+    subject-aware mailbox domain policy). Applied in this EXACT order:
+
+    1. Unicode NFKC normalisation (`unicodedata.normalize("NFKC", ...)`)
+       — canonicalises visually-identical-but-differently-encoded
+       characters (e.g. full-width vs. half-width forms) before any
+       comparison.
+    2. `.casefold()` — a real subject rule must never be defeated by
+       case variation.
+    3. `.strip()` — leading/trailing whitespace never carries meaning.
+    4. Collapse consecutive INTERNAL whitespace to one ASCII space — a
+       real, observed eBay defect (a literal double space inside a
+       subject line) must not silently defeat an otherwise-correct
+       predicate.
+
+    Deliberately does NOT strip punctuation/digits, and does NOT strip
+    `Re:`/`Fwd:` reply/forward prefixes — this is a NORMALISATION step,
+    never a semantic rewrite; a predicate author who wants to match past
+    a `Re:` prefix uses `STARTS_WITH` with the prefix included, or
+    `EXACT` against the reply subject's own literal (normalised) text.
+
+    `None` in -> `None` out (an `EXACT_DOMAIN_SUBJECT` rule never
+    matches a message with no subject at all — see
+    `MailboxDomainRuleRepository.find_for_sender`'s own Tier-2 gate)."""
+    if subject is None:
+        return None
+    normalized = unicodedata.normalize("NFKC", subject).casefold().strip()
+    return _WHITESPACE_RUN.sub(" ", normalized)
+
+
+def subject_matches_predicate(subject: Optional[str], *, predicate_type: str, predicate_value: str) -> bool:
+    """The ONE place a real message subject is tested against a stored
+    `MATCH_MODE_EXACT_DOMAIN_SUBJECT` predicate — used by BOTH
+    `MailboxDomainRuleRepository.find_for_sender`'s own Tier-2
+    resolution (in-memory AND PostgreSQL implementations alike) and the
+    creation-time "has this predicate ever/currently matched a real
+    message" guards (`app/api/routers/mailboxes.py
+    ::upsert_mailbox_policy_rule`'s `subject_predicate_observed` check,
+    `services.mailbox.review_resolution.resolve_domain_review`'s own
+    eligible-candidate check) — never reimplemented at any of those call
+    sites.
+
+    ``subject`` is the RAW (un-normalised) candidate subject —
+    normalised HERE, internally, via `normalize_subject_for_policy`.
+    ``predicate_value`` MUST already be in canonical normalised form
+    (exactly what every rule stores — see
+    `MailboxDomainRule.subject_predicate_value`'s own docstring); it is
+    never re-normalised here, so a caller passing a raw, un-normalised
+    predicate value would silently never match — every caller of this
+    function is expected to already hold a normalised stored value."""
+    normalized_subject = normalize_subject_for_policy(subject)
+    if not normalized_subject:
+        return False
+    if predicate_type == SUBJECT_PREDICATE_EXACT:
+        return normalized_subject == predicate_value
+    if predicate_type == SUBJECT_PREDICATE_STARTS_WITH:
+        return normalized_subject.startswith(predicate_value)
+    return False
+
+
+def validate_and_normalize_subject_predicate(
+    *, match_mode: str, subject_predicate_type: Optional[str], subject_predicate_value: Optional[str]
+) -> tuple[Optional[str], Optional[str]]:
+    """The ONE shared STRUCTURAL validation+normalisation every caller
+    that lets an operator create/update a `MATCH_MODE_EXACT_DOMAIN_SUBJECT`
+    rule goes through (mirrors `validate_and_normalize_sender_address`'s
+    identical role for `EXACT_ADDRESS`) — checked BEFORE any "has this
+    predicate ever/currently matched a real message" observed-guard
+    (that check is deliberately NOT here — it differs by caller, see
+    `app/api/routers/mailboxes.py::upsert_mailbox_policy_rule` vs.
+    `services.mailbox.review_resolution.resolve_domain_review`'s own
+    docstrings for the two different observed-guards each applies):
+
+    * ``match_mode != MATCH_MODE_EXACT_DOMAIN_SUBJECT`` -> both fields
+      must be absent (`None`); returns ``(None, None)``.
+    * ``match_mode == MATCH_MODE_EXACT_DOMAIN_SUBJECT`` -> both fields
+      required: ``subject_predicate_type`` must be a real
+      `SUBJECT_PREDICATES` member, and ``subject_predicate_value`` must
+      normalise (via `normalize_subject_for_policy`) to a non-empty
+      string. Returns ``(subject_predicate_type, normalized_value)``.
+    """
+    if match_mode != MATCH_MODE_EXACT_DOMAIN_SUBJECT:
+        if subject_predicate_type is not None or subject_predicate_value is not None:
+            raise ValidationError(
+                f"subject_predicate_type/subject_predicate_value must not be supplied when match_mode is "
+                f"'{match_mode}' — only '{MATCH_MODE_EXACT_DOMAIN_SUBJECT}' rules use a subject predicate"
+            )
+        return None, None
+
+    if subject_predicate_type not in SUBJECT_PREDICATES:
+        raise ValidationError(
+            f"subject_predicate_type must be one of {sorted(SUBJECT_PREDICATES)} for "
+            f"{MATCH_MODE_EXACT_DOMAIN_SUBJECT} (got {subject_predicate_type!r})"
+        )
+    normalized_value = normalize_subject_for_policy(subject_predicate_value)
+    if not normalized_value:
+        raise ValidationError(
+            f"subject_predicate_value must normalize to a non-empty string for {MATCH_MODE_EXACT_DOMAIN_SUBJECT} "
+            f"(got {subject_predicate_value!r})"
+        )
+    return subject_predicate_type, normalized_value
+
+
 def validate_and_normalize_sender_address(
     *,
     message_repository,
@@ -405,13 +554,33 @@ def validate_and_normalize_sender_address(
 
 
 def validate_policy_fields_or_raise(
-    *, policy: str, destination_entity_id: Optional[str], destination_mode: Optional[str]
+    *,
+    policy: str,
+    destination_entity_id: Optional[str],
+    destination_mode: Optional[str],
+    match_mode: Optional[str] = None,
 ) -> None:
     """Shared validation both repository implementations call before
     persisting a rule — see contract's own field descriptions for the
-    exact rules enforced here."""
+    exact rules enforced here.
+
+    ``match_mode`` (CD-6 GUI-operations-foundation follow-on WO,
+    optional/backward-compatible — every pre-existing caller that never
+    passed it keeps its exact prior behaviour) additionally enforces
+    that `MATCH_MODE_EXACT_DOMAIN_SUBJECT + POLICY_GRAYLIST` is
+    explicitly REJECTED: subject-scoped GRAYLIST is not supported in
+    this delivery (a subject predicate expresses a specific, deterministic
+    "Matt already knows what this is" decision — MUST_READ or BLACKLIST
+    — never an open-ended "keep checking with me" state, which stays a
+    purely domain-level concept). Plain domain-level GRAYLIST/KEEP_GRAY
+    (`EXACT`/`INCLUDE_SUBDOMAINS`) is completely unaffected."""
     if policy not in POLICIES:
         raise ValidationError(f"'{policy}' is not a governed MailboxDomainRule policy — must be one of {sorted(POLICIES)}")
+    if match_mode == MATCH_MODE_EXACT_DOMAIN_SUBJECT and policy == POLICY_GRAYLIST:
+        raise ValidationError(
+            f"{MATCH_MODE_EXACT_DOMAIN_SUBJECT} rules do not support {POLICY_GRAYLIST} in this delivery — "
+            f"use {POLICY_MUST_READ} or {POLICY_BLACKLIST} instead (subject-scoped graylisting is not supported)"
+        )
     if policy in (POLICY_GRAYLIST, POLICY_BLACKLIST):
         if destination_entity_id is not None or destination_mode is not None:
             raise ValidationError(
@@ -431,25 +600,76 @@ def validate_policy_fields_or_raise(
         )
 
 
-def validate_match_fields_or_raise(*, match_mode: str, sender_address: Optional[str]) -> None:
+def validate_match_fields_or_raise(
+    *,
+    match_mode: str,
+    sender_address: Optional[str],
+    subject_predicate_type: Optional[str] = None,
+    subject_predicate_value: Optional[str] = None,
+) -> None:
     """CD-6 GUI-operations-foundation follow-on WO — the
     `MATCH_MODE_EXACT_ADDRESS` counterpart to
     :func:`validate_policy_fields_or_raise`: an `EXACT_ADDRESS` rule
     REQUIRES a real `sender_address`; a domain-level rule
     (`EXACT`/`INCLUDE_SUBDOMAINS`) must never carry one (mirrors
     `destination_entity_id`'s own "never present when it does not apply"
-    discipline one field up)."""
+    discipline one field up).
+
+    Extended (deterministic subject-aware mailbox domain policy) with
+    the analogous, symmetric check for
+    `subject_predicate_type`/`subject_predicate_value`: an
+    `EXACT_DOMAIN_SUBJECT` rule REQUIRES `sender_domain` (always
+    supplied by every real caller — enforced structurally, not here),
+    must NEVER carry a `sender_address`, REQUIRES a real
+    `subject_predicate_type` (`SUBJECT_PREDICATES` member) and a
+    `subject_predicate_value` that normalises to a non-empty string
+    (via `normalize_subject_for_policy`); every OTHER match mode must
+    never carry either subject field — mirrors `sender_address`'s own
+    "never present when it does not apply" discipline exactly."""
     if match_mode not in MATCH_MODES:
         raise ValidationError(f"'{match_mode}' is not a governed match_mode — must be one of {sorted(MATCH_MODES)}")
+
     if match_mode == MATCH_MODE_EXACT_ADDRESS:
         if not sender_address:
             raise ValidationError(
                 "a MATCH_MODE_EXACT_ADDRESS MailboxDomainRule requires a real sender_address"
             )
-    elif sender_address is not None:
+        if subject_predicate_type is not None or subject_predicate_value is not None:
+            raise ValidationError(
+                "a MATCH_MODE_EXACT_ADDRESS MailboxDomainRule must never carry subject_predicate_type/"
+                "subject_predicate_value (those fields only apply to MATCH_MODE_EXACT_DOMAIN_SUBJECT rules)"
+            )
+        return
+
+    if match_mode == MATCH_MODE_EXACT_DOMAIN_SUBJECT:
+        if sender_address is not None:
+            raise ValidationError(
+                "a MATCH_MODE_EXACT_DOMAIN_SUBJECT MailboxDomainRule must never carry a sender_address (that "
+                "field only applies to MATCH_MODE_EXACT_ADDRESS rules)"
+            )
+        if subject_predicate_type not in SUBJECT_PREDICATES:
+            raise ValidationError(
+                f"subject_predicate_type must be one of {sorted(SUBJECT_PREDICATES)} for "
+                f"{MATCH_MODE_EXACT_DOMAIN_SUBJECT} (got {subject_predicate_type!r})"
+            )
+        if not normalize_subject_for_policy(subject_predicate_value):
+            raise ValidationError(
+                f"subject_predicate_value must normalize to a non-empty string for "
+                f"{MATCH_MODE_EXACT_DOMAIN_SUBJECT} (got {subject_predicate_value!r})"
+            )
+        return
+
+    # EXACT / INCLUDE_SUBDOMAINS — neither sender_address nor a subject
+    # predicate may ever be present.
+    if sender_address is not None:
         raise ValidationError(
             f"a {match_mode} MailboxDomainRule must never carry a sender_address (that field only applies to "
             "MATCH_MODE_EXACT_ADDRESS rules)"
+        )
+    if subject_predicate_type is not None or subject_predicate_value is not None:
+        raise ValidationError(
+            f"a {match_mode} MailboxDomainRule must never carry subject_predicate_type/subject_predicate_value "
+            "(those fields only apply to MATCH_MODE_EXACT_DOMAIN_SUBJECT rules)"
         )
 
 
@@ -470,6 +690,7 @@ def transition_policy(rule: MailboxDomainRule, new_policy: str, **field_updates)
             policy=updated.policy,
             destination_entity_id=updated.destination_entity_id,
             destination_mode=updated.destination_mode,
+            match_mode=updated.match_mode,
         )
         validate_against_contract(updated.to_dict(), _SCHEMA)
     except ValidationError:
@@ -496,6 +717,8 @@ class MailboxDomainRuleRepository(abc.ABC):
         processor_hint: Optional[str] = None,
         approved_at: Optional[datetime] = None,
         sender_address: Optional[str] = None,
+        subject_predicate_type: Optional[str] = None,
+        subject_predicate_value: Optional[str] = None,
     ) -> MailboxDomainRule:
         """Resolve-or-create-or-update.
 
@@ -522,6 +745,18 @@ class MailboxDomainRuleRepository(abc.ABC):
         are supplied), purely for reporting/grouping — never part of
         this match mode's own identity key.
 
+        For an ``EXACT_DOMAIN_SUBJECT`` rule: keyed by ``(mailbox_id,
+        sender_domain, subject_predicate_type, subject_predicate_value)``
+        — a THIRD, separate identity space from both the domain-level
+        keying above and the address-level keying below (see module
+        docstring's "Rule specificity" section, and
+        `persistence/postgres/mailbox_domain_rule_models.py`'s own
+        module docstring for the partial unique index this maps to). A
+        genuinely new predicate identity creates a fresh row; an
+        existing exact predicate identity's rule is fully replaced —
+        mirrors the domain-level/address-level upsert-or-replace
+        behaviour exactly.
+
         A same-policy (or same-everything) upsert is a harmless no-op,
         rather than an error — mirrors this delivery's own established
         "a redundant same-state action must never fail" doctrine.
@@ -534,19 +769,46 @@ class MailboxDomainRuleRepository(abc.ABC):
 
     @abc.abstractmethod
     def find_for_sender(
-        self, *, mailbox_id: str, sender_domain: str, sender_address: Optional[str] = None
+        self,
+        *,
+        mailbox_id: str,
+        sender_domain: str,
+        sender_address: Optional[str] = None,
+        subject: Optional[str] = None,
     ) -> Optional[MailboxDomainRule]:
         """Resolve the SINGLE governing rule (if any) for a message from
-        ``sender_domain``/``sender_address`` observed in ``mailbox_id``,
-        in most-specific-first order (see module docstring's "Rule
-        specificity" section for the full three-tier resolution this
-        implements):
+        ``sender_domain``/``sender_address``/``subject`` observed in
+        ``mailbox_id``, in most-specific-first order (see module
+        docstring's "Rule specificity" section for the full four-tier
+        resolution this implements — extended by the CD-6 GUI-operations-
+        foundation follow-on WO's deterministic subject-aware policy):
 
         1. An ``EXACT_ADDRESS`` rule matching ``sender_address`` exactly
-           (only attempted when ``sender_address`` is supplied).
-        2. A domain-level rule matching ``sender_domain`` exactly.
-        3. An ``INCLUDE_SUBDOMAINS`` rule whose own domain is a parent of
-           ``sender_domain``.
+           (only attempted when ``sender_address`` is supplied) —
+           subject-independent, always wins if present.
+        2. An ``EXACT_DOMAIN_SUBJECT`` rule at the message's own EXACT
+           sender domain (never via subdomain matching) whose stored
+           predicate the message's own normalised ``subject`` satisfies
+           (only attempted when ``subject`` is supplied and normalises
+           non-empty — see `normalize_subject_for_policy`). When
+           multiple rules match: an ``EXACT`` predicate always beats
+           every ``STARTS_WITH`` predicate; among matching
+           ``STARTS_WITH`` rules, the LONGEST ``subject_predicate_value``
+           wins (explicit specificity ordering). Raises
+           ``core.errors.ConflictError`` — never silently picks one,
+           never falls through to a broader tier, never returns ``None``
+           — if two-or-more matches genuinely cannot be ordered this way
+           (only reachable via data corruption bypassing the normal,
+           validated write path — the real write path's own uniqueness
+           constraints make this structurally impossible in ordinary
+           operation).
+        3. A direct domain-level rule (``EXACT`` or
+           ``INCLUDE_SUBDOMAINS`` — only one can exist per domain, by
+           construction) matching the message's exact sender domain (an
+           ``INCLUDE_SUBDOMAINS`` rule AT the message's own exact domain
+           is still "direct" here, not "parent").
+        4. An ``INCLUDE_SUBDOMAINS`` rule whose own domain is a PARENT of
+           the message's sender domain.
 
         Returns ``None`` — never ``NotFoundError`` — when no rule
         governs this sender yet (the Stage-B 'unknown domain' path)."""
@@ -554,18 +816,31 @@ class MailboxDomainRuleRepository(abc.ABC):
 
     @abc.abstractmethod
     def find_exact(
-        self, *, mailbox_id: str, sender_domain: str, match_mode: str, sender_address: Optional[str] = None
+        self,
+        *,
+        mailbox_id: str,
+        sender_domain: str,
+        match_mode: str,
+        sender_address: Optional[str] = None,
+        subject_predicate_type: Optional[str] = None,
+        subject_predicate_value: Optional[str] = None,
     ) -> Optional[MailboxDomainRule]:
         """Look up the rule at this EXACT identity — never the
         most-specific-wins resolution :meth:`find_for_sender` performs
         (CD-6 policy-rules-endpoint WO). For ``match_mode`` ``EXACT``/
         ``INCLUDE_SUBDOMAINS`` (the domain-level identity space),
-        resolves by ``(mailbox_id, sender_domain)`` among non-
-        ``EXACT_ADDRESS`` rows only. For ``match_mode ==
-        MATCH_MODE_EXACT_ADDRESS`` (a SEPARATE identity space),
-        resolves by ``(mailbox_id, sender_address)`` instead —
+        resolves by ``(mailbox_id, sender_domain)`` among rows that are
+        neither ``EXACT_ADDRESS`` nor ``EXACT_DOMAIN_SUBJECT``. For
+        ``match_mode == MATCH_MODE_EXACT_ADDRESS`` (a SEPARATE identity
+        space), resolves by ``(mailbox_id, sender_address)`` instead —
         ``sender_address`` is then REQUIRED (raises ``ValidationError``
-        if omitted).
+        if omitted). For ``match_mode == MATCH_MODE_EXACT_DOMAIN_SUBJECT``
+        (a THIRD, separate identity space), resolves ONLY that exact
+        predicate identity — ``subject_predicate_type``/
+        ``subject_predicate_value`` are then BOTH REQUIRED (raises
+        ``ValidationError`` if either is omitted); never the domain
+        fallback, never a DIFFERENT subject predicate, never an address
+        rule.
 
         Returns ``None`` — never ``NotFoundError`` — when this specific
         identity has never had a rule. This is the correct "previous
@@ -582,16 +857,23 @@ class MailboxDomainRuleRepository(abc.ABC):
 
     @abc.abstractmethod
     def touch_last_seen(
-        self, *, mailbox_id: str, sender_domain: str, seen_at: datetime, sender_address: Optional[str] = None
+        self,
+        *,
+        mailbox_id: str,
+        sender_domain: str,
+        seen_at: datetime,
+        sender_address: Optional[str] = None,
+        subject: Optional[str] = None,
     ) -> MailboxDomainRule:
         """Stamp ``last_seen_at`` on the rule matched for this sender
         (observability only — never a gate decision) — re-resolves via
         :meth:`find_for_sender` using the SAME ``sender_domain``/
-        ``sender_address`` pair the caller already resolved its
-        governing rule from, so an ``EXACT_ADDRESS``-governed message
-        touches THAT rule, never a broader domain-level rule that
-        happens to also exist for the same domain. Raises
-        ``core.errors.NotFoundError`` if no rule exists."""
+        ``sender_address``/``subject`` the caller already resolved its
+        governing rule from, so an ``EXACT_ADDRESS``- or
+        ``EXACT_DOMAIN_SUBJECT``-governed message touches THAT rule,
+        never a broader domain-level rule that happens to also exist for
+        the same domain. Raises ``core.errors.NotFoundError`` if no rule
+        exists."""
         raise NotImplementedError
 
     @abc.abstractmethod
@@ -611,12 +893,27 @@ class InMemoryMailboxDomainRuleRepository(MailboxDomainRuleRepository):
         #: real, separate PARTIAL unique indexes the Postgres schema now
         #: carries (see `persistence/postgres/mailbox_domain_rule_models.py`).
         self._id_by_address_key: dict[tuple[str, str], str] = {}
+        #: A THIRD, separate identity space for `EXACT_DOMAIN_SUBJECT`
+        #: rules — an `EXACT_DOMAIN_SUBJECT` rule must NEVER be placed in
+        #: `_id_by_domain_key` (it is not a domain-level rule for
+        #: uniqueness purposes; several may coexist per domain).
+        self._id_by_subject_key: dict[tuple[str, str, str, str], str] = {}
 
     def _domain_key(self, *, mailbox_id: str, sender_domain: str) -> tuple[str, str]:
         return (mailbox_id, normalize_domain(sender_domain))
 
     def _address_key(self, *, mailbox_id: str, sender_address: str) -> tuple[str, str]:
         return (mailbox_id, normalize_address(sender_address))
+
+    def _subject_key(
+        self, *, mailbox_id: str, sender_domain: str, subject_predicate_type: str, subject_predicate_value: str
+    ) -> tuple[str, str, str, str]:
+        return (
+            mailbox_id,
+            normalize_domain(sender_domain),
+            subject_predicate_type,
+            normalize_subject_for_policy(subject_predicate_value),
+        )
 
     def upsert_rule(
         self,
@@ -631,13 +928,22 @@ class InMemoryMailboxDomainRuleRepository(MailboxDomainRuleRepository):
         processor_hint: Optional[str] = None,
         approved_at: Optional[datetime] = None,
         sender_address: Optional[str] = None,
+        subject_predicate_type: Optional[str] = None,
+        subject_predicate_value: Optional[str] = None,
     ) -> MailboxDomainRule:
-        validate_match_fields_or_raise(match_mode=match_mode, sender_address=sender_address)
+        validate_match_fields_or_raise(
+            match_mode=match_mode,
+            sender_address=sender_address,
+            subject_predicate_type=subject_predicate_type,
+            subject_predicate_value=subject_predicate_value,
+        )
         validate_policy_fields_or_raise(
-            policy=policy, destination_entity_id=destination_entity_id, destination_mode=destination_mode
+            policy=policy, destination_entity_id=destination_entity_id, destination_mode=destination_mode,
+            match_mode=match_mode,
         )
 
         is_address_rule = match_mode == MATCH_MODE_EXACT_ADDRESS
+        is_subject_rule = match_mode == MATCH_MODE_EXACT_DOMAIN_SUBJECT
         if is_address_rule:
             normalized_address = normalize_address(sender_address)
             derived_domain = domain_from_address(normalized_address)
@@ -647,11 +953,25 @@ class InMemoryMailboxDomainRuleRepository(MailboxDomainRuleRepository):
                     f"'{sender_address}' ('{derived_domain}')"
                 )
             normalized_domain = derived_domain
+            normalized_subject_type = None
+            normalized_subject_value = None
             key = self._address_key(mailbox_id=mailbox_id, sender_address=normalized_address)
             existing_id = self._id_by_address_key.get(key)
+        elif is_subject_rule:
+            normalized_address = None
+            normalized_domain = normalize_domain(sender_domain)
+            normalized_subject_type = subject_predicate_type
+            normalized_subject_value = normalize_subject_for_policy(subject_predicate_value)
+            key = self._subject_key(
+                mailbox_id=mailbox_id, sender_domain=normalized_domain,
+                subject_predicate_type=normalized_subject_type, subject_predicate_value=normalized_subject_value,
+            )
+            existing_id = self._id_by_subject_key.get(key)
         else:
             normalized_address = None
             normalized_domain = normalize_domain(sender_domain)
+            normalized_subject_type = None
+            normalized_subject_value = None
             key = self._domain_key(mailbox_id=mailbox_id, sender_domain=normalized_domain)
             existing_id = self._id_by_domain_key.get(key)
 
@@ -664,6 +984,8 @@ class InMemoryMailboxDomainRuleRepository(MailboxDomainRuleRepository):
                     mailbox_id=mailbox_id,
                     sender_domain=normalized_domain,
                     sender_address=normalized_address,
+                    subject_predicate_type=normalized_subject_type,
+                    subject_predicate_value=normalized_subject_value,
                     match_mode=match_mode,
                     policy=policy,
                     destination_entity_id=destination_entity_id,
@@ -683,6 +1005,8 @@ class InMemoryMailboxDomainRuleRepository(MailboxDomainRuleRepository):
             self._by_id[candidate.rule_id] = candidate
             if is_address_rule:
                 self._id_by_address_key[key] = candidate.rule_id
+            elif is_subject_rule:
+                self._id_by_subject_key[key] = candidate.rule_id
             else:
                 self._id_by_domain_key[key] = candidate.rule_id
             return candidate
@@ -693,6 +1017,8 @@ class InMemoryMailboxDomainRuleRepository(MailboxDomainRuleRepository):
                 current,
                 sender_domain=normalized_domain,
                 sender_address=normalized_address,
+                subject_predicate_type=normalized_subject_type,
+                subject_predicate_value=normalized_subject_value,
                 match_mode=match_mode,
                 policy=policy,
                 destination_entity_id=destination_entity_id,
@@ -717,10 +1043,16 @@ class InMemoryMailboxDomainRuleRepository(MailboxDomainRuleRepository):
             raise NotFoundError(f"no MailboxDomainRule with rule_id '{rule_id}'") from None
 
     def find_for_sender(
-        self, *, mailbox_id: str, sender_domain: str, sender_address: Optional[str] = None
+        self,
+        *,
+        mailbox_id: str,
+        sender_domain: str,
+        sender_address: Optional[str] = None,
+        subject: Optional[str] = None,
     ) -> Optional[MailboxDomainRule]:
         # Tier 1 — an EXACT_ADDRESS rule for this exact sender address
         # (the most specific possible match — see module docstring).
+        # Subject-independent: always wins if present.
         if sender_address:
             address_id = self._id_by_address_key.get(
                 self._address_key(mailbox_id=mailbox_id, sender_address=sender_address)
@@ -729,14 +1061,65 @@ class InMemoryMailboxDomainRuleRepository(MailboxDomainRuleRepository):
                 return self._by_id[address_id]
 
         normalized_domain = normalize_domain(sender_domain)
-        # Tier 2 — a direct domain-level rule (EXACT or INCLUDE_SUBDOMAINS
+        normalized_subject = normalize_subject_for_policy(subject)
+
+        # Tier 2 — an EXACT_DOMAIN_SUBJECT rule at this EXACT domain
+        # whose predicate the message's own normalised subject
+        # satisfies (never via subdomain matching — see module
+        # docstring).
+        if normalized_subject:
+            matching_subject_rules = [
+                rule
+                for rule in self._by_id.values()
+                if rule.mailbox_id == mailbox_id
+                and rule.match_mode == MATCH_MODE_EXACT_DOMAIN_SUBJECT
+                and rule.sender_domain == normalized_domain
+                and subject_matches_predicate(
+                    subject, predicate_type=rule.subject_predicate_type, predicate_value=rule.subject_predicate_value
+                )
+            ]
+            if matching_subject_rules:
+                exact_matches = [
+                    r for r in matching_subject_rules if r.subject_predicate_type == SUBJECT_PREDICATE_EXACT
+                ]
+                if exact_matches:
+                    # By construction (the write-path uniqueness index)
+                    # two colliding EXACT identities are impossible in
+                    # ordinary operation — a corruption test bypassing
+                    # that path is the only way to reach the ambiguous
+                    # branch below.
+                    if len(exact_matches) > 1:
+                        raise ConflictError(
+                            f"ambiguous EXACT_DOMAIN_SUBJECT resolution for mailbox '{mailbox_id}' domain "
+                            f"'{normalized_domain}': {len(exact_matches)} EXACT predicate rules all match this "
+                            "subject — refusing to silently pick one (this indicates data corruption bypassing "
+                            "the normal validated write path)"
+                        )
+                    return exact_matches[0]
+
+                starts_with_matches = [
+                    r for r in matching_subject_rules if r.subject_predicate_type == SUBJECT_PREDICATE_STARTS_WITH
+                ]
+                max_len = max(len(r.subject_predicate_value) for r in starts_with_matches)
+                longest = [r for r in starts_with_matches if len(r.subject_predicate_value) == max_len]
+                if len(longest) > 1:
+                    raise ConflictError(
+                        f"ambiguous EXACT_DOMAIN_SUBJECT resolution for mailbox '{mailbox_id}' domain "
+                        f"'{normalized_domain}': {len(longest)} STARTS_WITH predicate rules of equal, "
+                        f"longest-matching prefix length {max_len} all match this subject — refusing to "
+                        "silently pick one (this indicates data corruption bypassing the normal validated "
+                        "write path)"
+                    )
+                return longest[0]
+
+        # Tier 3 — a direct domain-level rule (EXACT or INCLUDE_SUBDOMAINS
         # — only one can exist per domain, by construction) for this
         # exact domain.
         exact_id = self._id_by_domain_key.get((mailbox_id, normalized_domain))
         if exact_id is not None:
             return self._by_id[exact_id]
 
-        # Tier 3 — an INCLUDE_SUBDOMAINS rule whose own domain is a
+        # Tier 4 — an INCLUDE_SUBDOMAINS rule whose own domain is a
         # PARENT of the observed domain.
         for rule in self._by_id.values():
             if rule.mailbox_id != mailbox_id or rule.match_mode != MATCH_MODE_INCLUDE_SUBDOMAINS:
@@ -746,7 +1129,14 @@ class InMemoryMailboxDomainRuleRepository(MailboxDomainRuleRepository):
         return None
 
     def find_exact(
-        self, *, mailbox_id: str, sender_domain: str, match_mode: str, sender_address: Optional[str] = None
+        self,
+        *,
+        mailbox_id: str,
+        sender_domain: str,
+        match_mode: str,
+        sender_address: Optional[str] = None,
+        subject_predicate_type: Optional[str] = None,
+        subject_predicate_value: Optional[str] = None,
     ) -> Optional[MailboxDomainRule]:
         if match_mode == MATCH_MODE_EXACT_ADDRESS:
             if not sender_address:
@@ -754,14 +1144,34 @@ class InMemoryMailboxDomainRuleRepository(MailboxDomainRuleRepository):
             rule_id = self._id_by_address_key.get(
                 self._address_key(mailbox_id=mailbox_id, sender_address=sender_address)
             )
+        elif match_mode == MATCH_MODE_EXACT_DOMAIN_SUBJECT:
+            if not subject_predicate_type or not subject_predicate_value:
+                raise ValidationError(
+                    "subject_predicate_type and subject_predicate_value are both required when match_mode is "
+                    f"'{MATCH_MODE_EXACT_DOMAIN_SUBJECT}'"
+                )
+            rule_id = self._id_by_subject_key.get(
+                self._subject_key(
+                    mailbox_id=mailbox_id, sender_domain=sender_domain,
+                    subject_predicate_type=subject_predicate_type, subject_predicate_value=subject_predicate_value,
+                )
+            )
         else:
             rule_id = self._id_by_domain_key.get(self._domain_key(mailbox_id=mailbox_id, sender_domain=sender_domain))
         return self._by_id[rule_id] if rule_id is not None else None
 
     def touch_last_seen(
-        self, *, mailbox_id: str, sender_domain: str, seen_at: datetime, sender_address: Optional[str] = None
+        self,
+        *,
+        mailbox_id: str,
+        sender_domain: str,
+        seen_at: datetime,
+        sender_address: Optional[str] = None,
+        subject: Optional[str] = None,
     ) -> MailboxDomainRule:
-        rule = self.find_for_sender(mailbox_id=mailbox_id, sender_domain=sender_domain, sender_address=sender_address)
+        rule = self.find_for_sender(
+            mailbox_id=mailbox_id, sender_domain=sender_domain, sender_address=sender_address, subject=subject
+        )
         if rule is None:
             raise NotFoundError(
                 f"no MailboxDomainRule governs mailbox_id={mailbox_id!r} sender_domain={sender_domain!r} — "

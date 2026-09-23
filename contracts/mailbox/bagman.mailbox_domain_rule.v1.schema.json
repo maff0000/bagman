@@ -28,8 +28,8 @@
     },
     "match_mode": {
       "type": "string",
-      "enum": ["EXACT", "INCLUDE_SUBDOMAINS", "EXACT_ADDRESS"],
-      "description": "`EXACT` — only the literal `sender_domain` matches. `INCLUDE_SUBDOMAINS` — `sender_domain` and any subdomain of it (e.g. a rule for `vendor.com` also matches `mail.vendor.com`) matches. `EXACT_ADDRESS` (CD-6 GUI-operations-foundation follow-on WO) — only the literal `sender_address` matches, overriding any broader domain-level rule for the same domain (most-specific-rule-wins — see `services.mailbox.domain_rule.MailboxDomainRuleRepository.find_for_sender`'s own docstring). Closed, small, operator-chosen set."
+      "enum": ["EXACT", "INCLUDE_SUBDOMAINS", "EXACT_ADDRESS", "EXACT_DOMAIN_SUBJECT"],
+      "description": "`EXACT` — only the literal `sender_domain` matches. `INCLUDE_SUBDOMAINS` — `sender_domain` and any subdomain of it (e.g. a rule for `vendor.com` also matches `mail.vendor.com`) matches. `EXACT_ADDRESS` (CD-6 GUI-operations-foundation follow-on WO) — only the literal `sender_address` matches, overriding any broader domain-level rule for the same domain (most-specific-rule-wins — see `services.mailbox.domain_rule.MailboxDomainRuleRepository.find_for_sender`'s own docstring). `EXACT_DOMAIN_SUBJECT` (deterministic subject-aware mailbox domain policy) — matches only a message whose sender domain EXACTLY equals `sender_domain` (never subdomains) AND whose normalised subject satisfies `subject_predicate_type`/`subject_predicate_value`. Closed, small, operator-chosen set."
     },
     "policy": {
       "type": "string",
@@ -81,6 +81,20 @@
       "$ref": "https://bagman.internal/contracts/common/bagman.utc_timestamp.v1.schema.json",
       "description": "UTC timestamp of the most recent message this rule matched during a sweep — observability only, never itself a gate decision."
     },
+    "subject_predicate_type": {
+      "oneOf": [
+        { "type": "string", "enum": ["EXACT", "STARTS_WITH"] },
+        { "type": "null" }
+      ],
+      "description": "Deterministic subject-aware mailbox domain policy. Populated ONLY when `match_mode` is `EXACT_DOMAIN_SUBJECT` (`null` for every other match mode — enforced at the service layer, mirrors `sender_address`'s own identical EXACT_ADDRESS-only doctrine). `EXACT` — the normalised subject must equal `subject_predicate_value` exactly. `STARTS_WITH` — the normalised subject must start with `subject_predicate_value`. No CONTAINS, no regex, no glob, no NLP — deliberately a small, deterministic, mechanically-explainable vocabulary."
+    },
+    "subject_predicate_value": {
+      "oneOf": [
+        { "type": "string", "minLength": 1 },
+        { "type": "null" }
+      ],
+      "description": "The predicate's own comparison value — ALWAYS stored in canonical NORMALISED form (Unicode NFKC, casefolded, stripped, internal whitespace collapsed — see `services.mailbox.domain_rule.normalize_subject_for_policy`), never raw/original casing or spacing. Populated ONLY when `match_mode` is `EXACT_DOMAIN_SUBJECT` (`null` for every other match mode — enforced at the service layer)."
+    },
     "schema_version": {
       "allOf": [
         { "$ref": "https://bagman.internal/contracts/common/bagman.schema_version.v1.schema.json" }
@@ -104,6 +118,8 @@
     "created_at",
     "updated_at",
     "last_seen_at",
+    "subject_predicate_type",
+    "subject_predicate_value",
     "schema_version"
   ],
   "additionalProperties": false
