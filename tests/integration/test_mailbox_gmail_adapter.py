@@ -7,6 +7,9 @@ and refresh-token preservation. All driven by `FakeGmailClient`/
 """
 from __future__ import annotations
 
+import json
+import urllib.error
+import urllib.request
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 
@@ -20,6 +23,7 @@ from services.mailbox.gmail.gmail_adapter import (
     _decode_delta_link,
 )
 from services.mailbox.gmail.gmail_client import (
+    GmailClient,
     GmailIdentity,
     GmailIdentityResult,
     GmailMessageListPageResult,
@@ -1326,3 +1330,119 @@ def test_pilot_shaped_regression_ten_candidates_twenty_governed_messages_get_cal
     # merely before the 10 metadata calls or the 10 raw calls alone.
     assert sleep.calls == pytest.approx([0.30] * 19)
     assert clock.now == pytest.approx(1_000.0 + 19 * 0.30)
+
+
+# =======================================================================
+# CD-6 real-production-incident regression — the REAL `GmailClient` (never
+# `FakeGmailClient`) wired into a real `GmailMailboxAdapter`, monkeypatching
+# ONLY `urllib.request.urlopen` (no real network call), proves the full
+# seam this delivery fixes: a genuine Gmail 403 quota-exceeded HTTPError
+# with a body over 500 characters — the real incident's own distinguishing
+# feature — actually produces `GmailOutcomeStatus.RATE_LIMITED` once it
+# reaches this adapter's own `fetch_message_headers`/`fetch_message_content`,
+# not merely at the lower-level `_classify_http_error` unit tests in
+# `test_mailbox_gmail_client.py`. The companion half of this proof — that
+# `services/mailbox/sweep.py`'s own bounded-retry-then-succeed logic
+# correctly reacts to a `RATE_LIMITED` result — is already covered by
+# `255b527`'s own `test_reprocess_header_rate_limited_retries_once_then_succeeds`
+# in `tests/integration/test_mailbox_sweep.py` (provider-neutral, driven via
+# `GraphMessageHeadersResult` directly) and is unchanged by this delivery.
+# =======================================================================
+
+
+#: Verbatim (module-local copy — this file drives the REAL `GmailClient`,
+#: not `_classify_http_error` directly, so it does not import test-only
+#: helpers from `test_mailbox_gmail_client.py`) real Google quota message
+#: text, matching the real production incident this delivery fixes.
+_REAL_QUOTA_MESSAGE_TEXT = (
+    "Quota exceeded for quota metric 'Total Query Cost' and limit 'Units per minute per user' "
+    "of service 'gmail.googleapis.com' for consumer 'project_number:393131324766'."
+)
+
+
+def _real_production_quota_body_over_500_chars() -> bytes:
+    body = {
+        "error": {
+            "code": 403,
+            "message": _REAL_QUOTA_MESSAGE_TEXT,
+            "errors": [
+                {
+                    "message": _REAL_QUOTA_MESSAGE_TEXT,
+                    "domain": "usageLimits",
+                    "reason": "rateLimitExceeded",
+                    "extendedHelp": "https://developers.google.com/gmail/api/reference/quota",
+                }
+            ],
+            "status": "RESOURCE_EXHAUSTED",
+        }
+    }
+    encoded = json.dumps(body).encode("utf-8")
+    assert len(encoded) > 500
+    return encoded
+
+
+def _fake_quota_http_error() -> urllib.error.HTTPError:
+    import io
+
+    return urllib.error.HTTPError(
+        url="https://www.googleapis.com/gmail/v1/users/me/messages/m1",
+        code=403,
+        msg="Forbidden",
+        hdrs=None,
+        fp=io.BytesIO(_real_production_quota_body_over_500_chars()),
+    )
+
+
+class _RaisingUrlopenOncePerCall:
+    """A fresh `HTTPError` (its body stream can only be read once) is
+    raised on EVERY call — mirrors a real Gmail transport genuinely
+    returning the same 403 repeatedly, never a stale/already-consumed
+    exception object reused across calls."""
+
+    def __call__(self, request, timeout=None):  # noqa: ARG002 - matches urlopen's own signature
+        raise _fake_quota_http_error()
+
+
+def test_real_gmail_client_403_over_500_chars_produces_rate_limited_via_fetch_message_headers(monkeypatch):
+    """The gmail_client half of the end-to-end seam: a REAL
+    `GmailMailboxAdapter`, wired to a REAL `GmailClient` (never
+    `FakeGmailClient`), given a genuine long-body 403 `HTTPError` from
+    the underlying transport, produces `RATE_LIMITED` from
+    `fetch_message_headers` — proving the CD-6 classification fix is
+    real at the adapter seam a real historical-backfill call site
+    actually uses, not just at the `_classify_http_error` unit level."""
+    oauth_client = FakeGmailOAuthClient()
+    gmail_client = GmailClient()
+    token_store = InMemoryGmailTokenStore()
+    mailbox_repo = InMemoryMailboxSourceRepository()
+    adapter = GmailMailboxAdapter(oauth_client=oauth_client, gmail_client=gmail_client, token_store=token_store, mailbox_repository=mailbox_repo)
+    mailbox = _seeded_mailbox(mailbox_repo)
+    # A fresh, non-expiring token — `_ensure_fresh_access_token` returns it
+    # directly, so no OAuth refresh call (real or fake) is ever needed.
+    token_store.write(mailbox.mailbox_id, access_token="access-1", refresh_token="refresh-1", expires_at=datetime.now(timezone.utc) + timedelta(hours=1))
+    monkeypatch.setattr(urllib.request, "urlopen", _RaisingUrlopenOncePerCall())
+
+    result = adapter.fetch_message_headers(mailbox_id=mailbox.mailbox_id, immutable_message_id="m1")
+
+    assert result.status == GmailOutcomeStatus.RATE_LIMITED
+    assert result.status != GmailOutcomeStatus.PERMISSION_ERROR
+
+
+def test_real_gmail_client_403_over_500_chars_produces_rate_limited_via_fetch_message_content(monkeypatch):
+    """The identical proof as above, for `fetch_message_content` (the
+    MIME/raw fetch) — the other real call site
+    `reprocess_all_historical_candidates_for_domain`/
+    `_reprocess_one_message` uses for a historical candidate."""
+    oauth_client = FakeGmailOAuthClient()
+    gmail_client = GmailClient()
+    token_store = InMemoryGmailTokenStore()
+    mailbox_repo = InMemoryMailboxSourceRepository()
+    adapter = GmailMailboxAdapter(oauth_client=oauth_client, gmail_client=gmail_client, token_store=token_store, mailbox_repository=mailbox_repo)
+    mailbox = _seeded_mailbox(mailbox_repo)
+    token_store.write(mailbox.mailbox_id, access_token="access-1", refresh_token="refresh-1", expires_at=datetime.now(timezone.utc) + timedelta(hours=1))
+    monkeypatch.setattr(urllib.request, "urlopen", _RaisingUrlopenOncePerCall())
+
+    result = adapter.fetch_message_content(mailbox_id=mailbox.mailbox_id, immutable_message_id="m1")
+
+    assert result.status == GmailOutcomeStatus.RATE_LIMITED
+    assert result.status != GmailOutcomeStatus.PERMISSION_ERROR

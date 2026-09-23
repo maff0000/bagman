@@ -24,8 +24,10 @@ from services.mailbox.gmail.gmail_client import (
     GmailClientProtocol,
     GmailOAuthClient,
     GmailOutcomeStatus,
+    _MAX_ERROR_BODY_BYTES,
     _classify_http_error,
     _decode_base64url,
+    _reason_for_403,
     _status_for_transport_error,
 )
 from services.mailbox.gmail.secrets import GmailAppCredentials
@@ -51,6 +53,57 @@ def _quota_body(reason: str) -> bytes:
     return json.dumps(
         {"error": {"errors": [{"domain": "usageLimits", "reason": reason, "message": "Quota exceeded for..."}], "code": 403, "message": "..."}}
     ).encode("utf-8")
+
+
+#: The REAL production message body text from the incident this
+#: delivery fixes — see WO/CLAUDE.md quoted body — verbatim, not a
+#: paraphrase, so `_production_quota_body` below reproduces the exact
+#: failing shape as closely as this test file reasonably can.
+_REAL_QUOTA_MESSAGE_TEXT = (
+    "Quota exceeded for quota metric 'Total Query Cost' and limit 'Units per minute per user' "
+    "of service 'gmail.googleapis.com' for consumer 'project_number:393131324766'."
+)
+
+
+def _production_quota_body(reason: str, *, second_entry: Optional[dict] = None) -> bytes:
+    """A real, valid, Google-shaped 403 JSON body — same `error.errors[]`
+    structure as `_quota_body` above, but comfortably OVER 500 characters
+    once serialized (matching the real production incident's own body,
+    which is itself long because Google's quota messages are verbose and
+    the message text is repeated at both `error.message` and
+    `error.errors[0].message`, plus a real `extendedHelp` URL and a
+    `status` field — all fields a genuine Google 403 quota response
+    carries). This is the load-bearing fixture for the >500-char
+    regression: the OLD `_read_body()[:500]`-then-`json.loads()` code
+    path truncates this body mid-string (see
+    `test_403_rate_limit_exceeded_with_body_over_500_chars_still_classifies_as_rate_limited`
+    for the direct proof), which is exactly the real incident's root
+    cause.
+
+    `second_entry`, when given, is appended as a SECOND entry in
+    `errors[]` — used by the "any entry wins, not just the first" proof
+    below."""
+    entries = [
+        {
+            "message": _REAL_QUOTA_MESSAGE_TEXT,
+            "domain": "usageLimits",
+            "reason": reason,
+            "extendedHelp": "https://developers.google.com/gmail/api/reference/quota",
+        }
+    ]
+    if second_entry is not None:
+        entries.append(second_entry)
+    body = {
+        "error": {
+            "code": 403,
+            "message": _REAL_QUOTA_MESSAGE_TEXT,
+            "errors": entries,
+            "status": "RESOURCE_EXHAUSTED",
+        }
+    }
+    encoded = json.dumps(body).encode("utf-8")
+    assert len(encoded) > 500, "fixture must exceed 500 chars to be the load-bearing regression it claims to be"
+    return encoded
 
 
 # -- base64url decode ------------------------------------------------------
@@ -136,6 +189,179 @@ def test_403_malformed_or_unexpected_body_shape_fails_closed_to_permission_error
     explicit instruction) — never silently treated as transient."""
     classified = _classify_http_error(_fake_http_error(403, body=malformed_body))
     assert classified.status == GmailOutcomeStatus.PERMISSION_ERROR
+
+
+# -- CD-6 real-incident regression: >500-char quota body -----------------
+#
+# THE load-bearing regression test for this delivery. The real
+# production incident (222-candidate MUST_READ backfill, candidate 78)
+# hit Google's own genuine quota-exceeded 403 with a body over 500
+# characters; the OLD code truncated that body to 500 chars BEFORE
+# `json.loads`, which cut the JSON off mid-structure, made `_reason_for_403`
+# raise+catch `JSONDecodeError` and return `None`, and fell through to the
+# fail-closed default `PERMISSION_ERROR` — so the bounded-retry-on-
+# RATE_LIMITED logic never fired and the whole backfill call raised
+# `ConflictError`. These tests prove: (a) the exact truncate-then-parse
+# failure mode this fixture reproduces, via `_reason_for_403` itself
+# (unchanged logic) fed a manually-truncated string, and (b) the NEW code
+# — fed the full, untruncated (up to `_MAX_ERROR_BODY_BYTES`) body via
+# `_read_body_bounded` — correctly classifies `RATE_LIMITED`.
+
+
+def test_403_rate_limit_exceeded_with_body_over_500_chars_still_classifies_as_rate_limited():
+    """The single most important test in this delivery."""
+    raw = _production_quota_body("rateLimitExceeded")
+    assert len(raw) > 500
+
+    # (a) Direct proof of the OLD bug's mechanics: `_reason_for_403`'s
+    # own logic is UNCHANGED by this delivery — feed it the SAME
+    # 500-char truncation the old `_read_body()` used to produce, and it
+    # returns `None` (a `JSONDecodeError` on the truncated JSON), which
+    # is exactly the fail-closed-to-PERMISSION_ERROR path the real
+    # incident hit.
+    truncated_the_old_way = raw.decode("utf-8", errors="replace")[:500]
+    assert _reason_for_403(truncated_the_old_way) is None
+
+    # (b) The NEW code, given the same real body via the real
+    # `_classify_http_error` entry point (bounded to `_MAX_ERROR_BODY_BYTES`,
+    # never to 500 chars), classifies correctly.
+    classified = _classify_http_error(_fake_http_error(403, body=raw))
+    assert classified.status == GmailOutcomeStatus.RATE_LIMITED
+    assert classified.status != GmailOutcomeStatus.PERMISSION_ERROR
+    assert "rateLimitExceeded" in classified.error_detail
+
+
+def test_403_user_rate_limit_exceeded_with_body_over_500_chars_still_classifies_as_rate_limited():
+    raw = _production_quota_body("userRateLimitExceeded")
+    assert len(raw) > 500
+    truncated_the_old_way = raw.decode("utf-8", errors="replace")[:500]
+    assert _reason_for_403(truncated_the_old_way) is None  # same truncate-then-parse failure mode
+
+    classified = _classify_http_error(_fake_http_error(403, body=raw))
+    assert classified.status == GmailOutcomeStatus.RATE_LIMITED
+
+
+def test_403_multi_entry_over_500_chars_any_entry_wins_not_just_first():
+    """`errors[0]` is a genuine non-quota reason, `errors[1]` is the
+    transient-quota reason — proves "any entry wins", not just the
+    first, on a real over-500-char body."""
+    raw = _production_quota_body("insufficientPermissions", second_entry={"domain": "usageLimits", "reason": "rateLimitExceeded", "message": _REAL_QUOTA_MESSAGE_TEXT})
+    assert len(raw) > 500
+
+    classified = _classify_http_error(_fake_http_error(403, body=raw))
+    assert classified.status == GmailOutcomeStatus.RATE_LIMITED
+
+
+def test_403_daily_limit_exceeded_not_added_to_transient_quota_reasons():
+    """`dailyLimitExceeded` is a hard daily/project cap, deliberately
+    kept conservatively distinct from the short transient per-minute
+    limiter — must NOT be treated as `RATE_LIMITED` unless a future
+    delivery explicitly decides otherwise."""
+    classified = _classify_http_error(_fake_http_error(403, body=_quota_body("dailyLimitExceeded")))
+    assert classified.status == GmailOutcomeStatus.PERMISSION_ERROR
+
+
+def test_403_message_text_only_quota_wording_never_influences_classification():
+    """A 403 whose `error.errors[]` has NO `reason` field at all (or a
+    non-quota one), but whose `message` text literally contains
+    quota-sounding human wording — must still fail closed to
+    `PERMISSION_ERROR`. Classification is driven ONLY by the structured
+    `reason` field, never by `message` text content."""
+    body = json.dumps(
+        {
+            "error": {
+                "code": 403,
+                "message": "Rate Limit Exceeded — please slow down your requests to this API immediately.",
+                "errors": [
+                    {
+                        "domain": "usageLimits",
+                        "message": "Rate Limit Exceeded — please slow down your requests to this API immediately.",
+                        # deliberately NO "reason" key at all
+                    }
+                ],
+            }
+        }
+    ).encode("utf-8")
+    classified = _classify_http_error(_fake_http_error(403, body=body))
+    assert classified.status == GmailOutcomeStatus.PERMISSION_ERROR
+
+
+def test_403_oversized_body_fails_closed_without_attempting_to_parse_a_truncated_document():
+    """A body GENUINELY larger than `_MAX_ERROR_BODY_BYTES` — even
+    though it would otherwise be valid, quota-shaped JSON — must fail
+    closed to `PERMISSION_ERROR`, and the diagnostic must name the bound
+    being exceeded, never dump the oversized body itself."""
+    # Pad the message field until the whole body is genuinely larger
+    # than the bound, while still being syntactically valid JSON on its
+    # own (never parsed, since it's oversized — but constructing it as
+    # valid JSON proves this is a SIZE-only rejection, not a
+    # malformed-JSON rejection).
+    padding = "x" * (_MAX_ERROR_BODY_BYTES + 1000)
+    oversized_body = json.dumps(
+        {"error": {"errors": [{"domain": "usageLimits", "reason": "rateLimitExceeded", "message": padding}], "code": 403}}
+    ).encode("utf-8")
+    assert len(oversized_body) > _MAX_ERROR_BODY_BYTES
+
+    classified = _classify_http_error(_fake_http_error(403, body=oversized_body))
+    assert classified.status == GmailOutcomeStatus.PERMISSION_ERROR
+    assert "exceed" in classified.error_detail.lower()
+    # Never dumps the (huge) body itself into the diagnostic.
+    assert "x" * 100 not in classified.error_detail
+    assert len(classified.error_detail) < 200
+
+
+def test_403_retry_after_unaffected_by_body_classification_change_both_fields_together():
+    """A 403 with structured `reason=rateLimitExceeded` AND an HTTP
+    `Retry-After: 30` header, using the real over-500-char production
+    body shape, must produce BOTH `status=RATE_LIMITED` AND
+    `retry_after_seconds=30.0` together — proving the body-classification
+    rewrite left `Retry-After` handling completely unaffected."""
+    raw = _production_quota_body("rateLimitExceeded")
+    classified = _classify_http_error(_fake_http_error(403, body=raw, headers={"Retry-After": "30"}))
+    assert (classified.status, classified.retry_after_seconds) == (GmailOutcomeStatus.RATE_LIMITED, 30.0)
+
+
+# -- CD-6: metadata and raw callers share the identical classifier -------
+
+
+class _RaisingUrlopen:
+    """Monkeypatch target for `urllib.request.urlopen` that always
+    raises the SAME `HTTPError` (bounded body, mirrors the real
+    incident's shape) — used to prove `fetch_message_metadata` and
+    `fetch_message_raw` both route through the one shared
+    `_classify_http_error` (no duplicated per-method classification
+    logic)."""
+
+    def __init__(self, exc_factory) -> None:
+        self._exc_factory = exc_factory
+        self.calls = 0
+
+    def __call__(self, request, timeout=None):  # noqa: ARG002 - matches urlopen's own signature
+        self.calls += 1
+        raise self._exc_factory()
+
+
+def test_metadata_and_raw_real_client_share_identical_classifier_for_over_500_char_403(monkeypatch):
+    """Confirmation test: both `GmailClient.fetch_message_metadata` and
+    `GmailClient.fetch_message_raw` produce `RATE_LIMITED` for the exact
+    same real, over-500-char quota-shaped 403 — via the one shared
+    `_classify_http_error`, never a duplicated per-method
+    classification path."""
+    raw_body = _production_quota_body("rateLimitExceeded")
+
+    def _new_exc():
+        return _fake_http_error(403, body=raw_body)
+
+    raising = _RaisingUrlopen(_new_exc)
+    monkeypatch.setattr(urllib.request, "urlopen", raising)
+    client = GmailClient()
+
+    metadata_result = client.fetch_message_metadata(access_token="tok", message_id="m1")
+    raw_result = client.fetch_message_raw(access_token="tok", message_id="m1")
+
+    assert metadata_result.status == GmailOutcomeStatus.RATE_LIMITED
+    assert raw_result.status == GmailOutcomeStatus.RATE_LIMITED
+    assert raising.calls == 2
 
 
 def test_429_still_classified_rate_limited_unchanged():

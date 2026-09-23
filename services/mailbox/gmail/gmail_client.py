@@ -241,7 +241,7 @@ class GmailOutcomeStatus(str, enum.Enum):
     #: 401 — the access token was rejected/expired.
     AUTH_ERROR = "AUTH_ERROR"
     #: 403 whose body carries no recognized transient-quota `reason` (see
-    #: `_status_from_code_and_body`'s own decision table) — a genuine
+    #: `_classify_403_body`/`_status_from_code`'s own decision table) — a genuine
     #: permission/scope/policy error this app's own grant lacks —
     #: distinct from AUTH_ERROR: a token refresh will never fix this.
     #: NEVER produced for a 403 whose structured
@@ -259,7 +259,7 @@ class GmailOutcomeStatus(str, enum.Enum):
     #: 429, OR a 403 whose structured `error.errors[].reason` is
     #: `rateLimitExceeded`/`userRateLimitExceeded` (Google's own real
     #: shape for per-user/per-project quota exhaustion — see
-    #: `_status_from_code_and_body`'s own decision table);
+    #: `_classify_403_body`/`_status_from_code`'s own decision table);
     #: `retry_after_seconds` carries Gmail's own `Retry-After` header
     #: when present (either shape).
     RATE_LIMITED = "RATE_LIMITED"
@@ -420,10 +420,111 @@ class GmailClientProtocol(Protocol):
 
 
 def _read_body(exc: urllib.error.HTTPError) -> str:
+    """A bounded, human-eyeball-only diagnostic excerpt
+    (<=`_DIAGNOSTIC_EXCERPT_CHARS` chars) of an `HTTPError`'s body —
+    used ONLY by call sites that never need to `json.loads` the result
+    (today: `GmailOAuthClient._token_request`'s own 400/401 diagnostic,
+    and every non-403 status in `_classify_http_error`). NEVER use this
+    for a body that will also be fed to `json.loads` for structured
+    classification — see :func:`_read_body_bounded`'s own docstring for
+    the real, proven production incident (a Gmail 403 quota-exceeded
+    body over 500 characters, truncated mid-structure BEFORE parsing,
+    silently misclassified as `PERMISSION_ERROR`) that resulted from
+    exactly that conflation, and why 403 classification now uses a
+    separate, genuinely-bounded-for-parsing read instead of this one."""
     try:
-        return exc.read().decode("utf-8", errors="replace")[:500]
+        return exc.read().decode("utf-8", errors="replace")[:_DIAGNOSTIC_EXCERPT_CHARS]
     except Exception:  # noqa: BLE001 - best-effort diagnostic only
         return ""
+
+
+#: Hard maximum, in bytes, this module will EVER read from a 403
+#: response body for STRUCTURED (`json.loads`) classification — see
+#: :func:`_read_body_bounded`'s own docstring. 64 KiB is deliberately
+#: generous headroom: Google's own real structured `error.errors[]`
+#: bodies are typically well under a few KB (including a verbose,
+#: human-readable `message` field), so this bound is never expected to
+#: be hit by a genuine Google response — its purpose is purely a hard
+#: ceiling against an oversized/malformed/hostile body consuming
+#: unbounded memory, NOT a realistic day-to-day limit.
+_MAX_ERROR_BODY_BYTES = 64 * 1024
+
+#: The short, human-eyeball-only diagnostic excerpt length used for
+#: `error_detail` strings derived from a 403 body — deliberately a
+#: SEPARATE constant from `_MAX_ERROR_BODY_BYTES` above, and much
+#: smaller. Conflating "how much to read for structured parsing" with
+#: "how much to show a human in a log line" is the exact class of bug
+#: this module's CD-6 fix corrects (see :func:`_read_body_bounded`) — a
+#: parsing bound and a diagnostic-excerpt bound must never be the same
+#: number, and a diagnostic string built from this excerpt must never
+#: itself be re-parsed as machine-trusted structured data.
+_DIAGNOSTIC_EXCERPT_CHARS = 500
+
+
+def _read_body_bounded(exc: urllib.error.HTTPError) -> tuple[str, bool]:
+    """The ONE place a 403 `HTTPError`'s body is ever read for
+    structured-reason classification (mirrors `_classify_http_error`'s
+    own "read exactly once" discipline for the whole exception — see
+    that function's docstring).
+
+    Why this exists — the real, proven production incident it fixes
+    ------------------------------------------------------------------
+    A real 222-candidate Gmail historical backfill hit Google's genuine
+    quota-exceeded 403 (`error.errors[0].reason ==
+    "rateLimitExceeded"`), which should have classified as
+    `GmailOutcomeStatus.RATE_LIMITED`. It classified as
+    `PERMISSION_ERROR` instead. Root cause: the OLD code path read the
+    full body via `_read_body()`, which truncates to 500 characters
+    BEFORE returning — a diagnostic-only bound that was then, by
+    accident, ALSO used as the input to `json.loads()` for structured
+    403 classification. Google's real quota-exceeded body (a verbose,
+    human-readable `message` plus a nested `error.errors[]` array) is
+    longer than 500 characters, so the truncated string cut the JSON off
+    mid-structure; `json.loads` raised `JSONDecodeError`;
+    `_reason_for_403` caught it and returned `None`; classification fell
+    through to its documented fail-closed default, `PERMISSION_ERROR`.
+    The bug was never a `_reason_for_403` logic defect — it was that a
+    500-char DIAGNOSTIC bound was silently doubling as a PARSING bound.
+
+    This function is the fix: a genuinely bounded read, sized for
+    parsing (`_MAX_ERROR_BODY_BYTES`, 64 KiB — see that constant's own
+    docstring), kept structurally separate from the 500-char
+    `_DIAGNOSTIC_EXCERPT_CHARS` bound used for human-readable
+    `error_detail` strings. The two bounds must never be merged again.
+
+    Reads AT MOST `_MAX_ERROR_BODY_BYTES + 1` bytes via
+    `HTTPError.read(amt)`'s own bounded-read support (`http.client
+    .HTTPResponse.read(amt)` under the hood) — NEVER bare `.read()` with
+    no argument, which would pull an arbitrarily large body fully into
+    memory. The `+1` is deliberate: it is what lets this function tell
+    "the real body was <= `_MAX_ERROR_BODY_BYTES`" apart from "the real
+    body was longer than that" WITHOUT first reading the whole
+    (possibly enormous) body — if exactly `_MAX_ERROR_BODY_BYTES + 1`
+    bytes come back, the body was oversized; that extra byte is then
+    discarded, never decoded or parsed either way.
+
+    Returns `(body_text, oversized)`. `body_text` is decoded from AT
+    MOST `_MAX_ERROR_BODY_BYTES` bytes (`errors="replace"`, matching
+    this module's existing best-effort decode discipline elsewhere).
+    When `oversized` is `True`, `body_text` is only a PREFIX of the real
+    body — callers MUST NOT attempt to `json.loads` it: a prefix of a
+    longer JSON document is not itself complete, valid JSON, and
+    attempting to parse it risks either an exception or (worse) a
+    coincidentally-balanced-but-wrong partial parse. On any read
+    failure, returns `("", False)` — the caller's own existing
+    fail-closed default (`PERMISSION_ERROR`) applies exactly as it
+    always has for an unreadable body."""
+    try:
+        raw = exc.read(_MAX_ERROR_BODY_BYTES + 1)
+    except Exception:  # noqa: BLE001 - best-effort; caller fails closed
+        return "", False
+    oversized = len(raw) > _MAX_ERROR_BODY_BYTES
+    if oversized:
+        raw = raw[:_MAX_ERROR_BODY_BYTES]
+    try:
+        return raw.decode("utf-8", errors="replace"), oversized
+    except Exception:  # noqa: BLE001 - best-effort diagnostic only
+        return "", oversized
 
 
 def _retry_after_seconds(exc: urllib.error.HTTPError) -> Optional[float]:
@@ -772,27 +873,82 @@ def _reason_for_403(body_text: str) -> Optional[str]:
     return reasons[0]
 
 
-def _status_from_code_and_body(code: int, body_text: str) -> GmailOutcomeStatus:
-    """The full HTTP-status (+ body, for 403 only) -> `GmailOutcomeStatus`
-    decision table — see module-level CD-6 quota-classification fix:
-    ``401 -> AUTH_ERROR``; ``403`` + a structured `reason` of
-    `rateLimitExceeded`/`userRateLimitExceeded` -> `RATE_LIMITED`; any
-    other/no recognized structured `reason` on a 403 (including a
-    malformed/unparseable body) -> `PERMISSION_ERROR` (fail-closed,
-    architect's own explicit instruction); ``404 -> NOT_FOUND``;
-    ``429 -> RATE_LIMITED``; anything else -> `PROVIDER_ERROR`."""
+def _status_from_code(code: int) -> GmailOutcomeStatus:
+    """HTTP status -> `GmailOutcomeStatus` for every status EXCEPT 403.
+    403 is deliberately NOT handled here — it alone needs to inspect the
+    response body to distinguish transient quota exhaustion from a
+    genuine permission failure (see :func:`_classify_403_body`), and
+    that decision is made by `_classify_http_error` before this function
+    is ever reached for a 403. Decision table: ``401 -> AUTH_ERROR``;
+    ``404 -> NOT_FOUND``; ``429 -> RATE_LIMITED``; anything else
+    (including a 403, which never reaches here) -> `PROVIDER_ERROR`."""
     if code == 401:
         return GmailOutcomeStatus.AUTH_ERROR
-    if code == 403:
-        reason = _reason_for_403(body_text)
-        if reason in _TRANSIENT_QUOTA_REASONS:
-            return GmailOutcomeStatus.RATE_LIMITED
-        return GmailOutcomeStatus.PERMISSION_ERROR
     if code == 404:
         return GmailOutcomeStatus.NOT_FOUND
     if code == 429:
         return GmailOutcomeStatus.RATE_LIMITED
     return GmailOutcomeStatus.PROVIDER_ERROR
+
+
+@dataclass(frozen=True)
+class _Classified403:
+    """The result of classifying one 403 response body — `status` is
+    always either `RATE_LIMITED` (a recognized transient-quota
+    `reason`) or `PERMISSION_ERROR` (fail-closed default: a genuine
+    non-quota `reason`, an oversized body, malformed JSON, or an
+    unexpected shape). `diagnostic` is a SHORT, human-eyeball-only
+    string — see :func:`_classify_403_body`'s own docstring for its
+    exact shapes; it is built from the classification outcome, never
+    from a re-parse of the raw body."""
+
+    status: GmailOutcomeStatus
+    diagnostic: str
+
+
+def _classify_403_body(body_text: str, *, oversized: bool) -> _Classified403:
+    """The full 403-body -> (`GmailOutcomeStatus`, diagnostic) decision,
+    given the bounded `(body_text, oversized)` pair
+    :func:`_read_body_bounded` produces.
+
+    Decision table
+    ------------------------------------------------------------------
+    * `oversized` -> `PERMISSION_ERROR`, fail-closed WITHOUT ever
+      attempting `json.loads` on `body_text` (it is only a PREFIX of the
+      real body when oversized — see `_read_body_bounded`'s own
+      docstring for why parsing a prefix of a longer document is never
+      safe). Diagnostic names the bound was exceeded — never dumps the
+      (possibly enormous) body itself.
+    * Structured `reason` recognized as transient quota
+      (`_TRANSIENT_QUOTA_REASONS`) -> `RATE_LIMITED`, diagnostic
+      `"HTTP 403; reason=<reason>"`.
+    * Structured `reason` present but NOT a recognized transient-quota
+      value (e.g. `insufficientPermissions`) -> `PERMISSION_ERROR`,
+      diagnostic `"HTTP 403; reason=<reason>"` (still names the real
+      reason — this is a genuine, informative permission failure, not
+      an unavailable one).
+    * No recognized structured `reason` at all (malformed JSON,
+      unexpected shape, empty `errors[]`) -> `PERMISSION_ERROR`,
+      diagnostic `"HTTP 403; structured reason unavailable"`.
+
+    NEVER inspects `body_text`'s `message` field for classification —
+    only `_reason_for_403`'s own structured `error.errors[].reason` scan
+    (see that function's docstring; message-text wording is not a
+    stable, documented Google contract and must never influence
+    classification). NEVER includes the raw body in a diagnostic string
+    — these strings can end up in exception messages, audit payloads,
+    and logs."""
+    if oversized:
+        return _Classified403(
+            status=GmailOutcomeStatus.PERMISSION_ERROR,
+            diagnostic="HTTP 403; structured reason unavailable (body exceeded bounded classification limit)",
+        )
+    reason = _reason_for_403(body_text)
+    if reason is None:
+        return _Classified403(status=GmailOutcomeStatus.PERMISSION_ERROR, diagnostic="HTTP 403; structured reason unavailable")
+    if reason in _TRANSIENT_QUOTA_REASONS:
+        return _Classified403(status=GmailOutcomeStatus.RATE_LIMITED, diagnostic=f"HTTP 403; reason={reason}")
+    return _Classified403(status=GmailOutcomeStatus.PERMISSION_ERROR, diagnostic=f"HTTP 403; reason={reason}")
 
 
 @dataclass(frozen=True)
@@ -814,18 +970,42 @@ def _classify_http_error(exc: urllib.error.HTTPError) -> _ClassifiedHttpError:
     site below (`get_profile`/`list_labels`/`list_messages`/
     `fetch_message_metadata`/`fetch_message_raw`) calls this exactly
     once per exception and uses its three fields, instead of separately
-    calling a status-classifier + `_retry_after_seconds` + `_read_body`
-    (which, now that classifying a 403 needs to inspect the body,
-    would exhaust `exc`'s stream on the first read and leave every
-    later `_read_body(exc)` call at that same call site returning an
-    empty string — silently breaking `error_detail` for every Gmail
-    HTTP error path in this client, not just 403s). `_read_body`/
-    `_retry_after_seconds` remain small internal helpers, but are now
-    called ONLY from here."""
-    body_text = _read_body(exc)
+    calling a status-classifier + `_retry_after_seconds` + a body-read
+    helper (which, now that classifying a 403 needs to inspect the
+    body, would exhaust `exc`'s stream on the first read and leave any
+    later read at that same call site returning an empty string —
+    silently breaking `error_detail` for every Gmail HTTP error path in
+    this client, not just 403s).
+
+    CD-6 fix — why 403 no longer shares a body-read/bound with every
+    other status
+    ------------------------------------------------------------------
+    A real production incident (see :func:`_read_body_bounded`'s own
+    docstring for the full account) was caused by a single 500-char
+    diagnostic-only truncation being reused, by accident, as the input
+    to `json.loads()` for 403 structured classification — a real Google
+    quota-exceeded body longer than 500 characters was cut off
+    mid-structure, `json.loads` raised, and classification silently
+    fell through to `PERMISSION_ERROR` instead of the correct
+    `RATE_LIMITED`. This function now branches on `exc.code` BEFORE
+    reading the body at all: a 403 uses :func:`_read_body_bounded` (a
+    genuinely large, parsing-sized bound, `_MAX_ERROR_BODY_BYTES`) and
+    :func:`_classify_403_body`; every other status uses the original
+    `_read_body` (a small, diagnostic-only bound) and
+    :func:`_status_from_code`, exactly as before — no body-parsing was
+    ever needed for non-403 statuses, and none is added now. Either
+    way, `exc`'s body is still read EXACTLY ONCE per exception."""
     retry_after_seconds = _retry_after_seconds(exc)
-    status = _status_from_code_and_body(exc.code, body_text)
-    return _ClassifiedHttpError(status=status, retry_after_seconds=retry_after_seconds, error_detail=f"HTTP {exc.code}: {body_text}")
+    code = exc.code
+
+    if code == 403:
+        body_text, oversized = _read_body_bounded(exc)
+        classified = _classify_403_body(body_text, oversized=oversized)
+        return _ClassifiedHttpError(status=classified.status, retry_after_seconds=retry_after_seconds, error_detail=classified.diagnostic)
+
+    body_text = _read_body(exc)
+    status = _status_from_code(code)
+    return _ClassifiedHttpError(status=status, retry_after_seconds=retry_after_seconds, error_detail=f"HTTP {code}: {body_text}")
 
 
 def _status_for_transport_error(exc: Exception) -> GmailOutcomeStatus:
