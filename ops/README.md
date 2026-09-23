@@ -20,6 +20,22 @@ Implemented by CD-3 WI-4 (PID §34-35, §50):
 * `_objects_common.py` — small shared helper module for the two object
   scripts above (not a public entry point itself).
 
+Added by CD-6 ClamAV reliability hardening governance delta (PID §99.2/
+§99.3 scoped exception, 2026-09-23):
+
+* `provision_clamav_volume.sh` — idempotent prerequisite for
+  `deployment/compose/docker-compose.mac-production.yml`'s external
+  `bagman-clamav-data` Docker volume (ClamAV's persistent virus-
+  definition store — the one BAGMAN data store that is NOT a host-
+  backed bind mount, because Colima's `virtiofs` cannot support this
+  non-root daemon's required UID/GID write semantics on a bind mount;
+  see that compose file's own comment for the full RCA). Creates the
+  volume only if it does not already exist; never recreates or
+  destroys a populated one. Run once per appliance before the first
+  `docker compose -f docker-compose.yml -f docker-compose.mac-production.yml up -d`,
+  safe to re-run on every subsequent deploy (no-op once the volume
+  exists).
+
 These are operational scripts, not a governed architectural component
 — no `component.yaml` was introduced for `ops/` (see the CD-3 WI-4
 completion report for that judgement call, per PID §19's "create
