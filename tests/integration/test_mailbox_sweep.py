@@ -3783,3 +3783,308 @@ def test_resolve_domain_review_allow_resume_after_middle_failure_still_respects_
     assert {m["immutable_provider_message_id"] for m in result["reprocessed_messages"]} == {"scope-m2", "scope-m3"}
     skip_msg_after = h.message_repo.find_by_provider_id(h.mailbox.mailbox_id, "skip-1")
     assert skip_msg_after.ingestion_status == INGESTION_STATUS_CHECKED_NOT_CANDIDATE
+
+
+# =======================================================================
+# CD-6 follow-on quota-scaling fix — historical backfill's own bounded
+# RATE_LIMITED retry. `_reprocess_one_message` used to treat a
+# `RATE_LIMITED` headers/content fetch identically to any other genuine
+# provider failure — an immediate, un-retried `raise ConflictError(...)`
+# — even though this module's own docstring claimed the existing bounded
+# rate-limit backoff discipline (`_MAX_RATE_LIMIT_BACKOFF_SECONDS`,
+# `run_sweep`'s own page-fetch retry shape) already applied here too. It
+# did not. These tests prove the fix: EXACTLY one bounded retry per call
+# (headers and content each independently), a second consecutive
+# RATE_LIMITED is a genuine interruption (never a third attempt), and —
+# per Defect 3 — a RATE_LIMITED-then-fail sequence never poisons the
+# mailbox's own `connection_state` away from CONNECTED.
+# =======================================================================
+
+
+class _RecordingSleep:
+    """A deterministic `sleep_fn` substitute that never actually sleeps
+    — records every `(seconds,)` it was called with so a test can assert
+    the exact bounded-backoff duration without any real wall-clock
+    delay."""
+
+    def __init__(self) -> None:
+        self.calls: list[float] = []
+
+    def __call__(self, seconds: float) -> None:
+        self.calls.append(seconds)
+
+
+def test_reprocess_header_rate_limited_retries_once_then_succeeds():
+    """Proof (Defect 2, headers): a `RATE_LIMITED` headers-fetch result
+    (`retry_after_seconds=2`) is retried EXACTLY once via `sleep_fn`,
+    for the SAME message_id, and processing continues normally through
+    to the MIME fetch and a real INGESTED outcome — never treated as an
+    unrecoverable failure."""
+    from services.mailbox.review_resolution import resolve_domain_review
+
+    h = Harness(allow_default_domain=False)
+    domain = "rate-limited-headers.example"
+    h.graph_client.queue_delta_result(
+        GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(_msg("rl-h1", sender_address=f"billing@{domain}"),), delta_link="d1")
+    )
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link="d-junk"))
+    h.sweep()
+    item = _open_domain_review_item(h, domain)
+
+    h.graph_client.queue_headers_result(
+        GraphMessageHeadersResult(status=GraphOutcomeStatus.RATE_LIMITED, retry_after_seconds=2.0)
+    )
+    h.graph_client.queue_headers_result(_headers_ok())
+    h.graph_client.queue_content_result(_content())
+
+    sleep = _RecordingSleep()
+    result = resolve_domain_review(
+        needs_you_repository=h.needs_you_repo, mailbox_message_repository=h.message_repo,
+        mailbox_domain_rule_repository=h.domain_rule_repo, entity_repository=h.api.entity_repository,
+        api=h.api, object_store=h.object_store, scanner=h.scanner, adapter=h.adapter, mailbox=h.mailbox,
+        mailbox_id=h.mailbox.mailbox_id, mailbox_source_id=h.source_id, item_id=item.item_id,
+        actor_type="SYSTEM", actor_id="test", decision="ALLOW", destination_entity_id=None,
+        destination_mode="REVIEW_REQUIRED", match_mode="EXACT", processor_hint=None, sender_address=None,
+        sleep_fn=sleep,
+    )
+
+    assert sleep.calls == pytest.approx([2.0])
+    assert h.graph_client.headers_calls == ["rl-h1", "rl-h1"]  # same message_id, retried once
+    assert h.graph_client.content_calls == ["rl-h1"]
+    assert result["needs_you_item"]["status"] == "RESOLVED"
+    assert len(result["reprocessed_messages"]) == 1
+    assert result["reprocessed_messages"][0]["ingestion_status"] == "INGESTED"
+
+
+def test_reprocess_content_rate_limited_retries_once_then_succeeds():
+    """Proof (Defect 2, content): headers PASS; the content/MIME fetch
+    is `RATE_LIMITED` (`retry_after_seconds=3`) on its first attempt and
+    retried EXACTLY once via `sleep_fn`, for the SAME message, and
+    normal ingest completes on the retry."""
+    from services.mailbox.review_resolution import resolve_domain_review
+
+    h = Harness(allow_default_domain=False)
+    domain = "rate-limited-content.example"
+    h.graph_client.queue_delta_result(
+        GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(_msg("rl-c1", sender_address=f"billing@{domain}"),), delta_link="d1")
+    )
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link="d-junk"))
+    h.sweep()
+    item = _open_domain_review_item(h, domain)
+
+    h.graph_client.queue_headers_result(_headers_ok())
+    h.graph_client.queue_content_result(
+        GraphMessageContentResult(status=GraphOutcomeStatus.RATE_LIMITED, retry_after_seconds=3.0)
+    )
+    h.graph_client.queue_content_result(_content())
+
+    sleep = _RecordingSleep()
+    result = resolve_domain_review(
+        needs_you_repository=h.needs_you_repo, mailbox_message_repository=h.message_repo,
+        mailbox_domain_rule_repository=h.domain_rule_repo, entity_repository=h.api.entity_repository,
+        api=h.api, object_store=h.object_store, scanner=h.scanner, adapter=h.adapter, mailbox=h.mailbox,
+        mailbox_id=h.mailbox.mailbox_id, mailbox_source_id=h.source_id, item_id=item.item_id,
+        actor_type="SYSTEM", actor_id="test", decision="ALLOW", destination_entity_id=None,
+        destination_mode="REVIEW_REQUIRED", match_mode="EXACT", processor_hint=None, sender_address=None,
+        sleep_fn=sleep,
+    )
+
+    assert sleep.calls == pytest.approx([3.0])
+    assert h.graph_client.headers_calls == ["rl-c1"]
+    assert h.graph_client.content_calls == ["rl-c1", "rl-c1"]  # same message_id, retried once
+    assert result["needs_you_item"]["status"] == "RESOLVED"
+    assert len(result["reprocessed_messages"]) == 1
+    assert result["reprocessed_messages"][0]["ingestion_status"] == "INGESTED"
+
+
+def test_reprocess_header_double_rate_limited_is_a_genuine_interruption_never_a_third_attempt():
+    """Proof (Defect 2 + Defect 3, headers): a SECOND consecutive
+    `RATE_LIMITED` on the headers fetch is a genuine, bounded
+    interruption — never a third provider attempt, propagates as
+    `ConflictError` through `reprocess_all_historical_candidates_for_domain`
+    /`resolve_domain_review`, the item stays OPEN, the rule stays
+    durable, and (Defect 3) the mailbox's own `connection_state` is
+    never poisoned away from CONNECTED."""
+    from services.mailbox.review_resolution import resolve_domain_review
+
+    h = Harness(allow_default_domain=False)
+    domain = "double-rate-limited-headers.example"
+    h.graph_client.queue_delta_result(
+        GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(_msg("drl-h1", sender_address=f"billing@{domain}"),), delta_link="d1")
+    )
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link="d-junk"))
+    h.sweep()
+    item = _open_domain_review_item(h, domain)
+    assert h.mailbox.connection_state == "CONNECTED"
+
+    h.graph_client.queue_headers_result(
+        GraphMessageHeadersResult(status=GraphOutcomeStatus.RATE_LIMITED, retry_after_seconds=1.0)
+    )
+    h.graph_client.queue_headers_result(
+        GraphMessageHeadersResult(status=GraphOutcomeStatus.RATE_LIMITED, retry_after_seconds=1.0)
+    )
+
+    sleep = _RecordingSleep()
+    with pytest.raises(ConflictError):
+        resolve_domain_review(
+            needs_you_repository=h.needs_you_repo, mailbox_message_repository=h.message_repo,
+            mailbox_domain_rule_repository=h.domain_rule_repo, entity_repository=h.api.entity_repository,
+            api=h.api, object_store=h.object_store, scanner=h.scanner, adapter=h.adapter, mailbox=h.mailbox,
+            mailbox_id=h.mailbox.mailbox_id, mailbox_source_id=h.source_id, item_id=item.item_id,
+            actor_type="SYSTEM", actor_id="test", decision="ALLOW", destination_entity_id=None,
+            destination_mode="REVIEW_REQUIRED", match_mode="EXACT", processor_hint=None, sender_address=None,
+            sleep_fn=sleep,
+        )
+
+    assert sleep.calls == pytest.approx([1.0])  # exactly one bounded retry, never a second
+    assert h.graph_client.headers_calls == ["drl-h1", "drl-h1"]  # never a third attempt
+    assert h.graph_client.content_calls == []  # never reached
+    refreshed_item = h.needs_you_repo.get_needs_you_item(item.item_id)
+    assert refreshed_item.status == "OPEN"
+    rule = h.domain_rule_repo.find_exact(mailbox_id=h.mailbox.mailbox_id, sender_domain=domain, match_mode="EXACT")
+    assert rule is not None and rule.policy == "MUST_READ"  # rule stays durable
+    assert h.mailbox_repo.get_mailbox(h.mailbox.mailbox_id).connection_state == "CONNECTED"
+
+
+def test_reprocess_content_double_rate_limited_is_a_genuine_interruption_never_a_third_attempt():
+    """Proof (Defect 2 + Defect 3, content): the identical shape as the
+    header double-RATE_LIMITED test above, but for the content/MIME
+    fetch — and proves the earlier-completed message in the same batch
+    stays durably INGESTED even though the batch as a whole raises."""
+    from services.mailbox.review_resolution import resolve_domain_review
+
+    h = Harness(allow_default_domain=False)
+    domain = "double-rate-limited-content.example"
+    h.graph_client.queue_delta_result(
+        GraphDeltaPageResult(
+            status=GraphOutcomeStatus.OK,
+            messages=(
+                _msg("drl-first", sender_address=f"billing@{domain}", received_at=datetime(2024, 1, 1, 12, 0, tzinfo=timezone.utc)),
+                _msg("drl-c1", sender_address=f"billing@{domain}", received_at=datetime(2024, 1, 1, 12, 1, tzinfo=timezone.utc)),
+            ),
+            delta_link="d1",
+        )
+    )
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link="d-junk"))
+    h.sweep()
+    item = _open_domain_review_item(h, domain)
+
+    # First candidate succeeds normally.
+    h.graph_client.queue_headers_result(_headers_ok())
+    h.graph_client.queue_content_result(_content())
+    # Second candidate's own content fetch is RATE_LIMITED twice.
+    h.graph_client.queue_headers_result(_headers_ok())
+    h.graph_client.queue_content_result(
+        GraphMessageContentResult(status=GraphOutcomeStatus.RATE_LIMITED, retry_after_seconds=1.5)
+    )
+    h.graph_client.queue_content_result(
+        GraphMessageContentResult(status=GraphOutcomeStatus.RATE_LIMITED, retry_after_seconds=1.5)
+    )
+
+    sleep = _RecordingSleep()
+    with pytest.raises(ConflictError):
+        resolve_domain_review(
+            needs_you_repository=h.needs_you_repo, mailbox_message_repository=h.message_repo,
+            mailbox_domain_rule_repository=h.domain_rule_repo, entity_repository=h.api.entity_repository,
+            api=h.api, object_store=h.object_store, scanner=h.scanner, adapter=h.adapter, mailbox=h.mailbox,
+            mailbox_id=h.mailbox.mailbox_id, mailbox_source_id=h.source_id, item_id=item.item_id,
+            actor_type="SYSTEM", actor_id="test", decision="ALLOW", destination_entity_id=None,
+            destination_mode="REVIEW_REQUIRED", match_mode="EXACT", processor_hint=None, sender_address=None,
+            sleep_fn=sleep,
+        )
+
+    assert sleep.calls == pytest.approx([1.5])
+    assert h.graph_client.content_calls == ["drl-first", "drl-c1", "drl-c1"]  # never a 4th (3rd for drl-c1)
+    refreshed_item = h.needs_you_repo.get_needs_you_item(item.item_id)
+    assert refreshed_item.status == "OPEN"  # the whole item, never touched
+    first_msg = h.message_repo.find_by_provider_id(h.mailbox.mailbox_id, "drl-first")
+    assert first_msg.ingestion_status == "INGESTED"  # durable despite the later raise
+    assert h.mailbox_repo.get_mailbox(h.mailbox.mailbox_id).connection_state == "CONNECTED"
+
+
+def test_resolve_domain_review_allow_resumability_survives_a_rate_limited_content_interruption():
+    """Proof (composition with `49da6f6`'s resumable-ALLOW fix): a
+    three-message cohort — m1 succeeds normally, m2's own content fetch
+    is RATE_LIMITED twice (a genuine interruption), m3 is never reached
+    in that first call. First call: m1 INGESTED, item stays OPEN, rule
+    durable, raises. A clean retry (provider now healthy) with the
+    IDENTICAL decision: m1 gets ZERO further provider calls (already
+    INGESTED, excluded by the candidate query's own idempotency — the
+    same invariant `49da6f6`'s own resumable-ALLOW fix already proved),
+    m2 and m3 both process, the item resolves, and exactly ONE
+    `MAILBOX_DOMAIN_RULE_MUST_READ` audit event exists in total (never
+    duplicated on retry)."""
+    from services.mailbox.review_resolution import resolve_domain_review
+
+    h = Harness(allow_default_domain=False)
+    domain = "resume-rate-limited.example"
+    h.graph_client.queue_delta_result(
+        GraphDeltaPageResult(
+            status=GraphOutcomeStatus.OK,
+            messages=(
+                _msg("rr-m1", sender_address=f"billing@{domain}", received_at=datetime(2024, 1, 1, 12, 0, tzinfo=timezone.utc)),
+                _msg("rr-m2", sender_address=f"billing@{domain}", received_at=datetime(2024, 1, 1, 12, 1, tzinfo=timezone.utc)),
+                _msg("rr-m3", sender_address=f"billing@{domain}", received_at=datetime(2024, 1, 1, 12, 2, tzinfo=timezone.utc)),
+            ),
+            delta_link="d1",
+        )
+    )
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link="d-junk"))
+    h.sweep()
+    item = _open_domain_review_item(h, domain)
+
+    # m1 — normal success.
+    h.graph_client.queue_headers_result(_headers_ok())
+    h.graph_client.queue_content_result(_content())
+    # m2 — content RATE_LIMITED twice -> interruption. m3 never reached.
+    h.graph_client.queue_headers_result(_headers_ok())
+    h.graph_client.queue_content_result(
+        GraphMessageContentResult(status=GraphOutcomeStatus.RATE_LIMITED, retry_after_seconds=1.0)
+    )
+    h.graph_client.queue_content_result(
+        GraphMessageContentResult(status=GraphOutcomeStatus.RATE_LIMITED, retry_after_seconds=1.0)
+    )
+
+    kwargs = dict(
+        needs_you_repository=h.needs_you_repo, mailbox_message_repository=h.message_repo,
+        mailbox_domain_rule_repository=h.domain_rule_repo, entity_repository=h.api.entity_repository,
+        api=h.api, object_store=h.object_store, scanner=h.scanner, adapter=h.adapter, mailbox=h.mailbox,
+        mailbox_id=h.mailbox.mailbox_id, mailbox_source_id=h.source_id, item_id=item.item_id,
+        actor_type="SYSTEM", actor_id="test", decision="ALLOW", destination_entity_id=None,
+        destination_mode="REVIEW_REQUIRED", match_mode="EXACT", processor_hint=None, sender_address=None,
+    )
+    sleep_first = _RecordingSleep()
+    with pytest.raises(ConflictError):
+        resolve_domain_review(**kwargs, sleep_fn=sleep_first)
+
+    assert sleep_first.calls == pytest.approx([1.0])
+    assert h.graph_client.headers_calls == ["rr-m1", "rr-m2"]  # m3 never reached
+    assert h.graph_client.content_calls == ["rr-m1", "rr-m2", "rr-m2"]
+    m1_after_first = h.message_repo.find_by_provider_id(h.mailbox.mailbox_id, "rr-m1")
+    assert m1_after_first.ingestion_status == "INGESTED"
+    assert h.needs_you_repo.get_needs_you_item(item.item_id).status == "OPEN"
+    audit_events_first = h.api.audit_repository.list_recent(limit=50, event_type_prefix="MAILBOX_DOMAIN_RULE_MUST_READ")
+    assert len(audit_events_first) == 1
+
+    # Clean retry — provider now healthy, no more RATE_LIMITED queued.
+    h.graph_client.queue_headers_result(_headers_ok())
+    h.graph_client.queue_content_result(_content())
+    h.graph_client.queue_headers_result(_headers_ok())
+    h.graph_client.queue_content_result(_content())
+
+    sleep_second = _RecordingSleep()
+    result = resolve_domain_review(**kwargs, sleep_fn=sleep_second)
+
+    assert sleep_second.calls == []  # a clean retry needs no backoff at all
+    # m1 gets ZERO further provider calls — already INGESTED, excluded
+    # by the candidate query's own idempotency (the `49da6f6` invariant).
+    assert h.graph_client.headers_calls == ["rr-m1", "rr-m2", "rr-m2", "rr-m3"]
+    assert h.graph_client.content_calls == ["rr-m1", "rr-m2", "rr-m2", "rr-m2", "rr-m3"]
+    assert {m["immutable_provider_message_id"] for m in result["reprocessed_messages"]} == {"rr-m2", "rr-m3"}
+    assert result["needs_you_item"]["status"] == "RESOLVED"
+    audit_events_second = h.api.audit_repository.list_recent(limit=50, event_type_prefix="MAILBOX_DOMAIN_RULE_MUST_READ")
+    assert len(audit_events_second) == 1  # still exactly one — never duplicated
+    for message_id in ("rr-m1", "rr-m2", "rr-m3"):
+        message = h.message_repo.find_by_provider_id(h.mailbox.mailbox_id, message_id)
+        assert message.ingestion_status == "INGESTED"
+    assert h.mailbox_repo.get_mailbox(h.mailbox.mailbox_id).connection_state == "CONNECTED"

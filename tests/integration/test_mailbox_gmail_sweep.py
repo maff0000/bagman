@@ -852,7 +852,7 @@ def test_historical_reprocess_still_fails_closed_when_refreshed_headers_omit_rec
 # ---------------------------------------------------------------------
 # Effective-rule scoping x Gmail quota pacing regression — the new
 # per-candidate `find_for_sender` re-resolution must never trigger the
-# proactive `_GmailMetadataFetchGovernor` pacing for a candidate that
+# proactive `_GmailMessagesGetGovernor` pacing for a candidate that
 # effective-rule filtering skips (see
 # `tests/integration/test_mailbox_gmail_adapter.py`'s own dedicated
 # governor test section for the governor's direct unit coverage; this
@@ -897,9 +897,11 @@ def test_reprocess_gmail_quota_governor_paces_only_actually_processed_candidates
     own). A more-specific BLACKLIST/EXACT_ADDRESS override is then set
     on `skip@newsupplier.com`, and `newsupplier.com` MUST_READ/EXACT is
     approved. Only `keep@newsupplier.com` is eligible after effective-
-    rule filtering, so exactly ONE further governor `wait()` (from its
-    own headers refresh) occurs — never a fourth call for the skipped
-    candidate. Total: 3 governor `wait()` invocations -> exactly 2
+    rule filtering, so exactly TWO further governor `wait()` invocations
+    occur for it (its own fresh headers refresh, THEN its own raw MIME
+    fetch — `fetch_message_content` is now governed too, CD-6 quota-
+    scaling follow-on fix) — never any call at all for the skipped
+    candidate. Total: 4 governor `wait()` invocations -> exactly 3
     sleeps (the first invocation for this mailbox_id never sleeps)."""
     from services.mailbox.sweep import reprocess_all_historical_candidates_for_domain
 
@@ -963,33 +965,40 @@ def test_reprocess_gmail_quota_governor_paces_only_actually_processed_candidates
     skip_msg = h.message_repo.find_by_provider_id(h.mailbox.mailbox_id, "skip-1")
     assert skip_msg.ingestion_status == INGESTION_STATUS_CHECKED_NOT_CANDIDATE
 
-    # Exactly 3 total governor `wait()` invocations for this mailbox_id
-    # (2 discovery + 1 reprocess-headers-refresh for `keep-1` only) ->
-    # exactly 2 sleeps. A 3rd sleep entry would mean the governor was
-    # wrongly consulted a 4th time — i.e. for the skipped candidate.
-    assert sleep.calls == pytest.approx([0.30, 0.30])
+    # Exactly 4 total governor `wait()` invocations for this mailbox_id
+    # (2 discovery + 1 reprocess-headers-refresh + 1 reprocess-raw-fetch,
+    # both for `keep-1` only) -> exactly 3 sleeps. A 4th sleep entry
+    # would mean the governor was wrongly consulted a 5th time — i.e.
+    # for the skipped candidate.
+    assert sleep.calls == pytest.approx([0.30, 0.30, 0.30])
 
 
 def test_resolve_domain_review_allow_resume_after_interrupted_backfill_only_paces_governor_for_candidates_actually_processed_in_the_retry(monkeypatch):
     """CD-6 GUI-operations-foundation follow-on WO — resumable ALLOW
     MUST_READ historical backfill (`services.mailbox.review_resolution
     .resolve_domain_review`), Gmail-specific regression: the shared
-    `_GmailMetadataFetchGovernor` must only ever be consulted for
+    `_GmailMessagesGetGovernor` must only ever be consulted for
     candidates the RETRY call actually (re-)processes, never for a
     candidate that already reached a final state on an earlier attempt.
 
     Two candidates (`gm1`, `gm2`) from an unknown domain are discovered
     (2 governor `wait()` calls). The domain is then approved via
     `resolve_domain_review` ALLOW: `gm1`'s own fresh headers refresh
-    succeeds and it is fully ingested (a 3rd governor `wait()`); `gm2`'s
-    own fresh headers refresh then hits a genuine provider error (a 4th
-    governor `wait()` — the governor is consulted BEFORE the underlying
-    API call, regardless of the call's own outcome), which propagates
-    out of `resolve_domain_review` uncaught. An identical retry resumes
-    ONLY `gm2` — `gm1` is no longer `CHECKED_NOT_CANDIDATE` and is never
+    succeeds (a 3rd governor `wait()`) and its own raw MIME fetch
+    succeeds too (a 4th governor `wait()` — `fetch_message_content` is
+    now governed identically to `fetch_message_headers`, CD-6 quota-
+    scaling follow-on fix), fully ingesting it; `gm2`'s own fresh headers
+    refresh then hits a genuine provider error (a 5th governor `wait()`
+    — the governor is consulted BEFORE the underlying API call,
+    regardless of the call's own outcome), which propagates out of
+    `resolve_domain_review` uncaught — `gm2` never reaches its own
+    content fetch at all this attempt. An identical retry resumes ONLY
+    `gm2` — `gm1` is no longer `CHECKED_NOT_CANDIDATE` and is never
     returned by the candidate query at all, so it can never reach
-    `fetch_message_headers`/the governor a second time. Exactly ONE more
-    governor `wait()` (a 5th) occurs on retry."""
+    `fetch_message_headers`/`fetch_message_content`/the governor a
+    second time. Exactly TWO more governor `wait()` invocations (a 6th
+    and 7th — gm2's own headers refresh, then its own content fetch)
+    occur on retry."""
     from datetime import datetime as _datetime, timezone as _timezone
 
     from core.errors import ConflictError as _ConflictError
@@ -1047,9 +1056,10 @@ def test_resolve_domain_review_allow_resume_after_interrupted_backfill_only_pace
     with pytest.raises(_ConflictError):
         resolve_domain_review(**kwargs)
 
-    # 2 discovery waits + 2 reprocess waits (gm1 success, gm2 failed
-    # attempt) = 4 total -> 3 sleeps (first-ever call never sleeps).
-    assert sleep.calls == pytest.approx([0.30, 0.30, 0.30])
+    # 2 discovery waits + 3 reprocess waits (gm1 headers, gm1 content,
+    # gm2 headers failed attempt) = 5 total -> 4 sleeps (first-ever call
+    # never sleeps).
+    assert sleep.calls == pytest.approx([0.30, 0.30, 0.30, 0.30])
     refreshed_item = h.needs_you_repo.get_needs_you_item(item.item_id)
     assert refreshed_item.status == "OPEN"
     gm1_msg = h.message_repo.find_by_provider_id(h.mailbox.mailbox_id, "gm1")
@@ -1070,9 +1080,11 @@ def test_resolve_domain_review_allow_resume_after_interrupted_backfill_only_pace
 
     assert [m["mailbox_message_id"] for m in result["reprocessed_messages"]] == [gm2_msg.mailbox_message_id]
     assert result["needs_you_item"]["status"] == "RESOLVED"
-    # Exactly ONE more governor wait() during the retry (a 4th sleep) —
-    # never a 5th, which would mean gm1 was wrongly re-consulted.
-    assert sleep.calls == pytest.approx([0.30, 0.30, 0.30, 0.30])
+    # Exactly TWO more governor wait() invocations during the retry (a
+    # 5th and 6th sleep — gm2's own headers refresh, then its own
+    # content fetch) — never a 7th, which would mean gm1 was wrongly
+    # re-consulted.
+    assert sleep.calls == pytest.approx([0.30, 0.30, 0.30, 0.30, 0.30, 0.30])
 
 
 # -- precondition -----------------------------------------------------------

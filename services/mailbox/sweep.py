@@ -357,7 +357,7 @@ from __future__ import annotations
 
 import time
 from datetime import datetime
-from typing import Any, Mapping, Optional, Protocol, Sequence
+from typing import Any, Callable, Mapping, Optional, Protocol, Sequence
 
 from core.entity import EntityRepository
 from core.errors import ConflictError, PersistenceError
@@ -1716,6 +1716,7 @@ def _reprocess_one_message(
     actor_id: str,
     correlation_id: Optional[str] = None,
     now: Optional[datetime] = None,
+    sleep_fn: Callable[[float], None] = time.sleep,
 ) -> MailboxMessage:
     """Private single-message reprocessing helper (was, until the
     operational addendum ahead of the first real large historical
@@ -1765,6 +1766,38 @@ def _reprocess_one_message(
     `destination_mode == "REVIEW_REQUIRED"` and ingestion succeeds
     (mirrors `run_sweep`'s own identical call — see that function's own
     module docstring, "Document-level destination review" section).
+
+    CD-6 follow-on quota-scaling fix — bounded RATE_LIMITED retry (this
+    delivery): this function's own module-level docstring / the public
+    :func:`reprocess_all_historical_candidates_for_domain`'s own
+    docstring used to CLAIM this reused "the existing bounded rate-limit
+    backoff discipline" every other Graph/Gmail call in this module
+    already uses — that claim was false for `RATE_LIMITED` specifically:
+    both the `adapter.fetch_message_headers` call and the
+    `adapter.fetch_message_content` call below used to treat ANY non-OK/
+    non-NOT_FOUND status (RATE_LIMITED included) identically — an
+    immediate, un-retried `raise ConflictError(...)`. Fixed here: for
+    EITHER call, a `RATE_LIMITED` result is retried EXACTLY ONCE — the
+    identical bounded shape `run_sweep`'s own page-fetch retry already
+    uses (`backoff = min(retry_after_seconds or 5.0,
+    _MAX_RATE_LIMIT_BACKOFF_SECONDS)`, `sleep_fn(backoff)`, then one
+    single retried call with the SAME arguments) — before falling
+    through to the existing NOT_FOUND/OK/else-raise handling, which
+    itself needed no changes at all: a second consecutive `RATE_LIMITED`
+    is simply one more non-OK/non-NOT_FOUND status that same existing
+    `raise ConflictError(...)` branch already covers, so it is never
+    special-cased separately. Neither retry mutates this message's own
+    ingestion status, calls `adapter.report_connection_error`, or
+    touches `mailbox.connection_state` — only the FINAL outcome of each
+    call (first attempt if not RATE_LIMITED, otherwise the one retry) is
+    ever recorded, exactly mirroring `run_sweep`'s own "the surrounding
+    failure path handles a still-RATE_LIMITED retry" doctrine.
+    `adapter.fetch_message_headers`/`fetch_message_content` (the Gmail
+    adapter's own implementations) already re-consult their own shared
+    per-mailbox `messages.get` pacing governor internally on every call
+    they make, retries included — this function stays fully adapter-
+    agnostic and never touches that governor (or any other adapter-
+    internal detail) directly.
     """
     current = message_repository.get_message(message_id)
     if current.ingestion_status in FINAL_INGESTION_STATUSES - {INGESTION_STATUS_CHECKED_NOT_CANDIDATE}:
@@ -1791,6 +1824,18 @@ def _reprocess_one_message(
     headers_result = adapter.fetch_message_headers(
         mailbox_id=mailbox.mailbox_id, immutable_message_id=current.immutable_provider_message_id
     )
+    if headers_result.status == GraphOutcomeStatus.RATE_LIMITED:
+        # Bounded single retry — identical shape to `run_sweep`'s own
+        # page-fetch retry (see this function's own docstring, "CD-6
+        # follow-on quota-scaling fix" section). A second RATE_LIMITED
+        # is never special-cased: it falls straight into the existing
+        # NOT_FOUND/OK/else-raise handling below like any other non-OK
+        # status would.
+        backoff = min(headers_result.retry_after_seconds or 5.0, _MAX_RATE_LIMIT_BACKOFF_SECONDS)
+        sleep_fn(backoff)
+        headers_result = adapter.fetch_message_headers(
+            mailbox_id=mailbox.mailbox_id, immutable_message_id=current.immutable_provider_message_id
+        )
 
     if headers_result.status == GraphOutcomeStatus.NOT_FOUND:
         message, _ = message_repository.record_observation(
@@ -1847,6 +1892,16 @@ def _reprocess_one_message(
     content_result = adapter.fetch_message_content(
         mailbox_id=mailbox.mailbox_id, immutable_message_id=current.immutable_provider_message_id
     )
+    if content_result.status == GraphOutcomeStatus.RATE_LIMITED:
+        # Bounded single retry — identical shape to the headers-fetch
+        # retry above (see this function's own docstring). A second
+        # RATE_LIMITED falls straight into the existing NOT_FOUND/OK/
+        # else-raise handling below unchanged.
+        backoff = min(content_result.retry_after_seconds or 5.0, _MAX_RATE_LIMIT_BACKOFF_SECONDS)
+        sleep_fn(backoff)
+        content_result = adapter.fetch_message_content(
+            mailbox_id=mailbox.mailbox_id, immutable_message_id=current.immutable_provider_message_id
+        )
 
     routing_metadata = _routing_metadata(rule)
 
@@ -2016,6 +2071,7 @@ def reprocess_all_historical_candidates_for_domain(
     actor_id: str,
     correlation_id: Optional[str] = None,
     now: Optional[datetime] = None,
+    sleep_fn: Callable[[float], None] = time.sleep,
 ) -> list[MailboxMessage]:
     """Operational addendum (ahead of the first real large historical
     sweep) — the architect's own most important new requirement here:
@@ -2078,13 +2134,22 @@ def reprocess_all_historical_candidates_for_domain(
 
     Bounded execution (architect §11 — "no retry storm, no unbounded
     parallel Graph requests"): candidates are reprocessed SEQUENTIALLY,
-    one message at a time, reusing the exact same
-    ``_MAX_RATE_LIMIT_BACKOFF_SECONDS`` rate-limit backoff discipline
-    every other Graph call in this module already uses (via
-    ``adapter.fetch_message_content`` inside
-    :func:`_reprocess_one_message`) — this function deliberately never
-    introduces concurrency here, however many historical candidates a
-    domain turns out to have.
+    one message at a time — this function deliberately never introduces
+    concurrency here, however many historical candidates a domain turns
+    out to have. A genuine `RATE_LIMITED` result from either
+    ``adapter.fetch_message_headers`` or ``adapter.fetch_message_content``
+    inside :func:`_reprocess_one_message` is now (CD-6 follow-on quota-
+    scaling fix) actually retried once, reusing the exact same
+    ``_MAX_RATE_LIMIT_BACKOFF_SECONDS``-bounded backoff shape
+    ``run_sweep``'s own page-fetch retry uses — see
+    :func:`_reprocess_one_message`'s own docstring, "CD-6 follow-on
+    quota-scaling fix" section, for the full contract (this docstring
+    used to claim that retry discipline already existed here; it did
+    not, for `RATE_LIMITED` specifically, until this fix). ``sleep_fn``
+    (defaulting to ``time.sleep``, mirroring ``run_sweep``'s own
+    identical parameter) is threaded straight through to each
+    :func:`_reprocess_one_message` call so tests can drive this
+    deterministically with zero real sleeping.
 
     Idempotent-safe as a whole, not merely per-message: invoking this
     function TWICE for the same domain (e.g. a genuine double-submit of
@@ -2152,6 +2217,7 @@ def reprocess_all_historical_candidates_for_domain(
                 actor_id=actor_id,
                 correlation_id=correlation_id,
                 now=now,
+                sleep_fn=sleep_fn,
             )
         )
     return results

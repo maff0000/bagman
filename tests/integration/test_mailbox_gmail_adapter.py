@@ -25,6 +25,7 @@ from services.mailbox.gmail.gmail_client import (
     GmailMessageListPageResult,
     GmailMessageMetadata,
     GmailMessageMetadataResult,
+    GmailMessageRawResult,
     GmailOutcomeStatus,
     GmailTokenBundle,
     GmailTokenResult,
@@ -970,12 +971,28 @@ def test_default_metadata_headers_production_path_reaches_pass_via_fetch_message
 
 # ---------------------------------------------------------------------
 # CD-6 follow-on fix — proactive Gmail quota pacing
-# (`_GmailMetadataFetchGovernor`). A real production historical sweep hit
+# (`_GmailMessagesGetGovernor`). A real production historical sweep hit
 # Google's own per-user `messages.get` quota mid-round; these tests prove
 # the adapter now paces itself PROACTIVELY (a minimum interval between
-# sequential `fetch_message_metadata` calls), scoped per mailbox_id,
-# using a fake monotonic clock + fake sleep so NO test here ever
-# actually blocks.
+# sequential `messages.get` calls, metadata AND raw format alike), scoped
+# per mailbox_id, using a fake monotonic clock + fake sleep so NO test
+# here ever actually blocks.
+#
+# CD-6 follow-on quota-SCALING fix (this delivery): `fetch_message_raw`
+# (the MIME/raw `messages.get` call `fetch_message_content` makes) used
+# to be entirely UNPACED — a real historical-deep-processing run makes
+# TWO `messages.get` calls per candidate (one metadata, one raw), both
+# against the SAME quota, so leaving raw fetches unpaced meant this
+# adapter was only pacing HALF of its own real quota consumption. The
+# governor (renamed from `_GmailMetadataFetchGovernor` to
+# `_GmailMessagesGetGovernor` — it was already generic, this rename is
+# the acknowledgement) now paces `fetch_message_content` identically to
+# `fetch_message_headers`: one `wait()` before the initial
+# `fetch_message_raw` call, and one more before its own AUTH_ERROR
+# reactive-retry call. The tests below prove: (1) mixed metadata/raw
+# calls for one mailbox share the SAME pacing state, (2) that pacing
+# stays fully mailbox_id-isolated, (3) the metadata AUTH-retry path
+# paces BOTH attempts, and (4) the NEW raw AUTH-retry path does too.
 # ---------------------------------------------------------------------
 
 
@@ -1020,7 +1037,7 @@ def _paced_adapter(*, min_interval_seconds: float = 0.30, start: float = 1_000.0
     mailbox_repo = InMemoryMailboxSourceRepository()
     adapter = GmailMailboxAdapter(
         oauth_client=oauth_client, gmail_client=gmail_client, token_store=token_store, mailbox_repository=mailbox_repo,
-        metadata_fetch_min_interval_seconds=min_interval_seconds, monotonic_fn=clock, sleep_fn=sleep,
+        messages_get_min_interval_seconds=min_interval_seconds, monotonic_fn=clock, sleep_fn=sleep,
     )
     return oauth_client, gmail_client, token_store, mailbox_repo, adapter, clock, sleep
 
@@ -1113,7 +1130,7 @@ def test_governor_cross_mailbox_isolation():
 
 
 def test_governor_wait_directly_zero_real_sleeping_proof():
-    """11. A direct, white-box proof against `_GmailMetadataFetchGovernor`
+    """11. A direct, white-box proof against `_GmailMessagesGetGovernor`
     itself (mirrors this file's own established pattern of testing
     private helpers like `_to_message_summary`/`_decode_delta_link`
     directly): the first `wait()` for a mailbox_id never sleeps; a
@@ -1121,11 +1138,11 @@ def test_governor_wait_directly_zero_real_sleeping_proof():
     fake-clock time, sleeps for exactly the configured minimum interval;
     at no point does this test block in real wall-clock time (proven by
     only ever asserting on `sleep.calls`, never timing the test itself)."""
-    from services.mailbox.gmail.gmail_adapter import _GmailMetadataFetchGovernor
+    from services.mailbox.gmail.gmail_adapter import _GmailMessagesGetGovernor
 
     clock = _FakeMonotonicClock(start=500.0)
     sleep = _FakeSleep(clock)
-    governor = _GmailMetadataFetchGovernor(min_interval_seconds=0.30, monotonic_fn=clock, sleep_fn=sleep)
+    governor = _GmailMessagesGetGovernor(min_interval_seconds=0.30, monotonic_fn=clock, sleep_fn=sleep)
 
     governor.wait("mailbox-x")
     assert sleep.calls == []
@@ -1137,3 +1154,175 @@ def test_governor_wait_directly_zero_real_sleeping_proof():
     # still needs no sleep at all.
     governor.wait("mailbox-y")
     assert sleep.calls == pytest.approx([0.30])
+
+
+# ---------------------------------------------------------------------
+# CD-6 follow-on quota-SCALING fix — `fetch_message_content` (raw MIME
+# `messages.get`) is now governed by the SAME shared
+# `_GmailMessagesGetGovernor` as `fetch_message_metadata`/
+# `fetch_message_headers`, closing the gap that let a real historical
+# deep-processing run (two `messages.get` calls per candidate) exceed
+# its safe quota budget unpaced.
+# ---------------------------------------------------------------------
+
+
+def test_governor_paces_mixed_metadata_and_raw_calls_for_the_same_mailbox():
+    """12. `metadata, raw, metadata, raw` for ONE mailbox_id, driven
+    directly via `fetch_message_headers`/`fetch_message_content` (never
+    `fetch_folder_delta` — this proves the governor is genuinely shared
+    across the two DIFFERENT public methods, not merely reused within
+    one). The first call never sleeps; every subsequent call — metadata
+    or raw alike — sleeps for exactly the configured minimum interval
+    relative to the immediately-preceding call, proving one unified
+    per-mailbox timeline rather than two independent ones."""
+    oauth_client, gmail_client, token_store, mailbox_repo, adapter, clock, sleep = _paced_adapter(min_interval_seconds=0.30)
+    mailbox = _seeded_mailbox(mailbox_repo)
+    token_store.write(mailbox.mailbox_id, access_token="a", refresh_token="r", expires_at=datetime.now(timezone.utc) + timedelta(hours=1))
+
+    gmail_client.queue_metadata_result(GmailMessageMetadataResult(status=GmailOutcomeStatus.OK, metadata=_msg_metadata("m1", label_ids=("INBOX",))))
+    headers1 = adapter.fetch_message_headers(mailbox_id=mailbox.mailbox_id, immutable_message_id="m1")
+    assert headers1.status == GmailOutcomeStatus.OK
+    assert sleep.calls == []  # very first messages.get call for this mailbox_id — no prior timestamp
+
+    gmail_client.queue_raw_result(GmailMessageRawResult(status=GmailOutcomeStatus.OK, content=b"raw-1"))
+    content1 = adapter.fetch_message_content(mailbox_id=mailbox.mailbox_id, immutable_message_id="m1")
+    assert content1.status == GmailOutcomeStatus.OK
+    assert sleep.calls == pytest.approx([0.30])  # raw call paced against the PRECEDING metadata call
+
+    gmail_client.queue_metadata_result(GmailMessageMetadataResult(status=GmailOutcomeStatus.OK, metadata=_msg_metadata("m2", label_ids=("INBOX",))))
+    headers2 = adapter.fetch_message_headers(mailbox_id=mailbox.mailbox_id, immutable_message_id="m2")
+    assert headers2.status == GmailOutcomeStatus.OK
+    assert sleep.calls == pytest.approx([0.30, 0.30])  # metadata call paced against the PRECEDING raw call
+
+    gmail_client.queue_raw_result(GmailMessageRawResult(status=GmailOutcomeStatus.OK, content=b"raw-2"))
+    content2 = adapter.fetch_message_content(mailbox_id=mailbox.mailbox_id, immutable_message_id="m2")
+    assert content2.status == GmailOutcomeStatus.OK
+    assert sleep.calls == pytest.approx([0.30, 0.30, 0.30])
+
+    # Zero real blocking — the fake clock only ever advances by the
+    # recorded sleep durations.
+    assert clock.now == pytest.approx(1_000.0 + 3 * 0.30)
+
+
+def test_governor_cross_mailbox_isolation_mixed_metadata_and_raw():
+    """13. Interleaved `Gmail-1 metadata, Gmail-1 raw, Gmail-2 metadata,
+    Gmail-2 raw` — Gmail-2's own FIRST call (a metadata fetch) must incur
+    zero governor-induced sleep despite Gmail-1's own recent, still-warm
+    pacing history, and Gmail-2's own SECOND call (raw) must then pace
+    normally against Gmail-2's own first call — never against Gmail-1's."""
+    oauth_client, gmail_client, token_store, mailbox_repo, adapter, clock, sleep = _paced_adapter(min_interval_seconds=0.30)
+    mailbox_1 = _seeded_mailbox(mailbox_repo, email="mgs241171@gmail.com")
+    mailbox_2 = _seeded_mailbox(mailbox_repo, email="matt.george.scott@gmail.com")
+    for mailbox in (mailbox_1, mailbox_2):
+        token_store.write(mailbox.mailbox_id, access_token="a", refresh_token="r", expires_at=datetime.now(timezone.utc) + timedelta(hours=1))
+
+    gmail_client.queue_metadata_result(GmailMessageMetadataResult(status=GmailOutcomeStatus.OK, metadata=_msg_metadata("g1-m1", label_ids=("INBOX",))))
+    adapter.fetch_message_headers(mailbox_id=mailbox_1.mailbox_id, immutable_message_id="g1-m1")
+    assert sleep.calls == []
+
+    gmail_client.queue_raw_result(GmailMessageRawResult(status=GmailOutcomeStatus.OK, content=b"raw"))
+    adapter.fetch_message_content(mailbox_id=mailbox_1.mailbox_id, immutable_message_id="g1-m1")
+    assert sleep.calls == pytest.approx([0.30])
+
+    # Gmail-2's own very first messages.get call, issued right after
+    # Gmail-1's own recent activity — must need no sleep at all.
+    gmail_client.queue_metadata_result(GmailMessageMetadataResult(status=GmailOutcomeStatus.OK, metadata=_msg_metadata("g2-m1", label_ids=("INBOX",))))
+    adapter.fetch_message_headers(mailbox_id=mailbox_2.mailbox_id, immutable_message_id="g2-m1")
+    assert sleep.calls == pytest.approx([0.30])  # unchanged — zero NEW sleeps from Gmail-2's first call
+
+    # Gmail-2's own SECOND call paces normally against Gmail-2's own
+    # first — never against Gmail-1's much-earlier-in-wall-clock-terms
+    # history.
+    gmail_client.queue_raw_result(GmailMessageRawResult(status=GmailOutcomeStatus.OK, content=b"raw"))
+    adapter.fetch_message_content(mailbox_id=mailbox_2.mailbox_id, immutable_message_id="g2-m1")
+    assert sleep.calls == pytest.approx([0.30, 0.30])
+
+
+def test_governor_paces_both_attempts_of_a_metadata_auth_error_retry():
+    """14. `fetch_message_headers` hits AUTH_ERROR on its first
+    `fetch_message_metadata` call, reactively refreshes, and retries the
+    SAME call once — both the original attempt AND the retry attempt
+    must each individually pass through the governor. Proven two ways:
+    (a) `gmail_client.metadata_calls` records the message_id TWICE (one
+    real provider round trip per governor consultation), and (b) the
+    retry attempt — issued with zero elapsed fake-clock time right after
+    the first — incurs exactly one governor-induced sleep, which could
+    only happen if the governor was consulted a SECOND time (a single
+    consultation for a mailbox_id with no prior history never sleeps)."""
+    oauth_client, gmail_client, token_store, mailbox_repo, adapter, clock, sleep = _paced_adapter(min_interval_seconds=0.30)
+    mailbox = _seeded_mailbox(mailbox_repo)
+    token_store.write(mailbox.mailbox_id, access_token="stale", refresh_token="refresh-token", expires_at=datetime.now(timezone.utc) + timedelta(hours=1))
+
+    gmail_client.queue_metadata_result(GmailMessageMetadataResult(status=GmailOutcomeStatus.AUTH_ERROR, error_detail="401"))
+    oauth_client.queue_refresh_result(GmailTokenResult(status=GmailOutcomeStatus.OK, tokens=_fresh_tokens()))
+    gmail_client.queue_metadata_result(GmailMessageMetadataResult(status=GmailOutcomeStatus.OK, metadata=_msg_metadata("m1", label_ids=("INBOX",))))
+
+    result = adapter.fetch_message_headers(mailbox_id=mailbox.mailbox_id, immutable_message_id="m1")
+
+    assert result.status == GmailOutcomeStatus.OK
+    assert gmail_client.metadata_calls == ["m1", "m1"]  # original attempt + retry, both real provider calls
+    assert len(oauth_client.token_calls) == 1  # exactly one reactive refresh, never more
+    # The retry's own governor consultation had zero elapsed fake-clock
+    # time relative to the first — it can only have needed to sleep if
+    # the governor was genuinely consulted a second time.
+    assert sleep.calls == pytest.approx([0.30])
+
+
+def test_governor_paces_both_attempts_of_a_raw_auth_error_retry():
+    """15. The identical shape as the metadata AUTH-retry test above, but
+    for `fetch_message_content`'s own AUTH_ERROR retry path — this is
+    the actual NEW coverage this WO adds, since `fetch_message_raw` was
+    entirely unpaced before this fix. Both the original
+    `fetch_message_raw` call and its reactive-refresh retry must each
+    individually pass through the governor."""
+    oauth_client, gmail_client, token_store, mailbox_repo, adapter, clock, sleep = _paced_adapter(min_interval_seconds=0.30)
+    mailbox = _seeded_mailbox(mailbox_repo)
+    token_store.write(mailbox.mailbox_id, access_token="stale", refresh_token="refresh-token", expires_at=datetime.now(timezone.utc) + timedelta(hours=1))
+
+    gmail_client.queue_raw_result(GmailMessageRawResult(status=GmailOutcomeStatus.AUTH_ERROR, error_detail="401"))
+    oauth_client.queue_refresh_result(GmailTokenResult(status=GmailOutcomeStatus.OK, tokens=_fresh_tokens()))
+    gmail_client.queue_raw_result(GmailMessageRawResult(status=GmailOutcomeStatus.OK, content=b"raw-bytes"))
+
+    result = adapter.fetch_message_content(mailbox_id=mailbox.mailbox_id, immutable_message_id="m1")
+
+    assert result.status == GmailOutcomeStatus.OK
+    assert result.content == b"raw-bytes"
+    assert gmail_client.raw_calls == ["m1", "m1"]  # original attempt + retry, both real provider calls
+    assert len(oauth_client.token_calls) == 1  # exactly one reactive refresh, never more
+    assert sleep.calls == pytest.approx([0.30])
+
+
+def test_pilot_shaped_regression_ten_candidates_twenty_governed_messages_get_calls():
+    """16. Reproduces the completed `email.interactivebrokers.com` pilot's
+    own real shape at the ADAPTER layer: 10 sequential candidates, each
+    needing one metadata (`fetch_message_headers`, mirroring
+    `_reprocess_one_message`'s own authentication-gate refresh) and one
+    raw (`fetch_message_content`) `messages.get` call — 20 logical
+    `messages.get` operations in total, all governed by the SAME shared
+    per-mailbox governor with correct spacing, zero real network calls."""
+    oauth_client, gmail_client, token_store, mailbox_repo, adapter, clock, sleep = _paced_adapter(min_interval_seconds=0.30)
+    mailbox = _seeded_mailbox(mailbox_repo)
+    token_store.write(mailbox.mailbox_id, access_token="a", refresh_token="r", expires_at=datetime.now(timezone.utc) + timedelta(hours=1))
+
+    message_ids = [f"ibkr-{i}" for i in range(10)]
+    for message_id in message_ids:
+        gmail_client.queue_metadata_result(
+            GmailMessageMetadataResult(status=GmailOutcomeStatus.OK, metadata=_msg_metadata(message_id, label_ids=("INBOX",)))
+        )
+        gmail_client.queue_raw_result(GmailMessageRawResult(status=GmailOutcomeStatus.OK, content=b"clean-mime"))
+
+    for message_id in message_ids:
+        headers_result = adapter.fetch_message_headers(mailbox_id=mailbox.mailbox_id, immutable_message_id=message_id)
+        assert headers_result.status == GmailOutcomeStatus.OK
+        content_result = adapter.fetch_message_content(mailbox_id=mailbox.mailbox_id, immutable_message_id=message_id)
+        assert content_result.status == GmailOutcomeStatus.OK
+
+    # 10 metadata + 10 raw == 20 real provider messages.get calls total.
+    assert len(gmail_client.metadata_calls) == 10
+    assert len(gmail_client.raw_calls) == 10
+    # 20 total governed calls for this mailbox_id -> the FIRST never
+    # sleeps, the other 19 each sleep the configured minimum interval —
+    # proving the unified governor was consulted before all 20, not
+    # merely before the 10 metadata calls or the 10 raw calls alone.
+    assert sleep.calls == pytest.approx([0.30] * 19)
+    assert clock.now == pytest.approx(1_000.0 + 19 * 0.30)

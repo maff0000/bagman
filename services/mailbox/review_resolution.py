@@ -102,7 +102,8 @@ router's own public HTTP contract changed.
 """
 from __future__ import annotations
 
-from typing import Any, Optional, Protocol
+import time
+from typing import Any, Callable, Optional, Protocol
 
 from core.entity import EntityRepository
 from core.errors import ConflictError, ValidationError
@@ -193,6 +194,7 @@ def resolve_domain_review(
     match_mode: str,  # "EXACT" | "INCLUDE_SUBDOMAINS" | "EXACT_ADDRESS"
     processor_hint: Optional[str],
     sender_address: Optional[str],
+    sleep_fn: Callable[[float], None] = time.sleep,
 ) -> dict[str, Any]:
     """Resolve one ``ITEM_TYPE_MAILBOX_DOMAIN_REVIEW`` Needs You item —
     see this module's own docstring for the full preserved behavioural
@@ -310,7 +312,16 @@ def resolve_domain_review(
       Either way, ``reprocess_all_historical_candidates_for_domain`` is
       then called (or re-called) against whichever rule was determined
       above, correlated to the item's OWN (still-open)
-      ``correlation_id``. **If this raises, it is left to propagate
+      ``correlation_id``, with ``sleep_fn`` threaded straight through
+      (see this function's own ``sleep_fn`` parameter, defaulting to
+      ``time.sleep`` — CD-6 follow-on quota-scaling fix: a genuine
+      ``RATE_LIMITED`` result during that backfill is now bounded-
+      retried exactly once per call, per
+      ``services.mailbox.sweep._reprocess_one_message``'s own docstring
+      — this never changes what propagates out of THIS function; only a
+      RATE_LIMITED that survives its own one retry still raises
+      ``ConflictError`` here, exactly as any other genuine provider
+      failure always has). **If this raises, it is left to propagate
       completely uncaught** — the rule is already durably
       upserted/reused, the item is left exactly ``OPEN`` (never touched),
       and every candidate already processed before the raise keeps its
@@ -520,6 +531,7 @@ def resolve_domain_review(
                 actor_type=actor_type,
                 actor_id=actor_id,
                 correlation_id=item.correlation_id,
+                sleep_fn=sleep_fn,
             )
         return {
             "needs_you_item": item.to_dict(),
@@ -656,6 +668,7 @@ def resolve_domain_review(
             actor_type=actor_type,
             actor_id=actor_id,
             correlation_id=item.correlation_id,
+            sleep_fn=sleep_fn,
         )
 
     # Only reached once the backfill call above has returned NORMALLY —
