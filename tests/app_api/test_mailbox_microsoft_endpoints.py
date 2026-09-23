@@ -604,6 +604,107 @@ def test_resolve_domain_review_allow_back_processes_every_historical_candidate_f
     assert r2.json()["reprocessed_messages"] == []
 
 
+def test_resolve_domain_review_allow_full_success_returns_200_with_resolved_item_and_reprocessed_messages(dev_client):
+    """CD-6 GUI-operations-foundation follow-on WO — resumable ALLOW
+    MUST_READ historical backfill: the ordinary, happy-path HTTP shape
+    is unchanged — 200 with the RESOLVED item and a populated
+    `reprocessed_messages`."""
+    mailbox_id, comp, entity = _connected_mailbox_with_entity_seeded(dev_client)
+    _sweep_unknown_domain_message(dev_client, mailbox_id)
+    item = [
+        i for i in comp.needs_you_repository.list_needs_you_items(item_type="MAILBOX_DOMAIN_REVIEW")
+        if i.metadata.get("mailbox_id") == mailbox_id
+    ][0]
+
+    comp.microsoft_graph_client.queue_headers_result(_headers_ok())
+    comp.microsoft_graph_client.queue_content_result(
+        GraphMessageContentResult(
+            status=GraphOutcomeStatus.OK, content=b"From: billing@new-supplier.example\r\nSubject: Invoice\r\n\r\nBody"
+        )
+    )
+    r = dev_client.post(
+        f"/internal/mailboxes/{mailbox_id}/microsoft/domain-review/{item.item_id}/resolve",
+        json={
+            "actor_type": "USER", "actor_id": ACTOR_ID, "decision": "ALLOW",
+            "destination_entity_id": entity.entity_id, "destination_mode": "FIXED",
+        },
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["needs_you_item"]["status"] == "RESOLVED"
+    assert len(body["reprocessed_messages"]) == 1
+    assert body["reprocessed_messages"][0]["ingestion_status"] == "INGESTED"
+
+
+def test_resolve_domain_review_allow_mid_batch_provider_failure_surfaces_as_409_not_a_fabricated_success(dev_client):
+    """A genuine provider/transport error partway through the historical
+    backfill must surface as a real HTTP error (409 — `ConflictError`'s
+    own global mapping, see `app/api/main.py`) — never a fabricated 200
+    success with a silently-stopped-short `reprocessed_messages`. The
+    rule is still real/durable (visible via the domain-rules endpoint),
+    the item stays OPEN (visible via the domain-review list endpoint),
+    and an identical retry of the exact same decision RESUMES and
+    completes — never duplicating the rule."""
+    mailbox_id, comp, entity = _connected_mailbox_with_entity_seeded(dev_client)
+    now = datetime.now(timezone.utc)
+    domain = "http-resume.example"
+    messages = tuple(
+        GraphMessageSummary(
+            immutable_id=f"AAMk-httpfail-{i}", internet_message_id=f"<httpfail{i}@b>", subject="Invoice attached",
+            sender_address=f"billing@{domain}", sender_display_name="Supplier", received_at=now,
+            has_attachments=False,
+        )
+        for i in range(1, 3)
+    )
+    _queue_folder_discovery(comp)
+    comp.microsoft_graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=messages, delta_link="d1"))
+    comp.microsoft_graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link="d-junk"))
+    r = dev_client.post(f"/internal/mailboxes/{mailbox_id}/microsoft/sweep", json={"actor_type": "USER", "actor_id": ACTOR_ID})
+    assert r.status_code == 200, r.text
+
+    item = _open_domain_review_item_for_domain(comp, mailbox_id, domain)
+
+    comp.microsoft_graph_client.queue_headers_result(_headers_ok())
+    comp.microsoft_graph_client.queue_content_result(
+        GraphMessageContentResult(status=GraphOutcomeStatus.OK, content=f"From: billing@{domain}\r\nSubject: Invoice\r\n\r\nBody".encode())
+    )
+    comp.microsoft_graph_client.queue_headers_result(
+        GraphMessageHeadersResult(status=GraphOutcomeStatus.PROVIDER_ERROR, error_detail="simulated transient provider error")
+    )
+
+    payload = {
+        "actor_type": "USER", "actor_id": ACTOR_ID, "decision": "ALLOW",
+        "destination_entity_id": entity.entity_id, "destination_mode": "FIXED",
+    }
+    r = dev_client.post(f"/internal/mailboxes/{mailbox_id}/microsoft/domain-review/{item.item_id}/resolve", json=payload)
+    assert r.status_code == 409, r.text
+
+    # The rule is still real/durable — a fabricated success would have
+    # left NO rule at all, or a caller unable to tell the difference.
+    rules = dev_client.get(f"/internal/mailboxes/{mailbox_id}/microsoft/domain-rules").json()
+    assert rules["count"] == 1
+    assert rules["items"][0]["sender_domain"] == domain
+
+    # The item is still OPEN — the default (no `status` param) listing
+    # is OPEN-only.
+    open_items = dev_client.get(f"/internal/mailboxes/{mailbox_id}/microsoft/domain-review").json()
+    assert any(i["item_id"] == item.item_id for i in open_items["items"])
+
+    # An identical retry resumes and completes — never duplicating the rule.
+    comp.microsoft_graph_client.queue_headers_result(_headers_ok())
+    comp.microsoft_graph_client.queue_content_result(
+        GraphMessageContentResult(status=GraphOutcomeStatus.OK, content=f"From: billing@{domain}\r\nSubject: Invoice\r\n\r\nBody".encode())
+    )
+    r2 = dev_client.post(f"/internal/mailboxes/{mailbox_id}/microsoft/domain-review/{item.item_id}/resolve", json=payload)
+    assert r2.status_code == 200, r2.text
+    body2 = r2.json()
+    assert body2["needs_you_item"]["status"] == "RESOLVED"
+    assert len(body2["reprocessed_messages"]) == 1
+
+    rules_after = dev_client.get(f"/internal/mailboxes/{mailbox_id}/microsoft/domain-rules").json()
+    assert rules_after["count"] == 1  # still exactly one — never duplicated
+
+
 def test_noustai_imap_mailbox_never_reaches_the_microsoft_router(dev_client):
     mailbox_id = _create_mailbox(dev_client, provider_kind="IMAP", email="ops@noustai.com")
     r = dev_client.post(f"/internal/mailboxes/{mailbox_id}/microsoft/sweep", json={"actor_type": "USER", "actor_id": ACTOR_ID})

@@ -970,6 +970,111 @@ def test_reprocess_gmail_quota_governor_paces_only_actually_processed_candidates
     assert sleep.calls == pytest.approx([0.30, 0.30])
 
 
+def test_resolve_domain_review_allow_resume_after_interrupted_backfill_only_paces_governor_for_candidates_actually_processed_in_the_retry(monkeypatch):
+    """CD-6 GUI-operations-foundation follow-on WO — resumable ALLOW
+    MUST_READ historical backfill (`services.mailbox.review_resolution
+    .resolve_domain_review`), Gmail-specific regression: the shared
+    `_GmailMetadataFetchGovernor` must only ever be consulted for
+    candidates the RETRY call actually (re-)processes, never for a
+    candidate that already reached a final state on an earlier attempt.
+
+    Two candidates (`gm1`, `gm2`) from an unknown domain are discovered
+    (2 governor `wait()` calls). The domain is then approved via
+    `resolve_domain_review` ALLOW: `gm1`'s own fresh headers refresh
+    succeeds and it is fully ingested (a 3rd governor `wait()`); `gm2`'s
+    own fresh headers refresh then hits a genuine provider error (a 4th
+    governor `wait()` — the governor is consulted BEFORE the underlying
+    API call, regardless of the call's own outcome), which propagates
+    out of `resolve_domain_review` uncaught. An identical retry resumes
+    ONLY `gm2` — `gm1` is no longer `CHECKED_NOT_CANDIDATE` and is never
+    returned by the candidate query at all, so it can never reach
+    `fetch_message_headers`/the governor a second time. Exactly ONE more
+    governor `wait()` (a 5th) occurs on retry."""
+    from datetime import datetime as _datetime, timezone as _timezone
+
+    from core.errors import ConflictError as _ConflictError
+    from services.mailbox.review_resolution import resolve_domain_review
+
+    h = Harness(allow_default_domain=False)
+    clock = _FakeMonotonicClock()
+    sleep = _FakeSleep(clock)
+    h.adapter = GmailMailboxAdapter(
+        oauth_client=h.oauth_client, gmail_client=h.gmail_client, token_store=h.token_store,
+        mailbox_repository=h.mailbox_repo, monotonic_fn=clock, sleep_fn=sleep,
+    )
+
+    domain = "quota-resume.example"
+    h.queue_discovery()
+    h.queue_folder_round(
+        message_ids=("gm1", "gm2"),
+        metadata_by_id={
+            "gm1": _metadata("gm1", subject="Invoice", sender=f"billing@{domain}", internal_date=_datetime(2024, 1, 1, 12, 0, tzinfo=_timezone.utc)),
+            "gm2": _metadata("gm2", subject="Invoice", sender=f"billing@{domain}", internal_date=_datetime(2024, 1, 1, 12, 1, tzinfo=_timezone.utc)),
+        },
+    )
+    h.sweep()
+    # Discovery: 2 sequential metadata fetches -> the SECOND one sleeps.
+    assert sleep.calls == pytest.approx([0.30])
+
+    items = [
+        i for i in h.needs_you_repo.list_needs_you_items(item_type=ITEM_TYPE_MAILBOX_DOMAIN_REVIEW)
+        if i.metadata.get("mailbox_id") == h.mailbox.mailbox_id
+    ]
+    assert len(items) == 1
+    item = items[0]
+
+    # gm1's own fresh headers refresh — genuine, trusted PASS.
+    h.gmail_client.queue_metadata_result(
+        GmailMessageMetadataResult(
+            status=GmailOutcomeStatus.OK,
+            metadata=_metadata("gm1", subject="Invoice", sender=f"billing@{domain}", extra_headers=_genuine_trusted_gmail_headers(domain=domain)),
+        )
+    )
+    h.queue_content(body=f"From: billing@{domain}\r\nSubject: Invoice\r\n\r\nBody".encode())
+    # gm2's own fresh headers refresh — a genuine provider error (still
+    # consumes the governor's own `wait()` first, per
+    # `GmailMailboxAdapter.fetch_message_headers`'s own ordering).
+    h.gmail_client.queue_metadata_result(GmailMessageMetadataResult(status=GmailOutcomeStatus.PERMISSION_ERROR, error_detail="simulated"))
+
+    kwargs = dict(
+        needs_you_repository=h.needs_you_repo, mailbox_message_repository=h.message_repo,
+        mailbox_domain_rule_repository=h.domain_rule_repo, entity_repository=h.api.entity_repository,
+        api=h.api, object_store=h.object_store, scanner=h.scanner, adapter=h.adapter, mailbox=h.mailbox,
+        mailbox_id=h.mailbox.mailbox_id, mailbox_source_id=h.source_id, item_id=item.item_id,
+        actor_type="SYSTEM", actor_id="test", decision="ALLOW", destination_entity_id=None,
+        destination_mode="REVIEW_REQUIRED", match_mode="EXACT", processor_hint=None, sender_address=None,
+    )
+    with pytest.raises(_ConflictError):
+        resolve_domain_review(**kwargs)
+
+    # 2 discovery waits + 2 reprocess waits (gm1 success, gm2 failed
+    # attempt) = 4 total -> 3 sleeps (first-ever call never sleeps).
+    assert sleep.calls == pytest.approx([0.30, 0.30, 0.30])
+    refreshed_item = h.needs_you_repo.get_needs_you_item(item.item_id)
+    assert refreshed_item.status == "OPEN"
+    gm1_msg = h.message_repo.find_by_provider_id(h.mailbox.mailbox_id, "gm1")
+    assert gm1_msg.ingestion_status == INGESTION_STATUS_INGESTED
+    gm2_msg = h.message_repo.find_by_provider_id(h.mailbox.mailbox_id, "gm2")
+    assert gm2_msg.ingestion_status == INGESTION_STATUS_CHECKED_NOT_CANDIDATE
+
+    # Retry — resumes ONLY gm2; gm1 must never touch the governor again.
+    h.gmail_client.queue_metadata_result(
+        GmailMessageMetadataResult(
+            status=GmailOutcomeStatus.OK,
+            metadata=_metadata("gm2", subject="Invoice", sender=f"billing@{domain}", extra_headers=_genuine_trusted_gmail_headers(domain=domain)),
+        )
+    )
+    h.queue_content(body=f"From: billing@{domain}\r\nSubject: Invoice\r\n\r\nBody".encode())
+
+    result = resolve_domain_review(**kwargs)
+
+    assert [m["mailbox_message_id"] for m in result["reprocessed_messages"]] == [gm2_msg.mailbox_message_id]
+    assert result["needs_you_item"]["status"] == "RESOLVED"
+    # Exactly ONE more governor wait() during the retry (a 4th sleep) —
+    # never a 5th, which would mean gm1 was wrongly re-consulted.
+    assert sleep.calls == pytest.approx([0.30, 0.30, 0.30, 0.30])
+
+
 # -- precondition -----------------------------------------------------------
 
 

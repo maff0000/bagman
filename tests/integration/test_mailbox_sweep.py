@@ -3154,3 +3154,632 @@ def test_unexpected_persistence_error_uses_persistence_error_code_and_sanitized_
 
     token = h.lock.try_acquire(h.mailbox.mailbox_id)
     h.lock.release(h.mailbox.mailbox_id, token)
+
+
+# =======================================================================
+# CD-6 GUI-operations-foundation follow-on WO — resumable ALLOW MUST_READ
+# historical backfill. `services.mailbox.review_resolution.resolve_domain_review`
+# was reordered so a genuine provider/transport failure PARTWAY through
+# `reprocess_all_historical_candidates_for_domain` (raised as
+# `core.errors.ConflictError` — see `sweep.py`'s own `_reprocess_one_message`)
+# leaves the item OPEN and the already-upserted `MailboxDomainRule`
+# durable, so an IDENTICAL retry of the same decision RESUMES the
+# backfill rather than hitting the old blanket "already RESOLVED"
+# idempotent no-op and silently abandoning the stranded candidates
+# forever. See `services.mailbox.review_resolution.resolve_domain_review`'s
+# own docstring for the full ordering/retry/self-heal contract these
+# tests prove.
+# =======================================================================
+
+
+class _ContentKeyedScanner(EvidenceSafetyScanner):
+    """Deterministic per-message scan verdict driven by a marker inside
+    the raw MIME body — lets ONE `resolve_domain_review`/
+    `reprocess_all_historical_candidates_for_domain` run exercise both a
+    clean-ingest and a quarantine outcome within the SAME batch
+    (`Harness.scanner` is otherwise one fixed verdict shared across
+    every message in a Harness)."""
+
+    def scan(self, content):
+        # `content` is a `Path` to the spooled file (see
+        # `services.evidence.intake.scanner.EvidenceSafetyScanner.scan`'s
+        # own `Union[Path, bytes]` signature) — read it before inspecting.
+        data = content.read_bytes() if hasattr(content, "read_bytes") else content
+        if b"QUARANTINE-ME" in data:
+            return ScanResult(ScanVerdict.MALICIOUS, detail="eicar")
+        return ScanResult(ScanVerdict.CLEAN, detail="clean")
+
+    def is_available(self):
+        return True
+
+
+_RESUME_FAIL_AUTH_HEADERS = GraphMessageHeadersResult(
+    status=GraphOutcomeStatus.OK,
+    raw_headers=(
+        {
+            "name": "Authentication-Results",
+            "value": "spf=fail smtp.mailfrom=vendor.com; dkim=fail header.d=vendor.com; "
+            "dmarc=fail action=quarantine header.from=vendor.com; compauth=fail reason=001",
+        },
+    ),
+)
+
+
+def _open_domain_review_item(h, domain):
+    items = [
+        i
+        for i in h.needs_you_repo.list_needs_you_items(item_type=ITEM_TYPE_MAILBOX_DOMAIN_REVIEW)
+        if i.metadata.get("mailbox_id") == h.mailbox.mailbox_id and i.metadata.get("sender_domain") == domain
+    ]
+    assert len(items) == 1, f"expected exactly one OPEN MAILBOX_DOMAIN_REVIEW item for {domain!r}, got {len(items)}"
+    return items[0]
+
+
+def test_resolve_domain_review_allow_open_full_success_all_candidates_ingested_rule_created_once():
+    """Baseline (proof #1): three eligible candidates all succeed in ONE
+    `resolve_domain_review` ALLOW call — rule created exactly once,
+    exactly one `MAILBOX_DOMAIN_RULE_MUST_READ` audit event, the item
+    resolves ONLY after the backfill completes, and all 3 come back in
+    `reprocessed_messages`."""
+    from services.mailbox.review_resolution import resolve_domain_review
+
+    h = Harness(allow_default_domain=False)
+    domain = "resume-success.example"
+    h.graph_client.queue_delta_result(
+        GraphDeltaPageResult(
+            status=GraphOutcomeStatus.OK,
+            messages=(
+                _msg("s1", sender_address=f"billing@{domain}", received_at=datetime(2024, 1, 1, 12, 0, tzinfo=timezone.utc)),
+                _msg("s2", sender_address=f"billing@{domain}", received_at=datetime(2024, 1, 1, 12, 1, tzinfo=timezone.utc)),
+                _msg("s3", sender_address=f"billing@{domain}", received_at=datetime(2024, 1, 1, 12, 2, tzinfo=timezone.utc)),
+            ),
+            delta_link="d1",
+        )
+    )
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link="d-junk"))
+    h.sweep()
+    item = _open_domain_review_item(h, domain)
+
+    for _ in range(3):
+        h.graph_client.queue_headers_result(_headers_ok())
+        h.graph_client.queue_content_result(_content())
+
+    result = resolve_domain_review(
+        needs_you_repository=h.needs_you_repo, mailbox_message_repository=h.message_repo,
+        mailbox_domain_rule_repository=h.domain_rule_repo, entity_repository=h.api.entity_repository,
+        api=h.api, object_store=h.object_store, scanner=h.scanner, adapter=h.adapter, mailbox=h.mailbox,
+        mailbox_id=h.mailbox.mailbox_id, mailbox_source_id=h.source_id, item_id=item.item_id,
+        actor_type="SYSTEM", actor_id="test", decision="ALLOW", destination_entity_id=None,
+        destination_mode="REVIEW_REQUIRED", match_mode="EXACT", processor_hint=None, sender_address=None,
+    )
+
+    assert result["needs_you_item"]["status"] == "RESOLVED"
+    assert len(result["reprocessed_messages"]) == 3
+    assert {m["ingestion_status"] for m in result["reprocessed_messages"]} == {"INGESTED"}
+    audit_events = h.api.audit_repository.list_recent(limit=50, event_type_prefix="MAILBOX_DOMAIN_RULE_MUST_READ")
+    assert len(audit_events) == 1
+    assert h.needs_you_repo.get_needs_you_item(item.item_id).status == "RESOLVED"
+
+
+def test_resolve_domain_review_allow_failure_on_first_candidate_propagates_and_retry_resumes_all_three():
+    """Proof #2: a genuine provider error on the very FIRST candidate's
+    own fresh headers refresh, before any candidate completes. The rule
+    is already durable, the item stays OPEN, zero EvidenceItems exist,
+    and exactly one `MAILBOX_DOMAIN_RULE_MUST_READ` audit event was
+    emitted (the genuine approval itself — never duplicated). The
+    exception propagates out of `resolve_domain_review` uncaught. An
+    identical retry then reuses the SAME rule (never re-upserted), never
+    emits a second audit event, and — since nothing succeeded on the
+    first attempt — reprocesses all 3 candidates."""
+    from services.mailbox.review_resolution import resolve_domain_review
+
+    h = Harness(allow_default_domain=False)
+    domain = "resume-first-fail.example"
+    h.graph_client.queue_delta_result(
+        GraphDeltaPageResult(
+            status=GraphOutcomeStatus.OK,
+            messages=(
+                _msg("f1", sender_address=f"billing@{domain}", received_at=datetime(2024, 1, 1, 12, 0, tzinfo=timezone.utc)),
+                _msg("f2", sender_address=f"billing@{domain}", received_at=datetime(2024, 1, 1, 12, 1, tzinfo=timezone.utc)),
+                _msg("f3", sender_address=f"billing@{domain}", received_at=datetime(2024, 1, 1, 12, 2, tzinfo=timezone.utc)),
+            ),
+            delta_link="d1",
+        )
+    )
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link="d-junk"))
+    h.sweep()
+    item = _open_domain_review_item(h, domain)
+
+    h.graph_client.queue_headers_result(
+        GraphMessageHeadersResult(status=GraphOutcomeStatus.PROVIDER_ERROR, error_detail="simulated transient provider error")
+    )
+
+    kwargs = dict(
+        needs_you_repository=h.needs_you_repo, mailbox_message_repository=h.message_repo,
+        mailbox_domain_rule_repository=h.domain_rule_repo, entity_repository=h.api.entity_repository,
+        api=h.api, object_store=h.object_store, scanner=h.scanner, adapter=h.adapter, mailbox=h.mailbox,
+        mailbox_id=h.mailbox.mailbox_id, mailbox_source_id=h.source_id, item_id=item.item_id,
+        actor_type="SYSTEM", actor_id="test", decision="ALLOW", destination_entity_id=None,
+        destination_mode="REVIEW_REQUIRED", match_mode="EXACT", processor_hint=None, sender_address=None,
+    )
+    with pytest.raises(ConflictError):
+        resolve_domain_review(**kwargs)
+
+    rule = h.domain_rule_repo.find_exact(mailbox_id=h.mailbox.mailbox_id, sender_domain=domain, match_mode="EXACT")
+    assert rule is not None
+    assert rule.policy == "MUST_READ"
+    assert h.needs_you_repo.get_needs_you_item(item.item_id).status == "OPEN"
+    assert h.api.evidence_repository.list_evidence() == []
+    assert h.graph_client.headers_calls == ["f1"]
+    assert h.graph_client.content_calls == []
+    audit_events = h.api.audit_repository.list_recent(limit=50, event_type_prefix="MAILBOX_DOMAIN_RULE_MUST_READ")
+    assert len(audit_events) == 1
+
+    for _ in range(3):
+        h.graph_client.queue_headers_result(_headers_ok())
+        h.graph_client.queue_content_result(_content())
+    result = resolve_domain_review(**kwargs)
+
+    assert result["mailbox_domain_rule"]["rule_id"] == rule.rule_id
+    assert len(result["reprocessed_messages"]) == 3
+    assert {m["ingestion_status"] for m in result["reprocessed_messages"]} == {"INGESTED"}
+    assert h.graph_client.headers_calls == ["f1", "f1", "f2", "f3"]
+    assert h.graph_client.content_calls == ["f1", "f2", "f3"]
+    audit_events_after = h.api.audit_repository.list_recent(limit=50, event_type_prefix="MAILBOX_DOMAIN_RULE_MUST_READ")
+    assert len(audit_events_after) == 1  # still exactly one — never duplicated on retry
+    assert len(h.api.evidence_repository.list_evidence()) == 3
+    assert result["needs_you_item"]["status"] == "RESOLVED"
+
+
+def test_resolve_domain_review_allow_failure_on_middle_candidate_never_attempts_the_third_then_retry_resumes_remaining():
+    """Proof #3: message-1 succeeds, message-2 errors, message-3 is
+    NEVER attempted in that first call (sequential, bounded execution —
+    architect §11). Retry: message-1 gets ZERO further provider calls
+    (already INGESTED, excluded by the candidate query itself);
+    message-2 and message-3 both complete."""
+    from services.mailbox.review_resolution import resolve_domain_review
+
+    h = Harness(allow_default_domain=False)
+    domain = "resume-middle-fail.example"
+    h.graph_client.queue_delta_result(
+        GraphDeltaPageResult(
+            status=GraphOutcomeStatus.OK,
+            messages=(
+                _msg("m1", sender_address=f"billing@{domain}", received_at=datetime(2024, 1, 1, 12, 0, tzinfo=timezone.utc)),
+                _msg("m2", sender_address=f"billing@{domain}", received_at=datetime(2024, 1, 1, 12, 1, tzinfo=timezone.utc)),
+                _msg("m3", sender_address=f"billing@{domain}", received_at=datetime(2024, 1, 1, 12, 2, tzinfo=timezone.utc)),
+            ),
+            delta_link="d1",
+        )
+    )
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link="d-junk"))
+    h.sweep()
+    item = _open_domain_review_item(h, domain)
+
+    h.graph_client.queue_headers_result(_headers_ok())
+    h.graph_client.queue_content_result(_content())
+    h.graph_client.queue_headers_result(
+        GraphMessageHeadersResult(status=GraphOutcomeStatus.PROVIDER_ERROR, error_detail="simulated")
+    )
+
+    kwargs = dict(
+        needs_you_repository=h.needs_you_repo, mailbox_message_repository=h.message_repo,
+        mailbox_domain_rule_repository=h.domain_rule_repo, entity_repository=h.api.entity_repository,
+        api=h.api, object_store=h.object_store, scanner=h.scanner, adapter=h.adapter, mailbox=h.mailbox,
+        mailbox_id=h.mailbox.mailbox_id, mailbox_source_id=h.source_id, item_id=item.item_id,
+        actor_type="SYSTEM", actor_id="test", decision="ALLOW", destination_entity_id=None,
+        destination_mode="REVIEW_REQUIRED", match_mode="EXACT", processor_hint=None, sender_address=None,
+    )
+    with pytest.raises(ConflictError):
+        resolve_domain_review(**kwargs)
+
+    assert h.graph_client.headers_calls == ["m1", "m2"]
+    assert h.graph_client.content_calls == ["m1"]  # m3 never attempted at all
+    assert h.needs_you_repo.get_needs_you_item(item.item_id).status == "OPEN"
+
+    h.graph_client.queue_headers_result(_headers_ok())
+    h.graph_client.queue_content_result(_content())
+    h.graph_client.queue_headers_result(_headers_ok())
+    h.graph_client.queue_content_result(_content())
+    result = resolve_domain_review(**kwargs)
+
+    assert h.graph_client.headers_calls == ["m1", "m2", "m2", "m3"]  # m1 never touched again
+    assert h.graph_client.content_calls == ["m1", "m2", "m3"]
+    assert {m["immutable_provider_message_id"] for m in result["reprocessed_messages"]} == {"m2", "m3"}
+    assert result["needs_you_item"]["status"] == "RESOLVED"
+
+
+def test_resolve_domain_review_allow_failure_on_final_candidate_then_retry_touches_only_it():
+    """Proof #4: message-1/2 succeed, message-3 errors. Prior successes
+    stay durable, item stays OPEN. Retry touches only message-3, then
+    resolves."""
+    from services.mailbox.review_resolution import resolve_domain_review
+
+    h = Harness(allow_default_domain=False)
+    domain = "resume-final-fail.example"
+    h.graph_client.queue_delta_result(
+        GraphDeltaPageResult(
+            status=GraphOutcomeStatus.OK,
+            messages=(
+                _msg("l1", sender_address=f"billing@{domain}", received_at=datetime(2024, 1, 1, 12, 0, tzinfo=timezone.utc)),
+                _msg("l2", sender_address=f"billing@{domain}", received_at=datetime(2024, 1, 1, 12, 1, tzinfo=timezone.utc)),
+                _msg("l3", sender_address=f"billing@{domain}", received_at=datetime(2024, 1, 1, 12, 2, tzinfo=timezone.utc)),
+            ),
+            delta_link="d1",
+        )
+    )
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link="d-junk"))
+    h.sweep()
+    item = _open_domain_review_item(h, domain)
+
+    h.graph_client.queue_headers_result(_headers_ok())
+    h.graph_client.queue_content_result(_content())
+    h.graph_client.queue_headers_result(_headers_ok())
+    h.graph_client.queue_content_result(_content())
+    h.graph_client.queue_headers_result(
+        GraphMessageHeadersResult(status=GraphOutcomeStatus.PROVIDER_ERROR, error_detail="simulated")
+    )
+
+    kwargs = dict(
+        needs_you_repository=h.needs_you_repo, mailbox_message_repository=h.message_repo,
+        mailbox_domain_rule_repository=h.domain_rule_repo, entity_repository=h.api.entity_repository,
+        api=h.api, object_store=h.object_store, scanner=h.scanner, adapter=h.adapter, mailbox=h.mailbox,
+        mailbox_id=h.mailbox.mailbox_id, mailbox_source_id=h.source_id, item_id=item.item_id,
+        actor_type="SYSTEM", actor_id="test", decision="ALLOW", destination_entity_id=None,
+        destination_mode="REVIEW_REQUIRED", match_mode="EXACT", processor_hint=None, sender_address=None,
+    )
+    with pytest.raises(ConflictError):
+        resolve_domain_review(**kwargs)
+
+    assert h.graph_client.headers_calls == ["l1", "l2", "l3"]
+    assert h.graph_client.content_calls == ["l1", "l2"]
+    assert h.needs_you_repo.get_needs_you_item(item.item_id).status == "OPEN"
+    for mid in ("l1", "l2"):
+        assert h.message_repo.find_by_provider_id(h.mailbox.mailbox_id, mid).ingestion_status == "INGESTED"
+
+    h.graph_client.queue_headers_result(_headers_ok())
+    h.graph_client.queue_content_result(_content())
+    result = resolve_domain_review(**kwargs)
+
+    assert h.graph_client.headers_calls == ["l1", "l2", "l3", "l3"]
+    assert h.graph_client.content_calls == ["l1", "l2", "l3"]
+    assert {m["immutable_provider_message_id"] for m in result["reprocessed_messages"]} == {"l3"}
+    assert result["needs_you_item"]["status"] == "RESOLVED"
+
+
+def test_resolve_domain_review_allow_resolved_identical_after_full_success_is_a_true_no_op():
+    """Proof #5: after a fully-successful ALLOW, submitting the EXACT
+    SAME resolution again must be a true no-op — same item (still
+    RESOLVED, unchanged), same rule, `reprocessed_messages == []`, zero
+    provider calls, zero new EvidenceItems, zero new
+    `MAILBOX_DOMAIN_RULE_MUST_READ` audit events."""
+    from services.mailbox.review_resolution import resolve_domain_review
+
+    h = Harness(allow_default_domain=False)
+    domain = "resume-noop.example"
+    h.graph_client.queue_delta_result(
+        GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(_msg("n1", sender_address=f"billing@{domain}"),), delta_link="d1")
+    )
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link="d-junk"))
+    h.sweep()
+    item = _open_domain_review_item(h, domain)
+
+    h.graph_client.queue_headers_result(_headers_ok())
+    h.graph_client.queue_content_result(_content())
+    kwargs = dict(
+        needs_you_repository=h.needs_you_repo, mailbox_message_repository=h.message_repo,
+        mailbox_domain_rule_repository=h.domain_rule_repo, entity_repository=h.api.entity_repository,
+        api=h.api, object_store=h.object_store, scanner=h.scanner, adapter=h.adapter, mailbox=h.mailbox,
+        mailbox_id=h.mailbox.mailbox_id, mailbox_source_id=h.source_id, item_id=item.item_id,
+        actor_type="SYSTEM", actor_id="test", decision="ALLOW", destination_entity_id=None,
+        destination_mode="REVIEW_REQUIRED", match_mode="EXACT", processor_hint=None, sender_address=None,
+    )
+    first = resolve_domain_review(**kwargs)
+    assert first["needs_you_item"]["status"] == "RESOLVED"
+    assert len(h.api.evidence_repository.list_evidence()) == 1
+
+    second = resolve_domain_review(**kwargs)
+
+    assert second["needs_you_item"] == first["needs_you_item"]
+    assert second["mailbox_domain_rule"]["rule_id"] == first["mailbox_domain_rule"]["rule_id"]
+    assert second["reprocessed_messages"] == []
+    assert h.graph_client.headers_calls == ["n1"]  # unchanged — no new provider calls
+    assert h.graph_client.content_calls == ["n1"]
+    assert len(h.api.evidence_repository.list_evidence()) == 1  # unchanged
+    audit_events = h.api.audit_repository.list_recent(limit=50, event_type_prefix="MAILBOX_DOMAIN_RULE_MUST_READ")
+    assert len(audit_events) == 1  # still exactly one
+
+
+def test_resolve_domain_review_allow_legacy_stranded_state_self_heals_without_reresolving_or_reauditing():
+    """Proof #6 — the legacy self-heal path: a NeedsYouItem already
+    RESOLVED with a matching ALLOW resolution, a matching
+    `MailboxDomainRule` already existing, and ONE eligible
+    `CHECKED_NOT_CANDIDATE` historical candidate still sitting there
+    untouched (simulating a real stranding from BEFORE this fix
+    existed, constructed here by going straight at the repositories,
+    bypassing `resolve_domain_review` itself — the OLD ordering this
+    fix replaces resolved the item and emitted its audit event BEFORE
+    ever attempting the backfill, so a pre-fix crash could genuinely
+    leave exactly this shape behind). Submitting the identical
+    resolution repairs the stranded candidate without ever re-resolving
+    the item or emitting a second audit event."""
+    from services.mailbox.review_resolution import resolve_domain_review
+
+    h = Harness(allow_default_domain=False)
+    domain = "legacy-selfheal.example"
+    h.graph_client.queue_delta_result(
+        GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(_msg("legacy-1", sender_address=f"billing@{domain}"),), delta_link="d1")
+    )
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link="d-junk"))
+    h.sweep()
+    item = _open_domain_review_item(h, domain)
+
+    legacy_rule = h.domain_rule_repo.upsert_rule(
+        mailbox_id=h.mailbox.mailbox_id, sender_domain=domain, match_mode="EXACT", policy="MUST_READ",
+        destination_entity_id=None, destination_mode="REVIEW_REQUIRED", source="OPERATOR",
+    )
+    legacy_resolution = {
+        "decision": "ALLOW", "destination_entity_id": None, "destination_mode": "REVIEW_REQUIRED",
+        "match_mode": "EXACT", "sender_address": None,
+    }
+    h.needs_you_repo.resolve_needs_you_item(
+        item.item_id, new_status="RESOLVED", resolution=legacy_resolution, actor_type="SYSTEM", actor_id="test"
+    )
+    candidate = h.message_repo.find_by_provider_id(h.mailbox.mailbox_id, "legacy-1")
+    assert candidate.ingestion_status == INGESTION_STATUS_CHECKED_NOT_CANDIDATE
+
+    h.graph_client.queue_headers_result(_headers_ok())
+    h.graph_client.queue_content_result(_content())
+
+    result = resolve_domain_review(
+        needs_you_repository=h.needs_you_repo, mailbox_message_repository=h.message_repo,
+        mailbox_domain_rule_repository=h.domain_rule_repo, entity_repository=h.api.entity_repository,
+        api=h.api, object_store=h.object_store, scanner=h.scanner, adapter=h.adapter, mailbox=h.mailbox,
+        mailbox_id=h.mailbox.mailbox_id, mailbox_source_id=h.source_id, item_id=item.item_id,
+        actor_type="SYSTEM", actor_id="test", decision="ALLOW", destination_entity_id=None,
+        destination_mode="REVIEW_REQUIRED", match_mode="EXACT", processor_hint=None, sender_address=None,
+    )
+
+    assert len(result["reprocessed_messages"]) == 1
+    assert result["reprocessed_messages"][0]["mailbox_message_id"] == candidate.mailbox_message_id
+    assert result["reprocessed_messages"][0]["ingestion_status"] == "INGESTED"
+    refreshed_item = h.needs_you_repo.get_needs_you_item(item.item_id)
+    assert refreshed_item.status == "RESOLVED"
+    assert refreshed_item.resolution == legacy_resolution
+    audit_events = h.api.audit_repository.list_recent(limit=50, event_type_prefix="MAILBOX_DOMAIN_RULE_MUST_READ")
+    assert len(audit_events) == 0  # the legacy item's own approval predates this test's own audit log
+    refreshed_rule = h.domain_rule_repo.get_rule(legacy_rule.rule_id)
+    assert refreshed_rule.rule_id == legacy_rule.rule_id
+    assert refreshed_rule.updated_at == legacy_rule.updated_at  # never refreshed
+
+
+def test_resolve_domain_review_allow_open_item_conflicts_on_a_pre_existing_differently_configured_exact_rule():
+    """Proof #7: an ``OPEN`` item, but an exact rule already exists at
+    that identity with a DIFFERENT ``destination_mode`` than what is
+    being requested now — a genuine, deliberate policy-change attempt,
+    never a resumable retry. Must raise ``ConflictError`` and must NOT
+    silently overwrite the existing rule."""
+    from services.mailbox.review_resolution import resolve_domain_review
+
+    h = Harness(allow_default_domain=False)
+    domain = "conflict-semantics.example"
+    h.graph_client.queue_delta_result(
+        GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(_msg("c1", sender_address=f"billing@{domain}"),), delta_link="d1")
+    )
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link="d-junk"))
+    h.sweep()
+    item = _open_domain_review_item(h, domain)
+
+    existing_rule = h.domain_rule_repo.upsert_rule(
+        mailbox_id=h.mailbox.mailbox_id, sender_domain=domain, match_mode="EXACT", policy="MUST_READ",
+        destination_entity_id=h.entity.entity_id, destination_mode="FIXED", source="OPERATOR",
+    )
+
+    with pytest.raises(ConflictError):
+        resolve_domain_review(
+            needs_you_repository=h.needs_you_repo, mailbox_message_repository=h.message_repo,
+            mailbox_domain_rule_repository=h.domain_rule_repo, entity_repository=h.api.entity_repository,
+            api=h.api, object_store=h.object_store, scanner=h.scanner, adapter=h.adapter, mailbox=h.mailbox,
+            mailbox_id=h.mailbox.mailbox_id, mailbox_source_id=h.source_id, item_id=item.item_id,
+            actor_type="SYSTEM", actor_id="test", decision="ALLOW", destination_entity_id=None,
+            destination_mode="REVIEW_REQUIRED", match_mode="EXACT", processor_hint=None, sender_address=None,
+        )
+
+    assert h.needs_you_repo.get_needs_you_item(item.item_id).status == "OPEN"
+    refreshed_rule = h.domain_rule_repo.get_rule(existing_rule.rule_id)
+    assert refreshed_rule.destination_mode == "FIXED"
+    assert refreshed_rule.destination_entity_id == h.entity.entity_id
+    assert refreshed_rule.updated_at == existing_rule.updated_at
+    audit_events = h.api.audit_repository.list_recent(limit=50, event_type_prefix="MAILBOX_DOMAIN_RULE_MUST_READ")
+    assert len(audit_events) == 0
+    assert h.graph_client.headers_calls == []
+
+
+def test_resolve_domain_review_allow_mixed_governed_outcomes_in_one_batch_never_stop_the_batch_or_leave_the_item_open():
+    """Proof #8: SECURITY_REVIEW (failed auth), VANISHED (content 404),
+    QUARANTINED (malicious scan verdict) and a normal INGESTED outcome
+    all in the SAME ALLOW call. None of these governed, non-raising
+    per-message outcomes are orchestration failures — the call completes
+    normally, the item resolves, and every candidate reaches its own
+    correct terminal state."""
+    from services.mailbox.review_resolution import resolve_domain_review
+
+    h = Harness(allow_default_domain=False, scanner=_ContentKeyedScanner())
+    domain = "mixed-outcomes.example"
+    h.graph_client.queue_delta_result(
+        GraphDeltaPageResult(
+            status=GraphOutcomeStatus.OK,
+            messages=(
+                _msg("mix-ingest", sender_address=f"billing@{domain}", received_at=datetime(2024, 1, 1, 12, 0, tzinfo=timezone.utc)),
+                _msg("mix-secreview", sender_address=f"billing@{domain}", received_at=datetime(2024, 1, 1, 12, 1, tzinfo=timezone.utc)),
+                _msg("mix-vanished", sender_address=f"billing@{domain}", received_at=datetime(2024, 1, 1, 12, 2, tzinfo=timezone.utc)),
+                _msg("mix-quarantine", sender_address=f"billing@{domain}", received_at=datetime(2024, 1, 1, 12, 3, tzinfo=timezone.utc)),
+            ),
+            delta_link="d1",
+        )
+    )
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link="d-junk"))
+    h.sweep()
+    item = _open_domain_review_item(h, domain)
+
+    # mix-ingest: passes auth, clean content -> INGESTED.
+    h.graph_client.queue_headers_result(_headers_ok())
+    h.graph_client.queue_content_result(_content(body=b"From: x\r\nSubject: Invoice\r\n\r\nBody"))
+    # mix-secreview: fails auth -> SECURITY_REVIEW, never reaches MIME fetch.
+    h.graph_client.queue_headers_result(_RESUME_FAIL_AUTH_HEADERS)
+    # mix-vanished: passes auth, content vanished -> VANISHED.
+    h.graph_client.queue_headers_result(_headers_ok())
+    h.graph_client.queue_content_result(GraphMessageContentResult(status=GraphOutcomeStatus.NOT_FOUND))
+    # mix-quarantine: passes auth, malicious content -> QUARANTINED.
+    h.graph_client.queue_headers_result(_headers_ok())
+    h.graph_client.queue_content_result(_content(body=b"From: x\r\nSubject: Invoice\r\n\r\nQUARANTINE-ME"))
+
+    result = resolve_domain_review(
+        needs_you_repository=h.needs_you_repo, mailbox_message_repository=h.message_repo,
+        mailbox_domain_rule_repository=h.domain_rule_repo, entity_repository=h.api.entity_repository,
+        api=h.api, object_store=h.object_store, scanner=h.scanner, adapter=h.adapter, mailbox=h.mailbox,
+        mailbox_id=h.mailbox.mailbox_id, mailbox_source_id=h.source_id, item_id=item.item_id,
+        actor_type="SYSTEM", actor_id="test", decision="ALLOW", destination_entity_id=None,
+        destination_mode="REVIEW_REQUIRED", match_mode="EXACT", processor_hint=None, sender_address=None,
+    )
+
+    assert result["needs_you_item"]["status"] == "RESOLVED"
+    statuses = {m["immutable_provider_message_id"]: m["ingestion_status"] for m in result["reprocessed_messages"]}
+    assert statuses["mix-ingest"] == "INGESTED"
+    assert statuses["mix-secreview"] == INGESTION_STATUS_SECURITY_REVIEW
+    assert statuses["mix-vanished"] == INGESTION_STATUS_VANISHED
+    assert statuses["mix-quarantine"] == "QUARANTINED"
+    escalation_items = h.needs_you_repo.list_needs_you_items(item_type=ITEM_TYPE_MAILBOX_AUTHENTICATION_ESCALATION)
+    assert len(escalation_items) == 1
+
+
+def test_resolve_domain_review_ignore_regression_never_calls_backfill_and_resolves_immediately():
+    """Proof #9 (Batch 1A / IGNORE regression): IGNORE keeps its
+    original, simple shape byte-for-byte — creates the BLACKLIST rule,
+    resolves the item immediately, never calls the historical backfill
+    function at all."""
+    from services.mailbox.review_resolution import resolve_domain_review
+
+    h = Harness(allow_default_domain=False)
+    domain = "ignore-regression.example"
+    h.graph_client.queue_delta_result(
+        GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(_msg("ig1", sender_address=f"billing@{domain}"),), delta_link="d1")
+    )
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link="d-junk"))
+    h.sweep()
+    item = _open_domain_review_item(h, domain)
+
+    result = resolve_domain_review(
+        needs_you_repository=h.needs_you_repo, mailbox_message_repository=h.message_repo,
+        mailbox_domain_rule_repository=h.domain_rule_repo, entity_repository=h.api.entity_repository,
+        api=h.api, object_store=h.object_store, scanner=h.scanner, adapter=h.adapter, mailbox=h.mailbox,
+        mailbox_id=h.mailbox.mailbox_id, mailbox_source_id=h.source_id, item_id=item.item_id,
+        actor_type="SYSTEM", actor_id="test", decision="IGNORE", destination_entity_id=None,
+        destination_mode=None, match_mode="EXACT", processor_hint=None, sender_address=None,
+    )
+
+    assert result["mailbox_domain_rule"]["policy"] == "BLACKLIST"
+    assert result["needs_you_item"]["status"] == "RESOLVED"
+    assert result["reprocessed_messages"] == []
+    assert h.graph_client.headers_calls == []
+    assert h.graph_client.content_calls == []
+    candidate = h.message_repo.find_by_provider_id(h.mailbox.mailbox_id, "ig1")
+    assert candidate.ingestion_status == INGESTION_STATUS_CHECKED_NOT_CANDIDATE
+
+
+def test_resolve_domain_review_keep_gray_regression_stays_open_unaffected_by_item_status():
+    """Proof #10: KEEP_GRAY keeps its original shape — creates the
+    GRAYLIST rule, item stays OPEN, `reprocessed_messages == []`,
+    entirely unaffected by (and evaluated before any check of)
+    `item.status`."""
+    from services.mailbox.review_resolution import resolve_domain_review
+
+    h = Harness(allow_default_domain=False)
+    domain = "keepgray-regression.example"
+    h.graph_client.queue_delta_result(
+        GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(_msg("kg1", sender_address=f"billing@{domain}"),), delta_link="d1")
+    )
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link="d-junk"))
+    h.sweep()
+    item = _open_domain_review_item(h, domain)
+
+    result = resolve_domain_review(
+        needs_you_repository=h.needs_you_repo, mailbox_message_repository=h.message_repo,
+        mailbox_domain_rule_repository=h.domain_rule_repo, entity_repository=h.api.entity_repository,
+        api=h.api, object_store=h.object_store, scanner=h.scanner, adapter=h.adapter, mailbox=h.mailbox,
+        mailbox_id=h.mailbox.mailbox_id, mailbox_source_id=h.source_id, item_id=item.item_id,
+        actor_type="SYSTEM", actor_id="test", decision="KEEP_GRAY", destination_entity_id=None,
+        destination_mode=None, match_mode="EXACT", processor_hint=None, sender_address=None,
+    )
+
+    assert result["mailbox_domain_rule"]["policy"] == "GRAYLIST"
+    assert result["reprocessed_messages"] == []
+    assert h.needs_you_repo.get_needs_you_item(item.item_id).status == "OPEN"
+    assert h.graph_client.headers_calls == []
+    assert h.graph_client.content_calls == []
+
+
+def test_resolve_domain_review_allow_resume_after_middle_failure_still_respects_effective_rule_scoping():
+    """Proof #11: a resumed backfill must still correctly skip a
+    candidate governed by a MORE SPECIFIC pre-existing BLACKLIST/
+    EXACT_ADDRESS override — zero provider calls for it, in BOTH the
+    first (interrupted) call and the retry — never regressing the
+    `58be986` effective-rule-scoping fix."""
+    from services.mailbox.review_resolution import resolve_domain_review
+
+    h = Harness(allow_default_domain=False)
+    domain = "resume-scoping.example"
+    blocked_address = f"blocked@{domain}"
+    h.domain_rule_repo.upsert_rule(
+        mailbox_id=h.mailbox.mailbox_id, sender_domain=domain, match_mode="EXACT_ADDRESS", policy="BLACKLIST",
+        destination_entity_id=None, destination_mode=None, source="OPERATOR", sender_address=blocked_address,
+    )
+    h.graph_client.queue_delta_result(
+        GraphDeltaPageResult(
+            status=GraphOutcomeStatus.OK,
+            messages=(
+                _msg("skip-1", sender_address=blocked_address, received_at=datetime(2024, 1, 1, 11, 59, tzinfo=timezone.utc)),
+                _msg("scope-m1", sender_address=f"billing@{domain}", received_at=datetime(2024, 1, 1, 12, 0, tzinfo=timezone.utc)),
+                _msg("scope-m2", sender_address=f"billing@{domain}", received_at=datetime(2024, 1, 1, 12, 1, tzinfo=timezone.utc)),
+                _msg("scope-m3", sender_address=f"billing@{domain}", received_at=datetime(2024, 1, 1, 12, 2, tzinfo=timezone.utc)),
+            ),
+            delta_link="d1",
+        )
+    )
+    h.graph_client.queue_delta_result(GraphDeltaPageResult(status=GraphOutcomeStatus.OK, messages=(), delta_link="d-junk"))
+    h.sweep()
+    item = _open_domain_review_item(h, domain)
+
+    h.graph_client.queue_headers_result(_headers_ok())
+    h.graph_client.queue_content_result(_content())
+    h.graph_client.queue_headers_result(GraphMessageHeadersResult(status=GraphOutcomeStatus.PROVIDER_ERROR, error_detail="simulated"))
+
+    kwargs = dict(
+        needs_you_repository=h.needs_you_repo, mailbox_message_repository=h.message_repo,
+        mailbox_domain_rule_repository=h.domain_rule_repo, entity_repository=h.api.entity_repository,
+        api=h.api, object_store=h.object_store, scanner=h.scanner, adapter=h.adapter, mailbox=h.mailbox,
+        mailbox_id=h.mailbox.mailbox_id, mailbox_source_id=h.source_id, item_id=item.item_id,
+        actor_type="SYSTEM", actor_id="test", decision="ALLOW", destination_entity_id=None,
+        destination_mode="REVIEW_REQUIRED", match_mode="EXACT", processor_hint=None, sender_address=None,
+    )
+    with pytest.raises(ConflictError):
+        resolve_domain_review(**kwargs)
+
+    assert "skip-1" not in h.graph_client.headers_calls
+    assert h.graph_client.headers_calls == ["scope-m1", "scope-m2"]
+    assert h.graph_client.content_calls == ["scope-m1"]
+    skip_msg = h.message_repo.find_by_provider_id(h.mailbox.mailbox_id, "skip-1")
+    assert skip_msg.ingestion_status == INGESTION_STATUS_CHECKED_NOT_CANDIDATE
+
+    h.graph_client.queue_headers_result(_headers_ok())
+    h.graph_client.queue_content_result(_content())
+    h.graph_client.queue_headers_result(_headers_ok())
+    h.graph_client.queue_content_result(_content())
+    result = resolve_domain_review(**kwargs)
+
+    assert "skip-1" not in h.graph_client.headers_calls  # never touched, even on retry
+    assert h.graph_client.headers_calls == ["scope-m1", "scope-m2", "scope-m2", "scope-m3"]
+    assert len(result["reprocessed_messages"]) == 2
+    assert {m["immutable_provider_message_id"] for m in result["reprocessed_messages"]} == {"scope-m2", "scope-m3"}
+    skip_msg_after = h.message_repo.find_by_provider_id(h.mailbox.mailbox_id, "skip-1")
+    assert skip_msg_after.ingestion_status == INGESTION_STATUS_CHECKED_NOT_CANDIDATE
