@@ -733,3 +733,166 @@ def test_no_hardcoded_company_truth_anywhere_in_static_ui():
         "(shell/entities.js::listEntities()), the one canonical source (PID §98.3/§98.4):\n"
         + "\n".join(violations)
     )
+
+
+# ---------------------------------------------------------------------
+# CD-6 Slice 5 WI-1 — EvidenceClassification/EvidenceClassificationRule
+# architecture-boundary proofs (WO §39-44's own explicit list).
+# ---------------------------------------------------------------------
+
+_CLASSIFICATION_MODULE_PATHS = [
+    REPO_ROOT / "services" / "evidence" / "classification.py",
+    REPO_ROOT / "services" / "evidence" / "classification_rule.py",
+    REPO_ROOT / "persistence" / "postgres" / "evidence_classification_models.py",
+    REPO_ROOT / "persistence" / "postgres" / "evidence_classification_repository.py",
+    REPO_ROOT / "persistence" / "postgres" / "evidence_classification_rule_models.py",
+    REPO_ROOT / "persistence" / "postgres" / "evidence_classification_rule_repository.py",
+]
+
+
+def test_evidence_classification_code_never_mutates_evidence_item():
+    """PID/WO invariant: classification code may reference `EvidenceItem`
+    (via `evidence_id`/`EvidenceItemRow`) but must never mutate it — the
+    only two EvidenceItem mutation paths anywhere in this codebase are
+    `EvidenceRepository.update_status`/`assign_entity`; neither may ever
+    be called from classification code, and no classification module
+    may write to an `EvidenceItemRow`'s own columns (the Postgres
+    repository's `SELECT ... FOR UPDATE` lock on `evidence_items` is
+    read-only — it exists purely to serialise the expected-current
+    check, never to change the row it locks)."""
+    forbidden_substrings = [
+        ".update_status(", ".assign_entity(",
+        "evidence_row.status", "evidence_row.entity_id", "evidence_row.evidence_type",
+        "evidence_row.mime_type", "evidence_row.size_bytes", "evidence_row.content_hash",
+    ]
+    violations = []
+    for path in _CLASSIFICATION_MODULE_PATHS:
+        text = path.read_text(encoding="utf-8")
+        for pattern in forbidden_substrings:
+            if pattern in text:
+                violations.append(f"{path.relative_to(REPO_ROOT)} contains {pattern!r}")
+    assert violations == [], (
+        "CD-6 Slice 5 WI-1 classification code must never mutate EvidenceItem — violations:\n"
+        + "\n".join(violations)
+    )
+
+
+def test_evidence_classification_migration_never_touches_evidence_items():
+    """The WI-1 migration is purely additive — two brand new tables,
+    zero modification to any existing table (in particular
+    `evidence_items` itself)."""
+    migration_path = REPO_ROOT / "alembic" / "versions" / "b4d8f1a92c65_evidence_classification.py"
+    assert migration_path.is_file(), f"expected {migration_path} to exist"
+    text = migration_path.read_text(encoding="utf-8")
+    forbidden_substrings = [
+        "add_column('evidence_items'", 'add_column("evidence_items"',
+        "alter_column('evidence_items'", 'alter_column("evidence_items"',
+        "drop_column('evidence_items'", 'drop_column("evidence_items"',
+    ]
+    violations = [p for p in forbidden_substrings if p in text]
+    assert violations == [], (
+        f"{migration_path.relative_to(REPO_ROOT)} must never modify evidence_items — found: {violations}"
+    )
+
+
+def test_classification_modules_never_import_ai_provider_or_gateway_code():
+    """CD-6 Slice 5 WI-1 is persistence/domain only — no AI execution.
+    Neither classification module may import anything under
+    `ai.providers`/`ai.gateway`/`ai.prompts` (the orchestration layers a
+    future WI-3 would wire up), only the neutral `ai.invocation` domain
+    model (`AIInvocation`/`AIInvocationRepository`, for type-shape/DI
+    purposes and existence-checking `.get_invocation`)."""
+    forbidden_ai_submodules = {"ai.providers", "ai.gateway", "ai.prompts", "ai.tasks"}
+    violations = []
+    for path in [
+        REPO_ROOT / "services" / "evidence" / "classification.py",
+        REPO_ROOT / "services" / "evidence" / "classification_rule.py",
+        REPO_ROOT / "persistence" / "postgres" / "evidence_classification_repository.py",
+        REPO_ROOT / "persistence" / "postgres" / "evidence_classification_rule_repository.py",
+    ]:
+        for imp in _imports_of(path):
+            if any(imp.full == mod or imp.full.startswith(mod + ".") for mod in forbidden_ai_submodules):
+                violations.append(f"{path.relative_to(REPO_ROOT)}:{imp.lineno} imports {imp.full!r}")
+    assert violations == [], (
+        "CD-6 Slice 5 WI-1 classification code must never import AI orchestration code — violations:\n"
+        + "\n".join(violations)
+    )
+
+
+def test_classification_rule_module_never_imports_mailbox_sweep_or_provider_adapters():
+    """`services.evidence.classification_rule` is authorised to import
+    ONLY the pure normalization helpers from `services.mailbox.domain_rule`
+    (see that module's own docstring) — never `services.mailbox.sweep`,
+    nor any provider-facing adapter neighbour
+    (`services.mailbox.microsoft`/`services.mailbox.gmail`/
+    `services.mailbox.imap`)."""
+    path = REPO_ROOT / "services" / "evidence" / "classification_rule.py"
+    forbidden_mailbox_submodules = (
+        "services.mailbox.sweep",
+        "services.mailbox.microsoft",
+        "services.mailbox.gmail",
+        "services.mailbox.imap",
+        "services.mailbox.message",
+        "services.mailbox.mailbox",
+    )
+    violations = []
+    for imp in _imports_of(path):
+        if any(imp.full == mod or imp.full.startswith(mod + ".") for mod in forbidden_mailbox_submodules):
+            violations.append(f"{path.relative_to(REPO_ROOT)}:{imp.lineno} imports {imp.full!r}")
+    assert violations == [], (
+        "services/evidence/classification_rule.py must never import mailbox sweep/provider-adapter code, only "
+        "services.mailbox.domain_rule's pure normalization helpers — violations:\n" + "\n".join(violations)
+    )
+    # Positive check: the one legitimate cross-module import really is
+    # there (this delivery's own WO-authorised exception).
+    mailbox_imports = [imp.full for imp in _imports_of(path) if imp.full.startswith("services.mailbox")]
+    assert mailbox_imports == ["services.mailbox.domain_rule"], (
+        f"expected classification_rule.py's only services.mailbox import to be "
+        f"'services.mailbox.domain_rule', found: {mailbox_imports}"
+    )
+
+
+def test_no_entity_proposal_or_needs_you_review_wiring_in_classification_modules():
+    """CD-6 Slice 5 WI-1 prohibitions: no `ENTITY_PROPOSAL` wiring, and
+    `ITEM_TYPE_CLASSIFICATION_REVIEW` (a Needs You producer) stays
+    completely untouched — zero new code anywhere references either."""
+    forbidden_tokens = ("ENTITY_PROPOSAL", "ITEM_TYPE_CLASSIFICATION_REVIEW", "run_background_task")
+    violations = []
+    for path in _CLASSIFICATION_MODULE_PATHS:
+        text = path.read_text(encoding="utf-8")
+        for token in forbidden_tokens:
+            if token in text:
+                violations.append(f"{path.relative_to(REPO_ROOT)} contains {token!r}")
+    assert violations == [], "\n".join(violations)
+
+
+def test_no_pdf_or_ocr_library_import_in_classification_modules():
+    """WI-1 is persistence/domain only — no document text-extraction
+    pipeline exists yet; classification code must never import a PDF/OCR
+    library."""
+    forbidden_roots = {
+        "fitz", "pypdf", "PyPDF2", "pdfplumber", "pytesseract", "pdf2image", "textract", "pikepdf", "pdfminer",
+    }
+    violations = []
+    for path in _CLASSIFICATION_MODULE_PATHS:
+        for imp in _imports_of(path):
+            if imp.root in forbidden_roots:
+                violations.append(f"{path.relative_to(REPO_ROOT)}:{imp.lineno} imports {imp.full!r}")
+    assert violations == [], "\n".join(violations)
+
+
+def test_no_production_content_fixture_added_for_evidence_classification():
+    """No binary/real-document fixture file was added anywhere under
+    `tests/` for this delivery — every classification/rule test uses
+    plain, synthetic, test-local values only (fabricated hashes,
+    in-memory dataclasses), nothing that could be mistaken for real
+    evidence content."""
+    forbidden_suffixes = {".pdf", ".docx", ".doc", ".png", ".jpg", ".jpeg", ".tiff", ".eml", ".msg"}
+    violations = []
+    for pattern in ("*evidence_classification*", "*classification_rule*"):
+        for path in REPO_ROOT.joinpath("tests").rglob(pattern):
+            if path.is_file() and path.suffix.lower() in forbidden_suffixes:
+                violations.append(str(path.relative_to(REPO_ROOT)))
+    assert violations == [], (
+        f"no binary/production-content fixture file may exist for this delivery's tests: {violations}"
+    )

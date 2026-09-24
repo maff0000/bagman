@@ -41,6 +41,8 @@ EXPECTED_TABLES = {
     "mailbox_microsoft_oauth_states",  # CD-6 Slice 4
     "mailbox_domain_rules",  # CD-6 architect amendment (two-stage mail processing)
     "mailbox_gmail_oauth_states",  # CD-6 GUI-operations-foundation follow-on WO (Gmail OAuth state persistence)
+    "evidence_classification_rules",  # CD-6 Slice 5 WI-1
+    "evidence_classifications",  # CD-6 Slice 5 WI-1
 }
 
 
@@ -102,6 +104,8 @@ def test_xero_migration_downgrade_genuinely_undoes_the_upgrade(postgres_containe
         "mailbox_sweep_locks", "mailbox_microsoft_oauth_states",
         "mailbox_domain_rules",  # CD-6 architect amendment, chained downstream of b7e2f5a9c1d3
         "mailbox_gmail_oauth_states",  # CD-6 GUI-ops-foundation follow-on WO, chained downstream of f7c3a58b1e9d
+        "evidence_classification_rules",  # CD-6 Slice 5 WI-1, chained downstream of a1c4e8f2d6b7
+        "evidence_classifications",  # CD-6 Slice 5 WI-1, chained downstream of a1c4e8f2d6b7
     }
     try:
         command.downgrade(cfg, "712c5a2aab92")
@@ -140,6 +144,8 @@ def test_mailbox_migration_downgrade_genuinely_undoes_the_upgrade(postgres_conta
         "mailbox_sweep_locks", "mailbox_microsoft_oauth_states",
         "mailbox_domain_rules",  # CD-6 architect amendment, chained downstream of b7e2f5a9c1d3
         "mailbox_gmail_oauth_states",  # CD-6 GUI-ops-foundation follow-on WO, chained downstream of f7c3a58b1e9d
+        "evidence_classification_rules",  # CD-6 Slice 5 WI-1, chained downstream of a1c4e8f2d6b7
+        "evidence_classifications",  # CD-6 Slice 5 WI-1, chained downstream of a1c4e8f2d6b7
     }
     try:
         command.downgrade(cfg, "5e8c1f42b9a7")
@@ -167,6 +173,8 @@ def test_mailbox_microsoft_sweep_migration_downgrade_genuinely_undoes_the_upgrad
         "mailbox_sweep_locks", "mailbox_microsoft_oauth_states",
         "mailbox_domain_rules",  # CD-6 architect amendment, chained downstream of b7e2f5a9c1d3
         "mailbox_gmail_oauth_states",  # CD-6 GUI-ops-foundation follow-on WO, chained downstream of f7c3a58b1e9d
+        "evidence_classification_rules",  # CD-6 Slice 5 WI-1, chained downstream of a1c4e8f2d6b7
+        "evidence_classifications",  # CD-6 Slice 5 WI-1, chained downstream of a1c4e8f2d6b7
     }
     try:
         command.downgrade(cfg, "a3d7c1f9e246")

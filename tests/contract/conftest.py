@@ -259,6 +259,64 @@ def make_mailbox_domain_rule(new_id, now_str) -> Callable[..., dict]:
 
 
 @pytest.fixture
+def make_evidence_classification(new_id, now_str) -> Callable[..., dict]:
+    """Factory for a minimal valid `bagman.evidence_classification.v1`
+    instance dict (CD-6 Slice 5 WI-1). Defaults to the simplest valid
+    shape — a DETERMINISTIC_RULE-sourced CLASSIFIED SUPPLIER_INVOICE —
+    callers pass source-specific overrides to build any of the other
+    valid shapes."""
+
+    def _make(**overrides: Any) -> dict:
+        instance = {
+            "classification_id": new_id(),
+            "evidence_id": new_id(),
+            "classification_type": "DOCUMENT_TYPE",
+            "document_type": "SUPPLIER_INVOICE",
+            "status": "CLASSIFIED",
+            "source": "DETERMINISTIC_RULE",
+            "confidence": None,
+            "rule_id": new_id(),
+            "ai_invocation_id": None,
+            "operator_action_id": None,
+            "reason_codes": [],
+            "supersedes_classification_id": None,
+            "created_at": now_str(),
+            "schema_version": "bagman.evidence_classification.v1",
+        }
+        instance.update(overrides)
+        return instance
+
+    return _make
+
+
+@pytest.fixture
+def make_evidence_classification_rule(new_id, now_str) -> Callable[..., dict]:
+    """Factory for a minimal valid `bagman.evidence_classification_rule.v1`
+    instance dict (CD-6 Slice 5 WI-1)."""
+
+    def _make(**overrides: Any) -> dict:
+        instance = {
+            "rule_id": new_id(),
+            "sender_scope_type": "EXACT_SENDER_DOMAIN",
+            "sender_scope_value": "vendor.com",
+            "subject_predicate_type": "EXACT",
+            "subject_predicate_value": "monthly statement",
+            "document_type": "SUPPLIER_INVOICE",
+            "status": "ACTIVE",
+            "source": "OPERATOR",
+            "supersedes_rule_id": None,
+            "created_at": now_str(),
+            "approved_at": now_str(),
+            "retired_at": None,
+            "schema_version": "bagman.evidence_classification_rule.v1",
+        }
+        instance.update(overrides)
+        return instance
+
+    return _make
+
+
+@pytest.fixture
 def make_audit_event(new_id, now_str) -> Callable[..., dict]:
     """Factory for a minimal valid `bagman.audit_event.v1` instance dict."""
 

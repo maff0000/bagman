@@ -1,0 +1,185 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://bagman.internal/contracts/evidence/bagman.evidence_classification.v1.schema.json",
+  "title": "BAGMAN EvidenceClassification",
+  "description": "An immutable, append-only classification of an EvidenceItem's document_type (CD-6 Slice 5 WI-1 — see services.evidence.classification's own module docstring). A classification row is NEVER a mutation of the EvidenceItem it references (evidence_id is a real reference, never a hard ownership/foreign column added to evidence_items itself); a row is created once and never updated in place — a correction is always a brand new row whose own supersedes_classification_id points back at the row it replaces. There is deliberately no is_current/SUPERSEDED status value anywhere in this schema: the 'current classification' for a given (evidence_id, classification_type) is defined structurally as the row no OTHER row's supersedes_classification_id points at (a real query, never a stored flag) — see services.evidence.classification.EvidenceClassificationRepository.get_current_classification.",
+  "type": "object",
+  "properties": {
+    "classification_id": {
+      "$ref": "https://bagman.internal/contracts/common/bagman.identifier.v1.schema.json",
+      "description": "Canonical BAGMAN identifier for this classification row."
+    },
+    "evidence_id": {
+      "$ref": "https://bagman.internal/contracts/common/bagman.identifier.v1.schema.json",
+      "description": "The EvidenceItem this classification is ABOUT — a real reference, proven to exist at creation time, but never a hard ownership column added to evidence_items itself."
+    },
+    "classification_type": {
+      "type": "string",
+      "pattern": "^[A-Z][A-Z_]*$",
+      "description": "Deliberately OPEN (NOT a closed enum) so a future classification dimension beyond 'what kind of document is this' never needs a contract migration to be added. Only one value is registered in V1: 'DOCUMENT_TYPE' — enforced at the Python layer (services.evidence.classification.validate_classification_fields_or_raise), not by this schema."
+    },
+    "document_type": {
+      "type": "string",
+      "enum": [
+        "SUPPLIER_INVOICE",
+        "RECEIPT",
+        "ORDER_CONFIRMATION",
+        "REFUND_CONFIRMATION",
+        "BROKER_STATEMENT",
+        "BROKER_ACTIVITY_NOTICE",
+        "NON_ACCOUNTING_DOCUMENT",
+        "UNKNOWN"
+      ],
+      "description": "The closed V1 document-type vocabulary. 'UNKNOWN' is a real, valid classification outcome (never treated as 'no classification exists') — see the status-conditional rules below for exactly when it is required vs. forbidden."
+    },
+    "status": {
+      "type": "string",
+      "enum": ["CLASSIFIED", "REVIEW_REQUIRED", "UNCLASSIFIABLE"],
+      "description": "Exactly three values — deliberately NO 'SUPERSEDED' value (supersession is expressed structurally via supersedes_classification_id, never as a status). 'CLASSIFIED' requires document_type != 'UNKNOWN'. 'UNCLASSIFIABLE' requires document_type == 'UNKNOWN'. 'REVIEW_REQUIRED' allows document_type to be any valid value (a concrete type or 'UNKNOWN') with no additional constraint. There is no persisted needs_operator_review field anywhere — it is derived (status == 'REVIEW_REQUIRED') at a later layer, never stored."
+    },
+    "source": {
+      "type": "string",
+      "enum": ["DETERMINISTIC_RULE", "AI_PROPOSAL", "OPERATOR_ASSIGNED"],
+      "description": "Who/what produced this classification. Each value carries its own closed cross-field reference/confidence shape — see the conditional rules below."
+    },
+    "confidence": {
+      "oneOf": [
+        { "type": "number", "minimum": 0.0, "maximum": 1.0 },
+        { "type": "null" }
+      ],
+      "description": "Non-null and in [0.0, 1.0] ONLY when source == 'AI_PROPOSAL'; null for every other source. Never a manufactured value — a DETERMINISTIC_RULE match is never assigned a fake confidence of 1.0."
+    },
+    "rule_id": {
+      "oneOf": [
+        { "$ref": "https://bagman.internal/contracts/common/bagman.identifier.v1.schema.json" },
+        { "type": "null" }
+      ],
+      "description": "The EvidenceClassificationRule that produced this classification — non-null ONLY when source == 'DETERMINISTIC_RULE'; null for every other source."
+    },
+    "ai_invocation_id": {
+      "oneOf": [
+        { "$ref": "https://bagman.internal/contracts/common/bagman.identifier.v1.schema.json" },
+        { "type": "null" }
+      ],
+      "description": "The AIInvocation that produced this classification (must have status == 'SUCCEEDED', enforced at the Python layer) — non-null ONLY when source == 'AI_PROPOSAL'; null for every other source."
+    },
+    "operator_action_id": {
+      "oneOf": [
+        { "type": "string", "minLength": 1 },
+        { "type": "null" }
+      ],
+      "description": "An identifier for the specific operator action that produced this classification — non-null (non-empty string) ONLY when source == 'OPERATOR_ASSIGNED'; null for every other source."
+    },
+    "reason_codes": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "description": "Bounded short machine reason codes explaining this outcome (e.g. what drove a REVIEW_REQUIRED/UNCLASSIFIABLE result) — may be empty. Must NEVER carry raw extracted document body content; V1 does not enforce a closed vocabulary or a length bound beyond 'a list of strings'."
+    },
+    "supersedes_classification_id": {
+      "oneOf": [
+        { "$ref": "https://bagman.internal/contracts/common/bagman.identifier.v1.schema.json" },
+        { "type": "null" }
+      ],
+      "description": "The prior classification row (of the SAME evidence_id + classification_type — enforced at the repository layer, not expressible by this schema alone) this row corrects. Null for the first classification in a lineage. At most one row may ever supersede a given classification_id (branch prevention, enforced at the repository/database layer)."
+    },
+    "created_at": {
+      "$ref": "https://bagman.internal/contracts/common/bagman.utc_timestamp.v1.schema.json",
+      "description": "UTC timestamp this row was created. There is no updated_at — rows are immutable after insert."
+    },
+    "schema_version": {
+      "allOf": [
+        { "$ref": "https://bagman.internal/contracts/common/bagman.schema_version.v1.schema.json" }
+      ],
+      "const": "bagman.evidence_classification.v1",
+      "description": "Must literally equal \"bagman.evidence_classification.v1\"."
+    }
+  },
+  "required": [
+    "classification_id",
+    "evidence_id",
+    "classification_type",
+    "document_type",
+    "status",
+    "source",
+    "confidence",
+    "rule_id",
+    "ai_invocation_id",
+    "operator_action_id",
+    "reason_codes",
+    "supersedes_classification_id",
+    "created_at",
+    "schema_version"
+  ],
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "description": "status == CLASSIFIED requires document_type != UNKNOWN (CD-6 Slice 5 WI-1's own status/document_type invariant, mirroring the mailbox_domain_rule contract's own match_mode-conditional allOf/if/then style).",
+      "if": {
+        "properties": { "status": { "const": "CLASSIFIED" } },
+        "required": ["status"]
+      },
+      "then": {
+        "properties": {
+          "document_type": { "not": { "const": "UNKNOWN" } }
+        }
+      }
+    },
+    {
+      "description": "status == UNCLASSIFIABLE requires document_type == UNKNOWN.",
+      "if": {
+        "properties": { "status": { "const": "UNCLASSIFIABLE" } },
+        "required": ["status"]
+      },
+      "then": {
+        "properties": {
+          "document_type": { "const": "UNKNOWN" }
+        }
+      }
+    },
+    {
+      "description": "source == DETERMINISTIC_RULE requires a real rule_id, and forbids ai_invocation_id/operator_action_id/confidence — never manufacture a confidence value for a deterministic rule match.",
+      "if": {
+        "properties": { "source": { "const": "DETERMINISTIC_RULE" } },
+        "required": ["source"]
+      },
+      "then": {
+        "properties": {
+          "rule_id": { "$ref": "https://bagman.internal/contracts/common/bagman.identifier.v1.schema.json" },
+          "ai_invocation_id": { "type": "null" },
+          "operator_action_id": { "type": "null" },
+          "confidence": { "type": "null" }
+        }
+      }
+    },
+    {
+      "description": "source == AI_PROPOSAL requires a real ai_invocation_id and a real confidence in [0.0, 1.0], and forbids rule_id/operator_action_id.",
+      "if": {
+        "properties": { "source": { "const": "AI_PROPOSAL" } },
+        "required": ["source"]
+      },
+      "then": {
+        "properties": {
+          "ai_invocation_id": { "$ref": "https://bagman.internal/contracts/common/bagman.identifier.v1.schema.json" },
+          "rule_id": { "type": "null" },
+          "operator_action_id": { "type": "null" },
+          "confidence": { "type": "number", "minimum": 0.0, "maximum": 1.0 }
+        }
+      }
+    },
+    {
+      "description": "source == OPERATOR_ASSIGNED requires a real, non-empty operator_action_id, and forbids rule_id/ai_invocation_id/confidence.",
+      "if": {
+        "properties": { "source": { "const": "OPERATOR_ASSIGNED" } },
+        "required": ["source"]
+      },
+      "then": {
+        "properties": {
+          "operator_action_id": { "type": "string", "minLength": 1 },
+          "rule_id": { "type": "null" },
+          "ai_invocation_id": { "type": "null" },
+          "confidence": { "type": "null" }
+        }
+      }
+    }
+  ]
+}

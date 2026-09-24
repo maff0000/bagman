@@ -40,6 +40,17 @@ from persistence.postgres import ai_invocation_models  # noqa: F401
 # for whoever next touches this file.)
 from persistence.postgres import xero_models  # noqa: F401
 
+# Registers EvidenceClassificationRuleRow/EvidenceClassificationRow on
+# the shared `Base.metadata` (CD-6 Slice 5 WI-1) — same reason as
+# intake_models/ai_invocation_models/xero_models above: these two
+# modules each live in their own file, so they must be imported here or
+# 'alembic revision --autogenerate' would never see the
+# `evidence_classification_rules`/`evidence_classifications` tables at
+# all. Rules module imported first — evidence_classification_models
+# declares a real foreign key to it.
+from persistence.postgres import evidence_classification_rule_models  # noqa: F401
+from persistence.postgres import evidence_classification_models  # noqa: F401
+
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.
 config = context.config
