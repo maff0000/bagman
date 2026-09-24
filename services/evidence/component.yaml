@@ -3,25 +3,41 @@
 # contracts/manifest/bagman.component_manifest.v1.schema.json.
 
 id: BAGMAN.SERVICES.EVIDENCE
-version: 1
+version: 2
 
 responsibility: >
   Own canonical EvidenceItem identity and its immutability and
   idempotent-observation semantics (an EvidenceItem, once recorded, is
   never mutated, and a replayed observation of the same external
   reference resolves to the existing record rather than creating a
-  duplicate).
+  duplicate); also owns EvidenceClassification (an append-only,
+  supersession-chained document_type classification of an EvidenceItem)
+  and EvidenceClassificationRule (the separate, deterministic
+  rule-based classification authority behind CD-6 Slice 5 WI-1) — two
+  distinct canonical types this component defines alongside EvidenceItem
+  itself, never folded into it.
 
 owns:
   - EvidenceItem
+  - EvidenceClassification
+  - EvidenceClassificationRule
 
 # What services/evidence/evidence.py actually imports from core/:
 # identity (id generation), timestamps (UTC handling), errors
 # (ImmutabilityViolationError, NotFoundError, ValidationError),
 # contract_validation (validate_against_contract), and the
 # ExternalReferenceRepository type it is constructed with.
+#
+# services/evidence/classification_rule.py additionally imports the
+# pure normalization helpers (normalize_address, normalize_domain,
+# normalize_subject_for_policy) directly from
+# services/mailbox/domain_rule.py (CD-6 Slice 5 WI-1 — a deliberate,
+# WO-authorized cross-module reuse of proven normalization logic, never
+# a copy-paste; that module's own docstring documents the same
+# precedent).
 consumes:
   - BAGMAN.CORE
+  - BAGMAN.MAILBOX
 
 # services/evidence/ does not itself emit audit events; core/api.py
 # does that centrally for every canonical write, including the

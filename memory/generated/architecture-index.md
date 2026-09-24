@@ -159,12 +159,12 @@ CD-6 Slice 1 (PID §98, "GUI Operations Foundation") additionally owns: a real p
 - **External access:** `false`
 - **Prohibited:** `direct_email_access`, `direct_bank_access`, `direct_xero_access`, `direct_chargebee_access`
 
-### `BAGMAN.SERVICES.EVIDENCE` (v1)
+### `BAGMAN.SERVICES.EVIDENCE` (v2)
 
-Own canonical EvidenceItem identity and its immutability and idempotent-observation semantics (an EvidenceItem, once recorded, is never mutated, and a replayed observation of the same external reference resolves to the existing record rather than creating a duplicate).
+Own canonical EvidenceItem identity and its immutability and idempotent-observation semantics (an EvidenceItem, once recorded, is never mutated, and a replayed observation of the same external reference resolves to the existing record rather than creating a duplicate); also owns EvidenceClassification (an append-only, supersession-chained document_type classification of an EvidenceItem) and EvidenceClassificationRule (the separate, deterministic rule-based classification authority behind CD-6 Slice 5 WI-1) — two distinct canonical types this component defines alongside EvidenceItem itself, never folded into it.
 
-- **Owns:** `EvidenceItem`
-- **Consumes:** `BAGMAN.CORE`
+- **Owns:** `EvidenceItem`, `EvidenceClassification`, `EvidenceClassificationRule`
+- **Consumes:** `BAGMAN.CORE`, `BAGMAN.MAILBOX`
 - **Produces:** _(none)_
 - **Dependencies:** `jsonschema`, `rfc3339-validator`
 - **External access:** `false`
@@ -192,6 +192,8 @@ Own the durable Company<->Xero-organisation mapping (XeroConnection, its closed 
 | `https://bagman.internal/contracts/common/bagman.utc_timestamp.v1.schema.json` | BAGMAN Canonical UTC Timestamp | `contracts/common/bagman.utc_timestamp.v1.schema.json` |
 | `https://bagman.internal/contracts/entity/bagman.entity.v1.schema.json` | BAGMAN GovernedEntity | `contracts/entity/bagman.entity.v1.schema.json` |
 | `https://bagman.internal/contracts/evidence/bagman.evidence.v1.schema.json` | BAGMAN EvidenceItem | `contracts/evidence/bagman.evidence.v1.schema.json` |
+| `https://bagman.internal/contracts/evidence/bagman.evidence_classification.v1.schema.json` | BAGMAN EvidenceClassification | `contracts/evidence/bagman.evidence_classification.v1.schema.json` |
+| `https://bagman.internal/contracts/evidence/bagman.evidence_classification_rule.v1.schema.json` | BAGMAN EvidenceClassificationRule | `contracts/evidence/bagman.evidence_classification_rule.v1.schema.json` |
 | `https://bagman.internal/contracts/intake/bagman.intake_record.v1.schema.json` | BAGMAN IntakeRecord | `contracts/intake/bagman.intake_record.v1.schema.json` |
 | `https://bagman.internal/contracts/mailbox/bagman.mailbox_domain_rule.v1.schema.json` | BAGMAN MailboxDomainRule | `contracts/mailbox/bagman.mailbox_domain_rule.v1.schema.json` |
 | `https://bagman.internal/contracts/mailbox/bagman.mailbox_message.v1.schema.json` | BAGMAN MailboxMessage | `contracts/mailbox/bagman.mailbox_message.v1.schema.json` |
