@@ -41,18 +41,47 @@ unambiguous, unlikely-to-collide port, consistent with "port 9000 is
 already occupied by something else on this host" caution for the wider
 environment.
 
-MinIO container/credentials (WI-2)
-------------------------------------
-See `tests/persistence/test_minio_store.py`'s own docstring for the
-`bagman-test-minio-wi2` container command. PL correction (before this
-branch was ever pushed): the original version of this file hardcoded a
-literal fallback access/secret key. Gitleaks correctly flagged that
-(RuleID `generic-api-key`) — a credential-shaped literal is not
-acceptable in Git history regardless of how low-stakes it actually is
-(CD-1 security doctrine). Fixed by generating the throwaway secret at
-import time via `secrets.token_urlsafe()` instead of a string literal
-(PID §30's own sanctioned "ephemeral credentials generated within
-isolated CI/runtime contexts" pattern).
+Object-store container/credentials (WI-2)
+------------------------------------------
+PL correction (before this branch was ever pushed): the original
+version of this file hardcoded a literal fallback access/secret key.
+Gitleaks correctly flagged that (RuleID `generic-api-key`) — a
+credential-shaped literal is not acceptable in Git history regardless
+of how low-stakes it actually is (CD-1 security doctrine). Fixed by
+generating the throwaway secret at import time via
+`secrets.token_urlsafe()` instead of a string literal (PID §30's own
+sanctioned "ephemeral credentials generated within isolated CI/runtime
+contexts" pattern).
+
+CD-6 MinIO withdrawal WO (2026-09-24): this disposable instance is now
+expected to be SeaweedFS 4.47 (`ghcr.io/chrislusf/seaweedfs`, pinned
+by digest — the withdrawn
+`quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z.hotfix.7aa24e772`
+this fixture used to point at is no longer pullable at all), reachable
+at `BAGMAN_TEST_MINIO_ENDPOINT` (default `http://127.0.0.1:19000`)
+with a static S3 identity config matching
+`BAGMAN_TEST_MINIO_ACCESS_KEY`/`BAGMAN_TEST_MINIO_SECRET_KEY`. A
+disposable container matching this exact shape, live-verified against
+this exact digest+command:
+
+    docker run -d --name bagman-test-minio-wi2 \\
+      -v "<host-path-to-s3.json>:/etc/seaweedfs/s3.json:ro" \\
+      -p 127.0.0.1:19000:9000 \\
+      ghcr.io/chrislusf/seaweedfs:4.47@sha256:ce9e796f1fe6f06968f4c04bdaf8f678dad9c8acdfef3d244133d71bfa6bf882 \\
+      server -dir=/data -ip=127.0.0.1 -ip.bind=127.0.0.1 \\
+      -master=true -volume=true -filer=true -s3=true \\
+      -s3.port=9000 -s3.ip.bind=0.0.0.0 -s3.config=/etc/seaweedfs/s3.json \\
+      -s3.port.iceberg=0 -s3.port.lance=0 -volume.max=0 -webdav=false
+
+where `<host-path-to-s3.json>` holds
+`{"identities": [{"name": "...", "credentials": [{"accessKey":
+"<BAGMAN_TEST_MINIO_ACCESS_KEY>", "secretKey":
+"<BAGMAN_TEST_MINIO_SECRET_KEY>"}], "actions": ["Admin", "Read",
+"List", "Write"]}]}` — the same shape
+`deployment/compose/docker-compose.yml`'s `bagman-objects` service and
+`tests/app_api/conftest.py`'s disposable fixture both use. See
+`deployment/compose/docker-compose.yml`'s `bagman-objects` comment for
+the full rationale/verification behind every flag.
 """
 from __future__ import annotations
 
@@ -276,9 +305,27 @@ _BUCKET = "bagman-test-wi2-objects"
 
 
 def _minio_is_up() -> bool:
+    """Whether SOMETHING genuinely S3-compatible answers at
+    `_ENDPOINT_URL`.
+
+    CD-6 MinIO withdrawal WO: this disposable instance is now expected
+    to be a SeaweedFS 4.47 container (see `test_minio_store.py`'s
+    module docstring for the exact disposable-container command), not
+    MinIO — SeaweedFS's S3 gateway has no MinIO-style
+    `/minio/health/live` path, so this now probes a bare `GET /`
+    instead. Live-verified (same finding as
+    `deployment/compose/docker-compose.yml`'s `bagman-objects`
+    healthcheck and `tests/app_api/conftest.py`'s `_wait_for_minio`):
+    an unauthenticated `GET /` on SeaweedFS's S3 port answers
+    `403 Forbidden` — that IS "up and correctly enforcing auth", not a
+    failure — so both 200 and 403 count as "up"; a connection failure
+    or any other status does not.
+    """
     try:
-        with urllib.request.urlopen(f"{_ENDPOINT_URL}/minio/health/live", timeout=2) as response:
-            return response.status == 200
+        with urllib.request.urlopen(f"{_ENDPOINT_URL}/", timeout=2) as response:
+            return response.status in (200, 403)
+    except urllib.error.HTTPError as exc:
+        return exc.code in (200, 403)
     except (urllib.error.URLError, OSError, ValueError):
         return False
 
@@ -286,10 +333,10 @@ def _minio_is_up() -> bool:
 requires_live_minio = pytest.mark.skipif(
     not _minio_is_up(),
     reason=(
-        f"no disposable MinIO answering at {_ENDPOINT_URL} — these tests "
+        f"no disposable object store answering at {_ENDPOINT_URL} — these tests "
         "require a REAL object store, not a mock (WI-2 contract); start the "
-        "bagman-test-minio-wi2 container documented in test_minio_store.py's "
-        "module docstring"
+        "bagman-test-minio-wi2 container documented in this module's own "
+        "docstring above ('Object-store container/credentials (WI-2)')"
     ),
 )
 

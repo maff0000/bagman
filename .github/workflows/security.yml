@@ -1,5 +1,17 @@
 name: Security
 
+# CD-6 MinIO withdrawal WO (2026-09-24): every "MinIO"/"MinIO container"
+# mention in the comments below is now, in terms of the actual image
+# these steps start, SeaweedFS 4.47 (see tests/app_api/conftest.py's
+# own module docstring) — the withdrawn MinIO tag this workflow used to
+# transitively pull via that fixture is no longer pullable at all. Left
+# as "MinIO" throughout rather than rewritten line-by-line: every
+# mention below is describing "the disposable object-store container
+# tests/app_api/'s fixture starts" at a conceptual level, which is
+# still exactly true; only the specific server image behind that
+# concept changed, and that is documented once, here and in the
+# fixture itself, rather than repeated at every mention.
+#
 # CD-1's security gate (secret scanning + tests/security/, PID.md
 # §14/§15), extended by CD-2 (PID.md §41) to also run the full pytest
 # suite added by CD-2: tests/contract/ (schema/contract tests),

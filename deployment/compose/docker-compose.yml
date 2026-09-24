@@ -34,8 +34,19 @@ networks:
 volumes:
   bagman-postgres-data:
     name: bagman-postgres-data
+  # Old MinIO volume — kept defined (but no longer referenced by any
+  # service below) so it remains available for rollback until actual
+  # production cutover happens (a separate, later step this WO does
+  # not perform). Do NOT remove this entry and do NOT let anything
+  # write into it going forward.
   bagman-object-data:
     name: bagman-object-data
+  # New SeaweedFS-backed object storage volume — deliberately a
+  # DIFFERENT named volume from `bagman-object-data` above (never
+  # reused), so the old MinIO volume's bytes are never touched by this
+  # cutover.
+  bagman-seaweedfs-data:
+    name: bagman-seaweedfs-data
 
 secrets:
   # Real secrets, provisioned externally by the PL at
@@ -43,10 +54,29 @@ secrets:
   # copied into this file, never committed. See PID §29-31.
   postgres_password:
     file: /srv/bagman-secrets/postgres_password
+  # CD-6 MinIO withdrawal WO: these two secrets are no longer
+  # referenced by `bagman-objects` below (it now uses
+  # `seaweedfs_s3_config` instead — see that service's own comment).
+  # Kept defined here, not deleted: actual production cutover away
+  # from the old MinIO instance is a SEPARATE, later step this WO does
+  # not perform, and `bagman-api` below still references these two
+  # secrets for its own MinIO-pointed configuration until that cutover
+  # happens.
   minio_root_user:
     file: /srv/bagman-secrets/minio_root_user
   minio_root_user_password:
     file: /srv/bagman-secrets/minio_root_user_password
+  # CD-6 MinIO withdrawal WO: the SeaweedFS 4.47 S3-gateway static
+  # identity config file (see `bagman-objects` below) — the
+  # `{"identities": [...]}` JSON shape SeaweedFS's `-s3.config` flag
+  # expects, holding the access/secret key pair BAGMAN's own object
+  # store client authenticates with. Same `/srv/bagman-secrets/<name>`
+  # convention as every other entry in this block (the architect's WO
+  # text illustrated `/opt/bagman/secrets/objects/...` only as a
+  # conceptual example — this repo's own real, established secret root
+  # is `/srv/bagman-secrets/`).
+  seaweedfs_s3_config:
+    file: /srv/bagman-secrets/seaweedfs_s3_config.json
   # CD-5 WI-2 (PID §13): the BAGMAN-scoped virtual key for the EXISTING
   # Trinity LiteLLM installation — never a second inference-control-plane
   # deployment (PID §8). Provisioned externally by Matt directly, same
@@ -96,35 +126,117 @@ services:
     restart: unless-stopped
 
   bagman-objects:
-    # Pinned to a real, pullable, non-`:latest` release tag (PID §7) —
-    # verified pullable via `docker manifest inspect` and cross-checked
-    # against quay.io's own tag listing API at delivery time
-    # (2026-09-12); this was the most recent RELEASE tag quay.io
-    # reported for quay.io/minio/minio at that time.
-    image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z.hotfix.7aa24e772
+    # CD-6 MinIO withdrawal WO (2026-09-24): the original MinIO pin,
+    # `quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z.hotfix.7aa24e772`,
+    # was WITHDRAWN from quay.io (no longer pullable at all) and the
+    # entire MinIO "community edition" release line it came from is
+    # now unmaintained/archived upstream with several unpatched CVEs —
+    # there is no newer community-edition tag to move to instead.
+    #
+    # Replacement: SeaweedFS 4.47 (`ghcr.io/chrislusf/seaweedfs`).
+    # Chosen after: (1) supply-chain verification — cosign signature
+    # verified (issuer `https://token.actions.githubusercontent.com`,
+    # identity
+    # `https://github.com/seaweedfs/seaweedfs/.github/workflows/container_release_unified.yml@refs/tags/4.47`),
+    # upstream commit `c5073360007d28385a33426a42ac3e4ec504c5a3` matches
+    # the `4.47` tag exactly; (2) a Trivy scan reconciling 8 relevant
+    # CVEs (7 named by the architect + 1 more found), all confirmed
+    # fixed in 4.47 via GitHub compare-API ancestry checks against that
+    # exact commit — one residual HIGH (CVE-2026-84445, a gRPC
+    # xDS-server DoS in the pinned grpc-go dev dependency) assessed as
+    # not applicable, since SeaweedFS never runs a gRPC xDS server
+    # role reachable via anything it itself exposes; (3) a live proof
+    # of the exact runtime shape below against BAGMAN's real,
+    # unmodified `persistence/objects/minio_store.py::MinIOObjectStore`
+    # — full S3-compatibility bounded test, a restart-durability +
+    # soak test, and a disposable production-shape migration proof —
+    # all passed with ZERO code changes to that module.
+    #
+    # The digest below is the authoritative reference; the `:4.47` tag
+    # is for operator readability only — always resolve/verify against
+    # the digest, never trust the tag alone to mean the same bytes
+    # tomorrow that it means today:
+    #   manifest-list (multi-arch index): sha256:ce9e796f1fe6f06968f4c04bdaf8f678dad9c8acdfef3d244133d71bfa6bf882
+    #   amd64:                            sha256:f83509b0721dfd8e2e07faf76c0a899f67a8a889c89abe2fa0a5227ba1320362
+    #   arm64:                            sha256:d4cf67729aa8777e1a43a5b61d72e5b96179e4b7bac9a221cb14cbc2036cb32e
+    image: ghcr.io/chrislusf/seaweedfs:4.47@sha256:ce9e796f1fe6f06968f4c04bdaf8f678dad9c8acdfef3d244133d71bfa6bf882
     container_name: bagman-objects
     networks:
       - bagman-net
-    # No host port publish by default (PID §32). A host-published port
-    # for the MinIO S3 API (:9000) / console (:9001), for local
-    # debugging only, is an explicit opt-in override — see
+    # No host port publish by default (PID §32) — unchanged from the
+    # MinIO-era default. A host-published port, for local debugging
+    # only, is an explicit opt-in override — see
     # docker-compose.debug-ports.yml — never the default.
-    command: ["server", "/data", "--console-address", ":9001"]
+    #
+    # `weed server` (NOT `weed mini` — `mini` only exposes one global
+    # `-ip.bind` with no per-component override, so it cannot isolate
+    # the S3 gateway's own bind address from master/volume/filer/admin
+    # the way this command does). Live-verified against this exact
+    # digest on this host: `-ip=127.0.0.1 -ip.bind=127.0.0.1` binds
+    # master(9333)/volume(8080 in `server` mode — NOT 9340, which is
+    # `mini`'s port)/filer(8888)/admin to loopback ONLY inside the
+    # container (confirmed via a second container on the same Docker
+    # network: 9333/8888/8080 all unreachable); `-s3.ip.bind=0.0.0.0`
+    # is the one deliberate per-component override that lets the S3
+    # gateway alone be reachable from other containers on `bagman-net`
+    # — it is still never published to the host, since that is
+    # controlled entirely by this service having no `ports:` block, not
+    # by this flag. `-s3.port.iceberg=0 -s3.port.lance=0` are REQUIRED:
+    # without them SeaweedFS auto-starts an Iceberg REST Catalog
+    # (8181) and a Lance Namespace server (9101), BOTH of which bind to
+    # `0.0.0.0` regardless of `-s3.ip.bind` — confirmed live, reachable
+    # from a second container until these two flags were added; this is
+    # the one place this image's default behavior is NOT secure and
+    # must be explicitly overridden. `-volume.max=0` (auto-size on free
+    # disk) is REQUIRED — the `server`-mode default (`volume.max=8`)
+    # caused a real `PutObject` failure ("No writable volumes and no
+    # free volumes left") once more than one bucket/collection's worth
+    # of volume growth was requested from the same 8-volume cap; do not
+    # revert to a fixed cap. `-webdav=false` — BAGMAN doesn't use
+    # WebDAV; `server` mode enables it by default, so it must be
+    # explicitly turned off.
+    command:
+      - server
+      - -dir=/data
+      - -ip=127.0.0.1
+      - -ip.bind=127.0.0.1
+      - -master=true
+      - -volume=true
+      - -filer=true
+      - -s3=true
+      - -s3.port=9000
+      - -s3.ip.bind=0.0.0.0
+      - -s3.config=/run/secrets/seaweedfs_s3_config
+      - -s3.port.iceberg=0
+      - -s3.port.lance=0
+      - -volume.max=0
+      - -webdav=false
     environment:
-      MINIO_ROOT_USER_FILE: /run/secrets/minio_root_user
-      MINIO_ROOT_PASSWORD_FILE: /run/secrets/minio_root_user_password
       TZ: UTC
     secrets:
-      - minio_root_user
-      - minio_root_user_password
+      - seaweedfs_s3_config
     volumes:
-      - bagman-object-data:/data
+      - bagman-seaweedfs-data:/data
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://127.0.0.1:9000/minio/health/live"]
+      # SeaweedFS's S3 gateway has no MinIO-style `/minio/health/live`
+      # path. A bare, unauthenticated `GET /` on the S3 port (9000)
+      # answers `403 Forbidden` (live-verified against this exact
+      # digest+flags) — that IS the correct "I am up and enforcing
+      # auth" signal, not a failure state, so a plain `curl -f` (which
+      # treats any 4xx as failure) would misreport a healthy server as
+      # down. Accept exactly 200 or 403 as "up"; anything else
+      # (connection refused, 5xx, timeout) is correctly reported down.
+      test:
+        - CMD-SHELL
+        - "curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:9000/ | grep -qE '^(200|403)$'"
+      # SeaweedFS needs longer than plain MinIO did to fully bootstrap
+      # (master/volume/filer/S3 all start and cross-register) — the PL
+      # measured ~15-20s before the S3 endpoint reliably answered after
+      # a restart in testing.
       interval: 5s
       timeout: 5s
       retries: 20
-      start_period: 10s
+      start_period: 30s
     restart: unless-stopped
 
   bagman-scan:
