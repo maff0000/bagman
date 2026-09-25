@@ -1323,3 +1323,146 @@ def test_wi5_projection_module_never_imports_ai_provider_or_gateway_code():
         if any(imp.full == mod or imp.full.startswith(mod + ".") for mod in forbidden_ai_submodules)
     ]
     assert violations == [], "\n".join(violations)
+
+
+# ---------------------------------------------------------------------
+# CD-6 Slice 5 WI-6 — historical reprocessing / evaluation tooling
+# boundary proofs (WO §61). Both new tools live under `scripts/` (real
+# operator CLI utilities, never `app/api/routers/*`), so their own
+# "no router" property is trivially true by construction — these tests
+# instead prove the substantive WI-6 boundaries: DETERMINISTIC_RULE_ONLY
+# for the reprocessing tool (no AI, no evidence/entity mutation, no rule
+# creation, no unbounded/un-gated apply), and a true read-only SHADOW
+# tool for the evaluator (no classification/rule/NeedsYou writes, no
+# mailbox/Xero reach).
+# ---------------------------------------------------------------------
+
+_WI6_REPROCESS_MODULE_PATH = REPO_ROOT / "scripts" / "reprocess_evidence_classification.py"
+_WI6_EVALUATE_MODULE_PATH = REPO_ROOT / "scripts" / "evaluate_document_classifier.py"
+
+
+def test_wi6_reprocess_script_never_imports_ai_or_mailbox_or_xero_code():
+    """WI-6 §4 — DETERMINISTIC_RULE_ONLY: this tool must never import
+    anything under `ai.*` (no AI fallback of any kind), and, like every
+    other classification module in this codebase, never
+    `services.mailbox.*`/`services.xero.*`."""
+    violations = []
+    for imp in _imports_of(_WI6_REPROCESS_MODULE_PATH):
+        if imp.root == "ai":
+            violations.append(f"reprocess_evidence_classification.py:{imp.lineno} imports {imp.full!r}")
+        if imp.full == "services.mailbox" or imp.full.startswith("services.mailbox."):
+            violations.append(f"reprocess_evidence_classification.py:{imp.lineno} imports {imp.full!r}")
+        if imp.full == "services.xero" or imp.full.startswith("services.xero."):
+            violations.append(f"reprocess_evidence_classification.py:{imp.lineno} imports {imp.full!r}")
+    assert violations == [], "\n".join(violations)
+
+
+def test_wi6_reprocess_script_never_calls_any_ai_provider_shaped_function():
+    """WI-6 §4/§16 — no `litellm_client`/`run_background_task` token
+    anywhere in this tool's own source at all (it never even accepts an
+    AI dependency as a parameter)."""
+    text = _WI6_REPROCESS_MODULE_PATH.read_text(encoding="utf-8")
+    forbidden_tokens = ("litellm_client", "run_background_task", "ai_invocation_repository")
+    violations = [token for token in forbidden_tokens if token in text]
+    assert violations == [], "\n".join(violations)
+
+
+def test_wi6_reprocess_script_never_mutates_evidence_ownership_or_creates_rules():
+    """WI-6 §61 — the historical tool may never call either real
+    `EvidenceItem` mutation path (`update_status`/`assign_entity` — see
+    this file's own WI-1 proof for the identical doctrine), never
+    `create_classification_rule(` (no new-rule creation), and never
+    constructs a `supersedes_classification_id=` itself — the only
+    write path it may use is the existing, unmodified
+    `classify_evidence_deterministically`, whose own internal
+    supersession behaviour (none, in V1) it must never second-guess or
+    duplicate."""
+    text = _WI6_REPROCESS_MODULE_PATH.read_text(encoding="utf-8")
+    forbidden_tokens = (
+        ".update_status(", ".assign_entity(", "create_classification_rule(", "supersedes_classification_id=",
+    )
+    violations = [token for token in forbidden_tokens if token in text]
+    assert violations == [], "\n".join(violations)
+
+
+def test_wi6_reprocess_script_cli_requires_limit_and_manifest_hash_for_apply():
+    """WI-6 §9/§10 — `--apply` genuinely requires both
+    `--expected-manifest-sha256` and a bounded `--limit`; neither may be
+    silently defaulted. Exercised via the real `_parse_args` function,
+    not by eyeballing the argparse definition."""
+    import scripts.reprocess_evidence_classification as reprocess_script
+
+    with pytest.raises(SystemExit):
+        reprocess_script._parse_args(["--runtime-dir", "/tmp/wi6-boundary", "--rule-id", "r1", "--apply", "--limit", "5"])
+    with pytest.raises(SystemExit):
+        reprocess_script._parse_args([
+            "--runtime-dir", "/tmp/wi6-boundary", "--rule-id", "r1", "--apply",
+            "--expected-manifest-sha256", "a" * 64,
+        ])
+    # Both present -> accepted (proves the two errors above are genuinely
+    # about the missing flag, not some other rejection).
+    args = reprocess_script._parse_args([
+        "--runtime-dir", "/tmp/wi6-boundary", "--rule-id", "r1", "--apply",
+        "--expected-manifest-sha256", "a" * 64, "--limit", "5",
+    ])
+    assert args.apply is True
+    assert args.limit == 5
+
+
+def test_wi6_reprocess_script_never_defines_a_router_or_http_endpoint():
+    """WI-6 §3 — the historical tool is a CLI script only; it must never
+    import `fastapi`/`APIRouter` or define an endpoint decorator."""
+    text = _WI6_REPROCESS_MODULE_PATH.read_text(encoding="utf-8")
+    forbidden_tokens = ("fastapi", "APIRouter", "@router.")
+    violations = [token for token in forbidden_tokens if token in text]
+    assert violations == [], "\n".join(violations)
+
+
+def test_wi6_evaluate_script_never_imports_mailbox_or_xero_code():
+    """WI-6 §61 — the shadow evaluator never fetches live mailbox
+    provider data and has no business calling Xero at all."""
+    violations = []
+    for imp in _imports_of(_WI6_EVALUATE_MODULE_PATH):
+        if imp.full == "services.mailbox" or imp.full.startswith("services.mailbox."):
+            violations.append(f"evaluate_document_classifier.py:{imp.lineno} imports {imp.full!r}")
+        if imp.full == "services.xero" or imp.full.startswith("services.xero."):
+            violations.append(f"evaluate_document_classifier.py:{imp.lineno} imports {imp.full!r}")
+    assert violations == [], "\n".join(violations)
+
+
+def test_wi6_evaluate_script_never_calls_any_classification_rule_or_needs_you_write_path():
+    """WI-6 §19/§26/§61 — a true SHADOW tool: zero call sites anywhere
+    in this script's own source for
+    `create_classification(`/`create_classification_with_result(`/
+    `create_classification_rule(`/`ensure_classification_review_item(`.
+    This script only ever calls the existing, governed
+    `classify_evidence(persist=False, ...)` — already proven elsewhere
+    to make every one of those write call sites structurally
+    unreachable under `persist=False` — and never any of them directly
+    itself."""
+    text = _WI6_EVALUATE_MODULE_PATH.read_text(encoding="utf-8")
+    forbidden_substrings = [
+        "create_classification(", "create_classification_with_result(", "create_classification_rule(",
+        "ensure_classification_review_item(",
+    ]
+    violations = [pattern for pattern in forbidden_substrings if pattern in text]
+    assert violations == [], "\n".join(violations)
+
+
+def test_wi6_evaluate_script_never_defines_a_router_or_http_endpoint():
+    """WI-6 §3 — the evaluator is a CLI script only."""
+    text = _WI6_EVALUATE_MODULE_PATH.read_text(encoding="utf-8")
+    forbidden_tokens = ("fastapi", "APIRouter", "@router.")
+    violations = [token for token in forbidden_tokens if token in text]
+    assert violations == [], "\n".join(violations)
+
+
+def test_wi6_evaluate_script_never_calls_persist_true():
+    """WI-6 §19 — the evaluator must always call the governed
+    orchestrator with `persist=False`; it must never spell
+    `persist=True` anywhere in its own source (the one and only
+    `classify_evidence(...)` call site in this script is grepped for
+    this literal)."""
+    text = _WI6_EVALUATE_MODULE_PATH.read_text(encoding="utf-8")
+    assert "persist=True" not in text
+    assert "persist=False" in text
