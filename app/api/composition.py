@@ -65,6 +65,8 @@ from ai.providers.litellm.client import LiteLLMClientProtocol
 from core import actor
 from core.api import BagmanCanonicalAPI
 from persistence.objects.store import EvidenceObjectStore
+from services.evidence.classification import EvidenceClassificationRepository
+from services.evidence.classification_rule import EvidenceClassificationRuleRepository
 from services.evidence.intake.intake import IntakeRepository
 from services.evidence.intake.scanner import EvidenceSafetyScanner, ScanResult, ScanVerdict
 from services.mailbox.cursor import MailboxFolderCursorRepository
@@ -432,6 +434,21 @@ class RuntimeComposition:
     #: (sharing `engine`) in production — same never-mixed-across-modes
     #: discipline as every repository above.
     mailbox_domain_rule_repository: MailboxDomainRuleRepository
+    #: CD-6 Slice 5 WI-2 — the deterministic classification-rule
+    #: registry and its derived classification records (WI-1 built both
+    #: domain models/repositories; WI-2 is the first delivery to wire
+    #: either into HTTP-reachable composition, via
+    #: `app/api/routers/evidence_classification.py`). In-memory in
+    #: development/test, real `Postgres*` implementations (sharing
+    #: `engine`) in production — same never-mixed-across-modes
+    #: discipline as every repository above.
+    #: `classification_repository` is constructed with
+    #: `evidence_repository`/`classification_rule_repository`/
+    #: `ai_invocation_repository` exactly like every other
+    #: WI-1-documented dependency shape (duck-typed — see that module's
+    #: own docstring).
+    classification_rule_repository: EvidenceClassificationRuleRepository
+    classification_repository: EvidenceClassificationRepository
 
 
 def _build_development_or_test(runtime_environment: str) -> RuntimeComposition:
@@ -536,6 +553,21 @@ def _build_development_or_test(runtime_environment: str) -> RuntimeComposition:
     # docstring ("Stale-RUNNING recovery") and
     # `AIInvocationRepository`'s own class docstring.
     ai_invocation_repository = InMemoryAIInvocationRepository(audit_repository=api.audit_repository)
+
+    # CD-6 Slice 5 WI-2 — the deterministic classification-rule registry
+    # and its derived classification records, sharing `api.evidence_repository`/
+    # `ai_invocation_repository` exactly like every other cross-repository
+    # dependency in this function.
+    from services.evidence.classification import InMemoryEvidenceClassificationRepository
+    from services.evidence.classification_rule import InMemoryEvidenceClassificationRuleRepository
+
+    classification_rule_repository = InMemoryEvidenceClassificationRuleRepository()
+    classification_repository = InMemoryEvidenceClassificationRepository(
+        evidence_repository=api.evidence_repository,
+        rule_repository=classification_rule_repository,
+        ai_invocation_repository=ai_invocation_repository,
+    )
+
     # `default_response` closes the WI-4 dev-mode gap documented on
     # `_dev_mode_litellm_default_response` above — without it, a real
     # click on the GUI's "Run analysis" button in a live dev server
@@ -586,6 +618,8 @@ def _build_development_or_test(runtime_environment: str) -> RuntimeComposition:
         gmail_token_store=gmail_token_store,
         gmail_mailbox_adapter=gmail_mailbox_adapter,
         mailbox_domain_rule_repository=mailbox_domain_rule_repository,
+        classification_rule_repository=classification_rule_repository,
+        classification_repository=classification_repository,
     )
 
 
@@ -611,6 +645,10 @@ def _build_production() -> RuntimeComposition:
         PostgresMailboxMicrosoftOAuthStateRepository,
         PostgresMailboxSweepLock,
         PostgresMailboxSweepRunRepository,
+    )
+    from persistence.postgres.evidence_classification_repository import PostgresEvidenceClassificationRepository
+    from persistence.postgres.evidence_classification_rule_repository import (
+        PostgresEvidenceClassificationRuleRepository,
     )
     from persistence.postgres.mailbox_repository import PostgresMailboxSourceRepository
     from persistence.postgres.needs_you_repository import PostgresNeedsYouRepository
@@ -712,6 +750,19 @@ def _build_production() -> RuntimeComposition:
     # ("Stale-RUNNING recovery") and `AIInvocationRepository`'s own
     # class docstring.
     ai_invocation_repository = PostgresAIInvocationRepository(engine, audit_repository=api.audit_repository)
+
+    # CD-6 Slice 5 WI-2 — durable classification-rule registry and its
+    # derived classification records, sharing `engine`/`api.evidence_repository`/
+    # `ai_invocation_repository` exactly like every other Postgres-backed
+    # repository above.
+    classification_rule_repository = PostgresEvidenceClassificationRuleRepository(engine)
+    classification_repository = PostgresEvidenceClassificationRepository(
+        evidence_repository=api.evidence_repository,
+        rule_repository=classification_rule_repository,
+        ai_invocation_repository=ai_invocation_repository,
+        engine=engine,
+    )
+
     litellm_client = LiteLLMClient(
         endpoint=os.environ.get("BAGMAN_LITELLM_ENDPOINT", DEFAULT_LITELLM_ENDPOINT),
         api_key_file=os.environ.get("BAGMAN_LITELLM_API_KEY_FILE", DEFAULT_LITELLM_API_KEY_FILE),
@@ -866,6 +917,8 @@ def _build_production() -> RuntimeComposition:
         gmail_token_store=gmail_token_store,
         gmail_mailbox_adapter=gmail_mailbox_adapter,
         mailbox_domain_rule_repository=mailbox_domain_rule_repository,
+        classification_rule_repository=classification_rule_repository,
+        classification_repository=classification_repository,
     )
 
 

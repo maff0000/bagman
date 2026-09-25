@@ -3,7 +3,7 @@
 # contracts/manifest/bagman.component_manifest.v1.schema.json.
 
 id: BAGMAN.SERVICES.EVIDENCE
-version: 2
+version: 3
 
 responsibility: >
   Own canonical EvidenceItem identity and its immutability and
@@ -15,36 +15,52 @@ responsibility: >
   and EvidenceClassificationRule (the separate, deterministic
   rule-based classification authority behind CD-6 Slice 5 WI-1) — two
   distinct canonical types this component defines alongside EvidenceItem
-  itself, never folded into it.
+  itself, never folded into it. CD-6 Slice 5 WI-2 adds the deterministic
+  matcher/observed-evidence-guard/preview/governed-rule-lifecycle/
+  classification-service layer on top of that same data model — no new
+  canonical type, purely additive compute/orchestration logic.
 
 owns:
   - EvidenceItem
   - EvidenceClassification
   - EvidenceClassificationRule
 
-# What services/evidence/evidence.py actually imports from core/:
-# identity (id generation), timestamps (UTC handling), errors
+# What services/evidence/ actually imports from core/: identity (id
+# generation), timestamps (UTC handling), errors
 # (ImmutabilityViolationError, NotFoundError, ValidationError),
-# contract_validation (validate_against_contract), and the
+# contract_validation (validate_against_contract), text_matching (CD-6
+# Slice 5 WI-2 — normalize_address/normalize_domain/domain_from_address/
+# normalize_subject_for_policy/subject_matches_predicate; see
+# core/text_matching.py's own module docstring), and the
 # ExternalReferenceRepository type it is constructed with.
 #
-# services/evidence/classification_rule.py additionally imports the
-# pure normalization helpers (normalize_address, normalize_domain,
-# normalize_subject_for_policy) directly from
-# services/mailbox/domain_rule.py (CD-6 Slice 5 WI-1 — a deliberate,
-# WO-authorized cross-module reuse of proven normalization logic, never
-# a copy-paste; that module's own docstring documents the same
-# precedent).
+# CD-6 Slice 5 WI-2's own shared-normalization refactor extracted
+# classification_rule.py's normalization helpers out of
+# services/mailbox/domain_rule.py into the neutral core.text_matching
+# module (imported directly from core/ — see that module's own
+# docstring) — services/evidence/ has ZERO import of services/mailbox/
+# anywhere as of WI-2 (proven by
+# tests/integration/test_architecture_boundaries.py's own AST-based
+# checks), so BAGMAN.MAILBOX is removed from `consumes` below (it is no
+# longer a real dependency in code — manifests document dependencies
+# that exist, not aspirational ones).
 consumes:
   - BAGMAN.CORE
-  - BAGMAN.MAILBOX
 
-# services/evidence/ does not itself emit audit events; core/api.py
-# does that centrally for every canonical write, including the
-# EVIDENCE_OBSERVED event for evidence registered through this
-# component (see core/component.yaml's `produces`). Left empty here
-# rather than duplicating that attribution.
-produces: []
+# Every OTHER write in this component still goes through core/api.py's
+# central record_audit_event (EVIDENCE_OBSERVED etc — see
+# core/component.yaml's own `produces`). CD-6 Slice 5 WI-2's new
+# governed rule-lifecycle/classification services
+# (services/evidence/classification_rule_service.py,
+# services/evidence/classification_service.py) are the first code in
+# THIS component to call AuditRepository.record_audit_event directly —
+# per core/component.yaml's own documented rule ("attribute a produced
+# event to the component whose code actually emits it"), these three
+# event types are attributed here, not to core/.
+produces:
+  - EVIDENCE_CLASSIFICATION_RULE_CREATED
+  - EVIDENCE_CLASSIFICATION_RULE_RETIRED
+  - EVIDENCE_CLASSIFIED
 
 dependencies:
   - jsonschema

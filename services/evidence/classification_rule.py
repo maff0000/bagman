@@ -30,23 +30,25 @@ dishonest (mirrors this codebase's "no fake buttons" doctrine, see
 a `CANCELLED` GUI trigger). Do not add it "for completeness" in a future
 delivery without first building the pipeline it would depend on.
 
-Normalization — reused, not re-implemented, from
-``services.mailbox.domain_rule``
+Normalization — reused, not re-implemented, from ``core.text_matching``
 ------------------------------------------------------------------------
-:func:`services.mailbox.domain_rule.normalize_domain`,
-:func:`services.mailbox.domain_rule.normalize_address`, and
-:func:`services.mailbox.domain_rule.normalize_subject_for_policy` are
-imported and reused DIRECTLY here (NFKC-normalise, casefold, strip,
-collapse internal whitespace for subjects; strip+lowercase for
-domains/addresses) — this is a deliberate, WO-authorised cross-module
-import of pure, already-correct, dependency-free helper functions, never
-a copy-paste. There is no live matcher in THIS module yet (that is
-WI-2's job), so there is nothing here to refactor into a shared location
-today. **A future delivery (WI-2) is expected to extract these three
-helpers into a neutral shared module (e.g.
-``services/shared/text_normalization.py``) and re-export them from
-``services.mailbox.domain_rule`` for backward compatibility** — that
-refactor is explicitly OUT of WI-1's scope; do not perform it now.
+:func:`core.text_matching.normalize_domain`,
+:func:`core.text_matching.normalize_address`, and
+:func:`core.text_matching.normalize_subject_for_policy` are imported and
+reused DIRECTLY here (NFKC-normalise, casefold, strip, collapse internal
+whitespace for subjects; strip+lowercase for domains/addresses).
+
+CD-6 Slice 5 WI-2 performed the extraction WI-1's own docstring
+originally forward-declared here: these three helpers (plus
+``domain_from_address``/``subject_matches_predicate``, used elsewhere in
+this module's own matcher-adjacent code) now live in the neutral
+``core.text_matching`` module, imported directly — never transitively
+through ``services.mailbox.domain_rule`` (which still re-exports the
+same five names, unchanged, for ITS OWN existing callers — see that
+module's own docstring). This module has ZERO ``services.mailbox``
+import of any kind as of WI-2 (see
+``tests/integration/test_architecture_boundaries.py::test_classification_rule_module_never_imports_mailbox_sweep_or_provider_adapters``,
+updated by WI-2 to assert exactly that).
 
 ``document_type`` is imported FROM ``services.evidence.classification``
 (the single source of truth for the closed V1 vocabulary both modules
@@ -131,8 +133,8 @@ from core import identity
 from core.contract_validation import validate_against_contract
 from core.errors import ConflictError, InvalidStateTransitionError, NotFoundError, ValidationError
 from core.timestamps import to_contract_string, utc_now
+from core.text_matching import normalize_address, normalize_domain, normalize_subject_for_policy
 from services.evidence.classification import DOCUMENT_TYPES
-from services.mailbox.domain_rule import normalize_address, normalize_domain, normalize_subject_for_policy
 
 _SCHEMA = "evidence/bagman.evidence_classification_rule.v1.schema.json"
 SCHEMA_VERSION = "bagman.evidence_classification_rule.v1"

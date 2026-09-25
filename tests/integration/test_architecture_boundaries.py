@@ -747,6 +747,17 @@ _CLASSIFICATION_MODULE_PATHS = [
     REPO_ROOT / "persistence" / "postgres" / "evidence_classification_repository.py",
     REPO_ROOT / "persistence" / "postgres" / "evidence_classification_rule_models.py",
     REPO_ROOT / "persistence" / "postgres" / "evidence_classification_rule_repository.py",
+    # CD-6 Slice 5 WI-2 additions — the deterministic matcher/guard/
+    # preview/governed-service/router layer built on top of WI-1's own
+    # domain model. Added to this SAME shared list (rather than a
+    # parallel one) so every existing WI-1 check below (no EvidenceItem
+    # mutation, no ENTITY_PROPOSAL/Needs-You wiring, no PDF/OCR import)
+    # automatically covers WI-2's new modules too.
+    REPO_ROOT / "services" / "evidence" / "classification_matcher.py",
+    REPO_ROOT / "services" / "evidence" / "classification_observation.py",
+    REPO_ROOT / "services" / "evidence" / "classification_rule_service.py",
+    REPO_ROOT / "services" / "evidence" / "classification_service.py",
+    REPO_ROOT / "app" / "api" / "routers" / "evidence_classification.py",
 ]
 
 
@@ -820,35 +831,21 @@ def test_classification_modules_never_import_ai_provider_or_gateway_code():
 
 
 def test_classification_rule_module_never_imports_mailbox_sweep_or_provider_adapters():
-    """`services.evidence.classification_rule` is authorised to import
-    ONLY the pure normalization helpers from `services.mailbox.domain_rule`
-    (see that module's own docstring) — never `services.mailbox.sweep`,
-    nor any provider-facing adapter neighbour
-    (`services.mailbox.microsoft`/`services.mailbox.gmail`/
-    `services.mailbox.imap`)."""
+    """`services.evidence.classification_rule` must never import
+    anything under `services.mailbox` at all (CD-6 Slice 5 WI-2's own
+    shared-normalization refactor: the pure text-matching helpers this
+    module needs now live in the neutral `core.text_matching` module,
+    imported directly — see that module's own docstring, and
+    `classification_rule.py`'s own "Normalization — reused, not
+    re-implemented" docstring section). Before WI-2, this module's only
+    `services.mailbox` import was `services.mailbox.domain_rule` (for
+    those same three normalization helpers) — that transitive
+    dependency is now gone entirely, not merely narrowed."""
     path = REPO_ROOT / "services" / "evidence" / "classification_rule.py"
-    forbidden_mailbox_submodules = (
-        "services.mailbox.sweep",
-        "services.mailbox.microsoft",
-        "services.mailbox.gmail",
-        "services.mailbox.imap",
-        "services.mailbox.message",
-        "services.mailbox.mailbox",
-    )
-    violations = []
-    for imp in _imports_of(path):
-        if any(imp.full == mod or imp.full.startswith(mod + ".") for mod in forbidden_mailbox_submodules):
-            violations.append(f"{path.relative_to(REPO_ROOT)}:{imp.lineno} imports {imp.full!r}")
-    assert violations == [], (
-        "services/evidence/classification_rule.py must never import mailbox sweep/provider-adapter code, only "
-        "services.mailbox.domain_rule's pure normalization helpers — violations:\n" + "\n".join(violations)
-    )
-    # Positive check: the one legitimate cross-module import really is
-    # there (this delivery's own WO-authorised exception).
-    mailbox_imports = [imp.full for imp in _imports_of(path) if imp.full.startswith("services.mailbox")]
-    assert mailbox_imports == ["services.mailbox.domain_rule"], (
-        f"expected classification_rule.py's only services.mailbox import to be "
-        f"'services.mailbox.domain_rule', found: {mailbox_imports}"
+    mailbox_imports = [imp.full for imp in _imports_of(path) if imp.full == "services.mailbox" or imp.full.startswith("services.mailbox.")]
+    assert mailbox_imports == [], (
+        "services/evidence/classification_rule.py must never import anything under services.mailbox — "
+        f"found: {mailbox_imports}"
     )
 
 
@@ -896,3 +893,82 @@ def test_no_production_content_fixture_added_for_evidence_classification():
     assert violations == [], (
         f"no binary/production-content fixture file may exist for this delivery's tests: {violations}"
     )
+
+
+# ---------------------------------------------------------------------
+# CD-6 Slice 5 WI-2 — matcher/guard/preview/governed-service/router
+# architecture-boundary proofs.
+# ---------------------------------------------------------------------
+
+_WI2_NEW_MODULE_PATHS = [
+    REPO_ROOT / "services" / "evidence" / "classification_matcher.py",
+    REPO_ROOT / "services" / "evidence" / "classification_observation.py",
+    REPO_ROOT / "services" / "evidence" / "classification_rule_service.py",
+    REPO_ROOT / "services" / "evidence" / "classification_service.py",
+    REPO_ROOT / "app" / "api" / "routers" / "evidence_classification.py",
+    REPO_ROOT / "core" / "text_matching.py",
+]
+
+
+def test_wi2_classification_modules_never_import_provider_adapters_or_sweep():
+    """The matcher/guard/preview/service layer must never import a
+    Gmail/Microsoft-Graph/IMAP provider adapter or the sweep engine —
+    these modules are pure domain/compute logic operating on data a
+    caller already fetched, never a live mail-fetch path themselves."""
+    forbidden_mailbox_submodules = (
+        "services.mailbox.sweep",
+        "services.mailbox.microsoft",
+        "services.mailbox.gmail",
+        "services.mailbox.imap",
+    )
+    violations = []
+    for path in _WI2_NEW_MODULE_PATHS:
+        for imp in _imports_of(path):
+            if any(imp.full == mod or imp.full.startswith(mod + ".") for mod in forbidden_mailbox_submodules):
+                violations.append(f"{path.relative_to(REPO_ROOT)}:{imp.lineno} imports {imp.full!r}")
+    assert violations == [], (
+        "CD-6 Slice 5 WI-2 modules must never import a Gmail/Microsoft-Graph/IMAP provider adapter or the "
+        "sweep engine — violations:\n" + "\n".join(violations)
+    )
+
+
+def test_wi2_classification_modules_never_import_ai_orchestration_code():
+    """No `ai.*` import anywhere in WI-2's new modules — this delivery
+    is deterministic/non-AI only."""
+    forbidden_ai_roots = {"ai"}
+    violations = []
+    for path in _WI2_NEW_MODULE_PATHS:
+        for imp in _imports_of(path):
+            if imp.root in forbidden_ai_roots:
+                violations.append(f"{path.relative_to(REPO_ROOT)}:{imp.lineno} imports {imp.full!r}")
+    assert violations == [], (
+        "CD-6 Slice 5 WI-2 modules must never import ai.* — this delivery is deterministic/non-AI only — "
+        "violations:\n" + "\n".join(violations)
+    )
+
+
+def test_wi2_classification_modules_never_call_mailbox_domain_rule_write_methods():
+    """Classification rules must never touch mailbox policy —
+    `MailboxDomainRuleRepository.upsert_rule` (its only mutating method)
+    is never called from any WI-2 module."""
+    violations = []
+    for path in _WI2_NEW_MODULE_PATHS:
+        text = path.read_text(encoding="utf-8")
+        if ".upsert_rule(" in text:
+            violations.append(str(path.relative_to(REPO_ROOT)))
+    assert violations == [], (
+        f"CD-6 Slice 5 WI-2 modules must never call MailboxDomainRuleRepository.upsert_rule: {violations}"
+    )
+
+
+def test_wi2_classification_modules_never_call_evidence_object_store():
+    """The preview/guard/matcher/service layer reads only
+    `EvidenceItem.metadata` (sender/subject) — never document content,
+    raw MIME, or attachment bytes. No WI-2 module ever calls into an
+    object store."""
+    violations = []
+    for path in _WI2_NEW_MODULE_PATHS:
+        text = path.read_text(encoding="utf-8")
+        if "object_store" in text and "object_store.get(" in text:
+            violations.append(str(path.relative_to(REPO_ROOT)))
+    assert violations == [], f"CD-6 Slice 5 WI-2 modules must never read from an object store: {violations}"

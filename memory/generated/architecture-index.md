@@ -81,9 +81,9 @@ Own the ONE adapter that speaks to BAGMAN's LiteLLM gateway (CD-5 PID §6/§8/§
 - **External access:** `true`
 - **Prohibited:** `direct_email_access`, `direct_bank_access`, `direct_xero_access`, `direct_chargebee_access`, `direct_mac_mini_access`, `direct_ollama_mlx_llamacpp_access`, `trinity_star_alias_usage`, `raw_physical_model_name_usage`
 
-### `BAGMAN.CORE` (v1)
+### `BAGMAN.CORE` (v2)
 
-Own canonical identity, timestamp, error, contract-validation, and domain-model primitives (GovernedEntity, Source, ExternalReference, Provenance, AuditEvent) plus their in-memory reference repositories, and expose the single BagmanCanonicalAPI orchestration facade (core/api.py) that composes these with services/evidence/ to record every canonical write's audit event — including EVIDENCE_OBSERVED, which is emitted from here even though EvidenceItem itself is owned by services/evidence/ (see the `produces` note below).
+Own canonical identity, timestamp, error, contract-validation, and domain-model primitives (GovernedEntity, Source, ExternalReference, Provenance, AuditEvent) plus their in-memory reference repositories, and expose the single BagmanCanonicalAPI orchestration facade (core/api.py) that composes these with services/evidence/ to record every canonical write's audit event — including EVIDENCE_OBSERVED, which is emitted from here even though EvidenceItem itself is owned by services/evidence/ (see the `produces` note below). Also owns core/text_matching.py (CD-6 Slice 5 WI-2) — the neutral, dependency- free text-normalisation/predicate-matching primitives (normalize_domain/normalize_address/domain_from_address/ normalize_subject_for_policy/subject_matches_predicate) extracted out of services/mailbox/domain_rule.py so both mailbox-domain-rule policy and evidence-classification-rule matching can depend on ONE shared implementation rather than two independently-maintained copies. Not a new canonical domain TYPE (nothing to add to `owns` below — these are plain functions, the same style as core/identity.py/core/timestamps.py, neither of which is listed in `owns` either).
 
 - **Owns:** `GovernedEntity`, `Source`, `ExternalReference`, `Provenance`, `AuditEvent`
 - **Consumes:** `services/evidence`
@@ -159,13 +159,13 @@ CD-6 Slice 1 (PID §98, "GUI Operations Foundation") additionally owns: a real p
 - **External access:** `false`
 - **Prohibited:** `direct_email_access`, `direct_bank_access`, `direct_xero_access`, `direct_chargebee_access`
 
-### `BAGMAN.SERVICES.EVIDENCE` (v2)
+### `BAGMAN.SERVICES.EVIDENCE` (v3)
 
-Own canonical EvidenceItem identity and its immutability and idempotent-observation semantics (an EvidenceItem, once recorded, is never mutated, and a replayed observation of the same external reference resolves to the existing record rather than creating a duplicate); also owns EvidenceClassification (an append-only, supersession-chained document_type classification of an EvidenceItem) and EvidenceClassificationRule (the separate, deterministic rule-based classification authority behind CD-6 Slice 5 WI-1) — two distinct canonical types this component defines alongside EvidenceItem itself, never folded into it.
+Own canonical EvidenceItem identity and its immutability and idempotent-observation semantics (an EvidenceItem, once recorded, is never mutated, and a replayed observation of the same external reference resolves to the existing record rather than creating a duplicate); also owns EvidenceClassification (an append-only, supersession-chained document_type classification of an EvidenceItem) and EvidenceClassificationRule (the separate, deterministic rule-based classification authority behind CD-6 Slice 5 WI-1) — two distinct canonical types this component defines alongside EvidenceItem itself, never folded into it. CD-6 Slice 5 WI-2 adds the deterministic matcher/observed-evidence-guard/preview/governed-rule-lifecycle/ classification-service layer on top of that same data model — no new canonical type, purely additive compute/orchestration logic.
 
 - **Owns:** `EvidenceItem`, `EvidenceClassification`, `EvidenceClassificationRule`
-- **Consumes:** `BAGMAN.CORE`, `BAGMAN.MAILBOX`
-- **Produces:** _(none)_
+- **Consumes:** `BAGMAN.CORE`
+- **Produces:** `EVIDENCE_CLASSIFICATION_RULE_CREATED`, `EVIDENCE_CLASSIFICATION_RULE_RETIRED`, `EVIDENCE_CLASSIFIED`
 - **Dependencies:** `jsonschema`, `rfc3339-validator`
 - **External access:** `false`
 - **Prohibited:** `direct_email_access`, `direct_bank_access`, `direct_xero_access`, `direct_chargebee_access`

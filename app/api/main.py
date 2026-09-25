@@ -101,6 +101,7 @@ from app.api.logging_config import configure_logging
 from app.api.routers import (
     activity,
     ai,
+    evidence_classification,
     health,
     intake,
     internal,
@@ -158,6 +159,12 @@ app.include_router(mailboxes_imap.router)
 #: shape exactly — see `app/api/routers/mailboxes_gmail.py`'s own module
 #: docstring.
 app.include_router(mailboxes_gmail.router)
+#: CD-6 Slice 5 WI-2 — the deterministic (non-AI) evidence-classification
+#: HTTP surface (rule preview/create/list/detail/retire, and the
+#: manually-invoked deterministic classification endpoint). See
+#: app/api/routers/evidence_classification.py's own module docstring —
+#: never wired into any automatic sweep/intake path.
+app.include_router(evidence_classification.router)
 
 #: CD-4 WI-4 — the BAGMAN Documents GUI (PID §36-42), served as plain
 #: static assets. Mounted LAST and at "/" so it never shadows any

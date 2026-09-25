@@ -165,8 +165,6 @@ from __future__ import annotations
 
 import abc
 import dataclasses
-import re
-import unicodedata
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional
@@ -175,6 +173,25 @@ from core import identity
 from core.contract_validation import validate_against_contract
 from core.errors import ConflictError, InvalidStateTransitionError, NotFoundError, ValidationError
 from core.timestamps import to_contract_string, utc_now
+
+#: CD-6 Slice 5 WI-2 — these five functions were originally implemented
+#: IN THIS MODULE (see git history) and have since been extracted
+#: verbatim into the neutral ``core.text_matching`` module, then
+#: re-exported here so every existing caller in this codebase (across
+#: ``services/mailbox/*.py``, ``persistence/postgres/mailbox_domain_rule_repository.py``,
+#: and every test that imports them FROM this module) keeps working
+#: with ZERO code changes at any call site — a pure extraction, not a
+#: rename. See ``core.text_matching``'s own module docstring for why
+#: this refactor exists and why `domain_in_scope` (mailbox-domain-rule-
+#: specific INCLUDE_SUBDOMAINS scope logic) deliberately stayed here
+#: rather than being extracted alongside these five.
+from core.text_matching import (  # noqa: F401 - re-exported for backward compatibility
+    domain_from_address,
+    normalize_address,
+    normalize_domain,
+    normalize_subject_for_policy,
+    subject_matches_predicate,
+)
 
 _SCHEMA = "mailbox/bagman.mailbox_domain_rule.v1.schema.json"
 SCHEMA_VERSION = "bagman.mailbox_domain_rule.v1"
@@ -305,13 +322,6 @@ class MailboxDomainRule:
         }
 
 
-def normalize_domain(sender_domain: str) -> str:
-    """The ONE place every caller normalises a sender domain before
-    either a match/uniqueness comparison or storage — mirrors
-    ``services.mailbox.mailbox.normalize_email``'s identical role."""
-    return sender_domain.strip().lower()
-
-
 def domain_in_scope(candidate_domain: str, target_domain: str, *, include_subdomains: bool) -> bool:
     """The ONE shared boundary check for "is this candidate's domain
     ``target_domain`` itself, or (only when ``include_subdomains`` is
@@ -351,96 +361,6 @@ def domain_in_scope(candidate_domain: str, target_domain: str, *, include_subdom
     if not include_subdomains:
         return False
     return candidate_domain.endswith(f".{target_domain}")
-
-
-def normalize_address(sender_address: str) -> str:
-    """The ONE place every caller normalises a full sender email address
-    before either a match/uniqueness comparison or storage (CD-6
-    GUI-operations-foundation follow-on WO — `MATCH_MODE_EXACT_ADDRESS`).
-    Mirrors :func:`normalize_domain`'s identical role one level up."""
-    return sender_address.strip().lower()
-
-
-def domain_from_address(sender_address: str) -> str:
-    """The one place this module derives a domain from a full email
-    address — mirrors ``services.mailbox.sweep._extract_sender_domain``'s
-    own normalisation discipline, applied here to an already-known-valid
-    address (an `EXACT_ADDRESS` rule's own `sender_address`)."""
-    normalized = normalize_address(sender_address)
-    if "@" not in normalized:
-        raise ValidationError(f"'{sender_address}' is not a valid email address (missing '@')")
-    domain = normalized.rsplit("@", 1)[-1]
-    if not domain:
-        raise ValidationError(f"'{sender_address}' is not a valid email address (empty domain)")
-    return domain
-
-
-#: Collapse consecutive internal whitespace to one ASCII space — applied
-#: AFTER casefold/strip in `normalize_subject_for_policy` below.
-_WHITESPACE_RUN = re.compile(r"\s+")
-
-
-def normalize_subject_for_policy(subject: Optional[str]) -> Optional[str]:
-    """The ONE place every caller normalises a message subject before
-    either a `MATCH_MODE_EXACT_DOMAIN_SUBJECT` predicate comparison or
-    storage (CD-6 GUI-operations-foundation follow-on WO — deterministic
-    subject-aware mailbox domain policy). Applied in this EXACT order:
-
-    1. Unicode NFKC normalisation (`unicodedata.normalize("NFKC", ...)`)
-       — canonicalises visually-identical-but-differently-encoded
-       characters (e.g. full-width vs. half-width forms) before any
-       comparison.
-    2. `.casefold()` — a real subject rule must never be defeated by
-       case variation.
-    3. `.strip()` — leading/trailing whitespace never carries meaning.
-    4. Collapse consecutive INTERNAL whitespace to one ASCII space — a
-       real, observed eBay defect (a literal double space inside a
-       subject line) must not silently defeat an otherwise-correct
-       predicate.
-
-    Deliberately does NOT strip punctuation/digits, and does NOT strip
-    `Re:`/`Fwd:` reply/forward prefixes — this is a NORMALISATION step,
-    never a semantic rewrite; a predicate author who wants to match past
-    a `Re:` prefix uses `STARTS_WITH` with the prefix included, or
-    `EXACT` against the reply subject's own literal (normalised) text.
-
-    `None` in -> `None` out (an `EXACT_DOMAIN_SUBJECT` rule never
-    matches a message with no subject at all — see
-    `MailboxDomainRuleRepository.find_for_sender`'s own Tier-2 gate)."""
-    if subject is None:
-        return None
-    normalized = unicodedata.normalize("NFKC", subject).casefold().strip()
-    return _WHITESPACE_RUN.sub(" ", normalized)
-
-
-def subject_matches_predicate(subject: Optional[str], *, predicate_type: str, predicate_value: str) -> bool:
-    """The ONE place a real message subject is tested against a stored
-    `MATCH_MODE_EXACT_DOMAIN_SUBJECT` predicate — used by BOTH
-    `MailboxDomainRuleRepository.find_for_sender`'s own Tier-2
-    resolution (in-memory AND PostgreSQL implementations alike) and the
-    creation-time "has this predicate ever/currently matched a real
-    message" guards (`app/api/routers/mailboxes.py
-    ::upsert_mailbox_policy_rule`'s `subject_predicate_observed` check,
-    `services.mailbox.review_resolution.resolve_domain_review`'s own
-    eligible-candidate check) — never reimplemented at any of those call
-    sites.
-
-    ``subject`` is the RAW (un-normalised) candidate subject —
-    normalised HERE, internally, via `normalize_subject_for_policy`.
-    ``predicate_value`` MUST already be in canonical normalised form
-    (exactly what every rule stores — see
-    `MailboxDomainRule.subject_predicate_value`'s own docstring); it is
-    never re-normalised here, so a caller passing a raw, un-normalised
-    predicate value would silently never match — every caller of this
-    function is expected to already hold a normalised stored value."""
-    normalized_subject = normalize_subject_for_policy(subject)
-    if not normalized_subject:
-        return False
-    if predicate_type == SUBJECT_PREDICATE_EXACT:
-        return normalized_subject == predicate_value
-    if predicate_type == SUBJECT_PREDICATE_STARTS_WITH:
-        return normalized_subject.startswith(predicate_value)
-    return False
 
 
 def validate_and_normalize_subject_predicate(
