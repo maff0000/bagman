@@ -192,6 +192,82 @@ def test_dismissed_is_rejected_for_classification_review_with_no_mutation():
 
 
 # ---------------------------------------------------------------------
+# WI-4-correction §18 — closed resolution-shape validation
+# ---------------------------------------------------------------------
+
+
+def test_resolution_with_unsupported_extra_key_is_rejected_via_http():
+    client, composition = _client()
+    _evidence_id, classification_id = _create_ai_proposal(client, composition)
+    item = _find_open_review_item(client, classification_id)
+
+    response = client.post(
+        f"/internal/needs-you/{item['item_id']}/resolve",
+        json={
+            "new_status": "RESOLVED", "actor_type": "USER", "actor_id": "matt",
+            "resolution": {"document_type": "SUPPLIER_INVOICE", "teach_rule": None, "confidence": 0.99},
+        },
+    )
+    assert response.status_code == 422, response.text
+
+    fetched = client.get(f"/internal/needs-you/{item['item_id']}").json()
+    assert fetched["status"] == "OPEN"
+    classification_history = client.get(f"/internal/evidence/{_evidence_id}/classifications").json()
+    assert len(classification_history["items"]) == 1
+
+
+# ---------------------------------------------------------------------
+# WI-4-correction §11 — different document_type after a partial
+# failure must never silently resolve with the wrong canonical truth.
+# ---------------------------------------------------------------------
+
+
+def test_different_document_type_retry_via_http_returns_409_and_preserves_committed_classification():
+    client, composition = _client()
+    _evidence_id, classification_id = _create_ai_proposal(client, composition, proposed_type="RECEIPT")
+    item = _find_open_review_item(client, classification_id)
+
+    # First request commits SUPPLIER_INVOICE at the SERVICE layer only
+    # (never reaching the router's own final `resolve_needs_you_item`
+    # call) — simulating "operator classification committed, then a
+    # downstream failure before Needs You resolution" exactly like the
+    # service-level tests do, but here proven through the real
+    # composition's own classification repository directly, then the
+    # retry goes through the REAL HTTP endpoint.
+    from services.evidence.classification_review import resolve_classification_review
+
+    needs_you_item = composition.needs_you_repository.get_needs_you_item(item["item_id"])
+    first = resolve_classification_review(
+        needs_you_item=needs_you_item, resolution={"document_type": "SUPPLIER_INVOICE", "teach_rule": None},
+        actor_type="USER", actor_id="matt",
+        evidence_repository=composition.api.evidence_repository,
+        classification_repository=composition.classification_repository,
+        rule_repository=composition.classification_rule_repository,
+        audit_repository=composition.api.audit_repository,
+        record_audit_event=composition.api.record_audit_event,
+    )
+    assert first.classification_was_created is True
+    assert first.classification.document_type == "SUPPLIER_INVOICE"
+
+    response = client.post(
+        f"/internal/needs-you/{item['item_id']}/resolve",
+        json={
+            "new_status": "RESOLVED", "actor_type": "USER", "actor_id": "matt",
+            "resolution": {"document_type": "RECEIPT", "teach_rule": None},
+        },
+    )
+    assert response.status_code == 409, response.text
+
+    fetched = client.get(f"/internal/needs-you/{item['item_id']}").json()
+    assert fetched["status"] == "OPEN"
+    classification_history = client.get(f"/internal/evidence/{_evidence_id}/classifications").json()
+    assert len(classification_history["items"]) == 2
+    current = [c for c in classification_history["items"] if c["is_current"]][0]
+    assert current["document_type"] == "SUPPLIER_INVOICE"
+    assert current["classification_id"] == first.classification.classification_id
+
+
+# ---------------------------------------------------------------------
 # §43/§44 — classification history read endpoint
 # ---------------------------------------------------------------------
 

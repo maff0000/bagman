@@ -76,7 +76,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Mapping, Optional
 
-from core.errors import ValidationError
+from core.errors import ConflictError, ValidationError
 from core.text_matching import normalize_subject_for_policy
 from core.timestamps import utc_now
 from services.evidence.classification import (
@@ -210,23 +210,50 @@ class ClassificationReviewResolutionResult:
     rule_was_created: Optional[bool] = None
 
 
+#: WI-4-correction §18 — the CLOSED set of top-level `resolution` keys
+#: for a CLASSIFICATION_REVIEW resolution. `NeedsYouItem.resolution` is
+#: durable operator-action provenance — it must carry only governed
+#: semantics, never ignored/free-form baggage.
+_RESOLUTION_ALLOWED_KEYS = frozenset({"document_type", "teach_rule"})
+
+#: WI-4-correction §18 — the CLOSED set of `teach_rule` fields.
+_TEACH_RULE_ALLOWED_KEYS = frozenset(
+    {"sender_scope_type", "sender_scope_value", "subject_predicate_type", "subject_predicate_value"}
+)
+
+
 def _validate_resolution_or_raise(resolution: Optional[Mapping[str, Any]]) -> tuple[str, Optional[Mapping[str, Any]]]:
     """WI-4 §13/§14/§25 step 1 — validate the operator's resolution
     payload shape, BEFORE any state is touched. Returns
     ``(document_type, teach_rule)``.
 
+    WI-4-correction §18 — the payload is CLOSED: only ``document_type``/
+    ``teach_rule`` at the top level, and only the four governed scope/
+    predicate fields inside ``teach_rule``. An unrecognised extra key is
+    rejected outright, never silently ignored and stored anyway —
+    ``NeedsYouItem.resolution`` is durable operator-action provenance,
+    not a free-form bag.
+
     Raises:
         core.errors.ValidationError: missing/malformed ``document_type``,
-            a ``document_type`` outside the closed WI-1 vocabulary, a
-            malformed ``teach_rule`` shape, or a ``teach_rule`` request
-            against a final ``document_type`` of ``UNKNOWN`` (WI-4 §30 —
-            a deterministic rule may never be taught to UNKNOWN).
+            a ``document_type`` outside the closed WI-1 vocabulary, an
+            unrecognised top-level or ``teach_rule`` key, a malformed
+            ``teach_rule`` shape, or a ``teach_rule`` request against a
+            final ``document_type`` of ``UNKNOWN`` (WI-4 §30 — a
+            deterministic rule may never be taught to UNKNOWN).
     """
     if not resolution:
         raise ValidationError(
             "a CLASSIFICATION_REVIEW resolution requires a non-empty `resolution` object carrying at "
             "least `document_type`"
         )
+    extra_top_keys = set(resolution.keys()) - _RESOLUTION_ALLOWED_KEYS
+    if extra_top_keys:
+        raise ValidationError(
+            f"resolution contains unsupported key(s) {sorted(extra_top_keys)} — only "
+            f"{sorted(_RESOLUTION_ALLOWED_KEYS)} are permitted for a CLASSIFICATION_REVIEW resolution"
+        )
+
     document_type = resolution.get("document_type")
     if not document_type or document_type not in DOCUMENT_TYPES:
         raise ValidationError(
@@ -237,12 +264,15 @@ def _validate_resolution_or_raise(resolution: Optional[Mapping[str, Any]]) -> tu
     if teach_rule is not None:
         if not isinstance(teach_rule, Mapping):
             raise ValidationError("resolution.teach_rule must be an object (or null/omitted for no teaching)")
-        required_fields = (
-            "sender_scope_type", "sender_scope_value", "subject_predicate_type", "subject_predicate_value",
-        )
-        missing = [f for f in required_fields if not teach_rule.get(f)]
+        extra_teach_keys = set(teach_rule.keys()) - _TEACH_RULE_ALLOWED_KEYS
+        if extra_teach_keys:
+            raise ValidationError(
+                f"resolution.teach_rule contains unsupported key(s) {sorted(extra_teach_keys)} — only "
+                f"{sorted(_TEACH_RULE_ALLOWED_KEYS)} are permitted"
+            )
+        missing = [f for f in _TEACH_RULE_ALLOWED_KEYS if not teach_rule.get(f)]
         if missing:
-            raise ValidationError(f"resolution.teach_rule is missing required field(s): {missing}")
+            raise ValidationError(f"resolution.teach_rule is missing required field(s): {sorted(missing)}")
         if document_type == DOCUMENT_TYPE_UNKNOWN:
             raise ValidationError(
                 "resolution.teach_rule may never be supplied when the final document_type is UNKNOWN "
@@ -286,6 +316,83 @@ def _build_candidate_rule(
         created_at=now,
         approved_at=now,
     )
+
+
+def _validate_replay_semantic_compatibility_or_raise(
+    classification: EvidenceClassification,
+    *,
+    ai_classification: EvidenceClassification,
+    needs_you_item: NeedsYouItem,
+    requested_document_type: str,
+    expected_status: str,
+) -> None:
+    """WI-4-correction §1-7 — the defect this closes: repository
+    producer-identity replay (WI-1's own, correct, doctrine — see this
+    module's own "Idempotency reuses the SAME producer-identity
+    mechanism" section) means "this operator action has already
+    established its canonical classification decision", NOT "this
+    request's own document_type is whatever the caller says it is
+    right now". A retry may continue unfinished DOWNSTREAM work (rule
+    teaching, Needs You resolution) only when it is semantically
+    COMPATIBLE with the already-committed row — never a licence to
+    reinterpret it.
+
+    Called UNCONDITIONALLY, on BOTH the fresh-create path (`was_created
+    == True`, where every invariant below holds trivially by
+    construction) AND the replay path (`was_created == False`, where a
+    DIFFERENT prior request could have committed a different decision)
+    — WI-4-correction §5's own explicit "do not maintain different
+    compatibility rules for fresh and replay paths" instruction. One
+    shared check, always run.
+
+    Raises:
+        core.errors.ConflictError: `classification` (whatever the
+            repository actually returned — freshly created or replayed)
+            does not match every invariant WI-4-correction §4 lists.
+            Never silently rewrites/supersedes/re-labels the existing
+            row (WI-4-correction §7) — the caller must treat this
+            exactly like any other genuine conflict: no rule teaching,
+            no Needs You transition, no Needs You resolution audit.
+    """
+    mismatches: list[str] = []
+    if classification.source != SOURCE_OPERATOR_ASSIGNED:
+        mismatches.append(f"source={classification.source!r} (expected {SOURCE_OPERATOR_ASSIGNED!r})")
+    if classification.operator_action_id != needs_you_item.item_id:
+        mismatches.append(
+            f"operator_action_id={classification.operator_action_id!r} (expected {needs_you_item.item_id!r})"
+        )
+    if classification.evidence_id != ai_classification.evidence_id:
+        mismatches.append(
+            f"evidence_id={classification.evidence_id!r} (expected {ai_classification.evidence_id!r})"
+        )
+    if classification.classification_type != CLASSIFICATION_TYPE_DOCUMENT_TYPE:
+        mismatches.append(
+            f"classification_type={classification.classification_type!r} "
+            f"(expected {CLASSIFICATION_TYPE_DOCUMENT_TYPE!r})"
+        )
+    if classification.supersedes_classification_id != ai_classification.classification_id:
+        mismatches.append(
+            f"supersedes_classification_id={classification.supersedes_classification_id!r} "
+            f"(expected {ai_classification.classification_id!r})"
+        )
+    if classification.document_type != requested_document_type:
+        mismatches.append(
+            f"document_type={classification.document_type!r} (this request asked for {requested_document_type!r})"
+        )
+    if classification.status != expected_status:
+        mismatches.append(f"status={classification.status!r} (expected {expected_status!r})")
+
+    if mismatches:
+        raise ConflictError(
+            f"NeedsYouItem '{needs_you_item.item_id}' (operator_action_id) has ALREADY committed a "
+            f"different operator classification decision (classification_id="
+            f"{classification.classification_id!r}) than this request asks for: {'; '.join(mismatches)}. "
+            "A producer replay of the same operator action returns the EXISTING row unchanged — it can "
+            "never be used to reinterpret an already-committed classification decision (WI-4-correction "
+            "§3/§7). If a genuine correction to an already-committed operator classification is needed, "
+            "that requires a separate, explicit correction workflow — not a retry of this same Needs You "
+            "resolution."
+        )
 
 
 def resolve_classification_review(
@@ -356,7 +463,6 @@ def resolve_classification_review(
     evidence = evidence_repository.get_evidence(ai_classification.evidence_id)
 
     is_unknown = document_type == DOCUMENT_TYPE_UNKNOWN
-    decision = DECISION_CONFIRMED if document_type == ai_classification.document_type else DECISION_CORRECTED
     new_status = STATUS_UNCLASSIFIABLE if is_unknown else STATUS_CLASSIFIED
 
     creation_result = classification_repository.create_classification_with_result(
@@ -371,6 +477,34 @@ def resolve_classification_review(
     )
     operator_classification = creation_result.classification
     classification_was_created = creation_result.was_created
+
+    # WI-4-correction §1-7 — the defect this delta closes: a repository
+    # producer-identity REPLAY (`was_created == False`) can return a row
+    # an EARLIER, semantically DIFFERENT request committed (e.g. a
+    # prior document_type=SUPPLIER_INVOICE decision, if THIS request
+    # now asks for RECEIPT) — replay is never permission to reinterpret
+    # an already-established operator decision. Run the SAME check on
+    # BOTH the fresh-create and replay paths (§5) — on fresh-create
+    # every invariant holds trivially by construction; on replay it is
+    # the only thing standing between a stale/differently-intentioned
+    # retry and silently reporting the wrong canonical truth.
+    _validate_replay_semantic_compatibility_or_raise(
+        operator_classification,
+        ai_classification=ai_classification,
+        needs_you_item=needs_you_item,
+        requested_document_type=document_type,
+        expected_status=new_status,
+    )
+
+    # WI-4-correction §8 — derive CONFIRMED/CORRECTED from the ACTUAL
+    # canonical row now that semantic compatibility is proven, never
+    # from the raw incoming `document_type` alone — so audit semantics
+    # always describe stored truth (after §4's check succeeds the two
+    # are guaranteed equal, but this is the robust, drift-proof source).
+    decision = (
+        DECISION_CONFIRMED if operator_classification.document_type == ai_classification.document_type
+        else DECISION_CORRECTED
+    )
 
     if classification_was_created:
         event_type = EVIDENCE_CLASSIFICATION_CONFIRMED if decision == DECISION_CONFIRMED else EVIDENCE_CLASSIFICATION_CORRECTED
@@ -421,13 +555,17 @@ def resolve_classification_review(
         # WI-4 §33 — the existing governed WI-2 rule-creation service:
         # observed-evidence guard, identity normalization, conflict
         # checking, repository-authoritative was_created, audit exactly
-        # once. `document_type` is ALWAYS the final operator-selected
-        # value (§29) — never an independently caller-supplied one.
+        # once. WI-4-correction §9 — `document_type` comes from the
+        # CANONICAL `operator_classification` row, never the raw
+        # incoming `document_type` variable: after the §4 semantic-
+        # compatibility check above the two are guaranteed equal, but
+        # reading the canonical row is what actually prevents future
+        # drift if this ordering is ever refactored.
         create_rule_result = create_classification_rule(
             sender_scope_type=teach_rule["sender_scope_type"], sender_scope_value=teach_rule["sender_scope_value"],
             subject_predicate_type=teach_rule["subject_predicate_type"],
             subject_predicate_value=teach_rule["subject_predicate_value"],
-            document_type=document_type, source=RULE_SOURCE_OPERATOR,
+            document_type=operator_classification.document_type, source=RULE_SOURCE_OPERATOR,
             actor_type=actor_type, actor_id=actor_id,
             rule_repository=rule_repository, evidence_repository=evidence_repository,
             audit_repository=audit_repository,

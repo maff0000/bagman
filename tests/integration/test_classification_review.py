@@ -453,6 +453,307 @@ def test_retry_after_operator_classification_created_reuses_same_row_no_duplicat
 
 
 # ---------------------------------------------------------------------
+# WI-4-correction §6/§10/§11/§12/§13/§14 — replay semantic-compatibility
+# guard: a producer replay (`was_created=False`) must never be treated
+# as permission to reinterpret an already-committed operator decision.
+# ---------------------------------------------------------------------
+
+
+def test_same_semantic_retry_after_partial_failure_is_compatible_and_continues(
+    evidence_repository, classification_repository, ai_invocation_repository, rule_repository, audit_repository,
+    needs_you_repository,
+):
+    """WI-4-correction §14 — same document_type on retry is fully
+    compatible: same classification_id reused, was_created=False,
+    exactly one classification audit total, and downstream work (here,
+    a teach_rule that was OMITTED on the first call but supplied on the
+    retry) still genuinely continues."""
+    evidence, ai_classification, ai_invocation_id = _make_ai_proposal(
+        classification_repository, ai_invocation_repository, evidence_repository,
+        sender_address="orders@ebay.com", subject="Order confirmed: widget", document_type="BROKER_STATEMENT",
+    )
+    item = ensure_classification_review_item(
+        classification=ai_classification, evidence=evidence, ai_invocation_id=ai_invocation_id,
+        needs_you_repository=needs_you_repository,
+    )
+    first = _resolve(
+        item, {"document_type": "BROKER_STATEMENT", "teach_rule": None},
+        evidence_repository=evidence_repository, classification_repository=classification_repository,
+        rule_repository=rule_repository, audit_repository=audit_repository,
+    )
+    assert first.classification_was_created is True
+
+    second = _resolve(
+        item, {"document_type": "BROKER_STATEMENT", "teach_rule": None},
+        evidence_repository=evidence_repository, classification_repository=classification_repository,
+        rule_repository=rule_repository, audit_repository=audit_repository,
+    )
+    assert second.classification.classification_id == first.classification.classification_id
+    assert second.classification_was_created is False
+
+    confirmed_events = [
+        e for e in audit_repository.list_by_subject("EvidenceClassification", first.classification.classification_id)
+        if e.event_type in (EVIDENCE_CLASSIFICATION_CONFIRMED, EVIDENCE_CLASSIFICATION_CORRECTED)
+    ]
+    assert len(confirmed_events) == 1
+
+
+def test_same_classification_changed_teaching_request_remains_valid(
+    evidence_repository, classification_repository, ai_invocation_repository, rule_repository, audit_repository,
+    needs_you_repository,
+):
+    """WI-4-correction §10 — the SAME document_type with a DIFFERENT
+    (or omitted) teach_rule on retry is a valid, conservative recovery
+    path: same C2 reused, no second classification audit, and the new
+    teach_rule request is evaluated fresh on its own merits."""
+    evidence, ai_classification, ai_invocation_id = _make_ai_proposal(
+        classification_repository, ai_invocation_repository, evidence_repository,
+        sender_address="orders@ebay.com", subject="Order confirmed: widget", document_type="ORDER_CONFIRMATION",
+    )
+    item = ensure_classification_review_item(
+        classification=ai_classification, evidence=evidence, ai_invocation_id=ai_invocation_id,
+        needs_you_repository=needs_you_repository,
+    )
+    # First request: no teaching at all (simulates "rule A failed
+    # downstream" by simply never having attempted it in this call).
+    first = _resolve(
+        item, {"document_type": "ORDER_CONFIRMATION", "teach_rule": None},
+        evidence_repository=evidence_repository, classification_repository=classification_repository,
+        rule_repository=rule_repository, audit_repository=audit_repository,
+    )
+    assert first.classification_was_created is True
+    assert first.rule is None
+
+    # Retry: SAME document_type, now WITH a genuinely matching teach_rule.
+    second = _resolve(
+        item,
+        {
+            "document_type": "ORDER_CONFIRMATION",
+            "teach_rule": {
+                "sender_scope_type": "EXACT_SENDER_DOMAIN", "sender_scope_value": "ebay.com",
+                "subject_predicate_type": "STARTS_WITH", "subject_predicate_value": "Order confirmed:",
+            },
+        },
+        evidence_repository=evidence_repository, classification_repository=classification_repository,
+        rule_repository=rule_repository, audit_repository=audit_repository,
+    )
+    assert second.classification.classification_id == first.classification.classification_id
+    assert second.classification_was_created is False
+    assert second.rule is not None
+    assert second.rule_was_created is True
+
+    confirmed_events = [
+        e for e in audit_repository.list_by_subject("EvidenceClassification", first.classification.classification_id)
+        if e.event_type in (EVIDENCE_CLASSIFICATION_CONFIRMED, EVIDENCE_CLASSIFICATION_CORRECTED)
+    ]
+    assert len(confirmed_events) == 1
+
+
+def test_different_document_type_after_partial_failure_raises_conflict(
+    evidence_repository, classification_repository, ai_invocation_repository, rule_repository, audit_repository,
+    needs_you_repository,
+):
+    """WI-4-correction §11 — the exact failure sequence the architect
+    described: AI proposes RECEIPT; first resolution commits
+    SUPPLIER_INVOICE; Needs You stays OPEN (simulated downstream
+    failure); retry asks for RECEIPT (the ORIGINAL AI proposal's own
+    type — the most dangerous case, since it 'looks like' a plausible
+    confirm). Must raise ConflictError, never silently resolve with a
+    document_type that contradicts the already-committed C2."""
+    evidence, ai_classification, ai_invocation_id = _make_ai_proposal(
+        classification_repository, ai_invocation_repository, evidence_repository, document_type="RECEIPT",
+    )
+    item = ensure_classification_review_item(
+        classification=ai_classification, evidence=evidence, ai_invocation_id=ai_invocation_id,
+        needs_you_repository=needs_you_repository,
+    )
+    first = _resolve(
+        item, {"document_type": "SUPPLIER_INVOICE", "teach_rule": None},
+        evidence_repository=evidence_repository, classification_repository=classification_repository,
+        rule_repository=rule_repository, audit_repository=audit_repository,
+    )
+    assert first.classification_was_created is True
+    assert first.classification.document_type == "SUPPLIER_INVOICE"
+
+    with pytest.raises(ConflictError):
+        _resolve(
+            item, {"document_type": "RECEIPT", "teach_rule": None},
+            evidence_repository=evidence_repository, classification_repository=classification_repository,
+            rule_repository=rule_repository, audit_repository=audit_repository,
+        )
+
+    # The existing C2 is completely untouched — still SUPPLIER_INVOICE,
+    # still the only OPERATOR_ASSIGNED row, no new classification row,
+    # no new classification audit.
+    current = classification_repository.get_current_classification(evidence.evidence_id, CLASSIFICATION_TYPE_DOCUMENT_TYPE)
+    assert current.classification_id == first.classification.classification_id
+    assert current.document_type == "SUPPLIER_INVOICE"
+    history = classification_repository.list_classification_history(evidence.evidence_id, CLASSIFICATION_TYPE_DOCUMENT_TYPE)
+    assert len(history) == 2  # AI proposal + the one real operator row
+    confirmed_events = [
+        e for e in audit_repository.list_by_subject("EvidenceClassification", first.classification.classification_id)
+        if e.event_type in (EVIDENCE_CLASSIFICATION_CONFIRMED, EVIDENCE_CLASSIFICATION_CORRECTED)
+    ]
+    assert len(confirmed_events) == 1
+    assert rule_repository.list_rules() == []
+
+
+def test_different_document_type_with_valid_teach_rule_raises_conflict_before_rule_creation(
+    evidence_repository, classification_repository, ai_invocation_repository, rule_repository, audit_repository,
+    needs_you_repository,
+):
+    """WI-4-correction §12 — the most dangerous variant: the retry's
+    document_type differs from the already-committed decision AND
+    supplies a teach_rule that would otherwise validly match the
+    evidence. The semantic-compatibility check must fire BEFORE rule
+    creation is ever attempted — zero rule rows, zero rule audit."""
+    evidence, ai_classification, ai_invocation_id = _make_ai_proposal(
+        classification_repository, ai_invocation_repository, evidence_repository,
+        sender_address="orders@ebay.com", subject="Order confirmed: widget", document_type="RECEIPT",
+    )
+    item = ensure_classification_review_item(
+        classification=ai_classification, evidence=evidence, ai_invocation_id=ai_invocation_id,
+        needs_you_repository=needs_you_repository,
+    )
+    first = _resolve(
+        item, {"document_type": "SUPPLIER_INVOICE", "teach_rule": None},
+        evidence_repository=evidence_repository, classification_repository=classification_repository,
+        rule_repository=rule_repository, audit_repository=audit_repository,
+    )
+    assert first.classification_was_created is True
+
+    with pytest.raises(ConflictError):
+        _resolve(
+            item,
+            {
+                "document_type": "ORDER_CONFIRMATION",
+                "teach_rule": {
+                    "sender_scope_type": "EXACT_SENDER_DOMAIN", "sender_scope_value": "ebay.com",
+                    "subject_predicate_type": "STARTS_WITH", "subject_predicate_value": "Order confirmed:",
+                },
+            },
+            evidence_repository=evidence_repository, classification_repository=classification_repository,
+            rule_repository=rule_repository, audit_repository=audit_repository,
+        )
+
+    assert rule_repository.list_rules() == []
+
+
+def test_unknown_mismatch_both_directions_raise_conflict(
+    evidence_repository, classification_repository, ai_invocation_repository, rule_repository, audit_repository,
+    needs_you_repository,
+):
+    """WI-4-correction §13 — UNKNOWN participates in the same semantic
+    check exactly like any other document_type: a committed UNKNOWN
+    decision cannot be silently reinterpreted as a real type on retry,
+    and vice versa."""
+    # Direction 1: first commits UNKNOWN, retry asks for a real type.
+    evidence_a, ai_classification_a, ai_invocation_id_a = _make_ai_proposal(
+        classification_repository, ai_invocation_repository, evidence_repository,
+        document_type="UNKNOWN", status=STATUS_UNCLASSIFIABLE,
+    )
+    item_a = ensure_classification_review_item(
+        classification=ai_classification_a, evidence=evidence_a, ai_invocation_id=ai_invocation_id_a,
+        needs_you_repository=needs_you_repository,
+    )
+    first_a = _resolve(
+        item_a, {"document_type": "UNKNOWN", "teach_rule": None},
+        evidence_repository=evidence_repository, classification_repository=classification_repository,
+        rule_repository=rule_repository, audit_repository=audit_repository,
+    )
+    assert first_a.classification.status == STATUS_UNCLASSIFIABLE
+    with pytest.raises(ConflictError):
+        _resolve(
+            item_a, {"document_type": "RECEIPT", "teach_rule": None},
+            evidence_repository=evidence_repository, classification_repository=classification_repository,
+            rule_repository=rule_repository, audit_repository=audit_repository,
+        )
+
+    # Direction 2 (inverse): first commits a real type, retry asks UNKNOWN.
+    evidence_b, ai_classification_b, ai_invocation_id_b = _make_ai_proposal(
+        classification_repository, ai_invocation_repository, evidence_repository, document_type="RECEIPT",
+    )
+    item_b = ensure_classification_review_item(
+        classification=ai_classification_b, evidence=evidence_b, ai_invocation_id=ai_invocation_id_b,
+        needs_you_repository=needs_you_repository,
+    )
+    first_b = _resolve(
+        item_b, {"document_type": "RECEIPT", "teach_rule": None},
+        evidence_repository=evidence_repository, classification_repository=classification_repository,
+        rule_repository=rule_repository, audit_repository=audit_repository,
+    )
+    assert first_b.classification.status == STATUS_CLASSIFIED
+    with pytest.raises(ConflictError):
+        _resolve(
+            item_b, {"document_type": "UNKNOWN", "teach_rule": None},
+            evidence_repository=evidence_repository, classification_repository=classification_repository,
+            rule_repository=rule_repository, audit_repository=audit_repository,
+        )
+
+
+# ---------------------------------------------------------------------
+# WI-4-correction §18 — closed resolution-shape validation
+# ---------------------------------------------------------------------
+
+
+def test_resolution_with_unsupported_top_level_key_raises_validation_error(
+    evidence_repository, classification_repository, ai_invocation_repository, rule_repository, audit_repository,
+    needs_you_repository,
+):
+    evidence, ai_classification, ai_invocation_id = _make_ai_proposal(
+        classification_repository, ai_invocation_repository, evidence_repository, document_type="RECEIPT",
+    )
+    item = ensure_classification_review_item(
+        classification=ai_classification, evidence=evidence, ai_invocation_id=ai_invocation_id,
+        needs_you_repository=needs_you_repository,
+    )
+    with pytest.raises(ValidationError):
+        _resolve(
+            item, {"document_type": "RECEIPT", "teach_rule": None, "notes": "looks fine to me"},
+            evidence_repository=evidence_repository, classification_repository=classification_repository,
+            rule_repository=rule_repository, audit_repository=audit_repository,
+        )
+    # The AI proposal (C1) remains untouched and current — no operator
+    # row was ever created (the shape validation must fail BEFORE any
+    # mutation, per §25 step 1).
+    current = classification_repository.get_current_classification(evidence.evidence_id, CLASSIFICATION_TYPE_DOCUMENT_TYPE)
+    assert current.classification_id == ai_classification.classification_id
+    assert current.source == SOURCE_AI_PROPOSAL
+
+
+def test_resolution_with_unsupported_teach_rule_key_raises_validation_error(
+    evidence_repository, classification_repository, ai_invocation_repository, rule_repository, audit_repository,
+    needs_you_repository,
+):
+    evidence, ai_classification, ai_invocation_id = _make_ai_proposal(
+        classification_repository, ai_invocation_repository, evidence_repository,
+        sender_address="orders@ebay.com", subject="Order confirmed: widget", document_type="ORDER_CONFIRMATION",
+    )
+    item = ensure_classification_review_item(
+        classification=ai_classification, evidence=evidence, ai_invocation_id=ai_invocation_id,
+        needs_you_repository=needs_you_repository,
+    )
+    with pytest.raises(ValidationError):
+        _resolve(
+            item,
+            {
+                "document_type": "ORDER_CONFIRMATION",
+                "teach_rule": {
+                    "sender_scope_type": "EXACT_SENDER_DOMAIN", "sender_scope_value": "ebay.com",
+                    "subject_predicate_type": "STARTS_WITH", "subject_predicate_value": "Order confirmed:",
+                    "document_type": "ORDER_CONFIRMATION",
+                },
+            },
+            evidence_repository=evidence_repository, classification_repository=classification_repository,
+            rule_repository=rule_repository, audit_repository=audit_repository,
+        )
+    current = classification_repository.get_current_classification(evidence.evidence_id, CLASSIFICATION_TYPE_DOCUMENT_TYPE)
+    assert current.classification_id == ai_classification.classification_id
+    assert current.source == SOURCE_AI_PROPOSAL
+    assert rule_repository.list_rules() == []
+
+
+# ---------------------------------------------------------------------
 # §54 — teaching happy path
 # ---------------------------------------------------------------------
 
