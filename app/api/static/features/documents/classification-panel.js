@@ -202,7 +202,23 @@ export const ClassificationPanel = {
   // ---- action (WI-5 §20/§22) ----
 
   _renderAction(host, evidenceId, current, container) {
-    if (current) return; // §20 — only offered when NO current classification exists.
+    // A proposal that still needs a human decision (REVIEW_REQUIRED —
+    // BAGMAN proposed a concrete type — or UNCLASSIFIABLE — BAGMAN
+    // could not determine a type at all, see
+    // services/evidence/classification_review.py's own doctrine, "both
+    // concrete and UNKNOWN outcomes need a review item") must always
+    // offer a way back into the review, not only in the same session
+    // as the original "Classify with BAGMAN" click — the Needs You
+    // queue itself has no per-item deep link the operator can rely on
+    // finding again (WI-5 §1's "review/correct an AI proposal" is a
+    // standing purpose, not a same-visit-only action).
+    if (current && current.source === "AI_PROPOSAL" && (current.status === "REVIEW_REQUIRED" || current.status === "UNCLASSIFIABLE")) {
+      const reviewBtn = el("button", { class: "btn btn--secondary", text: "Review classification", attrs: { type: "button" } });
+      reviewBtn.addEventListener("click", () => this._openReviewFor(current.classification_id));
+      host.appendChild(reviewBtn);
+      return;
+    }
+    if (current) return; // §20 — otherwise only offered when NO current classification exists.
 
     const btn = el("button", { class: "btn btn--primary", text: "Classify with BAGMAN", attrs: { type: "button" } });
     const statusEl = el("div", { class: "upload-status", attrs: { "aria-live": "polite" } });
