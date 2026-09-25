@@ -73,6 +73,7 @@ from services.evidence.classification_service import (
     OUTCOME_NO_MATCH,
     classify_evidence_deterministically,
 )
+from services.evidence.classification import CLASSIFICATION_TYPE_DOCUMENT_TYPE
 
 router = APIRouter()
 
@@ -325,6 +326,7 @@ def _run_orchestrator(evidence_id: str, payload: OrchestratedClassifyRequest, *,
         object_store=composition.object_store,
         audit_repository=composition.api.audit_repository,
         record_audit_event=composition.api.record_audit_event,
+        needs_you_repository=composition.needs_you_repository,
         actor_type=payload.actor_type,
         actor_id=payload.actor_id,
         correlation_id=payload.correlation_id,
@@ -417,3 +419,47 @@ async def classify_orchestrated(evidence_id: str, payload: OrchestratedClassifyR
     review/acceptance.
     """
     return _run_orchestrator(evidence_id, payload, persist=True)
+
+
+# ---------------------------------------------------------------------
+# Classification history (CD-6 Slice 5 WI-4 §43)
+# ---------------------------------------------------------------------
+
+
+@router.get("/internal/evidence/{evidence_id}/classifications")
+async def list_evidence_classifications(evidence_id: str) -> dict[str, Any]:
+    """WI-4 §43 — the full DOCUMENT_TYPE classification lineage for one
+    EvidenceItem, oldest-first (``EvidenceClassificationRepository
+    .list_classification_history``'s own existing ordering — never
+    reimplemented). Each row is rendered via its own ``to_dict()`` plus
+    a computed ``is_current`` flag (compared against
+    ``get_current_classification``) — never raw AI prompt/document
+    content, and never the full referenced rule/AIInvocation/operator
+    action objects (only the existing ``rule_id``/``ai_invocation_id``/
+    ``operator_action_id`` fields already on each row).
+    """
+    composition = get_composition()
+    # Prove the evidence itself is real before reporting its (possibly
+    # empty) classification history — an honest 404 rather than a
+    # silently empty list for a bogus evidence_id.
+    composition.api.get_evidence(evidence_id)
+
+    history = composition.classification_repository.list_classification_history(
+        evidence_id, CLASSIFICATION_TYPE_DOCUMENT_TYPE
+    )
+    current = composition.classification_repository.get_current_classification(
+        evidence_id, CLASSIFICATION_TYPE_DOCUMENT_TYPE
+    )
+    current_id = current.classification_id if current is not None else None
+
+    items = []
+    for classification in history:
+        row = classification.to_dict()
+        row["is_current"] = classification.classification_id == current_id
+        items.append(row)
+
+    return {
+        "evidence_id": evidence_id,
+        "classification_type": CLASSIFICATION_TYPE_DOCUMENT_TYPE,
+        "items": items,
+    }

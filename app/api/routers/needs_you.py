@@ -41,7 +41,8 @@ from pydantic import BaseModel
 
 from core.errors import ConflictError, ValidationError
 from app.api.composition import get_composition
-from services.needs_you.needs_you import ITEM_TYPE_COMPANY_REQUIRED
+from services.evidence.classification_review import resolve_classification_review
+from services.needs_you.needs_you import ITEM_TYPE_CLASSIFICATION_REVIEW, ITEM_TYPE_COMPANY_REQUIRED
 
 router = APIRouter(prefix="/internal/needs-you")
 
@@ -199,6 +200,19 @@ async def resolve_needs_you_item(item_id: str, payload: ResolveNeedsYouItemReque
     composition = get_composition()
     current = composition.needs_you_repository.get_needs_you_item(item_id)
 
+    # CD-6 Slice 5 WI-4 §26/§58 — DISMISSED is never a valid resolution
+    # for CLASSIFICATION_REVIEW: dismissing the question while leaving
+    # an AI REVIEW_REQUIRED/UNCLASSIFIABLE proposal as current would
+    # create a permanently ambiguous lineage with no operator path
+    # remaining. Fires on EVERY attempt (including a retry against an
+    # already-terminal item), BEFORE any mutation.
+    if current.item_type == ITEM_TYPE_CLASSIFICATION_REVIEW and payload.new_status == "DISMISSED":
+        raise ValidationError(
+            f"NeedsYouItem '{item_id}' is a CLASSIFICATION_REVIEW item — DISMISSED is never a valid "
+            "resolution (WI-4 §26); classify the document as NON_ACCOUNTING_DOCUMENT if it should not "
+            "enter accounting workflows, or UNKNOWN if it truly cannot be determined"
+        )
+
     if current.status != "OPEN":
         same_outcome = current.status == payload.new_status and (current.resolution or {}) == (
             payload.resolution or {}
@@ -256,6 +270,28 @@ async def resolve_needs_you_item(item_id: str, payload: ResolveNeedsYouItemReque
             actor_type=payload.actor_type,
             actor_id=payload.actor_id,
             correlation_id=current.correlation_id,
+        )
+
+    if current.item_type == ITEM_TYPE_CLASSIFICATION_REVIEW and payload.new_status == "RESOLVED":
+        # CD-6 Slice 5 WI-4 — the real business-logic mutation for a
+        # CLASSIFICATION_REVIEW item, in the exact same slot the
+        # COMPANY_REQUIRED branch above occupies: real work BEFORE the
+        # generic `resolve_needs_you_item` call below. Any exception
+        # here (ValidationError/NotFoundError/ConflictError) propagates
+        # before the item is ever marked RESOLVED — the item stays OPEN,
+        # the operator classification either never exists or remains
+        # durable exactly as `resolve_classification_review`'s own
+        # docstring documents.
+        resolve_classification_review(
+            needs_you_item=current,
+            resolution=payload.resolution,
+            actor_type=payload.actor_type,
+            actor_id=payload.actor_id,
+            evidence_repository=composition.api.evidence_repository,
+            classification_repository=composition.classification_repository,
+            rule_repository=composition.classification_rule_repository,
+            audit_repository=composition.api.audit_repository,
+            record_audit_event=composition.api.record_audit_event,
         )
 
     updated = composition.needs_you_repository.resolve_needs_you_item(

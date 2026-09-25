@@ -38,6 +38,7 @@ from services.evidence.classification_orchestrator import (
 )
 from services.evidence.classification_rule import InMemoryEvidenceClassificationRuleRepository
 from services.evidence.evidence import InMemoryEvidenceRepository
+from services.needs_you.needs_you import InMemoryNeedsYouRepository
 
 ACTOR_ID = "wi3-orchestrator-tests"
 
@@ -80,6 +81,11 @@ def litellm_client():
     return FakeLiteLLMClient()
 
 
+@pytest.fixture
+def needs_you_repository():
+    return InMemoryNeedsYouRepository()
+
+
 def _register_email_evidence(
     evidence_repository, object_store, *, content: bytes, sender_address=None, subject=None,
 ) -> str:
@@ -110,12 +116,14 @@ def _rfc822_email(*, sender: str, subject: str, body: str) -> bytes:
 
 
 def _classify(evidence_id, *, persist, evidence_repository, rule_repository, classification_repository,
-              ai_invocation_repository, litellm_client, object_store, audit_repository, correlation_id=None):
+              ai_invocation_repository, litellm_client, object_store, audit_repository, needs_you_repository,
+              correlation_id=None):
     return classify_evidence(
         evidence_id=evidence_id, persist=persist,
         evidence_repository=evidence_repository, rule_repository=rule_repository,
         classification_repository=classification_repository, ai_invocation_repository=ai_invocation_repository,
         litellm_client=litellm_client, object_store=object_store, audit_repository=audit_repository,
+        needs_you_repository=needs_you_repository,
         record_audit_event=audit_repository.record_audit_event,
         actor_type=actor.SYSTEM, actor_id=ACTOR_ID, correlation_id=correlation_id,
     )
@@ -140,7 +148,7 @@ def _queue_proposal(litellm_client, *, proposed_type: str, confidence: float = 0
 
 def test_deterministic_match_short_circuits_ai_never_called(
     evidence_repository, rule_repository, classification_repository, ai_invocation_repository,
-    litellm_client, object_store, audit_repository,
+    litellm_client, object_store, audit_repository, needs_you_repository,
 ):
     rule_repository.create_rule(
         sender_scope_type="EXACT_SENDER_DOMAIN", sender_scope_value="vendor.com",
@@ -156,6 +164,7 @@ def test_deterministic_match_short_circuits_ai_never_called(
         evidence_id, persist=True, evidence_repository=evidence_repository, rule_repository=rule_repository,
         classification_repository=classification_repository, ai_invocation_repository=ai_invocation_repository,
         litellm_client=litellm_client, object_store=object_store, audit_repository=audit_repository,
+        needs_you_repository=needs_you_repository,
     )
     assert result.outcome == OUTCOME_DETERMINISTIC_CLASSIFIED
     assert result.classification.source == "DETERMINISTIC_RULE"
@@ -164,7 +173,7 @@ def test_deterministic_match_short_circuits_ai_never_called(
 
 def test_deterministic_conflict_stops_ai_never_called(
     evidence_repository, rule_repository, classification_repository, ai_invocation_repository,
-    litellm_client, object_store, audit_repository,
+    litellm_client, object_store, audit_repository, needs_you_repository,
 ):
     # CONFLICT is structurally unreachable through the ordinary,
     # validated `create_rule` write path (see
@@ -194,6 +203,7 @@ def test_deterministic_conflict_stops_ai_never_called(
         evidence_id, persist=True, evidence_repository=evidence_repository, rule_repository=rule_repository,
         classification_repository=classification_repository, ai_invocation_repository=ai_invocation_repository,
         litellm_client=litellm_client, object_store=object_store, audit_repository=audit_repository,
+        needs_you_repository=needs_you_repository,
     )
     assert result.outcome == OUTCOME_DETERMINISTIC_CONFLICT
     assert len(result.conflicting_rule_ids) == 2
@@ -203,7 +213,7 @@ def test_deterministic_conflict_stops_ai_never_called(
 
 def test_existing_current_classification_stops_ai_never_called(
     evidence_repository, rule_repository, classification_repository, ai_invocation_repository,
-    litellm_client, object_store, audit_repository,
+    litellm_client, object_store, audit_repository, needs_you_repository,
 ):
     evidence_id = _register_email_evidence(
         evidence_repository, object_store,
@@ -218,6 +228,7 @@ def test_existing_current_classification_stops_ai_never_called(
         evidence_id, persist=True, evidence_repository=evidence_repository, rule_repository=rule_repository,
         classification_repository=classification_repository, ai_invocation_repository=ai_invocation_repository,
         litellm_client=litellm_client, object_store=object_store, audit_repository=audit_repository,
+        needs_you_repository=needs_you_repository,
     )
     assert result.outcome == OUTCOME_CURRENT_CLASSIFICATION_EXISTS
     assert result.existing_source == "OPERATOR_ASSIGNED"
@@ -231,7 +242,7 @@ def test_existing_current_classification_stops_ai_never_called(
 
 def test_no_deterministic_match_calls_ai_v2(
     evidence_repository, rule_repository, classification_repository, ai_invocation_repository,
-    litellm_client, object_store, audit_repository,
+    litellm_client, object_store, audit_repository, needs_you_repository,
 ):
     evidence_id = _register_email_evidence(
         evidence_repository, object_store,
@@ -243,6 +254,7 @@ def test_no_deterministic_match_calls_ai_v2(
         evidence_id, persist=False, evidence_repository=evidence_repository, rule_repository=rule_repository,
         classification_repository=classification_repository, ai_invocation_repository=ai_invocation_repository,
         litellm_client=litellm_client, object_store=object_store, audit_repository=audit_repository,
+        needs_you_repository=needs_you_repository,
     )
     assert result.outcome == OUTCOME_AI_PROPOSAL_REVIEW_REQUIRED
     assert result.proposed_type == "SUPPLIER_INVOICE"
@@ -257,7 +269,7 @@ def test_no_deterministic_match_calls_ai_v2(
 
 def test_context_unsupported_ai_never_called(
     evidence_repository, rule_repository, classification_repository, ai_invocation_repository,
-    litellm_client, object_store, audit_repository,
+    litellm_client, object_store, audit_repository, needs_you_repository,
 ):
     content = b"%PDF-1.4 fake pdf bytes"
     content_hash = {"algorithm": "SHA-256", "value": hashlib.sha256(content).hexdigest()}
@@ -272,6 +284,7 @@ def test_context_unsupported_ai_never_called(
         item.evidence_id, persist=True, evidence_repository=evidence_repository, rule_repository=rule_repository,
         classification_repository=classification_repository, ai_invocation_repository=ai_invocation_repository,
         litellm_client=litellm_client, object_store=object_store, audit_repository=audit_repository,
+        needs_you_repository=needs_you_repository,
     )
     assert result.outcome == OUTCOME_CONTEXT_UNSUPPORTED
     assert result.unsupported_reason is not None
@@ -281,7 +294,7 @@ def test_context_unsupported_ai_never_called(
 
 def test_evidence_with_no_stored_content_is_context_unsupported(
     evidence_repository, rule_repository, classification_repository, ai_invocation_repository,
-    litellm_client, object_store, audit_repository,
+    litellm_client, object_store, audit_repository, needs_you_repository,
 ):
     now = datetime.now(timezone.utc)
     item = evidence_repository.register_evidence(
@@ -293,6 +306,7 @@ def test_evidence_with_no_stored_content_is_context_unsupported(
         item.evidence_id, persist=True, evidence_repository=evidence_repository, rule_repository=rule_repository,
         classification_repository=classification_repository, ai_invocation_repository=ai_invocation_repository,
         litellm_client=litellm_client, object_store=object_store, audit_repository=audit_repository,
+        needs_you_repository=needs_you_repository,
     )
     assert result.outcome == OUTCOME_CONTEXT_UNSUPPORTED
     assert litellm_client.calls == []
@@ -305,7 +319,7 @@ def test_evidence_with_no_stored_content_is_context_unsupported(
 
 def test_successful_concrete_proposal_persists_as_review_required(
     evidence_repository, rule_repository, classification_repository, ai_invocation_repository,
-    litellm_client, object_store, audit_repository,
+    litellm_client, object_store, audit_repository, needs_you_repository,
 ):
     evidence_id = _register_email_evidence(
         evidence_repository, object_store,
@@ -316,6 +330,7 @@ def test_successful_concrete_proposal_persists_as_review_required(
         evidence_id, persist=True, evidence_repository=evidence_repository, rule_repository=rule_repository,
         classification_repository=classification_repository, ai_invocation_repository=ai_invocation_repository,
         litellm_client=litellm_client, object_store=object_store, audit_repository=audit_repository,
+        needs_you_repository=needs_you_repository,
     )
     assert result.outcome == OUTCOME_AI_PROPOSAL_REVIEW_REQUIRED
     assert result.was_created is True
@@ -325,10 +340,22 @@ def test_successful_concrete_proposal_persists_as_review_required(
     assert result.classification.confidence == 0.91
     assert result.classification.ai_invocation_id == result.ai_invocation_id
 
+    # CD-6 Slice 5 WI-4 §5/§7/§45 — a genuinely fresh, persisted concrete
+    # AI proposal, produced through the REAL `classify_evidence` wiring
+    # (not a standalone call to `ensure_classification_review_item`),
+    # must result in exactly one OPEN CLASSIFICATION_REVIEW item anchored
+    # to this exact classification_id.
+    from services.needs_you.needs_you import ITEM_TYPE_CLASSIFICATION_REVIEW
+
+    review_items = needs_you_repository.list_needs_you_items(item_type=ITEM_TYPE_CLASSIFICATION_REVIEW)
+    assert len(review_items) == 1
+    assert review_items[0].status == "OPEN"
+    assert review_items[0].source_object_reference == result.classification.classification_id
+
 
 def test_unknown_proposal_persists_as_unclassifiable(
     evidence_repository, rule_repository, classification_repository, ai_invocation_repository,
-    litellm_client, object_store, audit_repository,
+    litellm_client, object_store, audit_repository, needs_you_repository,
 ):
     evidence_id = _register_email_evidence(
         evidence_repository, object_store,
@@ -339,16 +366,26 @@ def test_unknown_proposal_persists_as_unclassifiable(
         evidence_id, persist=True, evidence_repository=evidence_repository, rule_repository=rule_repository,
         classification_repository=classification_repository, ai_invocation_repository=ai_invocation_repository,
         litellm_client=litellm_client, object_store=object_store, audit_repository=audit_repository,
+        needs_you_repository=needs_you_repository,
     )
     assert result.outcome == OUTCOME_AI_PROPOSAL_UNCLASSIFIABLE
     assert result.classification.status == STATUS_UNCLASSIFIABLE
     assert result.classification.document_type == "UNKNOWN"
     assert result.classification.source == "AI_PROPOSAL"
 
+    # WI-4 §5 — an UNKNOWN proposal ALSO needs a review item (the
+    # operator may know what it is even when the model does not).
+    from services.needs_you.needs_you import ITEM_TYPE_CLASSIFICATION_REVIEW
+
+    review_items = needs_you_repository.list_needs_you_items(item_type=ITEM_TYPE_CLASSIFICATION_REVIEW)
+    assert len(review_items) == 1
+    assert review_items[0].status == "OPEN"
+    assert review_items[0].source_object_reference == result.classification.classification_id
+
 
 def test_preview_mode_never_persists_a_classification(
     evidence_repository, rule_repository, classification_repository, ai_invocation_repository,
-    litellm_client, object_store, audit_repository,
+    litellm_client, object_store, audit_repository, needs_you_repository,
 ):
     evidence_id = _register_email_evidence(
         evidence_repository, object_store,
@@ -359,6 +396,7 @@ def test_preview_mode_never_persists_a_classification(
         evidence_id, persist=False, evidence_repository=evidence_repository, rule_repository=rule_repository,
         classification_repository=classification_repository, ai_invocation_repository=ai_invocation_repository,
         litellm_client=litellm_client, object_store=object_store, audit_repository=audit_repository,
+        needs_you_repository=needs_you_repository,
     )
     assert result.outcome == OUTCOME_AI_PROPOSAL_REVIEW_REQUIRED
     assert result.classification is None
@@ -367,6 +405,9 @@ def test_preview_mode_never_persists_a_classification(
     # A real AIInvocation was still created.
     assert result.ai_invocation_id is not None
     ai_invocation_repository.get_invocation(result.ai_invocation_id)
+    # WI-4 §6/§9 — preview mode NEVER performs the review-item producer
+    # behaviour (zero EvidenceClassification AND zero NeedsYouItem).
+    assert needs_you_repository.list_needs_you_items() == []
 
 
 # ---------------------------------------------------------------------
@@ -376,7 +417,7 @@ def test_preview_mode_never_persists_a_classification(
 
 def test_preview_mode_never_persists_even_when_a_real_deterministic_rule_matches(
     evidence_repository, rule_repository, classification_repository, ai_invocation_repository,
-    litellm_client, object_store, audit_repository,
+    litellm_client, object_store, audit_repository, needs_you_repository,
 ):
     """PL independent-review regression: an earlier version of the
     orchestrator called WI-2's real, WRITING
@@ -403,6 +444,7 @@ def test_preview_mode_never_persists_even_when_a_real_deterministic_rule_matches
         evidence_id, persist=False, evidence_repository=evidence_repository, rule_repository=rule_repository,
         classification_repository=classification_repository, ai_invocation_repository=ai_invocation_repository,
         litellm_client=litellm_client, object_store=object_store, audit_repository=audit_repository,
+        needs_you_repository=needs_you_repository,
     )
     assert result.outcome == OUTCOME_DETERMINISTIC_CLASSIFIED
     # A real match was found (the caller can see this), but NOTHING was
@@ -416,7 +458,7 @@ def test_preview_mode_never_persists_even_when_a_real_deterministic_rule_matches
 
 def test_litellm_transport_failure_persists_no_classification(
     evidence_repository, rule_repository, classification_repository, ai_invocation_repository,
-    litellm_client, object_store, audit_repository,
+    litellm_client, object_store, audit_repository, needs_you_repository,
 ):
     evidence_id = _register_email_evidence(
         evidence_repository, object_store,
@@ -427,6 +469,7 @@ def test_litellm_transport_failure_persists_no_classification(
         evidence_id, persist=True, evidence_repository=evidence_repository, rule_repository=rule_repository,
         classification_repository=classification_repository, ai_invocation_repository=ai_invocation_repository,
         litellm_client=litellm_client, object_store=object_store, audit_repository=audit_repository,
+        needs_you_repository=needs_you_repository,
     )
     assert result.outcome == OUTCOME_AI_INVOCATION_FAILED
     assert result.error_code is not None
@@ -435,7 +478,7 @@ def test_litellm_transport_failure_persists_no_classification(
 
 def test_malformed_schema_invalid_ai_output_persists_no_classification(
     evidence_repository, rule_repository, classification_repository, ai_invocation_repository,
-    litellm_client, object_store, audit_repository,
+    litellm_client, object_store, audit_repository, needs_you_repository,
 ):
     evidence_id = _register_email_evidence(
         evidence_repository, object_store,
@@ -447,6 +490,7 @@ def test_malformed_schema_invalid_ai_output_persists_no_classification(
         evidence_id, persist=True, evidence_repository=evidence_repository, rule_repository=rule_repository,
         classification_repository=classification_repository, ai_invocation_repository=ai_invocation_repository,
         litellm_client=litellm_client, object_store=object_store, audit_repository=audit_repository,
+        needs_you_repository=needs_you_repository,
     )
     assert result.outcome == OUTCOME_AI_INVOCATION_FAILED
     assert result.error_code == "OUTPUT_SCHEMA_INVALID"
@@ -455,7 +499,7 @@ def test_malformed_schema_invalid_ai_output_persists_no_classification(
 
 def test_malformed_not_json_ai_output_persists_no_classification(
     evidence_repository, rule_repository, classification_repository, ai_invocation_repository,
-    litellm_client, object_store, audit_repository,
+    litellm_client, object_store, audit_repository, needs_you_repository,
 ):
     evidence_id = _register_email_evidence(
         evidence_repository, object_store,
@@ -466,6 +510,7 @@ def test_malformed_not_json_ai_output_persists_no_classification(
         evidence_id, persist=True, evidence_repository=evidence_repository, rule_repository=rule_repository,
         classification_repository=classification_repository, ai_invocation_repository=ai_invocation_repository,
         litellm_client=litellm_client, object_store=object_store, audit_repository=audit_repository,
+        needs_you_repository=needs_you_repository,
     )
     assert result.outcome == OUTCOME_AI_INVOCATION_FAILED
     assert result.error_code == "OUTPUT_NOT_JSON"
@@ -479,7 +524,7 @@ def test_malformed_not_json_ai_output_persists_no_classification(
 
 def test_second_identical_preview_request_reuses_invocation_no_second_provider_call(
     evidence_repository, rule_repository, classification_repository, ai_invocation_repository,
-    litellm_client, object_store, audit_repository,
+    litellm_client, object_store, audit_repository, needs_you_repository,
 ):
     evidence_id = _register_email_evidence(
         evidence_repository, object_store,
@@ -490,11 +535,13 @@ def test_second_identical_preview_request_reuses_invocation_no_second_provider_c
         evidence_id, persist=False, evidence_repository=evidence_repository, rule_repository=rule_repository,
         classification_repository=classification_repository, ai_invocation_repository=ai_invocation_repository,
         litellm_client=litellm_client, object_store=object_store, audit_repository=audit_repository,
+        needs_you_repository=needs_you_repository,
     )
     second = _classify(
         evidence_id, persist=False, evidence_repository=evidence_repository, rule_repository=rule_repository,
         classification_repository=classification_repository, ai_invocation_repository=ai_invocation_repository,
         litellm_client=litellm_client, object_store=object_store, audit_repository=audit_repository,
+        needs_you_repository=needs_you_repository,
     )
     assert len(litellm_client.calls) == 1
     assert first.ai_invocation_id == second.ai_invocation_id
@@ -503,7 +550,7 @@ def test_second_identical_preview_request_reuses_invocation_no_second_provider_c
 
 def test_crash_recovery_reuses_succeeded_invocation_to_create_missing_classification(
     evidence_repository, rule_repository, classification_repository, ai_invocation_repository,
-    litellm_client, object_store, audit_repository,
+    litellm_client, object_store, audit_repository, needs_you_repository,
 ):
     evidence_id = _register_email_evidence(
         evidence_repository, object_store,
@@ -517,6 +564,7 @@ def test_crash_recovery_reuses_succeeded_invocation_to_create_missing_classifica
         evidence_id, persist=False, evidence_repository=evidence_repository, rule_repository=rule_repository,
         classification_repository=classification_repository, ai_invocation_repository=ai_invocation_repository,
         litellm_client=litellm_client, object_store=object_store, audit_repository=audit_repository,
+        needs_you_repository=needs_you_repository,
     )
     assert classification_repository.get_current_classification(evidence_id, "DOCUMENT_TYPE") is None
 
@@ -524,6 +572,7 @@ def test_crash_recovery_reuses_succeeded_invocation_to_create_missing_classifica
         evidence_id, persist=True, evidence_repository=evidence_repository, rule_repository=rule_repository,
         classification_repository=classification_repository, ai_invocation_repository=ai_invocation_repository,
         litellm_client=litellm_client, object_store=object_store, audit_repository=audit_repository,
+        needs_you_repository=needs_you_repository,
     )
     assert len(litellm_client.calls) == 1  # no second model call
     assert recovered.ai_invocation_id == preview.ai_invocation_id
@@ -533,7 +582,7 @@ def test_crash_recovery_reuses_succeeded_invocation_to_create_missing_classifica
 
 def test_prior_failed_invocation_is_not_silently_retried(
     evidence_repository, rule_repository, classification_repository, ai_invocation_repository,
-    litellm_client, object_store, audit_repository,
+    litellm_client, object_store, audit_repository, needs_you_repository,
 ):
     evidence_id = _register_email_evidence(
         evidence_repository, object_store,
@@ -544,6 +593,7 @@ def test_prior_failed_invocation_is_not_silently_retried(
         evidence_id, persist=True, evidence_repository=evidence_repository, rule_repository=rule_repository,
         classification_repository=classification_repository, ai_invocation_repository=ai_invocation_repository,
         litellm_client=litellm_client, object_store=object_store, audit_repository=audit_repository,
+        needs_you_repository=needs_you_repository,
     )
     assert first.outcome == OUTCOME_AI_INVOCATION_FAILED
     assert len(litellm_client.calls) == 1
@@ -552,6 +602,7 @@ def test_prior_failed_invocation_is_not_silently_retried(
         evidence_id, persist=True, evidence_repository=evidence_repository, rule_repository=rule_repository,
         classification_repository=classification_repository, ai_invocation_repository=ai_invocation_repository,
         litellm_client=litellm_client, object_store=object_store, audit_repository=audit_repository,
+        needs_you_repository=needs_you_repository,
     )
     assert second.outcome == OUTCOME_AI_PRIOR_FAILURE
     assert second.ai_invocation_id == first.ai_invocation_id
@@ -563,7 +614,7 @@ def test_prior_failed_invocation_is_not_silently_retried(
 
 def test_active_invocation_guard_returns_ai_in_progress_never_launches_duplicate(
     evidence_repository, rule_repository, classification_repository, ai_invocation_repository,
-    litellm_client, object_store, audit_repository,
+    litellm_client, object_store, audit_repository, needs_you_repository,
 ):
     evidence_id = _register_email_evidence(
         evidence_repository, object_store,
@@ -580,6 +631,7 @@ def test_active_invocation_guard_returns_ai_in_progress_never_launches_duplicate
         evidence_id, persist=True, evidence_repository=evidence_repository, rule_repository=rule_repository,
         classification_repository=classification_repository, ai_invocation_repository=ai_invocation_repository,
         litellm_client=litellm_client, object_store=object_store, audit_repository=audit_repository,
+        needs_you_repository=needs_you_repository,
     )
     assert result.outcome == OUTCOME_AI_IN_PROGRESS
     assert result.ai_invocation_id == in_flight.ai_invocation_id
@@ -593,7 +645,7 @@ def test_active_invocation_guard_returns_ai_in_progress_never_launches_duplicate
 
 def test_race_after_model_completion_never_supersedes_established_current_truth(
     evidence_repository, rule_repository, classification_repository, ai_invocation_repository,
-    litellm_client, object_store, audit_repository,
+    litellm_client, object_store, audit_repository, needs_you_repository,
 ):
     evidence_id = _register_email_evidence(
         evidence_repository, object_store,
@@ -610,6 +662,7 @@ def test_race_after_model_completion_never_supersedes_established_current_truth(
         evidence_id, persist=False, evidence_repository=evidence_repository, rule_repository=rule_repository,
         classification_repository=classification_repository, ai_invocation_repository=ai_invocation_repository,
         litellm_client=litellm_client, object_store=object_store, audit_repository=audit_repository,
+        needs_you_repository=needs_you_repository,
     )
     assert preview.outcome == OUTCOME_AI_PROPOSAL_REVIEW_REQUIRED
 
@@ -623,6 +676,7 @@ def test_race_after_model_completion_never_supersedes_established_current_truth(
         evidence_id, persist=True, evidence_repository=evidence_repository, rule_repository=rule_repository,
         classification_repository=classification_repository, ai_invocation_repository=ai_invocation_repository,
         litellm_client=litellm_client, object_store=object_store, audit_repository=audit_repository,
+        needs_you_repository=needs_you_repository,
     )
     assert result.outcome == OUTCOME_CURRENT_CLASSIFICATION_EXISTS
     assert result.existing_source == "OPERATOR_ASSIGNED"
@@ -638,7 +692,7 @@ def test_race_after_model_completion_never_supersedes_established_current_truth(
 
 def test_genuinely_new_ai_classification_emits_one_bounded_audit_event(
     evidence_repository, rule_repository, classification_repository, ai_invocation_repository,
-    litellm_client, object_store, audit_repository,
+    litellm_client, object_store, audit_repository, needs_you_repository,
 ):
     evidence_id = _register_email_evidence(
         evidence_repository, object_store,
@@ -649,6 +703,7 @@ def test_genuinely_new_ai_classification_emits_one_bounded_audit_event(
         evidence_id, persist=True, evidence_repository=evidence_repository, rule_repository=rule_repository,
         classification_repository=classification_repository, ai_invocation_repository=ai_invocation_repository,
         litellm_client=litellm_client, object_store=object_store, audit_repository=audit_repository,
+        needs_you_repository=needs_you_repository,
     )
     events = audit_repository.list_by_subject("EvidenceClassification", result.classification.classification_id)
     classified_events = [e for e in events if e.event_type == "EVIDENCE_CLASSIFIED"]
@@ -663,7 +718,7 @@ def test_genuinely_new_ai_classification_emits_one_bounded_audit_event(
 
 def test_recovery_replay_never_double_audits(
     evidence_repository, rule_repository, classification_repository, ai_invocation_repository,
-    litellm_client, object_store, audit_repository,
+    litellm_client, object_store, audit_repository, needs_you_repository,
 ):
     evidence_id = _register_email_evidence(
         evidence_repository, object_store,
@@ -674,15 +729,146 @@ def test_recovery_replay_never_double_audits(
         evidence_id, persist=False, evidence_repository=evidence_repository, rule_repository=rule_repository,
         classification_repository=classification_repository, ai_invocation_repository=ai_invocation_repository,
         litellm_client=litellm_client, object_store=object_store, audit_repository=audit_repository,
+        needs_you_repository=needs_you_repository,
     )
     recovered = _classify(
         evidence_id, persist=True, evidence_repository=evidence_repository, rule_repository=rule_repository,
         classification_repository=classification_repository, ai_invocation_repository=ai_invocation_repository,
         litellm_client=litellm_client, object_store=object_store, audit_repository=audit_repository,
+        needs_you_repository=needs_you_repository,
     )
     events = audit_repository.list_by_subject("EvidenceClassification", recovered.classification.classification_id)
     classified_events = [e for e in events if e.event_type == "EVIDENCE_CLASSIFIED"]
     assert len(classified_events) == 1
+
+
+# ---------------------------------------------------------------------
+# WI-4 §5/§7/§8/§9/§45 — the review-item producer, exercised through the
+# REAL `classify_evidence` orchestrator wiring (not a standalone call to
+# `ensure_classification_review_item` — see
+# `tests/integration/test_classification_review.py` for that unit-level
+# coverage; these tests instead prove the actual integration point:
+# the two exact edit sites inside `classify_evidence` itself).
+# ---------------------------------------------------------------------
+
+
+def test_persistent_orchestrator_replay_reuses_the_same_review_item(
+    evidence_repository, rule_repository, classification_repository, ai_invocation_repository,
+    litellm_client, object_store, audit_repository, needs_you_repository,
+):
+    from services.needs_you.needs_you import ITEM_TYPE_CLASSIFICATION_REVIEW
+
+    evidence_id = _register_email_evidence(
+        evidence_repository, object_store,
+        content=_rfc822_email(sender="billing@vendor.com", subject="Invoice 42", body="Please pay $500."),
+    )
+    _queue_proposal(litellm_client, proposed_type="SUPPLIER_INVOICE", confidence=0.9)
+    first = _classify(
+        evidence_id, persist=True, evidence_repository=evidence_repository, rule_repository=rule_repository,
+        classification_repository=classification_repository, ai_invocation_repository=ai_invocation_repository,
+        litellm_client=litellm_client, object_store=object_store, audit_repository=audit_repository,
+        needs_you_repository=needs_you_repository,
+    )
+    # A second call now hits the top-of-function "current AI_PROPOSAL"
+    # guard (WI-4 §9) — it must re-ensure (idempotently) the SAME review
+    # item, never a second one.
+    second = _classify(
+        evidence_id, persist=True, evidence_repository=evidence_repository, rule_repository=rule_repository,
+        classification_repository=classification_repository, ai_invocation_repository=ai_invocation_repository,
+        litellm_client=litellm_client, object_store=object_store, audit_repository=audit_repository,
+        needs_you_repository=needs_you_repository,
+    )
+    assert second.outcome == OUTCOME_CURRENT_CLASSIFICATION_EXISTS
+    assert second.classification.classification_id == first.classification.classification_id
+
+    review_items = needs_you_repository.list_needs_you_items(item_type=ITEM_TYPE_CLASSIFICATION_REVIEW)
+    assert len(review_items) == 1
+    assert review_items[0].source_object_reference == first.classification.classification_id
+
+
+def test_orchestrator_recovers_missing_review_item_after_a_simulated_crash(
+    evidence_repository, rule_repository, classification_repository, ai_invocation_repository,
+    litellm_client, object_store, audit_repository, needs_you_repository,
+):
+    """WI-4 §8 — the crash-recovery case: an AI_PROPOSAL classification
+    already committed (simulated here via a DIRECT
+    `classification_repository.create_classification` call, exactly as
+    if an earlier `classify_evidence(persist=True)` call had reached
+    that point and then the process died before ever reaching the
+    review-item producer call) — the NEXT `classify_evidence(persist=True)`
+    call for the SAME evidence must detect the current AI_PROPOSAL via
+    the top-of-function guard and recover the missing review item,
+    never skip recovery merely because 'current already exists'."""
+    from services.needs_you.needs_you import ITEM_TYPE_CLASSIFICATION_REVIEW
+
+    evidence_id = _register_email_evidence(
+        evidence_repository, object_store,
+        content=_rfc822_email(sender="billing@vendor.com", subject="Invoice 42", body="Please pay $500."),
+    )
+    invocation = ai_invocation_repository.create_invocation(
+        task_id="DOCUMENT_TYPE_PROPOSAL", task_version=2, role="BACKGROUND", provider="LITELLM",
+        capability_alias="bagman-core", input_references={"evidence_id": evidence_id},
+        actor_type=actor.SYSTEM, actor_id=ACTOR_ID,
+    )
+    ai_invocation_repository.transition_status(invocation.ai_invocation_id, "RUNNING")
+    ai_invocation_repository.transition_status(invocation.ai_invocation_id, "SUCCEEDED")
+    classification = classification_repository.create_classification(
+        evidence_id=evidence_id, classification_type="DOCUMENT_TYPE", document_type="SUPPLIER_INVOICE",
+        status=STATUS_REVIEW_REQUIRED, source="AI_PROPOSAL", confidence=0.9,
+        ai_invocation_id=invocation.ai_invocation_id, expected_current_classification_id=None,
+    )
+    assert needs_you_repository.list_needs_you_items(item_type=ITEM_TYPE_CLASSIFICATION_REVIEW) == []
+
+    result = _classify(
+        evidence_id, persist=True, evidence_repository=evidence_repository, rule_repository=rule_repository,
+        classification_repository=classification_repository, ai_invocation_repository=ai_invocation_repository,
+        litellm_client=litellm_client, object_store=object_store, audit_repository=audit_repository,
+        needs_you_repository=needs_you_repository,
+    )
+    assert result.outcome == OUTCOME_CURRENT_CLASSIFICATION_EXISTS
+    assert result.classification.classification_id == classification.classification_id
+
+    review_items = needs_you_repository.list_needs_you_items(item_type=ITEM_TYPE_CLASSIFICATION_REVIEW)
+    assert len(review_items) == 1
+    assert review_items[0].source_object_reference == classification.classification_id
+
+
+def test_deterministic_classification_via_real_orchestrator_creates_no_review_item(
+    evidence_repository, rule_repository, classification_repository, ai_invocation_repository,
+    litellm_client, object_store, audit_repository, needs_you_repository,
+):
+    """WI-4 §40 — a real, genuine DETERMINISTIC_RULE current
+    classification, produced through the REAL `classify_evidence`
+    orchestrator (not a bypass), must never create a review item — both
+    on the fresh-classify call AND on a subsequent replay call that
+    hits the top-of-function current-classification guard."""
+    from services.needs_you.needs_you import ITEM_TYPE_CLASSIFICATION_REVIEW
+
+    rule_repository.create_rule(
+        sender_scope_type="EXACT_SENDER_DOMAIN", sender_scope_value="vendor.com",
+        subject_predicate_type="EXACT", subject_predicate_value="Monthly Statement",
+        document_type="SUPPLIER_INVOICE", source="OPERATOR",
+    )
+    evidence_id = _register_email_evidence(
+        evidence_repository, object_store,
+        content=_rfc822_email(sender="billing@vendor.com", subject="Monthly Statement", body="pay up"),
+        sender_address="billing@vendor.com", subject="Monthly Statement",
+    )
+    first = _classify(
+        evidence_id, persist=True, evidence_repository=evidence_repository, rule_repository=rule_repository,
+        classification_repository=classification_repository, ai_invocation_repository=ai_invocation_repository,
+        litellm_client=litellm_client, object_store=object_store, audit_repository=audit_repository,
+        needs_you_repository=needs_you_repository,
+    )
+    assert first.outcome == OUTCOME_DETERMINISTIC_CLASSIFIED
+    second = _classify(
+        evidence_id, persist=True, evidence_repository=evidence_repository, rule_repository=rule_repository,
+        classification_repository=classification_repository, ai_invocation_repository=ai_invocation_repository,
+        litellm_client=litellm_client, object_store=object_store, audit_repository=audit_repository,
+        needs_you_repository=needs_you_repository,
+    )
+    assert second.outcome == OUTCOME_CURRENT_CLASSIFICATION_EXISTS
+    assert needs_you_repository.list_needs_you_items(item_type=ITEM_TYPE_CLASSIFICATION_REVIEW) == []
 
 
 # ---------------------------------------------------------------------
@@ -693,7 +879,7 @@ def test_recovery_replay_never_double_audits(
 
 def test_ai_classification_never_mutates_evidence_item(
     evidence_repository, rule_repository, classification_repository, ai_invocation_repository,
-    litellm_client, object_store, audit_repository,
+    litellm_client, object_store, audit_repository, needs_you_repository,
 ):
     evidence_id = _register_email_evidence(
         evidence_repository, object_store,
@@ -705,6 +891,7 @@ def test_ai_classification_never_mutates_evidence_item(
         evidence_id, persist=True, evidence_repository=evidence_repository, rule_repository=rule_repository,
         classification_repository=classification_repository, ai_invocation_repository=ai_invocation_repository,
         litellm_client=litellm_client, object_store=object_store, audit_repository=audit_repository,
+        needs_you_repository=needs_you_repository,
     )
     after = evidence_repository.get_evidence(evidence_id)
     assert after.status == before.status
@@ -716,7 +903,7 @@ def test_ai_classification_never_mutates_evidence_item(
 
 def test_ai_classification_never_creates_a_classification_rule(
     evidence_repository, rule_repository, classification_repository, ai_invocation_repository,
-    litellm_client, object_store, audit_repository,
+    litellm_client, object_store, audit_repository, needs_you_repository,
 ):
     evidence_id = _register_email_evidence(
         evidence_repository, object_store,
@@ -727,6 +914,7 @@ def test_ai_classification_never_creates_a_classification_rule(
         evidence_id, persist=True, evidence_repository=evidence_repository, rule_repository=rule_repository,
         classification_repository=classification_repository, ai_invocation_repository=ai_invocation_repository,
         litellm_client=litellm_client, object_store=object_store, audit_repository=audit_repository,
+        needs_you_repository=needs_you_repository,
     )
     assert rule_repository.list_rules() == []
 
@@ -760,5 +948,6 @@ def test_not_found_evidence_id_propagates():
             classification_repository=classification_repository, ai_invocation_repository=ai_invocation_repository,
             litellm_client=FakeLiteLLMClient(), object_store=InMemoryObjectStore(),
             audit_repository=audit_repository, record_audit_event=audit_repository.record_audit_event,
+            needs_you_repository=InMemoryNeedsYouRepository(),
             actor_type=actor.SYSTEM, actor_id=ACTOR_ID,
         )

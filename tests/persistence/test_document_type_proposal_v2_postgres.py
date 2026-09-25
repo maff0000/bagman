@@ -31,6 +31,7 @@ from persistence.postgres.evidence_classification_rule_repository import Postgre
 from persistence.postgres.evidence_repository import PostgresEvidenceRepository
 from persistence.postgres.external_reference_repository import PostgresExternalReferenceRepository
 from persistence.postgres.session import get_engine, session_scope
+from persistence.postgres.needs_you_repository import PostgresNeedsYouRepository
 from persistence.postgres.source_repository import PostgresSourceRepository
 from persistence.objects.memory_store import InMemoryObjectStore
 from services.evidence.classification_orchestrator import (
@@ -90,6 +91,11 @@ def litellm_client():
     return FakeLiteLLMClient()
 
 
+@pytest.fixture
+def needs_you_repository(fresh_engine):
+    return PostgresNeedsYouRepository(fresh_engine)
+
+
 def _register_email_evidence(evidence_repository, object_store, *, sender_address=None, subject=None) -> str:
     import email.message
 
@@ -116,20 +122,21 @@ def _register_email_evidence(evidence_repository, object_store, *, sender_addres
 
 
 def _classify(evidence_id, *, persist, evidence_repository, rule_repository, classification_repository,
-              ai_invocation_repository, litellm_client, object_store, audit_repository):
+              ai_invocation_repository, litellm_client, object_store, audit_repository, needs_you_repository):
     return classify_evidence(
         evidence_id=evidence_id, persist=persist,
         evidence_repository=evidence_repository, rule_repository=rule_repository,
         classification_repository=classification_repository, ai_invocation_repository=ai_invocation_repository,
         litellm_client=litellm_client, object_store=object_store, audit_repository=audit_repository,
         record_audit_event=audit_repository.record_audit_event,
+        needs_you_repository=needs_you_repository,
         actor_type=actor.SYSTEM, actor_id=ACTOR_ID,
     )
 
 
 def test_full_orchestrated_flow_persists_review_required_on_real_postgres(
     fresh_engine, evidence_repository, rule_repository, classification_repository, ai_invocation_repository,
-    litellm_client, object_store, audit_repository,
+    litellm_client, object_store, audit_repository, needs_you_repository,
 ):
     evidence_id = _register_email_evidence(evidence_repository, object_store)
     litellm_client.queue_success(
@@ -140,6 +147,7 @@ def test_full_orchestrated_flow_persists_review_required_on_real_postgres(
         evidence_id, persist=True, evidence_repository=evidence_repository, rule_repository=rule_repository,
         classification_repository=classification_repository, ai_invocation_repository=ai_invocation_repository,
         litellm_client=litellm_client, object_store=object_store, audit_repository=audit_repository,
+        needs_you_repository=needs_you_repository,
     )
     assert result.outcome == OUTCOME_AI_PROPOSAL_REVIEW_REQUIRED
     assert result.was_created is True
@@ -159,7 +167,7 @@ def test_full_orchestrated_flow_persists_review_required_on_real_postgres(
 
 def test_deterministic_match_takes_precedence_over_ai_on_real_postgres(
     evidence_repository, rule_repository, classification_repository, ai_invocation_repository,
-    litellm_client, object_store, audit_repository,
+    litellm_client, object_store, audit_repository, needs_you_repository,
 ):
     rule_repository.create_rule(
         sender_scope_type="EXACT_SENDER_DOMAIN", sender_scope_value="vendor.com",
@@ -173,6 +181,7 @@ def test_deterministic_match_takes_precedence_over_ai_on_real_postgres(
         evidence_id, persist=True, evidence_repository=evidence_repository, rule_repository=rule_repository,
         classification_repository=classification_repository, ai_invocation_repository=ai_invocation_repository,
         litellm_client=litellm_client, object_store=object_store, audit_repository=audit_repository,
+        needs_you_repository=needs_you_repository,
     )
     assert result.outcome == OUTCOME_DETERMINISTIC_CLASSIFIED
     assert litellm_client.calls == []
@@ -180,7 +189,7 @@ def test_deterministic_match_takes_precedence_over_ai_on_real_postgres(
 
 def test_idempotent_reuse_across_two_calls_on_real_postgres(
     evidence_repository, rule_repository, classification_repository, ai_invocation_repository,
-    litellm_client, object_store, audit_repository,
+    litellm_client, object_store, audit_repository, needs_you_repository,
 ):
     evidence_id = _register_email_evidence(evidence_repository, object_store)
     litellm_client.queue_success(
@@ -191,11 +200,13 @@ def test_idempotent_reuse_across_two_calls_on_real_postgres(
         evidence_id, persist=False, evidence_repository=evidence_repository, rule_repository=rule_repository,
         classification_repository=classification_repository, ai_invocation_repository=ai_invocation_repository,
         litellm_client=litellm_client, object_store=object_store, audit_repository=audit_repository,
+        needs_you_repository=needs_you_repository,
     )
     second = _classify(
         evidence_id, persist=False, evidence_repository=evidence_repository, rule_repository=rule_repository,
         classification_repository=classification_repository, ai_invocation_repository=ai_invocation_repository,
         litellm_client=litellm_client, object_store=object_store, audit_repository=audit_repository,
+        needs_you_repository=needs_you_repository,
     )
     assert len(litellm_client.calls) == 1
     assert first.ai_invocation_id == second.ai_invocation_id
@@ -203,7 +214,7 @@ def test_idempotent_reuse_across_two_calls_on_real_postgres(
 
 def test_current_classification_guard_against_real_postgres(
     evidence_repository, rule_repository, classification_repository, ai_invocation_repository,
-    litellm_client, object_store, audit_repository,
+    litellm_client, object_store, audit_repository, needs_you_repository,
 ):
     evidence_id = _register_email_evidence(evidence_repository, object_store)
     classification_repository.create_classification(
@@ -215,6 +226,7 @@ def test_current_classification_guard_against_real_postgres(
         evidence_id, persist=True, evidence_repository=evidence_repository, rule_repository=rule_repository,
         classification_repository=classification_repository, ai_invocation_repository=ai_invocation_repository,
         litellm_client=litellm_client, object_store=object_store, audit_repository=audit_repository,
+        needs_you_repository=needs_you_repository,
     )
     assert result.outcome == OUTCOME_CURRENT_CLASSIFICATION_EXISTS
     assert litellm_client.calls == []
@@ -254,6 +266,10 @@ def _default_classification_repository() -> PostgresEvidenceClassificationReposi
         evidence_repository=_default_evidence_repository(), rule_repository=_default_rule_repository(),
         ai_invocation_repository=_default_ai_invocation_repository(),
     )
+
+
+def _default_needs_you_repository() -> PostgresNeedsYouRepository:
+    return PostgresNeedsYouRepository(get_engine())
 
 
 def test_concurrent_deterministic_classification_race_on_real_postgres():
@@ -385,6 +401,7 @@ def test_concurrent_orchestrated_persist_reusing_succeeded_invocation_converges_
         ai_invocation_repository=_default_ai_invocation_repository(),
         litellm_client=setup_litellm_client, object_store=object_store_instance,
         audit_repository=setup_audit_repository, record_audit_event=setup_audit_repository.record_audit_event,
+        needs_you_repository=_default_needs_you_repository(),
         actor_type="SYSTEM", actor_id="wi3-corr-ai-race-setup",
     )
     assert setup_result.ai_invocation_id is not None
@@ -407,6 +424,7 @@ def test_concurrent_orchestrated_persist_reusing_succeeded_invocation_converges_
             ai_invocation_repository=_default_ai_invocation_repository(),
             litellm_client=litellm_clients[index], object_store=object_store_instance,
             audit_repository=audit_repo, record_audit_event=audit_repo.record_audit_event,
+            needs_you_repository=_default_needs_you_repository(),
             actor_type="SYSTEM", actor_id=f"wi3-corr-ai-race-{index}",
         )
         results[index] = {

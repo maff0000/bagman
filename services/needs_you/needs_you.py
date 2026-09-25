@@ -199,6 +199,16 @@ ALLOWED_ACTION_MAILBOX_AUTHENTICATION_ESCALATION = "MAILBOX_AUTHENTICATION_ESCAL
 #: "Slice 1's one real trigger"). Also open (not contract-enforced).
 ALLOWED_ACTION_COMPANY_WHAT_WHY = "COMPANY_WHAT_WHY"
 
+#: CD-6 Slice 5 WI-4 addition — the ``allowed_action_type`` for
+#: ``ITEM_TYPE_CLASSIFICATION_REVIEW`` items (see that constant's own
+#: docstring, above). The first real producer for this item type;
+#: ``services.evidence.classification_review`` owns the producer and
+#: resolution logic, this module remains a pure domain module with no
+#: new dependency of its own (see module docstring's "Fabric First"-
+#: style discipline for this codebase: only a pointer/constant lives
+#: here, never business logic).
+ALLOWED_ACTION_CLASSIFICATION_REVIEW = "CLASSIFICATION_REVIEW"
+
 #: Closed status vocabulary (PID §98.5 — real, small, no stated
 #: extensibility need). Matches the contract's own closed `status` enum.
 STATUSES = frozenset({"OPEN", "RESOLVED", "DISMISSED"})

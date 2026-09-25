@@ -1145,3 +1145,90 @@ def test_wi3_document_type_proposal_v2_rejected_by_generic_ai_tasks_endpoint():
         f"{v1_response.status_code}: {v1_response.text}"
     )
     assert v1_response.json()["task_version"] == 1
+
+
+# ---------------------------------------------------------------------
+# CD-6 Slice 5 WI-4 — human-control-loop architecture-boundary proofs
+# (§61). `_WI4_REVIEW_MODULE_PATH` is deliberately its OWN, separate
+# module path — never added to `_CLASSIFICATION_MODULE_PATHS`, which
+# still (correctly) forbids `ITEM_TYPE_CLASSIFICATION_REVIEW`/
+# `ENTITY_PROPOSAL` wiring for WI-1/WI-2/WI-3's own modules; WI-4's
+# whole job is to wire exactly that review vocabulary in, just from a
+# NEW module.
+# ---------------------------------------------------------------------
+
+_WI4_REVIEW_MODULE_PATH = REPO_ROOT / "services" / "evidence" / "classification_review.py"
+
+
+def test_wi4_review_module_never_imports_ai_provider_or_gateway_code():
+    """WI-4 §2/§61 — the human-control loop never itself calls AI to
+    decide an operator resolution: `classification_review.py` must
+    never import anything under `ai.providers`/`ai.gateway`/`ai.tasks`
+    (it does not even need `ai.invocation` — it only ever handles
+    classification rows the orchestrator already resolved)."""
+    forbidden_ai_roots = {"ai"}
+    violations = [
+        f"{_WI4_REVIEW_MODULE_PATH.relative_to(REPO_ROOT)}:{imp.lineno} imports {imp.full!r}"
+        for imp in _imports_of(_WI4_REVIEW_MODULE_PATH)
+        if imp.root in forbidden_ai_roots
+    ]
+    assert violations == [], "\n".join(violations)
+
+
+def test_wi4_review_module_never_wires_entity_proposal_claude_or_evidence_mutation():
+    """WI-4 §61 — the resolver never invokes `ENTITY_PROPOSAL`, never
+    calls the Claude operator gateway, and never mutates `EvidenceItem`
+    (`update_status`/`assign_entity` are the only two EvidenceItem
+    mutation paths anywhere in this codebase — see this file's own
+    WI-1 `test_evidence_classification_code_never_mutates_evidence_item`
+    for the identical doctrine applied to WI-1/WI-2/WI-3's modules)."""
+    forbidden_tokens = (
+        "ENTITY_PROPOSAL", "ClaudeCodeOperatorRunner", "claude_code", "ASK_BAGMAN",
+        ".update_status(", ".assign_entity(",
+    )
+    text = _WI4_REVIEW_MODULE_PATH.read_text(encoding="utf-8")
+    violations = [token for token in forbidden_tokens if token in text]
+    assert violations == [], "\n".join(violations)
+
+
+def test_wi4_review_module_never_imports_mailbox_provider_code():
+    """WI-4 §61 — the resolver never fetches mailbox provider data; it
+    only ever reads the `EvidenceItem.metadata` a caller already
+    fetched. No `services.mailbox.*` import anywhere in this module."""
+    violations = [
+        f"{_WI4_REVIEW_MODULE_PATH.relative_to(REPO_ROOT)}:{imp.lineno} imports {imp.full!r}"
+        for imp in _imports_of(_WI4_REVIEW_MODULE_PATH)
+        if imp.full == "services.mailbox" or imp.full.startswith("services.mailbox.")
+    ]
+    assert violations == [], "\n".join(violations)
+
+
+def test_wi4_orchestrator_review_wiring_never_imports_persistence_or_app():
+    """WI-4 extends `classify_evidence` in-place — it must still never
+    import `app.*`/`persistence.*` directly (WI-3's own existing
+    `test_wi3_orchestrator_never_imports_persistence_or_app` re-run
+    above already proves this holds after the WI-4 edit; this is the
+    same proof, named for WI-4, so a future regression in either
+    delivery is caught under the section its own author is looking
+    at)."""
+    forbidden_roots = {"app", "persistence"}
+    violations = [
+        f"classification_orchestrator.py:{imp.lineno} imports {imp.full!r}"
+        for imp in _imports_of(_WI3_ORCHESTRATOR_MODULE_PATH)
+        if imp.root in forbidden_roots
+    ]
+    assert violations == [], "\n".join(violations)
+
+
+def test_wi4_document_type_vocabulary_unchanged():
+    """WI-4 §61 — no new classification vocabulary: `document_type`
+    remains exactly the 8 existing WI-1 values."""
+    from services.evidence.classification import DOCUMENT_TYPES
+
+    assert DOCUMENT_TYPES == frozenset(
+        {
+            "SUPPLIER_INVOICE", "RECEIPT", "ORDER_CONFIRMATION", "REFUND_CONFIRMATION",
+            "BROKER_STATEMENT", "BROKER_ACTIVITY_NOTICE", "NON_ACCOUNTING_DOCUMENT", "UNKNOWN",
+        }
+    )
+    assert len(DOCUMENT_TYPES) == 8

@@ -99,6 +99,7 @@ from services.evidence.classification import (
     STATUS_UNCLASSIFIABLE,
     EvidenceClassification,
 )
+from services.evidence.classification_review import ensure_classification_review_item
 from services.evidence.classification_ai_fingerprint import compute_classifier_fingerprint
 from services.evidence.classification_context import (
     OUTCOME_BUILT as _CONTEXT_OUTCOME_BUILT,
@@ -295,6 +296,7 @@ def classify_evidence(
     object_store,
     audit_repository,
     record_audit_event,
+    needs_you_repository,
     actor_type: str,
     actor_id: str,
     correlation_id: Optional[str] = None,
@@ -318,6 +320,25 @@ def classify_evidence(
     # BEFORE the deterministic classifier — see module docstring for why.
     current = classification_repository.get_current_classification(evidence_id, CLASSIFICATION_TYPE_DOCUMENT_TYPE)
     if current is not None:
+        # CD-6 Slice 5 WI-4 §8/§9 — source-aware: a DETERMINISTIC_RULE
+        # or OPERATOR_ASSIGNED current classification needs no review
+        # item (WI-4 §40 — the producer only ever fires off an
+        # AI_PROPOSAL). A current AI_PROPOSAL (REVIEW_REQUIRED or
+        # UNCLASSIFIABLE) still needs its review item ensured before
+        # returning — this is the crash-recovery path (§8): the AI
+        # classification committed on an earlier call, but the process
+        # died before the review item was created; a retry must detect
+        # and recover it here, at re-entry, rather than skip it because
+        # "current already exists". Preview mode (`persist=False`) NEVER
+        # performs this producer behaviour (§9's own explicit rule).
+        if persist and current.source == SOURCE_AI_PROPOSAL:
+            ensure_classification_review_item(
+                classification=current,
+                evidence=evidence,
+                ai_invocation_id=current.ai_invocation_id,
+                needs_you_repository=needs_you_repository,
+                correlation_id=correlation_id,
+            )
         return ClassifyEvidenceResult(
             outcome=OUTCOME_CURRENT_CLASSIFICATION_EXISTS,
             classification=current,
@@ -612,6 +633,25 @@ def classify_evidence(
                 "confidence": created.confidence,
                 "classification_context_version": context.context_contract_version,
             },
+        )
+
+        # WI-4 §5/§7 — ensure exactly one CLASSIFICATION_REVIEW Needs
+        # You item for this genuinely-new AI proposal, AFTER the
+        # classification row and its own EVIDENCE_CLASSIFIED audit event
+        # (the review question must anchor to canonical classification
+        # state, never precede it). Both concrete (REVIEW_REQUIRED) and
+        # UNKNOWN (UNCLASSIFIABLE) outcomes need a review item. A
+        # `was_created=False` replay/race-loser branch (the `if
+        # was_created:` above being False) is deliberately NOT handled
+        # here — that path is already covered by re-entry through the
+        # top-of-function current-classification check on any subsequent
+        # call to this function (see that guard's own WI-4 comment).
+        ensure_classification_review_item(
+            classification=created,
+            evidence=evidence,
+            ai_invocation_id=invocation.ai_invocation_id,
+            needs_you_repository=needs_you_repository,
+            correlation_id=correlation_id,
         )
 
     return ClassifyEvidenceResult(
