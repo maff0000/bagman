@@ -36,6 +36,7 @@ from services.evidence.classification_rule import (
     RULE_STATUS_RETIRED,
     EvidenceClassificationRule,
     EvidenceClassificationRuleRepository,
+    RuleCreationResult,
     normalize_sender_scope_value,
     validate_rule_fields_or_raise,
 )
@@ -78,6 +79,45 @@ class PostgresEvidenceClassificationRuleRepository(EvidenceClassificationRuleRep
         source: str,
         supersedes_rule_id: Optional[str] = None,
     ) -> EvidenceClassificationRule:
+        return self._create_rule_impl(
+            sender_scope_type=sender_scope_type, sender_scope_value=sender_scope_value,
+            subject_predicate_type=subject_predicate_type, subject_predicate_value=subject_predicate_value,
+            document_type=document_type, source=source, supersedes_rule_id=supersedes_rule_id,
+        ).rule
+
+    def create_rule_with_result(
+        self,
+        *,
+        sender_scope_type: str,
+        sender_scope_value: str,
+        subject_predicate_type: str,
+        subject_predicate_value: str,
+        document_type: str,
+        source: str,
+        supersedes_rule_id: Optional[str] = None,
+    ) -> RuleCreationResult:
+        return self._create_rule_impl(
+            sender_scope_type=sender_scope_type, sender_scope_value=sender_scope_value,
+            subject_predicate_type=subject_predicate_type, subject_predicate_value=subject_predicate_value,
+            document_type=document_type, source=source, supersedes_rule_id=supersedes_rule_id,
+        )
+
+    def _create_rule_impl(
+        self,
+        *,
+        sender_scope_type: str,
+        sender_scope_value: str,
+        subject_predicate_type: str,
+        subject_predicate_value: str,
+        document_type: str,
+        source: str,
+        supersedes_rule_id: Optional[str] = None,
+    ) -> RuleCreationResult:
+        """The ONE shared implementation :meth:`create_rule` and
+        :meth:`create_rule_with_result` both call — see
+        ``services.evidence.classification_rule.RuleCreationResult``'s
+        own docstring for why this exists (never two independent copies
+        of this concurrency-critical logic)."""
         normalized_scope_value = normalize_sender_scope_value(sender_scope_type, sender_scope_value)
         normalized_subject_value = normalize_subject_for_policy(subject_predicate_value) or ""
 
@@ -108,7 +148,7 @@ class PostgresEvidenceClassificationRuleRepository(EvidenceClassificationRuleRep
                 )
                 if existing_row is not None:
                     if existing_row.document_type == document_type:
-                        return _row_to_rule(existing_row)
+                        return RuleCreationResult(rule=_row_to_rule(existing_row), was_created=False)
                     raise ConflictError(
                         f"an ACTIVE EvidenceClassificationRule already exists at this identity with a "
                         f"different document_type ('{existing_row.document_type}' != '{document_type}') — "
@@ -169,7 +209,10 @@ class PostgresEvidenceClassificationRuleRepository(EvidenceClassificationRuleRep
                         .one()
                     )
                     if winner.document_type == document_type:
-                        return _row_to_rule(winner)
+                        # The real loser-of-a-genuine-race path — the
+                        # actual DB winner's row, was_created=False (this
+                        # call did NOT insert it).
+                        return RuleCreationResult(rule=_row_to_rule(winner), was_created=False)
                     raise ConflictError(
                         f"an ACTIVE EvidenceClassificationRule already exists at this identity with a "
                         f"different document_type ('{winner.document_type}' != '{document_type}') — resolved "
@@ -179,7 +222,10 @@ class PostgresEvidenceClassificationRuleRepository(EvidenceClassificationRuleRep
         except SQLAlchemyError as exc:
             raise PersistenceError(f"could not create EvidenceClassificationRule: {exc}") from exc
 
-        return candidate
+        # Reached only via the genuine fresh-insert path above (no
+        # existing_row found, no IntegrityError raised) — the real DB
+        # winner, was_created=True.
+        return RuleCreationResult(rule=candidate, was_created=True)
 
     def get_rule(self, rule_id: str) -> EvidenceClassificationRule:
         try:

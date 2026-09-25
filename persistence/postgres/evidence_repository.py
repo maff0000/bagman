@@ -358,6 +358,7 @@ class PostgresEvidenceRepository(EvidenceRepository):
         sender_domain: str,
         sender_address: Optional[str] = None,
         limit: int = _DEFAULT_CANDIDATE_LIMIT,
+        offset: int = 0,
     ) -> list[EvidenceItem]:
         normalized_domain = normalize_domain(sender_domain)
         normalized_address = normalize_address(sender_address) if sender_address else None
@@ -399,7 +400,10 @@ class PostgresEvidenceRepository(EvidenceRepository):
                     )
                 query = query.order_by(
                     EvidenceItemRow.received_at.desc(), EvidenceItemRow.evidence_id.desc()
-                ).limit(limit)
+                )
+                if offset:
+                    query = query.offset(offset)
+                query = query.limit(limit)
                 rows = query.all()
                 return [_row_to_evidence(row) for row in rows]
         except SQLAlchemyError as exc:

@@ -192,9 +192,12 @@ class EvidenceRepository(abc.ABC):
         sender_domain: str,
         sender_address: Optional[str] = None,
         limit: int = _DEFAULT_CANDIDATE_LIMIT,
+        offset: int = 0,
     ) -> list[EvidenceItem]:
-        """CD-6 Slice 5 WI-2 — a bounded, NARROWING candidate query for
-        the classification-rule observed-evidence guard/preview
+        """CD-6 Slice 5 WI-2, paginated as of the 2026-09-25 correctness
+        delta — one PAGE (bounded to ``limit`` rows, offset by
+        ``offset``) of a NARROWING candidate query for the
+        classification-rule observed-evidence guard/preview
         (``services.evidence.classification_matcher``): every
         ``EvidenceItem`` whose ``metadata`` carries both
         ``sender_address`` and ``subject`` keys, AND whose
@@ -202,7 +205,18 @@ class EvidenceRepository(abc.ABC):
         ``sender_domain`` (exactly, normalised) — or, when
         ``sender_address`` is also supplied, whose
         ``metadata['sender_address']`` exactly equals it (normalised) —
-        most-recently-``received_at``-first, bounded to ``limit`` rows.
+        most-recently-``received_at``-first (with ``evidence_id`` as a
+        deterministic tie-breaker), ``limit`` rows starting at ``offset``.
+
+        ``limit`` is a PAGE SIZE, not a total result cap: a caller that
+        needs an EXHAUSTIVE answer (e.g. "does any match exist at all",
+        or "the true match_count") calls this method repeatedly with
+        increasing ``offset`` until a page returns fewer than ``limit``
+        rows — see ``services.evidence.classification_observation``'s
+        own module docstring, "Exhaustive truth, bounded processing",
+        for the doctrine this exists to serve. This method itself never
+        loads the whole corpus in one query regardless of how many
+        pages a caller ultimately walks.
 
         This is a NARROWING optimisation only, never the source of
         match truth: the Postgres implementation applies a loose
@@ -402,6 +416,7 @@ class InMemoryEvidenceRepository(EvidenceRepository):
         sender_domain: str,
         sender_address: Optional[str] = None,
         limit: int = _DEFAULT_CANDIDATE_LIMIT,
+        offset: int = 0,
     ) -> list[EvidenceItem]:
         normalized_address = normalize_address(sender_address) if sender_address else None
         candidates: list[EvidenceItem] = []
@@ -422,5 +437,9 @@ class InMemoryEvidenceRepository(EvidenceRepository):
                 continue
             candidates.append(item)
 
+        # Deterministic order FIRST, then page — offset/limit must slice
+        # a stable ordering or pagination could skip/duplicate rows
+        # across calls (the exact bug a real "ORDER BY ... LIMIT ...
+        # OFFSET ..." query would also need to avoid).
         candidates.sort(key=lambda i: (i.received_at, i.evidence_id), reverse=True)
-        return candidates[:limit]
+        return candidates[offset : offset + limit]

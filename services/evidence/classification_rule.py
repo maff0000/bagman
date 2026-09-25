@@ -224,6 +224,37 @@ class EvidenceClassificationRule:
         }
 
 
+@dataclass(frozen=True)
+class RuleCreationResult:
+    """CD-6 Slice 5 WI-2 correctness delta (2026-09-25) — the
+    DATABASE-AUTHORITATIVE result of a :meth:`EvidenceClassificationRuleRepository.create_rule_with_result`
+    call. ``was_created`` is ``True`` if and only if THIS call is the one
+    that genuinely inserted a new row — never a service-layer pre-check
+    (see ``services.evidence.classification_rule_service``'s own module
+    docstring for the concurrent-audit-duplication defect this closes):
+
+    * a fresh insert with no prior ACTIVE row at this identity ->
+      ``was_created=True``;
+    * an ordinary sequential exact replay (an ACTIVE row with the SAME
+      ``document_type`` already existed) -> ``was_created=False``;
+    * the LOSER of a genuine concurrent race at the same identity/
+      document_type (the real unique-constraint violation backstop, not
+      merely the pre-check) -> ``was_created=False``, carrying the
+      actual DB winner's row;
+    * a different ``document_type`` at an already-occupied identity ->
+      ``ConflictError`` is raised instead (no ``RuleCreationResult`` is
+      ever returned for that case, concurrent or not).
+
+    A caller that only needs the rule itself (not the audit-decision
+    authority) may keep calling :meth:`create_rule`, which is now a
+    thin wrapper returning ``.rule`` from this same result — the two
+    methods share ONE underlying implementation, never two independent
+    copies of this concurrency-critical logic."""
+
+    rule: "EvidenceClassificationRule"
+    was_created: bool
+
+
 def validate_rule_fields_or_raise(
     *,
     sender_scope_type: str,
@@ -310,6 +341,35 @@ class EvidenceClassificationRuleRepository(abc.ABC):
         raise NotImplementedError
 
     @abc.abstractmethod
+    def create_rule_with_result(
+        self,
+        *,
+        sender_scope_type: str,
+        sender_scope_value: str,
+        subject_predicate_type: str,
+        subject_predicate_value: str,
+        document_type: str,
+        source: str,
+        supersedes_rule_id: Optional[str] = None,
+    ) -> "RuleCreationResult":
+        """CD-6 Slice 5 WI-2 correctness delta — identical creation
+        semantics to :meth:`create_rule` (same validation, same
+        idempotent-replay-vs-conflict decision, same concurrency
+        safety), but returns the DATABASE-AUTHORITATIVE
+        :class:`RuleCreationResult` (``rule`` + ``was_created``) instead
+        of the bare rule — see that class's own docstring. This is the
+        ONLY correct way for a caller to decide whether to emit a
+        "rule genuinely created" audit event; a caller-side pre-check
+        (e.g. calling :meth:`find_active_rule_at_identity` before this
+        method) can never be concurrency-safe, since two callers can
+        both observe "nothing exists yet" before either one's write
+        lands.
+
+        Raises exactly the same errors as :meth:`create_rule`.
+        """
+        raise NotImplementedError
+
+    @abc.abstractmethod
     def get_rule(self, rule_id: str) -> "EvidenceClassificationRule":
         raise NotImplementedError
 
@@ -388,6 +448,44 @@ class InMemoryEvidenceClassificationRuleRepository(EvidenceClassificationRuleRep
         source: str,
         supersedes_rule_id: Optional[str] = None,
     ) -> EvidenceClassificationRule:
+        return self._create_rule_impl(
+            sender_scope_type=sender_scope_type, sender_scope_value=sender_scope_value,
+            subject_predicate_type=subject_predicate_type, subject_predicate_value=subject_predicate_value,
+            document_type=document_type, source=source, supersedes_rule_id=supersedes_rule_id,
+        ).rule
+
+    def create_rule_with_result(
+        self,
+        *,
+        sender_scope_type: str,
+        sender_scope_value: str,
+        subject_predicate_type: str,
+        subject_predicate_value: str,
+        document_type: str,
+        source: str,
+        supersedes_rule_id: Optional[str] = None,
+    ) -> RuleCreationResult:
+        return self._create_rule_impl(
+            sender_scope_type=sender_scope_type, sender_scope_value=sender_scope_value,
+            subject_predicate_type=subject_predicate_type, subject_predicate_value=subject_predicate_value,
+            document_type=document_type, source=source, supersedes_rule_id=supersedes_rule_id,
+        )
+
+    def _create_rule_impl(
+        self,
+        *,
+        sender_scope_type: str,
+        sender_scope_value: str,
+        subject_predicate_type: str,
+        subject_predicate_value: str,
+        document_type: str,
+        source: str,
+        supersedes_rule_id: Optional[str] = None,
+    ) -> RuleCreationResult:
+        """The ONE shared implementation :meth:`create_rule` and
+        :meth:`create_rule_with_result` both call — see
+        :class:`RuleCreationResult`'s own docstring for why this exists
+        (never two independent copies of this logic)."""
         normalized_scope_value = normalize_sender_scope_value(sender_scope_type, sender_scope_value)
         normalized_subject_value = normalize_subject_for_policy(subject_predicate_value)
 
@@ -405,7 +503,7 @@ class InMemoryEvidenceClassificationRuleRepository(EvidenceClassificationRuleRep
         if existing_id is not None:
             existing = self._by_id[existing_id]
             if existing.document_type == document_type:
-                return existing  # exact semantic replay -> idempotent no-op
+                return RuleCreationResult(rule=existing, was_created=False)  # exact semantic replay -> idempotent no-op
             raise ConflictError(
                 f"an ACTIVE EvidenceClassificationRule already exists at this identity with a different "
                 f"document_type ('{existing.document_type}' != '{document_type}') — retire the existing rule "
@@ -436,7 +534,7 @@ class InMemoryEvidenceClassificationRuleRepository(EvidenceClassificationRuleRep
 
         self._by_id[candidate.rule_id] = candidate
         self._active_id_by_identity[key] = candidate.rule_id
-        return candidate
+        return RuleCreationResult(rule=candidate, was_created=True)
 
     def get_rule(self, rule_id: str) -> EvidenceClassificationRule:
         try:

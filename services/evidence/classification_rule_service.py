@@ -102,17 +102,22 @@ def create_classification_rule(
     3. Normalise the identity (``normalize_sender_scope_value`` +
        ``normalize_subject_for_policy``).
     4. Run the observed-evidence guard (§3) — ``ValidationError`` if
-       ``match_count == 0``, BEFORE calling ``create_rule`` at all.
-    5. Detect replay-vs-genuine-creation via
-       ``find_active_rule_at_identity`` BEFORE calling ``create_rule``
-       (``create_rule`` itself already handles the idempotent-replay-
-       vs-conflict logic internally — WI-1 — so this is purely for
-       audit-emission decisioning, never duplicated business logic).
-    6. ``create_rule`` — a same-identity/different-document_type
-       ``ConflictError`` propagates as-is (already mapped to 409 by
-       ``app/api/main.py``'s central error handler).
-    7. On genuine creation only: record
-       ``EVIDENCE_CLASSIFICATION_RULE_CREATED``.
+       ``match_count == 0``, BEFORE calling the repository at all.
+    5. ``rule_repository.create_rule_with_result(...)`` — the
+       DATABASE-AUTHORITATIVE creation call (CD-6 correctness delta,
+       2026-09-25; see the inline comment at the call site and
+       ``RuleCreationResult``'s own docstring). A same-identity/
+       different-document_type ``ConflictError`` propagates as-is
+       (already mapped to 409 by ``app/api/main.py``'s central error
+       handler). This deliberately does NOT use a
+       ``find_active_rule_at_identity`` pre-check as audit-decision
+       authority — a caller-side pre-check can never be concurrency-safe
+       (two genuinely concurrent identical callers could both observe
+       "nothing exists yet" before either write lands, and both would
+       incorrectly believe they created the rule).
+    6. On genuine creation only (``creation_result.was_created is True``
+       — the real DB winner, never a caller-side guess): record
+       ``EVIDENCE_CLASSIFICATION_RULE_CREATED`` exactly once.
 
     Never touches ``EvidenceClassificationRepository`` — no
     classification row is ever created merely because a rule was
@@ -154,11 +159,19 @@ def create_classification_rule(
             "EvidenceItem — refusing to create a rule with zero observed evidence"
         )
 
-    existing = rule_repository.find_active_rule_at_identity(
-        sender_scope_type, normalized_scope_value, subject_predicate_type, normalized_subject_value
-    )
-
-    rule = rule_repository.create_rule(
+    # CD-6 correctness delta (2026-09-25): the creation-vs-replay
+    # decision comes from the REPOSITORY's own database-authoritative
+    # result, never a service-layer `find_active_rule_at_identity`
+    # pre-check — two genuinely concurrent identical callers can both
+    # observe "nothing exists yet" from a pre-check before either
+    # write lands, which would make BOTH of them believe they created
+    # the rule and both emit a CREATED audit event, even though the
+    # database itself only ever holds one row. `create_rule_with_result`
+    # resolves this the same way the Postgres implementation already
+    # resolves the row itself: only the real DB-level winner (a fresh
+    # insert, or the actual winner of a unique-constraint race) reports
+    # `was_created=True` — see `RuleCreationResult`'s own docstring.
+    creation_result = rule_repository.create_rule_with_result(
         sender_scope_type=sender_scope_type,
         sender_scope_value=sender_scope_value,
         subject_predicate_type=subject_predicate_type,
@@ -166,13 +179,8 @@ def create_classification_rule(
         document_type=document_type,
         source=source,
     )
-
-    # `existing is None` before the call above proves this `create_rule`
-    # call was a GENUINE first creation (not a replay — a replay
-    # requires an existing ACTIVE row at this identity; a
-    # different-document_type conflict would have raised ConflictError,
-    # which propagates above and never reaches this line).
-    was_created = existing is None
+    rule = creation_result.rule
+    was_created = creation_result.was_created
 
     if was_created:
         # Sequential, non-atomic write-then-audit — see module docstring

@@ -13,22 +13,33 @@ independent near-copies that could silently drift apart — see this
 module's own test suite for a literal proof all three code paths agree
 on one hand-picked normalisation edge case.
 
-Bounded, never a full scan
+Exhaustive truth, bounded processing (CD-6 correctness delta, 2026-09-25)
 ------------------------------------------------------------------------
-``services.evidence.evidence.EvidenceRepository.find_candidate_evidence_for_sender``
-is a NARROWING SQL query, bounded to ``candidate_limit`` rows
-(default 200) — never "every EvidenceItem ever observed". Consequently
-``match_count``/the guard's return value are correct WITHIN that
-bounded candidate window, not a full-corpus count: a sender with more
-than ``candidate_limit`` historical messages could have MORE real
-matches than this reports. This is judged acceptable for a
-CREATION-TIME "has this ever been observed at least once" guard (only
-``>= 1`` matters, and the query is ordered most-recent-first, so a
-genuinely-never-observed identity will correctly show zero regardless
-of corpus size) and for an operator-facing PREVIEW (an operator
-does not need every historical match enumerated to understand what a
-rule would do) — flagged here explicitly rather than silently
-presented as an exhaustive count.
+The ORIGINAL WI-2 delivery bounded the candidate query to a single page
+(``candidate_limit``, default 200) and reported ``match_count`` over
+just that page — for a sender with MORE than 200 historical messages
+(a real, observed production case: ``interactivebrokers.com`` alone has
+226), this made ``match_count`` a silent LOWER BOUND, not the true
+count, and could make the creation-time guard falsely reject a
+genuinely-observed rule if every real match happened to lie outside the
+newest-200 window. That was a real correctness defect, not an
+acceptable approximation — closed here.
+
+The corrected doctrine: bound PROCESSING (how many rows are fetched and
+held at once), never bound TRUTH (whether a match exists, the exact
+``match_count``, or the classification-distribution over every real
+match). :func:`_observed_matches` now walks
+``EvidenceRepository.find_candidate_evidence_for_sender`` PAGE BY PAGE
+(``_PAGE_SIZE`` rows per call) until a page returns fewer rows than the
+page size (exhaustion), accumulating every genuine match — never
+loading the whole corpus in one query, but never silently stopping
+early either. Only the REPRESENTATIVE output
+(``representative_evidence_ids``/``representative_subjects``, still
+bounded to ``representative_limit``) and the
+``current_classification_distribution`` (now computed over every
+genuine match, per the Architect's explicit V1 preference — not the
+representative subset) are affected by scale in a way this module's own
+docstring is honest about below.
 
 Never reads document content, raw MIME, or attachment bytes
 ------------------------------------------------------------------------
@@ -56,9 +67,10 @@ from services.evidence.classification_rule import (
     normalize_sender_scope_value,
 )
 
-#: Default bound both `observed_evidence_guard`/`preview_classification_rule`
-#: use for the underlying candidate query — see module docstring.
-_DEFAULT_CANDIDATE_LIMIT = 200
+#: CD-6 correctness delta (2026-09-25) — a PAGE size for the exhaustive
+#: paginated walk `_observed_matches` performs, never a total-result
+#: cap (see module docstring, "Exhaustive truth, bounded processing").
+_PAGE_SIZE = 200
 #: How many representative evidence_id/subject pairs
 #: `preview_classification_rule` returns — bounded, never every match.
 _DEFAULT_REPRESENTATIVE_LIMIT = 10
@@ -112,16 +124,20 @@ def _observed_matches(
     subject_predicate_type: str,
     subject_predicate_value: str,
     evidence_repository,
-    candidate_limit: int = _DEFAULT_CANDIDATE_LIMIT,
+    page_size: int = _PAGE_SIZE,
 ) -> list:
-    """The one shared core: normalise the candidate identity, fetch a
-    BOUNDED set of plausible candidates from `evidence_repository`
-    (never trusting that SQL-level narrowing as final truth), and
-    re-verify EACH one through the real matcher
+    """The one shared core: normalise the candidate identity, then walk
+    `evidence_repository.find_candidate_evidence_for_sender` PAGE BY
+    PAGE (never trusting that SQL-level narrowing as final truth) until
+    every candidate has genuinely been examined — see module docstring,
+    "Exhaustive truth, bounded processing". Every candidate is
+    re-verified through the real matcher
     (`services.evidence.classification_matcher.match_evidence_to_rule`)
-    against a single synthetic candidate rule. Returns the list of
-    `EvidenceItem`s that genuinely matched, most-recent-first (the same
-    order `find_candidate_evidence_for_sender` already returns)."""
+    against a single synthetic candidate rule. Returns EVERY
+    `EvidenceItem` that genuinely matched — the full, true list, never a
+    bounded/truncated one — ordered most-recent-first (the same order
+    each page from `find_candidate_evidence_for_sender` already uses;
+    concatenating pages preserves it)."""
     normalized_scope_value = normalize_sender_scope_value(sender_scope_type, sender_scope_value)
     normalized_subject_value = normalize_subject_for_policy(subject_predicate_value) or ""
     _validate_identity_fields(
@@ -136,24 +152,32 @@ def _observed_matches(
         candidate_sender_domain = normalized_scope_value
         candidate_sender_address = None
 
-    candidates = evidence_repository.find_candidate_evidence_for_sender(
-        sender_domain=candidate_sender_domain, sender_address=candidate_sender_address, limit=candidate_limit,
-    )
-
     synthetic_rule = _synthetic_candidate_rule(
         sender_scope_type=sender_scope_type, normalized_sender_scope_value=normalized_scope_value,
         subject_predicate_type=subject_predicate_type, normalized_subject_predicate_value=normalized_subject_value,
     )
 
-    matches = []
-    for item in candidates:
-        result = match_evidence_to_rule(
-            sender_address=item.metadata.get("sender_address"),
-            subject=item.metadata.get("subject"),
-            active_rules=[synthetic_rule],
+    matches: list = []
+    offset = 0
+    while True:
+        page = evidence_repository.find_candidate_evidence_for_sender(
+            sender_domain=candidate_sender_domain, sender_address=candidate_sender_address,
+            limit=page_size, offset=offset,
         )
-        if result.outcome == OUTCOME_MATCH:
-            matches.append(item)
+        if not page:
+            break
+        for item in page:
+            result = match_evidence_to_rule(
+                sender_address=item.metadata.get("sender_address"),
+                subject=item.metadata.get("subject"),
+                active_rules=[synthetic_rule],
+            )
+            if result.outcome == OUTCOME_MATCH:
+                matches.append(item)
+        if len(page) < page_size:
+            # A short page IS the last page — no further query needed.
+            break
+        offset += page_size
     return matches
 
 
@@ -164,15 +188,18 @@ def observed_evidence_guard(
     subject_predicate_type: str,
     subject_predicate_value: str,
     evidence_repository,
-    candidate_limit: int = _DEFAULT_CANDIDATE_LIMIT,
+    page_size: int = _PAGE_SIZE,
 ) -> int:
     """CD-6 Slice 5 WI-2 — the creation-time guard: before a new ACTIVE
     ``EvidenceClassificationRule`` may be created, it must match at
     least one REAL, persisted ``EvidenceItem`` (via the SAME matcher
-    every other caller uses — see module docstring). Returns
-    ``match_count`` (bounded — see module docstring); the CALLER decides
-    the ``>= 1`` policy (this function never raises on zero matches
-    itself — see ``services.evidence.classification_rule_service.create_rule``
+    every other caller uses — see module docstring). Returns the TRUE,
+    EXHAUSTIVE ``match_count`` (CD-6 correctness delta, 2026-09-25 — see
+    module docstring, "Exhaustive truth, bounded processing"; processing
+    is still bounded to ``page_size`` rows per underlying query, but the
+    count itself is never a lower bound). The CALLER decides the
+    ``>= 1`` policy (this function never raises on zero matches itself —
+    see ``services.evidence.classification_rule_service.create_classification_rule``
     for where that decision is actually enforced).
 
     Never accidentally counts a manual-upload/non-mailbox
@@ -183,7 +210,7 @@ def observed_evidence_guard(
         _observed_matches(
             sender_scope_type=sender_scope_type, sender_scope_value=sender_scope_value,
             subject_predicate_type=subject_predicate_type, subject_predicate_value=subject_predicate_value,
-            evidence_repository=evidence_repository, candidate_limit=candidate_limit,
+            evidence_repository=evidence_repository, page_size=page_size,
         )
     )
 
@@ -198,15 +225,21 @@ class PreviewResult:
 
     normalized_sender_scope_value: str
     normalized_subject_predicate_value: str
-    #: Bounded — see module docstring's "Bounded, never a full scan".
+    #: EXHAUSTIVE — the true count over every eligible persisted
+    #: EvidenceItem (CD-6 correctness delta, 2026-09-25), never a
+    #: bounded/sampled approximation — see module docstring.
     match_count: int
     #: Bounded to (at most) the representative limit, paired by index
-    #: with `representative_subjects`.
+    #: with `representative_subjects` — a SAMPLE for display, never the
+    #: count itself.
     representative_evidence_ids: tuple[str, ...] = field(default_factory=tuple)
     representative_subjects: tuple[Optional[str], ...] = field(default_factory=tuple)
-    #: document_type (or the literal "NONE") -> count, over the
-    #: representative subset only (see module docstring) — a bounded
-    #: summary, never a full-corpus tally.
+    #: document_type (or the literal "NONE") -> count, computed over
+    #: EVERY genuinely matched EvidenceItem (CD-6 correctness delta,
+    #: 2026-09-25 — the Architect's explicit V1 preference: a full
+    #: matched-corpus distribution, not a representative-subset sample;
+    #: see module docstring). The field name deliberately does NOT say
+    #: "representative" — it is not one.
     current_classification_distribution: Mapping[str, int] = field(default_factory=dict)
 
 
@@ -219,7 +252,7 @@ def preview_classification_rule(
     document_type: str,
     evidence_repository,
     classification_repository,
-    candidate_limit: int = _DEFAULT_CANDIDATE_LIMIT,
+    page_size: int = _PAGE_SIZE,
     representative_limit: int = _DEFAULT_REPRESENTATIVE_LIMIT,
 ) -> PreviewResult:
     """CD-6 Slice 5 WI-2 — read-only preview of a candidate
@@ -246,12 +279,18 @@ def preview_classification_rule(
     matches = _observed_matches(
         sender_scope_type=sender_scope_type, sender_scope_value=sender_scope_value,
         subject_predicate_type=subject_predicate_type, subject_predicate_value=subject_predicate_value,
-        evidence_repository=evidence_repository, candidate_limit=candidate_limit,
+        evidence_repository=evidence_repository, page_size=page_size,
     )
 
     representative = matches[:representative_limit]
+    # CD-6 correctness delta (2026-09-25): iterate over the FULL matched
+    # set, not the bounded `representative` slice — the Architect's
+    # explicit V1 preference is a full matched-corpus distribution (see
+    # `PreviewResult.current_classification_distribution`'s own
+    # docstring). `representative` remains bounded and is used ONLY for
+    # `representative_evidence_ids`/`representative_subjects` below.
     distribution: dict[str, int] = {}
-    for item in representative:
+    for item in matches:
         current = classification_repository.get_current_classification(
             item.evidence_id, CLASSIFICATION_TYPE_DOCUMENT_TYPE
         )
