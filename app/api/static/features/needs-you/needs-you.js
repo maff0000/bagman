@@ -123,10 +123,25 @@ export const NeedsYou = {
     card.appendChild(
       el("div", { class: "needs-you-card__meta muted small", text: `${item.domain} · ${item.item_type}` })
     );
+    // CD-6 Slice 5 WI-5 §23 — the CLASSIFICATION_REVIEW card renders a
+    // distinct, bounded summary (subject/filename, BAGMAN's proposal,
+    // confidence) straight from the item's own metadata — never a
+    // per-card evidence/entity fetch (the review drawer itself already
+    // resolves the real entity, §25). Every value here comes straight
+    // from `services.evidence.classification_review
+    // .ensure_classification_review_item`'s own bounded metadata shape
+    // — no client-side classification logic (§51).
+    if (item.allowed_action_type === "CLASSIFICATION_REVIEW") {
+      const m = item.metadata || {};
+      const pct = m.confidence != null ? ` · ${Math.round(m.confidence * 100)}%` : "";
+      card.appendChild(
+        el("div", { class: "needs-you-card__meta small", text: `${m.subject || "(no subject)"}${pct}` })
+      );
+    }
     if (item.status === "OPEN") {
       const reviewBtn = el("button", {
         class: "btn btn--primary",
-        text: "Review",
+        text: item.allowed_action_type === "CLASSIFICATION_REVIEW" ? "Review classification" : "Review",
         attrs: { type: "button" },
       });
       reviewBtn.addEventListener("click", () => this.openReview(item));
