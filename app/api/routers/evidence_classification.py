@@ -54,6 +54,12 @@ from pydantic import BaseModel
 from app.api.composition import get_composition
 from core.errors import ConflictError
 from services.evidence.classification_observation import preview_classification_rule
+from services.evidence.classification_orchestrator import (
+    OUTCOME_AI_IN_PROGRESS,
+    OUTCOME_CURRENT_CLASSIFICATION_EXISTS as ORCH_OUTCOME_CURRENT_CLASSIFICATION_EXISTS,
+    OUTCOME_DETERMINISTIC_CONFLICT,
+    classify_evidence,
+)
 from services.evidence.classification_rule_service import (
     create_classification_rule,
     retire_classification_rule,
@@ -288,3 +294,126 @@ async def classify_deterministically(evidence_id: str, payload: DeterministicCla
         OUTCOME_NO_APPLICABLE_RULE_INPUT: 200,
     }[result.outcome]
     return JSONResponse(status_code=status_code, content=body)
+
+
+# ---------------------------------------------------------------------
+# Governed AI-fallback classification orchestrator (CD-6 Slice 5 WI-3)
+# ---------------------------------------------------------------------
+
+
+class OrchestratedClassifyRequest(BaseModel):
+    actor_type: str
+    actor_id: str
+    correlation_id: Optional[str] = None
+
+
+def _run_orchestrator(evidence_id: str, payload: OrchestratedClassifyRequest, *, persist: bool) -> JSONResponse:
+    """Shared thin-router body for both governed AI-fallback endpoints
+    below — the only difference between them is `persist`. See
+    `services.evidence.classification_orchestrator.classify_evidence`'s
+    own module docstring for the full deterministic-first, AI-fallback
+    sequence and outcome contract this renders."""
+    composition = get_composition()
+    result = classify_evidence(
+        evidence_id=evidence_id,
+        persist=persist,
+        evidence_repository=composition.api.evidence_repository,
+        rule_repository=composition.classification_rule_repository,
+        classification_repository=composition.classification_repository,
+        ai_invocation_repository=composition.ai_invocation_repository,
+        litellm_client=composition.litellm_client,
+        object_store=composition.object_store,
+        audit_repository=composition.api.audit_repository,
+        record_audit_event=composition.api.record_audit_event,
+        actor_type=payload.actor_type,
+        actor_id=payload.actor_id,
+        correlation_id=payload.correlation_id,
+    )
+
+    # A genuine conflict — with existing canonical classification
+    # truth, with an unresolved deterministic rule ambiguity, or with
+    # an already-in-flight invocation for this exact subject — is
+    # raised the same way `classify_deterministically` above already
+    # raises `ConflictError` for its own analogous outcomes, so every
+    # 409 on this router means the same thing to a caller.
+    if result.outcome == ORCH_OUTCOME_CURRENT_CLASSIFICATION_EXISTS:
+        raise ConflictError(
+            f"EvidenceItem '{evidence_id}' already has a current DOCUMENT_TYPE classification "
+            f"'{result.existing_classification_id}' (source={result.existing_source!r}, "
+            f"document_type={result.existing_document_type!r}) — the AI-fallback orchestrator "
+            "never supersedes existing canonical classification truth"
+        )
+    if result.outcome == OUTCOME_DETERMINISTIC_CONFLICT:
+        raise ConflictError(
+            f"EvidenceItem '{evidence_id}': {len(result.conflicting_rule_ids)} ACTIVE "
+            "EvidenceClassificationRule rows are equally authoritative for this evidence — "
+            f"refusing to let AI arbitrate a deterministic rule conflict: {list(result.conflicting_rule_ids)}"
+        )
+    if result.outcome == OUTCOME_AI_IN_PROGRESS:
+        raise ConflictError(
+            f"EvidenceItem '{evidence_id}' already has an in-flight DOCUMENT_TYPE_PROPOSAL v2 "
+            f"AIInvocation '{result.ai_invocation_id}' — refusing to launch a parallel duplicate"
+        )
+
+    body: dict[str, Any] = {"outcome": result.outcome}
+    if result.deterministic_outcome is not None:
+        body["deterministic_outcome"] = result.deterministic_outcome
+    if result.classification is not None:
+        body["evidence_classification"] = result.classification.to_dict()
+    if result.was_created is not None:
+        body["was_created"] = result.was_created
+    if result.ai_invocation_id is not None:
+        body["ai_invocation_id"] = result.ai_invocation_id
+    if result.proposed_type is not None:
+        body["proposed_type"] = result.proposed_type
+    if result.confidence is not None:
+        body["confidence"] = result.confidence
+    if result.signals:
+        body["signals"] = list(result.signals)
+    if result.warnings:
+        body["warnings"] = list(result.warnings)
+    if result.classifier_fingerprint is not None:
+        body["classifier_fingerprint"] = result.classifier_fingerprint
+    if result.classification_context_version is not None:
+        body["classification_context_version"] = result.classification_context_version
+    if result.matched_rule_id is not None:
+        body["matched_rule_id"] = result.matched_rule_id
+    if result.unsupported_reason is not None:
+        body["unsupported_reason"] = result.unsupported_reason
+    if result.error_code is not None:
+        body["error_code"] = result.error_code
+
+    status_code = 201 if result.was_created else 200
+    return JSONResponse(status_code=status_code, content=body)
+
+
+@router.post("/internal/evidence/{evidence_id}/classifications/ai-preview")
+async def classify_ai_preview(evidence_id: str, payload: OrchestratedClassifyRequest) -> JSONResponse:
+    """CD-6 Slice 5 WI-3 §39 — the production acceptance surface.
+
+    Runs the full deterministic-first, AI-fallback sequence (WI-2's
+    deterministic classifier, then, only if it finds no match, the
+    bounded context builder + `DOCUMENT_TYPE_PROPOSAL` v2 AI
+    invocation) but creates NO `EvidenceClassification` row regardless
+    of outcome — a real `AIInvocation`/audit trail is created (so the
+    real proposal and its provenance are inspectable), but canonical
+    classification truth is never touched by a call to this endpoint.
+    """
+    return _run_orchestrator(evidence_id, payload, persist=False)
+
+
+@router.post("/internal/evidence/{evidence_id}/classifications/orchestrated")
+async def classify_orchestrated(evidence_id: str, payload: OrchestratedClassifyRequest) -> JSONResponse:
+    """CD-6 Slice 5 WI-3 §40 — the persistent orchestrated endpoint.
+
+    Identical sequence to `.../ai-preview` above, but a concrete AI
+    proposal IS persisted as a new `EvidenceClassification`
+    (`source=AI_PROPOSAL`, `status=REVIEW_REQUIRED`) and a `UNKNOWN`
+    proposal is persisted as `status=UNCLASSIFIABLE` (WI-3 §32-33) —
+    never `status=CLASSIFIED`; every AI proposal always requires
+    review. Not invoked against production evidence as part of this
+    WI's own acceptance (WI-3 §40's own explicit instruction) — it is
+    implemented and fully tested here for a human PL's independent
+    review/acceptance.
+    """
+    return _run_orchestrator(evidence_id, payload, persist=True)

@@ -972,3 +972,176 @@ def test_wi2_classification_modules_never_call_evidence_object_store():
         if "object_store" in text and "object_store.get(" in text:
             violations.append(str(path.relative_to(REPO_ROOT)))
     assert violations == [], f"CD-6 Slice 5 WI-2 modules must never read from an object store: {violations}"
+
+
+# ---------------------------------------------------------------------
+# CD-6 Slice 5 WI-3 — context-builder/fingerprint/orchestrator
+# architecture-boundary proofs. Deliberately a SEPARATE module list
+# from `_CLASSIFICATION_MODULE_PATHS`/`_WI2_NEW_MODULE_PATHS` above —
+# unlike WI-1/WI-2, WI-3's own orchestrator IS supposed to import
+# `ai.gateway.background`/`ai.tasks`/`ai.prompts.loader` (that is its
+# entire job), so it must never be added to either of those two
+# AI-import-forbidding lists.
+# ---------------------------------------------------------------------
+
+_WI3_CONTEXT_AND_FINGERPRINT_MODULE_PATHS = [
+    REPO_ROOT / "services" / "evidence" / "classification_context.py",
+    REPO_ROOT / "services" / "evidence" / "classification_ai_fingerprint.py",
+]
+
+_WI3_ORCHESTRATOR_MODULE_PATH = REPO_ROOT / "services" / "evidence" / "classification_orchestrator.py"
+
+
+def test_wi3_context_and_fingerprint_modules_never_import_ai_provider_or_gateway_code():
+    """The context builder and fingerprint modules are pure,
+    deterministic, non-AI helpers (WI-3 §13/§23) — neither may import
+    anything under `ai.providers`/`ai.gateway`/`ai.tasks`. (The
+    orchestrator, which genuinely needs those, is checked separately
+    below — never against this same prohibition.)"""
+    forbidden_ai_submodules = {"ai.providers", "ai.gateway", "ai.tasks"}
+    violations = []
+    for path in _WI3_CONTEXT_AND_FINGERPRINT_MODULE_PATHS:
+        for imp in _imports_of(path):
+            if any(imp.full == mod or imp.full.startswith(mod + ".") for mod in forbidden_ai_submodules):
+                violations.append(f"{path.relative_to(REPO_ROOT)}:{imp.lineno} imports {imp.full!r}")
+    assert violations == [], (
+        "CD-6 Slice 5 WI-3 context/fingerprint modules must never import AI orchestration code — "
+        "violations:\n" + "\n".join(violations)
+    )
+
+
+def test_wi3_context_module_never_imports_pdf_or_ocr_library():
+    """WI-3 adds no PDF/OCR/Office parser (§14/§21) — only stdlib
+    `email`/`html.parser` for `message/rfc822`/`text/plain`."""
+    forbidden_roots = {
+        "fitz", "pypdf", "PyPDF2", "pdfplumber", "pytesseract", "pdf2image", "textract", "pikepdf", "pdfminer",
+        "docx", "openpyxl", "bs4", "lxml",
+    }
+    violations = []
+    for imp in _imports_of(REPO_ROOT / "services" / "evidence" / "classification_context.py"):
+        if imp.root in forbidden_roots:
+            violations.append(f"classification_context.py:{imp.lineno} imports {imp.full!r}")
+    assert violations == [], "\n".join(violations)
+
+
+def test_wi3_orchestrator_never_mutates_evidence_item():
+    """Same invariant WI-1/WI-2 already enforce for their own modules
+    (`test_evidence_classification_code_never_mutates_evidence_item`),
+    re-proven independently for WI-3's new orchestrator: it may
+    reference `evidence_id`/read `EvidenceItem` fields, but must never
+    call the two EvidenceItem mutation paths, and must never write to
+    an `EvidenceItemRow`'s own columns."""
+    forbidden_substrings = [
+        ".update_status(", ".assign_entity(",
+        "evidence_row.status", "evidence_row.entity_id", "evidence_row.evidence_type",
+        "evidence_row.mime_type", "evidence_row.size_bytes", "evidence_row.content_hash",
+    ]
+    text = _WI3_ORCHESTRATOR_MODULE_PATH.read_text(encoding="utf-8")
+    violations = [pattern for pattern in forbidden_substrings if pattern in text]
+    assert violations == [], (
+        f"CD-6 Slice 5 WI-3 classification_orchestrator.py must never mutate EvidenceItem — "
+        f"violations: {violations}"
+    )
+
+
+def test_wi3_orchestrator_never_wires_entity_proposal_or_needs_you_review():
+    """WI-3 §43: AI document classification cannot alter
+    `EvidenceItem.entity_id` — ownership and document type remain
+    separate authorities. `ENTITY_PROPOSAL` is never invoked/modified,
+    and the Needs You producer `ITEM_TYPE_CLASSIFICATION_REVIEW` stays
+    completely untouched."""
+    forbidden_tokens = ("ENTITY_PROPOSAL", "ITEM_TYPE_CLASSIFICATION_REVIEW")
+    text = _WI3_ORCHESTRATOR_MODULE_PATH.read_text(encoding="utf-8")
+    violations = [token for token in forbidden_tokens if token in text]
+    assert violations == [], "\n".join(violations)
+
+
+def test_wi3_orchestrator_never_calls_claude_code_or_operator_document_review():
+    """WI-3 §44: no silent cloud/Claude escalation on a failed local
+    classification. Neither `OPERATOR_DOCUMENT_REVIEW` nor any
+    Claude-operator-gateway symbol ever appears in the orchestrator."""
+    forbidden_tokens = ("OPERATOR_DOCUMENT_REVIEW", "ClaudeCodeOperatorRunner", "claude_code", "ASK_BAGMAN")
+    text = _WI3_ORCHESTRATOR_MODULE_PATH.read_text(encoding="utf-8")
+    violations = [token for token in forbidden_tokens if token in text]
+    assert violations == [], "\n".join(violations)
+
+
+def test_wi3_orchestrator_never_imports_persistence_or_app():
+    """WI-3's orchestrator is dependency-injected (constructor/call
+    parameters only) — it must never import `app.*`/`persistence.*`
+    directly, mirroring `ai.gateway.background.run_background_task`'s
+    own documented discipline."""
+    forbidden_roots = {"app", "persistence"}
+    violations = []
+    for imp in _imports_of(_WI3_ORCHESTRATOR_MODULE_PATH):
+        if imp.root in forbidden_roots:
+            violations.append(f"classification_orchestrator.py:{imp.lineno} imports {imp.full!r}")
+    assert violations == [], "\n".join(violations)
+
+
+def test_wi3_document_type_proposal_v2_rejected_by_generic_ai_tasks_endpoint():
+    """CD-6 Slice 5 WI-3 §22 — a genuine request-level proof (this
+    file's usual style is purely static/import-based, but §22 is
+    fundamentally an HTTP-behavioural guarantee: "this exact request
+    shape is refused" can only be proven by actually sending it).
+    `DOCUMENT_TYPE_PROPOSAL` v2 must be refused by the generic
+    `POST /internal/ai/tasks` surface; v1 must remain completely
+    unaffected through the exact same surface."""
+    from fastapi.testclient import TestClient
+
+    from app.api.composition import get_composition, reset_composition_for_tests
+    from app.api.main import app
+
+    reset_composition_for_tests()
+    client = TestClient(app)
+    composition = get_composition()
+
+    source = composition.api.register_source(
+        source_type="MANUAL_UPLOAD", provider="architecture-boundary-test", status="ACTIVE",
+        actor_type="SYSTEM", actor_id="wi3-boundary-test",
+    )
+    import hashlib
+    from datetime import datetime, timezone
+
+    from core import identity as _identity
+
+    content = b"Synthetic WI-3 architecture-boundary-test evidence."
+    content_hash = {"algorithm": "SHA-256", "value": hashlib.sha256(content).hexdigest()}
+    storage_reference = composition.object_store.put(_identity.generate_id(), content_hash, content)
+    evidence = composition.api.register_evidence(
+        entity_id=None, evidence_type="INVOICE", source_id=source.source_id,
+        observed_at=datetime.now(timezone.utc), received_at=datetime.now(timezone.utc),
+        content_hash=content_hash, mime_type="text/plain", size_bytes=len(content),
+        actor_type="SYSTEM", actor_id="wi3-boundary-test", storage_reference=storage_reference,
+    )
+
+    v2_response = client.post(
+        "/internal/ai/tasks",
+        json={
+            "task_id": "DOCUMENT_TYPE_PROPOSAL", "task_version": 2,
+            "input_references": {"evidence_id": evidence.evidence_id},
+            "actor_type": "SYSTEM", "actor_id": "wi3-boundary-test",
+        },
+    )
+    assert v2_response.status_code == 422, (
+        f"expected DOCUMENT_TYPE_PROPOSAL v2 to be rejected (422) on the generic path, "
+        f"got {v2_response.status_code}: {v2_response.text}"
+    )
+
+    composition.litellm_client.queue_success(
+        capability_alias="bagman-fast",
+        content=json.dumps({"proposed_type": "INVOICE", "confidence": 0.5, "signals": [], "warnings": []}),
+    )
+    v1_response = client.post(
+        "/internal/ai/tasks",
+        json={
+            "task_id": "DOCUMENT_TYPE_PROPOSAL", "task_version": 1,
+            "input_references": {"evidence_id": evidence.evidence_id},
+            "actor_type": "SYSTEM", "actor_id": "wi3-boundary-test",
+        },
+    )
+    assert v1_response.status_code == 200, (
+        f"v1 must remain completely callable through the generic path (WI-3 §22) — got "
+        f"{v1_response.status_code}: {v1_response.text}"
+    )
+    assert v1_response.json()["task_version"] == 1
