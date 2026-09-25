@@ -78,6 +78,7 @@ from services.evidence.classification import (
     AI_INVOCATION_SUCCEEDED_STATUS,
     SOURCE_AI_PROPOSAL,
     SOURCE_DETERMINISTIC_RULE,
+    ClassificationCreationResult,
     EvidenceClassification,
     EvidenceClassificationRepository,
     validate_classification_fields_or_raise,
@@ -193,6 +194,58 @@ class PostgresEvidenceClassificationRepository(EvidenceClassificationRepository)
         supersedes_classification_id: Optional[str] = None,
         expected_current_classification_id: Optional[str] = None,
     ) -> EvidenceClassification:
+        return self._create_classification_impl(
+            evidence_id=evidence_id, classification_type=classification_type, document_type=document_type,
+            status=status, source=source, confidence=confidence, rule_id=rule_id,
+            ai_invocation_id=ai_invocation_id, operator_action_id=operator_action_id, reason_codes=reason_codes,
+            supersedes_classification_id=supersedes_classification_id,
+            expected_current_classification_id=expected_current_classification_id,
+        ).classification
+
+    def create_classification_with_result(
+        self,
+        *,
+        evidence_id: str,
+        classification_type: str,
+        document_type: str,
+        status: str,
+        source: str,
+        confidence: Optional[float] = None,
+        rule_id: Optional[str] = None,
+        ai_invocation_id: Optional[str] = None,
+        operator_action_id: Optional[str] = None,
+        reason_codes: Optional[Sequence[str]] = None,
+        supersedes_classification_id: Optional[str] = None,
+        expected_current_classification_id: Optional[str] = None,
+    ) -> ClassificationCreationResult:
+        return self._create_classification_impl(
+            evidence_id=evidence_id, classification_type=classification_type, document_type=document_type,
+            status=status, source=source, confidence=confidence, rule_id=rule_id,
+            ai_invocation_id=ai_invocation_id, operator_action_id=operator_action_id, reason_codes=reason_codes,
+            supersedes_classification_id=supersedes_classification_id,
+            expected_current_classification_id=expected_current_classification_id,
+        )
+
+    def _create_classification_impl(
+        self,
+        *,
+        evidence_id: str,
+        classification_type: str,
+        document_type: str,
+        status: str,
+        source: str,
+        confidence: Optional[float] = None,
+        rule_id: Optional[str] = None,
+        ai_invocation_id: Optional[str] = None,
+        operator_action_id: Optional[str] = None,
+        reason_codes: Optional[Sequence[str]] = None,
+        supersedes_classification_id: Optional[str] = None,
+        expected_current_classification_id: Optional[str] = None,
+    ) -> ClassificationCreationResult:
+        """Shared implementation behind both public creation methods —
+        never duplicated (CD-6 cross-WI concurrency correction,
+        2026-09-25 — see ``services.evidence.classification
+        .ClassificationCreationResult``'s own docstring)."""
         validate_classification_fields_or_raise(
             classification_type=classification_type, document_type=document_type, status=status, source=source,
             confidence=confidence, rule_id=rule_id, ai_invocation_id=ai_invocation_id,
@@ -233,7 +286,9 @@ class PostgresEvidenceClassificationRepository(EvidenceClassificationRepository)
                 # 2. Producer-idempotency check, inside the lock.
                 existing_row = session.query(EvidenceClassificationRow).filter(producer_filter).one_or_none()
                 if existing_row is not None:
-                    return _row_to_classification(existing_row)
+                    return ClassificationCreationResult(
+                        classification=_row_to_classification(existing_row), was_created=False
+                    )
 
                 # 3. supersedes_classification_id validation.
                 if supersedes_classification_id is not None:
@@ -315,10 +370,14 @@ class PostgresEvidenceClassificationRepository(EvidenceClassificationRepository)
                 # Someone else's concurrent replay of the SAME producer
                 # identity won the race — return THEIR row (the same
                 # idempotent-return semantics the pre-check above
-                # provides in the non-racing case).
+                # provides in the non-racing case). was_created=False —
+                # THIS call did not insert it, regardless of which
+                # constraint family caught the race.
                 with session_scope(self._engine) as retry_session:
                     winner = retry_session.query(EvidenceClassificationRow).filter(producer_filter).one()
-                    return _row_to_classification(winner)
+                    return ClassificationCreationResult(
+                        classification=_row_to_classification(winner), was_created=False
+                    )
             if constraint == _SUPERSEDES_CONSTRAINT:
                 raise ConflictError(
                     f"classification_id '{supersedes_classification_id}' is already superseded by another row "
@@ -330,7 +389,10 @@ class PostgresEvidenceClassificationRepository(EvidenceClassificationRepository)
         except SQLAlchemyError as exc:
             raise PersistenceError(f"could not create EvidenceClassification: {exc}") from exc
 
-        return candidate
+        # Reached only via the genuine fresh-insert path above (no
+        # existing_row found, no IntegrityError raised) — the real DB
+        # winner, was_created=True.
+        return ClassificationCreationResult(classification=candidate, was_created=True)
 
     def get_classification(self, classification_id: str) -> EvidenceClassification:
         try:

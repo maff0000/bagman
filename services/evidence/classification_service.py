@@ -27,6 +27,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Optional
 
+from core.errors import ConflictError
 from services.evidence.classification import (
     CLASSIFICATION_TYPE_DOCUMENT_TYPE,
     DOCUMENT_TYPE_UNKNOWN,
@@ -160,40 +161,93 @@ def classify_evidence_deterministically(
         # a STATUS_UNCLASSIFIABLE row instead.
         status = STATUS_UNCLASSIFIABLE if result.document_type == DOCUMENT_TYPE_UNKNOWN else STATUS_CLASSIFIED
 
-        created = classification_repository.create_classification(
-            evidence_id=evidence_id,
-            classification_type=CLASSIFICATION_TYPE_DOCUMENT_TYPE,
-            document_type=result.document_type,
-            status=status,
-            source=SOURCE_DETERMINISTIC_RULE,
-            confidence=None,
-            rule_id=result.rule_id,
-            ai_invocation_id=None,
-            operator_action_id=None,
-            reason_codes=(),
-            supersedes_classification_id=None,
-            expected_current_classification_id=None,
-        )
+        # CD-6 cross-WI concurrency correction (2026-09-25): the
+        # creation-vs-replay decision (and therefore the CLASSIFIED-vs-
+        # EXISTING outcome and whether an audit event fires) comes from
+        # the REPOSITORY's own database-authoritative
+        # `create_classification_with_result` — never inferred from the
+        # `current is None` pre-read above, which is retained purely as
+        # a cheap optimisation (skip the repository call entirely when
+        # this evidence item plainly already has a DIFFERENT current
+        # classification) but is NOT creation authority: two genuinely
+        # concurrent callers can both observe `current is None` before
+        # either write lands, and both would incorrectly believe they
+        # performed the creation if that pre-read alone decided the
+        # outcome — exactly the doctrine already established for
+        # `services.evidence.classification_rule_service.create_classification_rule`.
+        try:
+            creation_result = classification_repository.create_classification_with_result(
+                evidence_id=evidence_id,
+                classification_type=CLASSIFICATION_TYPE_DOCUMENT_TYPE,
+                document_type=result.document_type,
+                status=status,
+                source=SOURCE_DETERMINISTIC_RULE,
+                confidence=None,
+                rule_id=result.rule_id,
+                ai_invocation_id=None,
+                operator_action_id=None,
+                reason_codes=(),
+                supersedes_classification_id=None,
+                expected_current_classification_id=None,
+            )
+        except ConflictError:
+            # WI-3 §13's cross-producer race: a DIFFERENT producer (a
+            # different source, or the same source but a different
+            # rule_id) won the very first classification for this
+            # (evidence_id, classification_type) between this
+            # function's own `current is None` pre-read above and this
+            # create call — the repository's own expected-current check
+            # is the real, authoritative arbiter here; re-resolve and
+            # report the real current truth via the SAME
+            # CURRENT_CLASSIFICATION_EXISTS-shaped outcome this
+            # function already reports for the non-racing "a rule
+            # matched but a different producer already holds current"
+            # case below — never a raw, unhandled ConflictError, and
+            # never a second/forked classification row. AI must never
+            # supersede deterministic truth (or vice versa) merely by
+            # completing later.
+            recheck = classification_repository.get_current_classification(
+                evidence_id, CLASSIFICATION_TYPE_DOCUMENT_TYPE
+            )
+            return DeterministicClassificationResult(
+                outcome=OUTCOME_CURRENT_CLASSIFICATION_EXISTS,
+                existing_classification_id=recheck.classification_id if recheck is not None else None,
+                existing_source=recheck.source if recheck is not None else None,
+                existing_document_type=recheck.document_type if recheck is not None else None,
+            )
 
-        # Sequential, non-atomic write-then-audit — see module docstring.
-        audit_repository.record_audit_event(
-            event_type="EVIDENCE_CLASSIFIED",
-            actor_type=actor_type,
-            actor_id=actor_id,
-            subject_type="EvidenceClassification",
-            subject_id=created.classification_id,
-            correlation_id=created.classification_id,
-            causation_id=None,
-            payload={
-                "evidence_id": evidence_id,
-                "rule_id": result.rule_id,
-                "document_type": result.document_type,
-                "matching_tier": result.matching_tier,
-            },
-        )
+        if creation_result.was_created:
+            # Sequential, non-atomic write-then-audit — see module
+            # docstring.
+            audit_repository.record_audit_event(
+                event_type="EVIDENCE_CLASSIFIED",
+                actor_type=actor_type,
+                actor_id=actor_id,
+                subject_type="EvidenceClassification",
+                subject_id=creation_result.classification.classification_id,
+                correlation_id=creation_result.classification.classification_id,
+                causation_id=None,
+                payload={
+                    "evidence_id": evidence_id,
+                    "rule_id": result.rule_id,
+                    "document_type": result.document_type,
+                    "matching_tier": result.matching_tier,
+                },
+            )
+            return DeterministicClassificationResult(
+                outcome=OUTCOME_CLASSIFIED,
+                classification=creation_result.classification,
+                matched_rule_id=result.rule_id,
+                matching_tier=result.matching_tier,
+            )
+
+        # was_created=False — a same-rule producer replay the repository
+        # itself resolved (an ordinary sequential replay, or the loser
+        # of a genuine concurrent same-identity race) — never a second
+        # write, never a second audit event.
         return DeterministicClassificationResult(
-            outcome=OUTCOME_CLASSIFIED,
-            classification=created,
+            outcome=OUTCOME_EXISTING,
+            classification=creation_result.classification,
             matched_rule_id=result.rule_id,
             matching_tier=result.matching_tier,
         )

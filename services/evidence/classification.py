@@ -354,6 +354,32 @@ def validate_classification_fields_or_raise(
             )
 
 
+@dataclass(frozen=True)
+class ClassificationCreationResult:
+    """CD-6 Slice 5 cross-WI concurrency correction (2026-09-25) — the
+    DATABASE-AUTHORITATIVE result of a
+    :meth:`EvidenceClassificationRepository.create_classification_with_result`
+    call. ``was_created`` is ``True`` if and only if THIS call is the
+    one that genuinely inserted a new row — never inferred by a caller
+    from a separate prior read of "current classification" or history,
+    exactly the same doctrine already established for
+    ``services.evidence.classification_rule.RuleCreationResult``.
+
+    ``was_created=False`` means this call's producer-identity replay
+    returned an EXISTING row unchanged (either an ordinary sequential
+    replay, or the loser of a genuine concurrent producer-identity
+    race — see each repository's own ``create_classification_with_result``
+    docstring for exactly which DB mechanism resolves each case). A
+    cross-producer race for the very first classification of a given
+    ``(evidence_id, classification_type)`` is NOT a ``was_created=False``
+    outcome at all — it remains a real ``core.errors.ConflictError``,
+    unchanged (see module docstring's "Concurrency-safe creation").
+    """
+
+    classification: "EvidenceClassification"
+    was_created: bool
+
+
 class EvidenceClassificationRepository(abc.ABC):
     """Repository abstraction for EvidenceClassification. See module
     docstring for the full supersession/idempotency/existence-validation
@@ -399,6 +425,40 @@ class EvidenceClassificationRepository(abc.ABC):
                 superseded by another row (branch prevention), or a
                 ``supersedes_classification_id`` from a different
                 ``evidence_id``/``classification_type``.
+        """
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def create_classification_with_result(
+        self,
+        *,
+        evidence_id: str,
+        classification_type: str,
+        document_type: str,
+        status: str,
+        source: str,
+        confidence: Optional[float] = None,
+        rule_id: Optional[str] = None,
+        ai_invocation_id: Optional[str] = None,
+        operator_action_id: Optional[str] = None,
+        reason_codes: Optional[Sequence[str]] = None,
+        supersedes_classification_id: Optional[str] = None,
+        expected_current_classification_id: Optional[str] = None,
+    ) -> "ClassificationCreationResult":
+        """CD-6 Slice 5 cross-WI concurrency correction — identical
+        creation semantics to :meth:`create_classification` (same
+        validation, same producer-idempotency/branch-prevention/
+        expected-current doctrine, same exceptions), but returns the
+        DATABASE-AUTHORITATIVE :class:`ClassificationCreationResult`
+        instead of a bare :class:`EvidenceClassification` — so a
+        caller (a service layer emitting a creation audit event) never
+        has to infer "did I just create this row" from a separate,
+        racy pre-read of current state or history (see
+        :class:`ClassificationCreationResult`'s own docstring, and
+        ``services.evidence.classification_rule.RuleCreationResult``
+        for the identical doctrine this mirrors).
+
+        Raises the exact same exceptions as :meth:`create_classification`.
         """
         raise NotImplementedError
 
@@ -486,6 +546,57 @@ class InMemoryEvidenceClassificationRepository(EvidenceClassificationRepository)
         supersedes_classification_id: Optional[str] = None,
         expected_current_classification_id: Optional[str] = None,
     ) -> EvidenceClassification:
+        return self._create_classification_impl(
+            evidence_id=evidence_id, classification_type=classification_type, document_type=document_type,
+            status=status, source=source, confidence=confidence, rule_id=rule_id,
+            ai_invocation_id=ai_invocation_id, operator_action_id=operator_action_id, reason_codes=reason_codes,
+            supersedes_classification_id=supersedes_classification_id,
+            expected_current_classification_id=expected_current_classification_id,
+        ).classification
+
+    def create_classification_with_result(
+        self,
+        *,
+        evidence_id: str,
+        classification_type: str,
+        document_type: str,
+        status: str,
+        source: str,
+        confidence: Optional[float] = None,
+        rule_id: Optional[str] = None,
+        ai_invocation_id: Optional[str] = None,
+        operator_action_id: Optional[str] = None,
+        reason_codes: Optional[Sequence[str]] = None,
+        supersedes_classification_id: Optional[str] = None,
+        expected_current_classification_id: Optional[str] = None,
+    ) -> ClassificationCreationResult:
+        return self._create_classification_impl(
+            evidence_id=evidence_id, classification_type=classification_type, document_type=document_type,
+            status=status, source=source, confidence=confidence, rule_id=rule_id,
+            ai_invocation_id=ai_invocation_id, operator_action_id=operator_action_id, reason_codes=reason_codes,
+            supersedes_classification_id=supersedes_classification_id,
+            expected_current_classification_id=expected_current_classification_id,
+        )
+
+    def _create_classification_impl(
+        self,
+        *,
+        evidence_id: str,
+        classification_type: str,
+        document_type: str,
+        status: str,
+        source: str,
+        confidence: Optional[float] = None,
+        rule_id: Optional[str] = None,
+        ai_invocation_id: Optional[str] = None,
+        operator_action_id: Optional[str] = None,
+        reason_codes: Optional[Sequence[str]] = None,
+        supersedes_classification_id: Optional[str] = None,
+        expected_current_classification_id: Optional[str] = None,
+    ) -> ClassificationCreationResult:
+        """Shared implementation behind both public creation methods —
+        never duplicated (see module's cross-WI concurrency-correction
+        note on :class:`ClassificationCreationResult`)."""
         validate_classification_fields_or_raise(
             classification_type=classification_type, document_type=document_type, status=status, source=source,
             confidence=confidence, rule_id=rule_id, ai_invocation_id=ai_invocation_id,
@@ -516,7 +627,7 @@ class InMemoryEvidenceClassificationRepository(EvidenceClassificationRepository)
         )
         existing_id = self._id_by_producer_key.get(producer_key)
         if existing_id is not None:
-            return self._by_id[existing_id]
+            return ClassificationCreationResult(classification=self._by_id[existing_id], was_created=False)
 
         if supersedes_classification_id is not None:
             superseded = self.get_classification(supersedes_classification_id)
@@ -573,7 +684,7 @@ class InMemoryEvidenceClassificationRepository(EvidenceClassificationRepository)
         if supersedes_classification_id is not None:
             self._superseded_by[supersedes_classification_id] = candidate.classification_id
         self._history.setdefault((evidence_id, classification_type), []).append(candidate.classification_id)
-        return candidate
+        return ClassificationCreationResult(classification=candidate, was_created=True)
 
     def get_classification(self, classification_id: str) -> EvidenceClassification:
         try:

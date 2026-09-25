@@ -380,6 +380,115 @@ def test_operator_assigned_producer_replay_returns_the_same_row(repo, evidence_r
     assert replay.classification_id == first.classification_id
 
 
+# ---------------------------------------------------------------------
+# CD-6 cross-WI concurrency correction (2026-09-25) —
+# `create_classification_with_result` / `ClassificationCreationResult`
+# InMemory parity: identical create/replay `was_created` semantics to
+# the Postgres implementation, re-proving all three WI-1 producer
+# identities (§14) even though WI-4 does not yet produce operator
+# classifications.
+# ---------------------------------------------------------------------
+
+
+def test_create_classification_with_result_fresh_insert_reports_was_created_true(
+    repo, evidence_repository, rule_repository
+):
+    evidence_id = _register_evidence(evidence_repository)
+    rule_id = _active_rule(rule_repository)
+    result = repo.create_classification_with_result(
+        evidence_id=evidence_id, classification_type=CLASSIFICATION_TYPE_DOCUMENT_TYPE,
+        document_type="SUPPLIER_INVOICE", status=STATUS_CLASSIFIED, source=SOURCE_DETERMINISTIC_RULE,
+        rule_id=rule_id, expected_current_classification_id=None,
+    )
+    assert result.was_created is True
+    assert result.classification.document_type == "SUPPLIER_INVOICE"
+
+
+def test_create_classification_with_result_sequential_replay_reports_was_created_false(
+    repo, evidence_repository, rule_repository
+):
+    evidence_id = _register_evidence(evidence_repository)
+    rule_id = _active_rule(rule_repository)
+    first = repo.create_classification_with_result(
+        evidence_id=evidence_id, classification_type=CLASSIFICATION_TYPE_DOCUMENT_TYPE,
+        document_type="SUPPLIER_INVOICE", status=STATUS_CLASSIFIED, source=SOURCE_DETERMINISTIC_RULE,
+        rule_id=rule_id, expected_current_classification_id=None,
+    )
+    replay = repo.create_classification_with_result(
+        evidence_id=evidence_id, classification_type=CLASSIFICATION_TYPE_DOCUMENT_TYPE,
+        document_type="SUPPLIER_INVOICE", status=STATUS_CLASSIFIED, source=SOURCE_DETERMINISTIC_RULE,
+        rule_id=rule_id, expected_current_classification_id=None,
+    )
+    assert first.was_created is True
+    assert replay.was_created is False
+    assert replay.classification.classification_id == first.classification.classification_id
+    assert len(repo.list_classification_history(evidence_id, CLASSIFICATION_TYPE_DOCUMENT_TYPE)) == 1
+
+
+def test_create_classification_with_result_ai_proposal_producer_identity(
+    repo, evidence_repository, ai_invocation_repository
+):
+    evidence_id = _register_evidence(evidence_repository)
+    invocation_id = _succeeded_invocation(ai_invocation_repository, evidence_id)
+    first = repo.create_classification_with_result(
+        evidence_id=evidence_id, classification_type=CLASSIFICATION_TYPE_DOCUMENT_TYPE,
+        document_type="RECEIPT", status=STATUS_CLASSIFIED, source=SOURCE_AI_PROPOSAL,
+        ai_invocation_id=invocation_id, confidence=0.9, expected_current_classification_id=None,
+    )
+    replay = repo.create_classification_with_result(
+        evidence_id=evidence_id, classification_type=CLASSIFICATION_TYPE_DOCUMENT_TYPE,
+        document_type="RECEIPT", status=STATUS_CLASSIFIED, source=SOURCE_AI_PROPOSAL,
+        ai_invocation_id=invocation_id, confidence=0.9, expected_current_classification_id=None,
+    )
+    assert first.was_created is True
+    assert replay.was_created is False
+    assert replay.classification.classification_id == first.classification.classification_id
+
+
+def test_create_classification_with_result_operator_assigned_producer_identity(repo, evidence_repository):
+    """WI-4 does not yet produce operator classifications, but
+    repository result semantics must already be correct for that
+    source (WI-3-correction §14's own explicit instruction)."""
+    evidence_id = _register_evidence(evidence_repository)
+    first = repo.create_classification_with_result(
+        evidence_id=evidence_id, classification_type=CLASSIFICATION_TYPE_DOCUMENT_TYPE,
+        document_type="RECEIPT", status=STATUS_CLASSIFIED, source=SOURCE_OPERATOR_ASSIGNED,
+        operator_action_id="op-with-result-1", expected_current_classification_id=None,
+    )
+    replay = repo.create_classification_with_result(
+        evidence_id=evidence_id, classification_type=CLASSIFICATION_TYPE_DOCUMENT_TYPE,
+        document_type="RECEIPT", status=STATUS_CLASSIFIED, source=SOURCE_OPERATOR_ASSIGNED,
+        operator_action_id="op-with-result-1", expected_current_classification_id=None,
+    )
+    assert first.was_created is True
+    assert replay.was_created is False
+    assert replay.classification.classification_id == first.classification.classification_id
+
+
+def test_create_classification_and_create_classification_with_result_share_one_impl(
+    repo, evidence_repository, rule_repository
+):
+    """`create_classification` (bare `EvidenceClassification`) and
+    `create_classification_with_result` (`ClassificationCreationResult`)
+    must observe/produce the exact same underlying row for the exact
+    same producer identity — proving they share one implementation,
+    never two independent copies that could drift apart."""
+    evidence_id = _register_evidence(evidence_repository)
+    rule_id = _active_rule(rule_repository)
+    bare = repo.create_classification(
+        evidence_id=evidence_id, classification_type=CLASSIFICATION_TYPE_DOCUMENT_TYPE,
+        document_type="SUPPLIER_INVOICE", status=STATUS_CLASSIFIED, source=SOURCE_DETERMINISTIC_RULE,
+        rule_id=rule_id, expected_current_classification_id=None,
+    )
+    with_result = repo.create_classification_with_result(
+        evidence_id=evidence_id, classification_type=CLASSIFICATION_TYPE_DOCUMENT_TYPE,
+        document_type="SUPPLIER_INVOICE", status=STATUS_CLASSIFIED, source=SOURCE_DETERMINISTIC_RULE,
+        rule_id=rule_id, expected_current_classification_id=None,
+    )
+    assert with_result.was_created is False
+    assert with_result.classification.classification_id == bare.classification_id
+
+
 def test_different_producer_same_subject_is_not_idempotent(repo, evidence_repository, rule_repository):
     """A DIFFERENT rule_id creating a classification for the same
     (evidence_id, classification_type) is a genuinely different producer

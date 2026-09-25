@@ -356,6 +356,229 @@ def test_operator_assigned_producer_replay_returns_the_same_row():
     assert replay.classification_id == first.classification_id
 
 
+# ---------------------------------------------------------------------
+# CD-6 cross-WI concurrency correction (2026-09-25) —
+# `create_classification_with_result` / `ClassificationCreationResult`:
+# fresh-create / replay / real-threaded unique-race-loser proofs against
+# the real database, mirroring the identical doctrine this correction
+# establishes for `EvidenceClassificationRuleRepository.create_rule_with_result`.
+# ---------------------------------------------------------------------
+
+
+def test_create_classification_with_result_fresh_insert_reports_was_created_true_on_postgres():
+    evidence_id = _make_evidence()
+    rule_id = _make_rule()
+    result = _repo().create_classification_with_result(
+        evidence_id=evidence_id, classification_type=CLASSIFICATION_TYPE_DOCUMENT_TYPE,
+        document_type="SUPPLIER_INVOICE", status=STATUS_CLASSIFIED, source=SOURCE_DETERMINISTIC_RULE,
+        rule_id=rule_id, expected_current_classification_id=None,
+    )
+    assert result.was_created is True
+    assert result.classification.document_type == "SUPPLIER_INVOICE"
+
+
+def test_create_classification_with_result_sequential_replay_reports_was_created_false_on_postgres():
+    evidence_id = _make_evidence()
+    rule_id = _make_rule()
+    repo = _repo()
+    first = repo.create_classification_with_result(
+        evidence_id=evidence_id, classification_type=CLASSIFICATION_TYPE_DOCUMENT_TYPE,
+        document_type="SUPPLIER_INVOICE", status=STATUS_CLASSIFIED, source=SOURCE_DETERMINISTIC_RULE,
+        rule_id=rule_id, expected_current_classification_id=None,
+    )
+    replay = repo.create_classification_with_result(
+        evidence_id=evidence_id, classification_type=CLASSIFICATION_TYPE_DOCUMENT_TYPE,
+        document_type="SUPPLIER_INVOICE", status=STATUS_CLASSIFIED, source=SOURCE_DETERMINISTIC_RULE,
+        rule_id=rule_id, expected_current_classification_id=None,
+    )
+    assert first.was_created is True
+    assert replay.was_created is False
+    assert replay.classification.classification_id == first.classification.classification_id
+    with session_scope(get_engine()) as session:
+        count = session.query(EvidenceClassificationRow).filter_by(evidence_id=evidence_id).count()
+        assert count == 1
+
+
+def test_genuinely_concurrent_same_producer_identity_resolves_to_exactly_one_created_row():
+    """WI-3-correction §5/§11 — the real, database-enforced backstop:
+    N genuinely concurrent callers racing to create a classification
+    for the EXACT SAME producer identity (same `ai_invocation_id`, i.e.
+    the shape the WI-3 orchestrator's own persist step races under)
+    must resolve to exactly one `was_created=True` (the real INSERT
+    winner — either the pre-check winner, or the real database
+    unique-constraint winner if the pre-check itself raced) and every
+    other caller `was_created=False`, all returning the SAME
+    classification_id, with no raw DB error ever reaching the caller."""
+    evidence_id = _make_evidence()
+    invocation_id = _make_succeeded_invocation(evidence_id)
+    n_workers = 8
+    barrier = threading.Barrier(n_workers)
+    results: list[dict] = [{} for _ in range(n_workers)]
+
+    def _worker(index: int) -> None:
+        repo = _repo()
+        barrier.wait()
+        start = time.monotonic()
+        result = repo.create_classification_with_result(
+            evidence_id=evidence_id, classification_type=CLASSIFICATION_TYPE_DOCUMENT_TYPE,
+            document_type="RECEIPT", status=STATUS_CLASSIFIED, source=SOURCE_AI_PROPOSAL,
+            ai_invocation_id=invocation_id, confidence=0.9, expected_current_classification_id=None,
+        )
+        results[index] = {
+            "classification_id": result.classification.classification_id, "was_created": result.was_created,
+            "start": start, "end": time.monotonic(),
+        }
+
+    threads = [threading.Thread(target=_worker, args=(i,)) for i in range(n_workers)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+
+    assert all(r for r in results), f"one or more worker threads did not complete: {results}"
+
+    classification_ids = {r["classification_id"] for r in results}
+    assert len(classification_ids) == 1, f"expected all callers to agree on ONE classification_id: {results}"
+
+    created_true = [r for r in results if r["was_created"] is True]
+    created_false = [r for r in results if r["was_created"] is False]
+    assert len(created_true) == 1, f"expected exactly ONE was_created=True, got {len(created_true)}: {results}"
+    assert len(created_false) == n_workers - 1, f"expected every other caller was_created=False: {results}"
+
+    windows = [(r["start"], r["end"]) for r in results]
+    overlap_found = any(
+        a_start < b_end and b_start < a_end
+        for i, (a_start, a_end) in enumerate(windows)
+        for j, (b_start, b_end) in enumerate(windows)
+        if i < j
+    )
+    assert overlap_found, f"no genuine wall-clock overlap detected between worker call windows: {windows}"
+
+    with session_scope(get_engine()) as session:
+        count = (
+            session.query(EvidenceClassificationRow)
+            .filter_by(evidence_id=evidence_id, classification_type=CLASSIFICATION_TYPE_DOCUMENT_TYPE)
+            .count()
+        )
+        assert count == 1
+
+
+def test_cross_producer_race_deterministic_vs_ai_proposal_resolves_to_one_winner_one_audit():
+    """WI-3-correction §13 — two DIFFERENT producer types (a
+    deterministic rule producer and an AI proposal producer) racing to
+    establish the FIRST classification for the same
+    (evidence_id, DOCUMENT_TYPE). Uses the real, governed
+    `classify_evidence_deterministically` (WI-2) for the rule side, and
+    a faithful inline replica of the orchestrator's own
+    create-then-conditionally-audit persist step (WI-3
+    `classification_orchestrator.classify_evidence`'s own §32-38 logic)
+    for the AI side — never a second reimplementation of either
+    module's real logic, just the minimal harness needed to race the
+    two real producer shapes against the real database. AI must never
+    supersede deterministic truth (or vice versa) merely by winning a
+    race."""
+    from persistence.postgres.audit_repository import PostgresAuditRepository
+    from services.evidence.classification_service import (
+        OUTCOME_CLASSIFIED as DET_OUTCOME_CLASSIFIED,
+        OUTCOME_CURRENT_CLASSIFICATION_EXISTS as DET_OUTCOME_CURRENT_CLASSIFICATION_EXISTS,
+        classify_evidence_deterministically,
+    )
+
+    sender_domain = f"cross-producer-{identity.generate_id()}.example"
+    rule_id = _make_rule(sender_scope_value=sender_domain, subject_predicate_value="cross-producer statement")
+    source = _make_source()
+    now = _utc_now()
+    evidence = PostgresEvidenceRepository(PostgresExternalReferenceRepository()).register_evidence(
+        entity_id=None, evidence_type="EMAIL", source_id=source.source_id, observed_at=now, received_at=now,
+        content_hash=_fabricated_content_hash(identity.generate_id()), mime_type="message/rfc822", size_bytes=100,
+        metadata={"sender_address": f"billing@{sender_domain}", "subject": "cross-producer statement"},
+    )
+    evidence_id = evidence.evidence_id
+    invocation_id = _make_succeeded_invocation(evidence_id)
+
+    barrier = threading.Barrier(2)
+    results: dict[str, dict] = {}
+
+    def _rule_worker() -> None:
+        evidence_repo = PostgresEvidenceRepository(PostgresExternalReferenceRepository())
+        rule_repo = PostgresEvidenceClassificationRuleRepository()
+        classification_repo = _repo()
+        audit_repo = PostgresAuditRepository()
+        barrier.wait()
+        outcome = classify_evidence_deterministically(
+            evidence_id=evidence_id, evidence_repository=evidence_repo, rule_repository=rule_repo,
+            classification_repository=classification_repo, audit_repository=audit_repo,
+            actor_type="SYSTEM", actor_id="cross-producer-rule-thread",
+        )
+        results["rule"] = {"outcome": outcome.outcome, "classification": outcome.classification}
+
+    def _ai_worker() -> None:
+        classification_repo = _repo()
+        audit_repo = PostgresAuditRepository()
+        barrier.wait()
+        try:
+            creation_result = classification_repo.create_classification_with_result(
+                evidence_id=evidence_id, classification_type=CLASSIFICATION_TYPE_DOCUMENT_TYPE,
+                document_type="RECEIPT", status=STATUS_CLASSIFIED, source=SOURCE_AI_PROPOSAL,
+                ai_invocation_id=invocation_id, confidence=0.85, expected_current_classification_id=None,
+            )
+        except ConflictError:
+            results["ai"] = {"outcome": "CONFLICT", "classification": None}
+            return
+        if creation_result.was_created:
+            audit_repo.record_audit_event(
+                event_type="EVIDENCE_CLASSIFIED", actor_type="SYSTEM", actor_id="cross-producer-ai-thread",
+                subject_type="EvidenceClassification", subject_id=creation_result.classification.classification_id,
+                correlation_id=creation_result.classification.classification_id, causation_id=None,
+                payload={"evidence_id": evidence_id, "ai_invocation_id": invocation_id},
+            )
+        results["ai"] = {
+            "outcome": "CREATED" if creation_result.was_created else "REPLAY",
+            "classification": creation_result.classification,
+        }
+
+    threads = [threading.Thread(target=_rule_worker), threading.Thread(target=_ai_worker)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+
+    assert set(results.keys()) == {"rule", "ai"}, f"one or both worker threads did not complete: {results}"
+
+    # Exactly one winner overall.
+    rule_won = results["rule"]["outcome"] == DET_OUTCOME_CLASSIFIED
+    ai_won = results["ai"]["outcome"] == "CREATED"
+    assert rule_won != ai_won, f"expected exactly one producer to win, got: {results}"
+
+    if rule_won:
+        assert results["ai"]["outcome"] == "CONFLICT", f"expected the AI thread to lose via ConflictError: {results}"
+        winning_classification_id = results["rule"]["classification"].classification_id
+        assert results["rule"]["classification"].rule_id == rule_id
+    else:
+        assert results["rule"]["outcome"] == DET_OUTCOME_CURRENT_CLASSIFICATION_EXISTS, (
+            f"expected the rule thread to lose via CURRENT_CLASSIFICATION_EXISTS: {results}"
+        )
+        winning_classification_id = results["ai"]["classification"].classification_id
+
+    # No branch/fork — exactly one row for this (evidence_id, DOCUMENT_TYPE).
+    with session_scope(get_engine()) as session:
+        count = (
+            session.query(EvidenceClassificationRow)
+            .filter_by(evidence_id=evidence_id, classification_type=CLASSIFICATION_TYPE_DOCUMENT_TYPE)
+            .count()
+        )
+        assert count == 1
+
+    current = _repo().get_current_classification(evidence_id, CLASSIFICATION_TYPE_DOCUMENT_TYPE)
+    assert current is not None
+    assert current.classification_id == winning_classification_id
+
+    # Exactly one EVIDENCE_CLASSIFIED audit event for the winning row.
+    audit_events = PostgresAuditRepository().list_by_subject("EvidenceClassification", winning_classification_id)
+    created_events = [e for e in audit_events if e.event_type == "EVIDENCE_CLASSIFIED"]
+    assert len(created_events) == 1, f"expected exactly ONE EVIDENCE_CLASSIFIED audit event, got {len(created_events)}"
+
+
 def test_database_level_producer_idempotency_indexes_exist():
     """A raw duplicate insert at the same (evidence_id, classification_type,
     rule_id) identity under source=DETERMINISTIC_RULE must be rejected

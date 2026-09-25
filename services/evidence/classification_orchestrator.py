@@ -539,13 +539,24 @@ def classify_evidence(
     if context.attachment_content_not_extracted and context.attachment_count > 0:
         reason_codes.append(REASON_CODE_ATTACHMENT_CONTENT_NOT_EXTRACTED)
 
-    existing_ids_before = {
-        c.classification_id
-        for c in classification_repository.list_classification_history(evidence_id, CLASSIFICATION_TYPE_DOCUMENT_TYPE)
-    }
-
+    # CD-6 cross-WI concurrency correction (2026-09-25): the
+    # creation-vs-replay decision comes from the REPOSITORY's own
+    # database-authoritative `create_classification_with_result` —
+    # never inferred from a service-layer history-snapshot diff. The
+    # previous `existing_ids_before = {...history...}` /
+    # `was_created = created.classification_id not in existing_ids_before`
+    # pattern was unsafe under genuine concurrent replay: two racing
+    # callers persisting the SAME AI proposal (identical
+    # ai_invocation_id, i.e. the exact same producer identity) could
+    # both read an empty/stale history snapshot before either write
+    # landed, and both would then believe THEY created the row and
+    # both emit EVIDENCE_CLASSIFIED — even though the database only
+    # ever holds one row for that producer identity. See
+    # `services.evidence.classification.ClassificationCreationResult`'s
+    # own docstring — the exact same doctrine already established for
+    # `services.evidence.classification_rule_service.create_classification_rule`.
     try:
-        created = classification_repository.create_classification(
+        creation_result = classification_repository.create_classification_with_result(
             evidence_id=evidence_id,
             classification_type=CLASSIFICATION_TYPE_DOCUMENT_TYPE,
             document_type=DOCUMENT_TYPE_UNKNOWN if is_unknown else proposed_type,
@@ -576,12 +587,15 @@ def classify_evidence(
             deterministic_outcome=det_result.outcome,
         )
 
-    was_created = created.classification_id not in existing_ids_before
+    created = creation_result.classification
+    was_created = creation_result.was_created
 
     if was_created:
-        # §35 — bounded AI audit event, only for a genuinely NEW row
-        # (§37 — an ordinary producer-identity replay must never
-        # double-audit).
+        # §35 — bounded AI audit event, only for a genuinely NEW row —
+        # the repository's own database-authoritative decision, never
+        # a service-layer inference (§37 — an ordinary producer-identity
+        # replay, or the loser of a genuine concurrent replay race,
+        # must never double-audit).
         record_audit_event(
             event_type="EVIDENCE_CLASSIFIED",
             actor_type=actor_type,
