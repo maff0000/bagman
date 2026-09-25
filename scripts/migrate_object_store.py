@@ -28,15 +28,29 @@ Design constraints (all deliberate, not oversights):
   expected to always be unreferenced (see PL's DB object-reference
   inventory in the work order); that is correct, not a bug.
 
-* Resumable and safe to rerun: a checkpoint file (append-only
-  JSON-lines) records one line per key that reached a verified
-  terminal success (either "already identical at the destination" or
-  "freshly migrated and read back byte-identical"). A crash mid-run
-  loses at most the one in-flight key — everything already flushed to
-  the checkpoint is skipped on the next run. Rerunning against an
-  already-fully-migrated destination is a safe no-op even with a
-  *fresh* checkpoint: the per-key HEAD-then-compare-bytes logic itself
-  (not merely the checkpoint) is what makes this idempotent.
+* Checkpoint doctrine (CD-6 migration-safety hardening delta,
+  2026-09-25) — a checkpoint is evidence that a key was PREVIOUSLY
+  verified, never proof that the destination still holds it NOW. The
+  original version of this tool treated `key in checkpoint_done` as
+  skip authority — that was a real defect: if a destination object
+  were lost or altered out-of-band between runs, a stale checkpoint
+  would silently hide that loss forever. Corrected doctrine: EVERY key
+  in the source bucket is re-GET'd from source, re-hash-verified, and
+  re-inspected against the destination on EVERY run, checkpoint or
+  not. The checkpoint no longer skips any verification work — it only
+  changes which report bucket a verified-identical or
+  freshly-recopied key lands in (`already_identical` vs
+  `verified_via_checkpoint`; `migrated` vs
+  `remigrated_checkpoint_missing`), for progress-reporting purposes
+  only. A checkpointed key whose destination copy is found missing is
+  transparently re-migrated; a checkpointed key whose destination copy
+  now holds DIFFERENT bytes than source is a hard FAILURE (never
+  overwritten) — the exact same immutability doctrine as an
+  uncheckpointed key, applied uniformly. Existing JSONL checkpoint
+  files from before this correction remain fully readable — their
+  records simply become "previously completed, still to be
+  revalidated" hints rather than skip directives (no format change,
+  only an interpretation change).
 
 * Never overwrites a destination object that already holds different
   bytes than the source — the exact same immutability doctrine
@@ -48,9 +62,31 @@ Design constraints (all deliberate, not oversights):
   exactly three `SELECT` statements and nothing else; it never writes
   to any BAGMAN canonical table.
 
+* Defense-in-depth set reconciliation (CD-6 hardening delta) — this
+  tool does not trust a single point-in-time source enumeration.
+  Source keys are enumerated once BEFORE copying
+  (`source_key_count_initial`) and once AFTER
+  (`source_key_count_final`); if the two enumerations differ at all,
+  the whole run is a hard FAILURE (`source_changed_during_migration`)
+  even if every individual copy that happened was itself correct —
+  a source that changed mid-run means this run's picture of "the
+  source" was never actually stable, and production's own migration
+  procedure additionally quiesces writers so this should never fire
+  for real (see the module-level "Production cutover sequence" note
+  below). Destination is reconciled by exact SET equality against the
+  FINAL source enumeration, not merely a matching count — an
+  unexpected extra destination-only key (`extra_in_destination`) is
+  just as much a hard failure as a missing one
+  (`missing_from_destination`); this tool never treats an unexpected
+  destination object as something to silently garbage-collect.
+
 * No hard-coded expected counts anywhere in this file — every number
   in the final report is computed from what was actually observed
   this run, per the work order's explicit instruction.
+  `EvidenceItem`/canonical-DB-row counts are never assumed to equal
+  the physical object count: source bucket enumeration is storage
+  truth, `DB_REFERENCED_KEYS` is integrity/reconciliation truth,
+  neither substitutes for the other.
 
 Usage
 -----
@@ -66,14 +102,47 @@ Usage
         --db-dsn-file /path/to/db_dsn \\
         --checkpoint-file /path/to/checkpoint.jsonl
 
-``--db-dsn-file`` names a file containing a single PostgreSQL
-connection string (e.g. ``postgresql://user:password@host:5432/dbname``)
-— never a literal DSN on the command line. The database is only ever
-read (three plain `SELECT`s, no writes).
+``--db-dsn-file`` names a file containing a single PostgreSQL connection
+string (e.g. ``postgresql://user:password@host:5432/dbname``) — never a
+literal DSN on the command line. The database is only ever read (three
+plain `SELECT`s, no writes).
 
-Prints one JSON report to stdout as this script's last line. Exits
-non-zero if `MISSING_FROM_SOURCE` is non-empty (before any copying) or
-if any key ended in FAILURE during the copy phase.
+Exit code is 0 only when ALL of the following hold (see `run()`):
+``missing_reference_count == 0`` (checked before any copying),
+``source_changed_during_migration is False``,
+``missing_from_destination_count == 0``,
+``extra_in_destination_count == 0``, and ``failure_count == 0``. Prints
+one JSON report to stdout as this script's last line in every case.
+
+Production cutover sequence (CD-6 hardening delta, §18-21 — documented
+here now for the record; NOT executed by this delivery, a separate,
+later Architect-authorized step performs the actual cutover):
+
+1. Verify zero running Gmail sweep/intake activity.
+2. Stop `bagman-api` (the only writer to both the object store and the
+   canonical database).
+3. Verify no other object-store writer exists.
+4. Leave PostgreSQL running (this tool reads it; the app does not
+   write to it while stopped).
+5. Leave the OLD MinIO container running — read-only by operational
+   circumstance (no writer is running), not by any access-control
+   change this tool makes.
+6. Capture a DB/object-store preflight snapshot: the three
+   `DB_REFERENCED_KEYS` sources' row counts/values BEFORE migration.
+7. Run this tool. After it exits 0, re-query the same three DB
+   reference sources and require byte/set equality against the
+   preflight snapshot — this proves the canonical database's own
+   object references stayed frozen (not merely the object-store
+   buckets) while `bagman-api` was stopped, before restarting it.
+   Do NOT implement application-level dual-write for this — a short,
+   bounded maintenance window with the API stopped is simpler and
+   strictly safer than trying to keep two live object stores
+   consistent under concurrent writes.
+8. Do not rotate S3 credentials as part of this cutover — reuse
+   BAGMAN's current object-store access/secret values in the new
+   SeaweedFS static identity file. Provider replacement and credential
+   rotation are independent risk domains; a later, separate hardening
+   WO may rotate credentials.
 """
 from __future__ import annotations
 
@@ -188,11 +257,19 @@ def query_db_referenced_keys(dsn: str) -> set[str]:
 
 
 # ---------------------------------------------------------------------
-# Checkpoint (append-only JSON-lines, one line per verified-done key)
+# Checkpoint (append-only JSON-lines) — a revalidation HINT, never a
+# skip authority. See the module docstring's "Checkpoint doctrine".
 # ---------------------------------------------------------------------
 
 
 def load_checkpoint(path: Path) -> dict[str, dict]:
+    """Load prior checkpoint records, keyed by key. The returned dict
+    is consulted ONLY to decide which report bucket a key's outcome
+    lands in this run (`already_identical` vs `verified_via_checkpoint`,
+    `migrated` vs `remigrated_checkpoint_missing`) — it is never used
+    to skip GET/HEAD/hash-verification of that key. Old-format records
+    (from before this correction) are read identically; nothing about
+    the on-disk shape changed."""
     done: dict[str, dict] = {}
     if not path.is_file():
         return done
@@ -233,7 +310,9 @@ def append_checkpoint(path: Path, record: dict) -> None:
 
 @dataclass
 class RunResult:
-    source_key_count: int = 0
+    source_key_count_initial: int = 0
+    source_key_count_final: int = 0
+    source_changed_during_migration: bool = False
     destination_key_count: int = 0
     total_bytes_migrated: int = 0
     canonical_reference_count: int = 0
@@ -243,9 +322,16 @@ class RunResult:
     missing_reference_keys: list[str] = field(default_factory=list)
     migrated_count: int = 0
     already_identical_count: int = 0
-    skipped_via_checkpoint_count: int = 0
+    verified_via_checkpoint_count: int = 0
+    remigrated_checkpoint_missing_count: int = 0
     failure_count: int = 0
     failures: list[dict] = field(default_factory=list)
+    missing_from_destination_count: int = 0
+    missing_from_destination_keys: list[str] = field(default_factory=list)
+    extra_in_destination_count: int = 0
+    extra_in_destination_keys: list[str] = field(default_factory=list)
+    all_key_sets_equal: bool = False
+    all_destination_bytes_verified: bool = False
 
 
 def _head_exists(client, bucket: str, key: str) -> bool:
@@ -267,13 +353,15 @@ def migrate_key(
     dest_client,
     dest_bucket: str,
     checkpoint_path: Path,
-    checkpoint_done: dict[str, dict],
+    was_checkpointed: bool,
     result: RunResult,
 ) -> None:
-    if key in checkpoint_done:
-        result.skipped_via_checkpoint_count += 1
-        return
-
+    """Fully (re)verify and, if needed, (re)copy one key. Runs
+    identically whether or not `was_checkpointed` — the ONLY effect
+    `was_checkpointed` has is which of two equivalent report counters
+    a verified-identical or freshly-copied outcome is attributed to,
+    for progress-reporting purposes. See the module docstring's
+    "Checkpoint doctrine"."""
     try:
         source_obj = source_client.get_object(Bucket=source_bucket, Key=key)
         source_bytes = source_obj["Body"].read()
@@ -315,16 +403,25 @@ def migrate_key(
             return
 
         if dest_bytes == source_bytes:
-            result.already_identical_count += 1
-            record = {"key": key, "status": "done", "outcome": "already_identical", "bytes": len(source_bytes)}
-            append_checkpoint(checkpoint_path, record)
-            checkpoint_done[key] = record
+            # Byte-for-byte equality is strictly stronger than hash
+            # equality (no SHA-256 collision risk realistically) — a
+            # separate `sha256(dest) == expected_hash` check would be
+            # redundant given source already passed that check above
+            # and dest_bytes == source_bytes here.
+            if was_checkpointed:
+                result.verified_via_checkpoint_count += 1
+                outcome = "verified_via_checkpoint"
+            else:
+                result.already_identical_count += 1
+                outcome = "already_identical"
+            append_checkpoint(checkpoint_path, {"key": key, "status": "done", "outcome": outcome, "bytes": len(source_bytes)})
             return
 
         result.failure_count += 1
         result.failures.append(
             {
                 "key": key,
+                "was_checkpointed": was_checkpointed,
                 "reason": (
                     "destination already holds DIFFERENT bytes at this key — refusing to "
                     "overwrite (same immutability doctrine as MinIOObjectStore.put)"
@@ -333,6 +430,12 @@ def migrate_key(
         )
         return
 
+    # Destination does not currently have this key — (re)migrate it.
+    # This branch is reached identically whether the checkpoint had
+    # never seen this key before, or had previously recorded it done
+    # and the destination has since lost it (the exact defect this
+    # correction closes) — either way the correct action is the same:
+    # copy it now and verify the copy.
     try:
         dest_client.put_object(Bucket=dest_bucket, Key=key, Body=source_bytes)
     except (BotoCoreError, ClientError) as exc:
@@ -353,11 +456,14 @@ def migrate_key(
         result.failures.append({"key": key, "reason": "post-write readback bytes did not match source bytes"})
         return
 
-    result.migrated_count += 1
     result.total_bytes_migrated += len(source_bytes)
-    record = {"key": key, "status": "done", "outcome": "migrated", "bytes": len(source_bytes)}
-    append_checkpoint(checkpoint_path, record)
-    checkpoint_done[key] = record
+    if was_checkpointed:
+        result.remigrated_checkpoint_missing_count += 1
+        outcome = "remigrated_checkpoint_missing"
+    else:
+        result.migrated_count += 1
+        outcome = "migrated"
+    append_checkpoint(checkpoint_path, {"key": key, "status": "done", "outcome": outcome, "bytes": len(source_bytes)})
 
 
 # ---------------------------------------------------------------------
@@ -379,15 +485,15 @@ def run(args: argparse.Namespace) -> tuple[int, dict]:
         args.destination_endpoint_url, dest_access_key, dest_secret_key, args.destination_bucket, args.destination_region
     )
 
-    print(f"[migrate_object_store] enumerating source keys at {args.source_endpoint_url} bucket={source_bucket}", file=sys.stderr)
-    source_keys = list_all_keys(source_client, source_bucket)
-    print(f"[migrate_object_store] {len(source_keys)} source key(s) found", file=sys.stderr)
+    print(f"[migrate_object_store] enumerating source keys (initial) at {args.source_endpoint_url} bucket={source_bucket}", file=sys.stderr)
+    source_keys_initial = list_all_keys(source_client, source_bucket)
+    print(f"[migrate_object_store] {len(source_keys_initial)} source key(s) found (initial)", file=sys.stderr)
 
     print(f"[migrate_object_store] querying DB-referenced keys via {args.db_dsn_file}", file=sys.stderr)
     db_referenced_keys = query_db_referenced_keys(db_dsn)
     print(f"[migrate_object_store] {len(db_referenced_keys)} DB-referenced key(s) found", file=sys.stderr)
 
-    missing_from_source = sorted(db_referenced_keys - source_keys)
+    missing_from_source = sorted(db_referenced_keys - source_keys_initial)
     if missing_from_source:
         report = {
             "error": "MISSING_FROM_SOURCE",
@@ -402,10 +508,10 @@ def run(args: argparse.Namespace) -> tuple[int, dict]:
         print(json.dumps(report, indent=2, sort_keys=True))
         return 1, report
 
-    unreferenced_source = sorted(source_keys - db_referenced_keys)
+    unreferenced_source = sorted(source_keys_initial - db_referenced_keys)
 
     result = RunResult(
-        source_key_count=len(source_keys),
+        source_key_count_initial=len(source_keys_initial),
         canonical_reference_count=len(db_referenced_keys),
         unreferenced_source_count=len(unreferenced_source),
         unreferenced_source_keys=unreferenced_source,
@@ -416,7 +522,7 @@ def run(args: argparse.Namespace) -> tuple[int, dict]:
     checkpoint_path = Path(args.checkpoint_file)
     checkpoint_done = load_checkpoint(checkpoint_path)
 
-    for key in sorted(source_keys):
+    for key in sorted(source_keys_initial):
         migrate_key(
             key=key,
             source_client=source_client,
@@ -424,15 +530,40 @@ def run(args: argparse.Namespace) -> tuple[int, dict]:
             dest_client=dest_client,
             dest_bucket=dest_bucket,
             checkpoint_path=checkpoint_path,
-            checkpoint_done=checkpoint_done,
+            was_checkpointed=(key in checkpoint_done),
             result=result,
         )
 
+    result.all_destination_bytes_verified = result.failure_count == 0
+
+    # Source mutation detection (defense-in-depth) — re-enumerate
+    # source AFTER copying and compare to the initial enumeration.
+    print(f"[migrate_object_store] enumerating source keys (final) at {args.source_endpoint_url} bucket={source_bucket}", file=sys.stderr)
+    source_keys_final = list_all_keys(source_client, source_bucket)
+    result.source_key_count_final = len(source_keys_final)
+    result.source_changed_during_migration = source_keys_final != source_keys_initial
+
+    # Authoritative destination-set reconciliation against the FINAL
+    # source enumeration — exact set equality, not merely a count.
     destination_keys = list_all_keys(dest_client, dest_bucket)
     result.destination_key_count = len(destination_keys)
+    missing_from_destination = sorted(source_keys_final - destination_keys)
+    extra_in_destination = sorted(destination_keys - source_keys_final)
+    result.missing_from_destination_count = len(missing_from_destination)
+    result.missing_from_destination_keys = missing_from_destination
+    result.extra_in_destination_count = len(extra_in_destination)
+    result.extra_in_destination_keys = extra_in_destination
+
+    result.all_key_sets_equal = (
+        not result.source_changed_during_migration
+        and not missing_from_destination
+        and not extra_in_destination
+    )
 
     report = {
-        "source_key_count": result.source_key_count,
+        "source_key_count_initial": result.source_key_count_initial,
+        "source_key_count_final": result.source_key_count_final,
+        "source_changed_during_migration": result.source_changed_during_migration,
         "destination_key_count": result.destination_key_count,
         "total_bytes_migrated": result.total_bytes_migrated,
         "canonical_reference_count": result.canonical_reference_count,
@@ -441,12 +572,26 @@ def run(args: argparse.Namespace) -> tuple[int, dict]:
         "missing_reference_count": result.missing_reference_count,
         "migrated_count": result.migrated_count,
         "already_identical_count": result.already_identical_count,
-        "skipped_via_checkpoint_count": result.skipped_via_checkpoint_count,
+        "verified_via_checkpoint_count": result.verified_via_checkpoint_count,
+        "remigrated_checkpoint_missing_count": result.remigrated_checkpoint_missing_count,
         "failure_count": result.failure_count,
         "failures": result.failures,
+        "missing_from_destination_count": result.missing_from_destination_count,
+        "missing_from_destination_keys": result.missing_from_destination_keys,
+        "extra_in_destination_count": result.extra_in_destination_count,
+        "extra_in_destination_keys": result.extra_in_destination_keys,
+        "all_key_sets_equal": result.all_key_sets_equal,
+        "all_destination_bytes_verified": result.all_destination_bytes_verified,
     }
     print(json.dumps(report, indent=2, sort_keys=True))
-    return (1 if result.failure_count else 0), report
+
+    success = (
+        result.failure_count == 0
+        and not result.source_changed_during_migration
+        and result.missing_from_destination_count == 0
+        and result.extra_in_destination_count == 0
+    )
+    return (0 if success else 1), report
 
 
 def _parse_args(argv: Iterable[str] | None) -> argparse.Namespace:

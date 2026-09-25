@@ -126,6 +126,18 @@ services:
     restart: unless-stopped
 
   bagman-objects:
+    # CD-6 migration-safety hardening delta (2026-09-25): the actual
+    # production cutover to this service (still pointing `bagman-api`
+    # at the OLD MinIO secrets below as of this delta — see that
+    # service's own `BAGMAN_OBJECT_STORE_*` block) is a separate,
+    # later, Architect-authorized step. The full cutover sequence
+    # (quiesce writers, stop `bagman-api`, run
+    # `scripts/migrate_object_store.py`, freeze/refreeze-verify the
+    # three DB storage_reference sources, reuse — never rotate —
+    # existing credentials, restart) is documented in that script's
+    # own module docstring, "Production cutover sequence" — read it
+    # before performing the cutover.
+    #
     # CD-6 MinIO withdrawal WO (2026-09-24): the original MinIO pin,
     # `quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z.hotfix.7aa24e772`,
     # was WITHDRAWN from quay.io (no longer pullable at all) and the
