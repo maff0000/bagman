@@ -180,7 +180,7 @@ export const Mailboxes = {
       list.appendChild(
         emptyState(
           "No mailboxes configured yet.",
-          "Add a mailbox to register a source of evidence BAGMAN will monitor in a future delivery."
+          "Add a mailbox to register a source of evidence BAGMAN can connect to and sweep."
         )
       );
       return;

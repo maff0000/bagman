@@ -25,6 +25,11 @@ import { getXeroAccounts } from "../xero/xero-api.js";
 // summary-only render, reusing that module's own metadata-row helper
 // rather than duplicating it.
 import { DomainReview } from "../mailbox/domain-review.js";
+// CD-6 Slice 5 WI-5 §24 — the CLASSIFICATION_REVIEW branch of this
+// SAME universal review drawer (never a separate review modal/queue).
+// See features/needs-you/classification-review.js's own module
+// docstring for why it imports `NeedsYou` back from this file.
+import { ClassificationReview } from "./classification-review.js";
 
 //: services.needs_you.needs_you.ALLOWED_ACTION_MAILBOX_DOMAIN_REVIEW's
 //: own real string value (services/needs_you/needs_you.py) — kept here
@@ -174,6 +179,16 @@ export const NeedsYou = {
     } else {
       clear(previewHost);
       previewHost.appendChild(emptyState("This item is not anchored to a single evidence record."));
+    }
+
+    if (item.allowed_action_type === "CLASSIFICATION_REVIEW") {
+      // CD-6 Slice 5 WI-5 §24 — the full classification-review drawer
+      // body (§25-36), branched exactly like MAILBOX_DOMAIN_REVIEW/
+      // COMPANY_WHAT_WHY below. §28 — this branch never renders a
+      // Dismiss button (the backend already rejects DISMISSED for this
+      // item type, see app/api/routers/needs_you.py).
+      await ClassificationReview.render(body, item);
+      return;
     }
 
     if (item.allowed_action_type === ALLOWED_ACTION_MAILBOX_DOMAIN_REVIEW) {

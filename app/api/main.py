@@ -101,6 +101,7 @@ from app.api.logging_config import configure_logging
 from app.api.routers import (
     activity,
     ai,
+    documents,
     evidence_classification,
     health,
     intake,
@@ -165,6 +166,12 @@ app.include_router(mailboxes_gmail.router)
 #: app/api/routers/evidence_classification.py's own module docstring —
 #: never wired into any automatic sweep/intake path.
 app.include_router(evidence_classification.router)
+#: CD-6 Slice 5 WI-5 — the read-only, evidence-first Documents
+#: projection HTTP surface (GET /internal/documents[/{evidence_id}]).
+#: See app/api/routers/documents.py's own module docstring — a pure
+#: read composition over existing canonical repositories, never a new
+#: persistence authority.
+app.include_router(documents.router)
 
 #: CD-4 WI-4 — the BAGMAN Documents GUI (PID §36-42), served as plain
 #: static assets. Mounted LAST and at "/" so it never shadows any

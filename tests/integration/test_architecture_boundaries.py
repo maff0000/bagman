@@ -1232,3 +1232,94 @@ def test_wi4_document_type_vocabulary_unchanged():
         }
     )
     assert len(DOCUMENT_TYPES) == 8
+
+
+# ---------------------------------------------------------------------
+# CD-6 Slice 5 WI-5 — GUI-operations-foundation Document projection
+# boundary proofs (WO §64): the new projection service/router must
+# never call ENTITY_PROPOSAL, never mutate EvidenceItem ownership,
+# never import services.xero.*/services.mailbox.*, and never create an
+# EvidenceClassification/EvidenceClassificationRule row itself (a pure
+# read projection, by construction).
+# ---------------------------------------------------------------------
+
+_WI5_PROJECTION_MODULE_PATH = REPO_ROOT / "services" / "evidence" / "document_projection.py"
+_WI5_ROUTER_MODULE_PATH = REPO_ROOT / "app" / "api" / "routers" / "documents.py"
+_WI5_MODULE_PATHS = [_WI5_PROJECTION_MODULE_PATH, _WI5_ROUTER_MODULE_PATH]
+
+
+def test_wi5_projection_modules_never_wire_entity_proposal_or_mutate_evidence():
+    """WI-5 §64 — the projection never invokes `ENTITY_PROPOSAL`, and
+    never calls either of the two real `EvidenceItem` mutation paths
+    (`update_status`/`assign_entity` — see this file's own WI-1
+    `test_evidence_classification_code_never_mutates_evidence_item` for
+    the identical doctrine)."""
+    forbidden_tokens = ("ENTITY_PROPOSAL", ".update_status(", ".assign_entity(")
+    violations = []
+    for path in _WI5_MODULE_PATHS:
+        text = path.read_text(encoding="utf-8")
+        for token in forbidden_tokens:
+            if token in text:
+                violations.append(f"{path.relative_to(REPO_ROOT)} contains {token!r}")
+    assert violations == [], "\n".join(violations)
+
+
+def test_wi5_projection_modules_never_import_xero_or_mailbox_code():
+    """WI-5 §64 — document review must never fetch live mailbox
+    provider data, and this GUI-operations projection has no business
+    calling Xero at all. No `services.xero.*`/`services.mailbox.*`
+    import anywhere in either new module."""
+    forbidden_roots = {"services.xero", "services.mailbox"}
+    violations = []
+    for path in _WI5_MODULE_PATHS:
+        for imp in _imports_of(path):
+            if any(imp.full == mod or imp.full.startswith(mod + ".") for mod in forbidden_roots):
+                violations.append(f"{path.relative_to(REPO_ROOT)}:{imp.lineno} imports {imp.full!r}")
+    assert violations == [], "\n".join(violations)
+
+
+def test_wi5_projection_modules_never_create_classification_or_rule_rows():
+    """WI-5 §5/§49 — a pure read projection: neither module may call
+    any classification/rule CREATE path (`create_classification`,
+    `create_classification_with_result`, `create_classification_rule`).
+    Retrieval-only calls (`get_current_classification`,
+    `list_classification_history`, `get_classification`) are fine and
+    expected."""
+    forbidden_substrings = [
+        "create_classification(", "create_classification_with_result(", "create_classification_rule(",
+    ]
+    violations = []
+    for path in _WI5_MODULE_PATHS:
+        text = path.read_text(encoding="utf-8")
+        for pattern in forbidden_substrings:
+            if pattern in text:
+                violations.append(f"{path.relative_to(REPO_ROOT)} contains {pattern!r}")
+    assert violations == [], "\n".join(violations)
+
+
+def test_wi5_projection_service_never_imports_app_or_persistence():
+    """The projection service is dependency-injected (constructor/call
+    parameters only), mirroring every other services.evidence.* module
+    in this codebase (see e.g. classification_orchestrator's own
+    identical proof) — it must never import `app.*`/`persistence.*`
+    directly. Only the router (the HTTP layer) may unpack
+    `get_composition()` onto these parameters."""
+    forbidden_roots = {"app", "persistence"}
+    violations = [
+        f"document_projection.py:{imp.lineno} imports {imp.full!r}"
+        for imp in _imports_of(_WI5_PROJECTION_MODULE_PATH)
+        if imp.root in forbidden_roots
+    ]
+    assert violations == [], "\n".join(violations)
+
+
+def test_wi5_projection_module_never_imports_ai_provider_or_gateway_code():
+    """The read projection never runs AI itself — no
+    `ai.providers`/`ai.gateway`/`ai.prompts` import."""
+    forbidden_ai_submodules = {"ai.providers", "ai.gateway", "ai.prompts"}
+    violations = [
+        f"document_projection.py:{imp.lineno} imports {imp.full!r}"
+        for imp in _imports_of(_WI5_PROJECTION_MODULE_PATH)
+        if any(imp.full == mod or imp.full.startswith(mod + ".") for mod in forbidden_ai_submodules)
+    ]
+    assert violations == [], "\n".join(violations)

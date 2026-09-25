@@ -20,8 +20,98 @@ import { getActorId } from "../../shared/operator.js";
 import { DOCUMENT_BACKGROUND_TASKS, listInvocationsForEvidence, runBackgroundTask } from "../ai/ai-api.js";
 import { renderInvocationCard } from "../ai/invocation-card.js";
 import * as AskBagman from "../ai/ask-bagman.js";
+import { ClassificationPanel } from "./classification-panel.js";
 
 export const Detail = {
+  /** CD-6 Slice 5 WI-5 §13 — the primary entry point from the new
+   * evidence-first Documents list: `row` is one item from
+   * `GET /internal/documents` (services/evidence/document_projection.py's
+   * own row shape) rather than a raw IntakeRecord. Renders the SAME
+   * detail slide-over as `open(record)` (an IntakeRecord), with the new
+   * "Classification" section placed ABOVE the generic "AI Analysis"
+   * section (WI-5 §13). When this document also has a real intake
+   * record (`row.intake`), that record is fetched and rendered via the
+   * existing `open()` renderer so upload-specific fields (quarantine
+   * reason, idempotency key, ...) are not lost — otherwise this renders
+   * the reduced evidence-only fields directly. */
+  async openDocument(row) {
+    if (row.intake && row.intake.intake_id) {
+      const { ok, body: record } = await apiGet(API.intakeOne(row.intake.intake_id));
+      if (ok && record) {
+        await this.open(record);
+        return;
+      }
+    }
+    await this._openEvidenceFirst(row);
+  },
+
+  async _openEvidenceFirst(row) {
+    const overlay = qs("#detail-overlay");
+    const body = qs("#detail-body");
+    qs("#detail-title").textContent = row.document_label || row.evidence_id;
+    clear(body);
+    overlay.hidden = false;
+
+    // ---- Classification (WI-5 §13 — ABOVE AI Analysis) ----
+    const classificationSection = el("div", { class: "detail-section" });
+    body.appendChild(classificationSection);
+    await ClassificationPanel.render(classificationSection, row.evidence_id);
+
+    const [evRes, provRes] = await Promise.all([
+      apiGet(API.evidenceOne(row.evidence_id)),
+      apiGet(API.provenance("EvidenceItem", row.evidence_id)),
+    ]);
+    if (!evRes.ok) {
+      body.appendChild(el("div", { class: "reason-box reason-box--bad", text: errorMessage(evRes.status, evRes.body) }));
+      return;
+    }
+    const evidence = evRes.body;
+    const provenanceEdges = provRes.ok && Array.isArray(provRes.body) ? provRes.body : [];
+    let sourceLabelText = "—";
+    const sourceEdge = provenanceEdges.find((e) => e.source);
+    if (sourceEdge && sourceEdge.source) {
+      sourceLabelText = `${sourceEdge.source.source_type} / ${sourceEdge.source.provider}`;
+    }
+
+    const kv = el("dl", { class: "detail-kv" });
+    const rows = [
+      ["Evidence ID", evidence.evidence_id],
+      ["Entity", row.entity ? row.entity.display_name : "UNRESOLVED"],
+      ["Sender", row.sender_address || "—"],
+      ["Subject", row.subject || "—"],
+      ["Evidence type", evidence.evidence_type || "—"],
+      ["Evidence state", evidence.status || "—"],
+      [
+        "Content hash",
+        evidence.content_hash ? `${evidence.content_hash.algorithm} ${evidence.content_hash.value}` : "—",
+      ],
+      ["Size", fmtBytes(evidence.size_bytes)],
+      ["Source", sourceLabelText],
+      ["Received", fmtDateTime(evidence.received_at)],
+    ];
+    for (const [k, v] of rows) {
+      kv.appendChild(el("dt", { text: k }));
+      kv.appendChild(el("dd", { text: v === null || v === undefined ? "—" : String(v) }));
+    }
+    body.appendChild(el("div", { class: "detail-section" }, [el("h3", { text: "Fields" }), kv]));
+
+    // ---- download (WI-5 §19 — classification never replaces original evidence) ----
+    const actions = el("div", { class: "detail-section" }, [el("h3", { text: "Actions" })]);
+    actions.appendChild(
+      el("a", {
+        class: "btn btn--primary",
+        text: "Download original",
+        attrs: { href: API.evidenceContent(row.evidence_id), download: row.original_name || row.evidence_id },
+      })
+    );
+    body.appendChild(actions);
+
+    // ---- AI Analysis (existing generic panel, preserved — WI-5 §63) ----
+    const aiSection = el("div", { class: "detail-section" });
+    body.appendChild(aiSection);
+    await this._renderAiPanel(aiSection, row.evidence_id);
+  },
+
   async open(record) {
     const overlay = qs("#detail-overlay");
     const body = qs("#detail-body");
@@ -144,6 +234,13 @@ export const Detail = {
     }
     body.appendChild(actions);
 
+    // ---- Classification (CD-6 Slice 5 WI-5 §13 — ABOVE AI Analysis) ----
+    if (record.evidence_id) {
+      const classificationSection = el("div", { class: "detail-section" });
+      body.appendChild(classificationSection);
+      await ClassificationPanel.render(classificationSection, record.evidence_id);
+    }
+
     // ---- AI Analysis (CD-5 WI-4, PID §45) ----
     if (record.evidence_id) {
       const aiSection = el("div", { class: "detail-section" });
@@ -226,6 +323,11 @@ export const Detail = {
       })
     );
     body.appendChild(actions);
+
+    // ---- Classification (CD-6 Slice 5 WI-5 §13 — ABOVE AI Analysis) ----
+    const classificationSection = el("div", { class: "detail-section" });
+    body.appendChild(classificationSection);
+    await ClassificationPanel.render(classificationSection, evidenceId);
 
     const aiSection = el("div", { class: "detail-section" });
     body.appendChild(aiSection);

@@ -27,11 +27,27 @@ export const AI_API = {
 //: exactly the kind of thing an operator reviewing one document wants
 //: to see alongside its type/summary, and it shares the same
 //: `{evidence_id}` input shape as the other two).
+// CD-6 Slice 5 WI-5 §21/§63 — `DOCUMENT_TYPE_PROPOSAL` v1 removed from
+// this list: canonical document classification now goes through the
+// governed WI-3 orchestrator (`features/documents/classification-api.js
+// ::classifyWithBagman`, "Classify with BAGMAN" on the detail panel),
+// never a new "Run analysis: Document type" v1 button. `DOCUMENT_SUMMARY`
+// and `ENTITY_PROPOSAL` are unchanged — the generic AI panel/Ask BAGMAN
+// keep working exactly as before, and historical v1 invocation CARDS
+// still render fine (driven by real AIInvocation history via
+// `listInvocationsForEvidence`, not this array).
 export const DOCUMENT_BACKGROUND_TASKS = [
-  { task_id: "DOCUMENT_TYPE_PROPOSAL", task_version: 1, label: "Document type" },
   { task_id: "DOCUMENT_SUMMARY", task_version: 1, label: "Summary" },
   { task_id: "ENTITY_PROPOSAL", task_version: 1, label: "Entity hint" },
 ];
+
+/** `GET /internal/ai/invocations/{id}` — the full AIInvocation record
+ * (WI-5 §17's "Why BAGMAN thinks this": `output.signals`/
+ * `output.warnings`/`output.confidence`/`capability_alias`/
+ * `provider_model`). */
+export function getInvocation(aiInvocationId) {
+  return apiGet(AI_API.invocationOne(aiInvocationId));
+}
 
 /** `POST /internal/ai/tasks` — dispatch one BACKGROUND task against
  * `evidence_id`. Synchronous (the fetch IS the "Running…" duration —

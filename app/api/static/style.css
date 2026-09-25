@@ -1464,3 +1464,39 @@ select {
   .toast-stack { left: var(--sp-3); right: var(--sp-3); max-width: none; }
   .needs-you-card { padding: var(--sp-4); }
 }
+
+/* ---------------------------------------------------------------------
+   CD-6 Slice 5 WI-5 — Documents Classification section (documents
+   detail panel) and the CLASSIFICATION_REVIEW review-drawer branch.
+   Reuses .detail-kv/.timeline/.review-drawer__section/.field-inline's
+   own existing tokens/spacing rather than inventing a new visual
+   language.
+--------------------------------------------------------------------- */
+.classification-panel__current,
+.classification-panel__explain,
+.classification-panel__history,
+.classification-panel__action {
+  margin-bottom: var(--sp-4);
+}
+.classification-panel__signal-list {
+  margin: var(--sp-2) 0;
+  padding-left: var(--sp-5);
+  font-size: var(--fs-sm);
+}
+.classification-panel__signal-list li {
+  margin-bottom: var(--sp-1);
+  word-break: break-word;
+}
+.review-teach-rule {
+  margin-top: var(--sp-3);
+  padding: var(--sp-3);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm, 6px);
+}
+.review-teach-rule[hidden] {
+  display: none;
+}
+.review-teach-rule__preview-result {
+  margin-top: var(--sp-2);
+  font-size: var(--fs-sm);
+}

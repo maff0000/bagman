@@ -53,10 +53,11 @@
     <div class="shell-nav__group-label">Records</div>
     <button class="tab-btn" data-tab="documents" type="button">Documents</button>
     <!-- CD-6 Slice 3 (Mailbox Management) — was a disabled placeholder
-         in Slice 1/2; now a real, live mailbox-registry tab. Mail
-         fetch/monitoring itself remains a future delivery — this tab
-         manages mailbox DEFINITIONS only (see
-         app/api/static/features/mailbox/mailboxes.js's own docstring). -->
+         in Slice 1/2; now a real, live mailbox-registry tab, with real
+         provider connectivity and governed sweeps (CD-6 Slices 3/4 and
+         the GUI-operations-foundation WO's Microsoft/IMAP/Gmail
+         adapters) — see
+         app/api/static/features/mailbox/mailboxes.js's own docstring. -->
     <button class="tab-btn" data-tab="mailboxes" type="button">Email</button>
     <button class="tab-btn tab-btn--disabled" type="button" disabled title="Not part of this delivery">
       Invoices <span class="pill pill--muted">unavailable</span>
@@ -218,26 +219,48 @@
       </div>
 
       <!-- ---------- List ---------- -->
+      <!-- CD-6 Slice 5 WI-5 §3/§11 — this list's primary authority is
+           now GET /internal/documents (canonical EvidenceItem-first,
+           regardless of source) rather than GET /internal/intake.
+           Filters below map onto that endpoint's own §9 filter set,
+           not IntakeRecord's own status vocabulary any more. -->
       <div class="list-panel">
         <div class="list-panel__toolbar">
-          <h2>Intake &amp; Evidence</h2>
+          <h2>Documents</h2>
           <div class="filters">
             <label>
-              Status
-              <select id="filter-status">
+              Entity
+              <select id="filter-entity">
                 <option value="">all</option>
-                <option value="RECEIVED">RECEIVED</option>
-                <option value="VALIDATING">VALIDATING</option>
-                <option value="ACCEPTED">ACCEPTED</option>
-                <option value="REGISTERED">REGISTERED</option>
-                <option value="QUARANTINED">QUARANTINED</option>
-                <option value="REJECTED">REJECTED</option>
-                <option value="FAILED">FAILED</option>
               </select>
             </label>
             <label>
-              Entity hint
-              <input type="text" id="filter-entity" placeholder="a company's canonical_name" />
+              Classification
+              <select id="filter-classification-status">
+                <option value="">all</option>
+                <option value="UNCLASSIFIED">Unclassified</option>
+                <option value="CLASSIFIED">Classified</option>
+                <option value="REVIEW_REQUIRED">Needs review</option>
+                <option value="UNCLASSIFIABLE">Unknown</option>
+              </select>
+            </label>
+            <label>
+              Document type
+              <select id="filter-document-type">
+                <option value="">all</option>
+                <option value="SUPPLIER_INVOICE">SUPPLIER_INVOICE</option>
+                <option value="RECEIPT">RECEIPT</option>
+                <option value="ORDER_CONFIRMATION">ORDER_CONFIRMATION</option>
+                <option value="REFUND_CONFIRMATION">REFUND_CONFIRMATION</option>
+                <option value="BROKER_STATEMENT">BROKER_STATEMENT</option>
+                <option value="BROKER_ACTIVITY_NOTICE">BROKER_ACTIVITY_NOTICE</option>
+                <option value="NON_ACCOUNTING_DOCUMENT">NON_ACCOUNTING_DOCUMENT</option>
+                <option value="UNKNOWN">UNKNOWN</option>
+              </select>
+            </label>
+            <label class="field-inline">
+              <input type="checkbox" id="filter-review-required" />
+              Needs your review only
             </label>
             <label>
               From
@@ -257,20 +280,18 @@
           <table class="doc-table">
             <thead>
               <tr>
-                <th>Status</th>
-                <th>Evidence ID</th>
+                <th>Document</th>
                 <th>Entity</th>
-                <th>Type</th>
-                <th>Filename</th>
-                <th>Received</th>
-                <th>Size</th>
-                <th>Integrity</th>
+                <th>Classification</th>
+                <th>Decision state</th>
                 <th>Source</th>
+                <th>Received</th>
+                <th>Integrity</th>
                 <th>Download</th>
               </tr>
             </thead>
             <tbody id="doc-table-body">
-              <tr><td colspan="10" class="muted">Loading…</td></tr>
+              <tr><td colspan="8" class="muted">Loading…</td></tr>
             </tbody>
           </table>
         </div>
@@ -300,9 +321,12 @@
         <div>
           <h1>Email</h1>
           <p class="muted">
-            Mailboxes BAGMAN will monitor for evidence — definitions only. A mailbox is a source of
-            evidence, never a company, ledger, or invoice owner. Connecting to a real provider and
-            fetching mail is a future delivery.
+            Mailboxes BAGMAN monitors for evidence. A mailbox is a source of evidence, never a
+            company, ledger, or invoice owner. Configured mailboxes connect to their real provider
+            (Microsoft Graph, IMAP, or Gmail) and are swept — governed intake driven by each
+            mailbox's own source rules — either on demand ("Sweep now") or as part of an explicit,
+            operator-triggered run; BAGMAN does not yet run these sweeps on an automatic recurring
+            schedule of its own.
           </p>
         </div>
         <button class="btn btn--primary" id="mailboxes-add" type="button">Add mailbox</button>
