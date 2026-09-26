@@ -2019,3 +2019,90 @@ Four additional real defects were found — by the architect, from direct live t
 - Full regression fresh at exact head `01a7ad2`: **925 passed, 24 skipped, 0 failed**; `gitleaks detect --source . --no-git -v` clean. Git working tree clean, local HEAD/Mac-deployed HEAD/origin HEAD all identical at `01a7ad2f3043d5362e12dec73f27ad920d6a8a89`. PR #6 confirmed OPEN/DRAFT/unmerged throughout.
 
 A fresh, independent Auditor (no inherited Engineer/PL reasoning) is being dispatched next, scoped per architect instruction to: canonical company selector, Xero OAuth lifecycle, deterministic tenant resolution, cross-company tenant isolation, token handling, account projection, sync failure/last-known-good semantics, GUI disconnected/stale/error states, the real two-company live evidence above, no-Xero-write-capability, and exact-head CI. PR #6 remains DRAFT; no merge; Slice 3 not started.
+
+---
+
+# 103. Inference Architecture Ruling — Model Invariance, `bagman-deep` Retirement, Trinity Backlog-Only (Architect ruling, 2026-09-26)
+
+This section records a GREEN-LIT Architect ruling on BAGMAN's LLM backend architecture, reached after four iterative rounds during CD-6 (WI-6-remediation's own live capacity investigation — §102's Xero slice is unrelated and unaffected). **The canonical, durable doctrine itself now lives in `ARCHITECTURE.md`'s new "Inference / LLM backend architecture" section — read that first.** This section records the supersession of prior PID text, the required `bagman-deep` reference inventory, the documentation/config/code delta list, and the bounded CD-5 implementation work order the ruling authorises for a future round. Per the Architect's own explicit instruction, this round is documentation, inspection, and planning ONLY — no application code, `config.yaml`, or Mac-appliance infrastructure was touched.
+
+## 103.1 What is superseded, and what is not
+
+Per this project's standing amendment convention (preserve history, mark superseded, never delete or rewrite):
+
+- **§2C** ("Trinity compute — escalation/deep tier... BAGMAN may escalate difficult cases to Trinity through governed routing only") — **SUPERSEDED.** Trinity is no longer a routine escalation tier reached per-task. It is backlog/overflow-only, reached only via a durable job queue's own operator/maintenance-mode decision, never a live per-request routing choice. See `ARCHITECTURE.md` points 5-6.
+- **§4's architecture diagram** (`existing TRINITY LITELLM (sole inference gateway)` fronting both `bagman-fast/core` and `bagman-deep`) — **SUPERSEDED**, on top of §96's own already-recorded topology correction (Mac-local gateway replacing Trinity's as the day-to-day path). §96 remains correct and is RATIFIED, not contradicted, by this ruling — see 103.1a below. What §4 additionally assumed — that `bagman-deep` denotes a genuinely different, heavier model reached through that same gateway as a normal routing outcome — is now superseded by `ARCHITECTURE.md` point 3.
+- **§8** ("ONE INFERENCE CONTROL PLANE — the existing Trinity LiteLLM installation... `bagman-deep → Trinity heavier model`") — **SUPERSEDED** on the `bagman-deep` row specifically, and on the premise that Trinity LiteLLM is BAGMAN's inference control plane at all (already corrected by §96; this ruling additionally retires the escalation semantics §8 assumed `bagman-deep` would use). §8's "DO NOT create a second LiteLLM architecture for BAGMAN" instruction is **also superseded** — §96 already recorded that a second, BAGMAN-exclusive Mac-local LiteLLM was in fact built and deployed, and this ruling explicitly RATIFIES retaining it (`ARCHITECTURE.md` point 4). §8's remaining content (semantic alias-only routing, no raw model selection) is unaffected and remains current doctrine.
+- **§9** ("`bagman-deep` → Trinity stronger/heavier model") — **SUPERSEDED.** `bagman-deep` no longer denotes a different model at all; see `ARCHITECTURE.md` points 2-3.
+- **§11** ("Routing Policy": `COMPLEX / ESCALATED → bagman-deep → Trinity`, and its own "If Trinity is unavailable: the deep/escalated task fails visibly" sub-bullet) — **SUPERSEDED.** There is no live per-task escalation tier to fail visibly; overflow is a queue-level operator decision, not a per-request routing branch. §11's Mac-mini-unavailable / Claude-unavailable sub-bullets are unaffected.
+- **§12** ("Existing LiteLLM Remains Authority... BAGMAN must not duplicate these functions") — **SUPERSEDED** as it pertains to Trinity's LiteLLM being the authority BAGMAN must not duplicate; already corrected in substance by §96, and now explicitly ratified in the other direction by `ARCHITECTURE.md` point 4 (the Mac-local duplicate gateway is not merely tolerated, it is affirmatively required to stay).
+- **§2A/§2B, §3, §5-§7, §10, §13 (BAGMAN credential structure)** — **NOT superseded.** Claude-as-operator, the Mac mini as primary background inference, the one-BAGMAN-AI-gateway component doctrine, physical-model abstraction, and the credential-scoping doctrine all stand unchanged.
+
+### 103.1a §96/§97 are ratified, not contradicted
+
+§96 (Topology Finalization Addendum, 2026-09-16) already records, as history, that HELM stood up a dedicated Mac-local LiteLLM+Postgres gateway to replace Trinity's shared installation as BAGMAN's day-to-day control plane. This was **not** undiscovered architectural drift needing correction — it was a deliberate, already-executed, already-documented decision. This ruling's own review process initially (incorrectly) treated retiring/simplifying that Mac-local gateway as an open question; the Architect's final GREEN LIGHT explicitly reversed that and ratified §96's real-world outcome as correct standing architecture (`ARCHITECTURE.md` point 4). §96/§97 require no further edits or superseded-markers of their own — they already correctly describe today's reality, which this ruling keeps.
+
+## 103.2 `bagman-deep` reference inventory (required action item 3)
+
+A full repository grep for `bagman-deep`/`bagman_deep`/`BAGMAN_DEEP` was performed. Findings, organised by disposition:
+
+**Confirmed: no live task contract uses it.** `ai/tasks.py`'s `TASK_REGISTRY` has no entry with `preferred_capability="bagman-deep"` — `DOCUMENT_SUMMARY`/`DOCUMENT_TYPE_PROPOSAL` prefer `bagman-fast`, `ENTITY_PROPOSAL` prefers `bagman-core`. This is independently confirmed by `memory/generated/CD5-EVIDENCE-AI-FOUNDATION-CLAUDE-OPERATOR-AND-GUI-INTEGRATION-2026-09-13.md` (lines 157/469, written at CD-5 Gate-1 closure) and by `tests/acceptance/trinity_escalation_live_proof.py`'s own docstring. **This means `bagman-deep`'s retirement requires zero task-contract migration** — it is a config/alias/test/doc-level cleanup only, with no business-logic change anywhere in `services/`.
+
+**Live, deployed, tested infrastructure that currently exists purely as unused capacity:** the Mac's own `bagman-ai-gateway` `config.yaml` (deployment-level, not in this repo) currently maps `bagman-deep` → `openai/bagman-deep`@Trinity's own LiteLLM, and this path was proven live end-to-end at CD-5 closure (`tests/acceptance/trinity_escalation_live_proof.py` — a dedicated live-proof script exercising exactly this path, real HTTP 200, real completion). It is fully working, GREEN infrastructure with zero current production callers.
+
+**Closed alias-governance surface (would need to change if `bagman-deep` is removed rather than repurposed):**
+- `ai/invocation.py:291` — `BACKGROUND_CAPABILITY_ALIASES: frozenset[str] = frozenset({"bagman-fast", "bagman-core", "bagman-deep"})`, BAGMAN's own closed alias-governance set.
+- `contracts/ai/bagman.ai_invocation.v1.schema.json` (lines 34/37/188) — the same three-value enum constraint at the schema/contract level.
+- `tests/security/test_ai_litellm_alias_lockdown.py:110` — asserts this exact closed frozenset.
+
+**Test coverage that currently asserts `bagman-deep`→different-Trinity-model behaviour as correct/expected, and would need updating or retiring once the alias's semantics change:**
+- `tests/acceptance/trinity_escalation_live_proof.py` (entire dedicated script — the live escalation proof).
+- `tests/acceptance/mac_mini_background_tier_live_proof.py:206`.
+- `tests/acceptance/structured_output_20x_proof.py` (lines 27/30/166/175/185/187/193).
+- `tests/integration/test_litellm_client.py:279/281`.
+- `tests/integration/test_architecture_boundaries.py:634`.
+- `tests/contract/test_ai_invocation_contract.py:81`.
+- `tests/app_api/test_ai_endpoints.py:233/243`.
+
+**Documentation/comments referencing `bagman-deep` (historical narrative — not code, no functional risk, but reader-facing and would read as stale/misleading once the alias is retired):**
+- `PID.md` itself (dozens of references, §2/§8/§9/§11 already addressed above; remaining references at §96/§97/§700ish/§943 etc. are historical narrative describing what was true at the time and do not need correction — they are accurate records of past state).
+- `CHANGELOG.md` (lines 130/195/262/285/293) — historical changelog entries, left as-is per this project's own "changelogs are not rewritten" convention.
+- `memory/generated/CD5-EVIDENCE-...md` — a frozen historical evidence record; explicitly NOT to be edited (it correctly describes what was true when CD-5 closed).
+- `ai/providers/litellm/client.py` (module docstring, lines 12/25/523), `ai/providers/__init__.py` (module docstring), `ai/tasks.py` (module docstring, lines 47/112), `deployment/compose/docker-compose.yml:366` (a comment), `app/api/static/features/ai/ai-api.js:111` (a GUI-facing comment) — all narrative/comment-only, no behavioural effect; would need a wording pass as part of the eventual implementation delta so they stop describing retired architecture as current.
+
+**GUI/status-display consideration (not yet resolved, flagged for the implementation WO, not decided here):** `PID.md` §700/§706-area doctrine and `ai-api.js` currently treat `bagman-deep` as a distinctly-displayed, independently-health-checked tier in the AI status surface. Whether that display collapses to two tiers (Mac profiles + Trinity overflow) or is reworked some other way is an implementation-round design decision, not resolved by this documentation round.
+
+## 103.3 Documentation/config/code delta list (required action item 4)
+
+**Changed THIS round (documentation and planning only):**
+- `ARCHITECTURE.md` — new "Inference / LLM backend architecture" section, the durable canonical doctrine.
+- `PID.md` — this §103 (supersession markers, inspection report, delta list, implementation work order).
+
+**Deferred to the bounded CD-5 implementation work order (§103.4) — NOT built this round:**
+- Deployment-level: the Mac's own `bagman-ai-gateway` `config.yaml` `bagman-deep` entry (repurpose or remove; decide as part of implementation, informed by the GUI-display question above).
+- `ai/invocation.py`'s `BACKGROUND_CAPABILITY_ALIASES` frozenset and the matching `contracts/ai/bagman.ai_invocation.v1.schema.json` enum — whether `bagman-deep` is removed outright or repurposed as a Mac-resident profile name (versus introducing a wholly separate `trinity-core` alias reached only through the new backend-selection mechanism, never through `BACKGROUND_CAPABILITY_ALIASES` at all, since that frozenset governs Mac-gateway-routed aliases specifically) is an implementation-round design decision.
+- The test files enumerated in §103.2 asserting `bagman-deep`'s current Trinity-escalation semantics — updated, retired, or repurposed to assert the NEW semantics (or deleted if genuinely superseded, per this project's own "delete only what is proven dead" discipline).
+- New: a durable Postgres-backed background-inference job table/repository (§103.4).
+- New: an explicit `MAC_LOCAL` / `TRINITY_CORE_OVERFLOW` backend-selection function, owned by BAGMAN's own gateway code.
+- New/changed: `AIInvocation` provenance fields for `inference_backend` and related metadata (contract + migration + repository).
+- New: the one-time `trinity-core` compatibility validation procedure and its evidence artifact.
+- Comment/docstring wording passes in the files listed in §103.2's "documentation/comments" bucket, once the real alias decision is made (wording changes should follow the code, not precede it, to avoid describing a decision before it is actually implemented).
+
+## 103.4 Bounded CD-5 implementation work order (specification only — not built this round)
+
+This is a planning artifact. It authorises no code changes by itself; a future round executes it under the normal Forge discipline (dispatch or direct implementation → PL review → tests → commit → push → CI → deploy → live verification → checkpoint).
+
+**Scope:**
+
+1. **Durable background-inference job table.** New Postgres table (reusing `bagman-db`, no new broker/queue technology), minimally: `id`, `task_id`, `task_version`, `generation_profile` (`fast`/`core`, replacing the current alias-as-profile conflation), `input_reference`, `status` (closed enum: `PENDING → CLAIMED → IN_PROGRESS → SUCCEEDED | FAILED_RETRYABLE | FAILED_TERMINAL`), `claimed_by`/`claimed_at` (for atomic claiming, `SELECT ... FOR UPDATE SKIP LOCKED` or equivalent), `attempt_count`, `max_attempts`, `last_error`, `inference_backend`, `created_at`/`updated_at`. Idempotency via a caller-supplied dedupe key (mirroring the existing `AIInvocation` fingerprint-reuse pattern). Restart recovery: a claimed-but-stale row (claimed past a bounded staleness window with no terminal status) is reclaimable, mirroring the existing stale-`REQUESTED`-recovery pattern already built in the AIInvocation reliability delta (§101) — same "re-check under a lock, never trust a pre-lock read alone" discipline.
+2. **Backend-selection function.** A single, explicit, BAGMAN-owned function (e.g. `services/ai/backend_selection.py::select_inference_backend(...) -> InferenceBackend`) returning `MAC_LOCAL` or `TRINITY_CORE_OVERFLOW`. For CD-5: default always `MAC_LOCAL`; `TRINITY_CORE_OVERFLOW` selectable only via an explicit, bounded operator/maintenance-mode control (e.g. a config flag or a small operator action), never an automatic threshold-triggered heuristic. No auto-escalation logic is authorised in this round.
+3. **Provenance schema addition.** Add `inference_backend` (closed enum, `MAC_LOCAL`/`TRINITY_CORE_OVERFLOW`) to the `AIInvocation` contract/model, migration chained off the current head, backward-compatible (nullable or defaulted for historical rows). Populate alongside the existing model/provider/latency/timestamp/validation/retry fields already recorded. Audit-only — never read by any business-logic branch.
+4. **`bagman-deep` retirement delta.** Remove or repurpose `bagman-deep` from `BACKGROUND_CAPABILITY_ALIASES` and the matching JSON-schema enum (final choice made at implementation time per §103.3); update or retire the test files enumerated in §103.2; update the AI-status GUI surface's tier display; a documentation wording pass over the comment/docstring locations in §103.2, once the code decision is made.
+5. **`trinity-core` compatibility validation procedure.** Before `trinity-core` may be used for any real overflow traffic: run representative BAGMAN tasks (at minimum `DOCUMENT_TYPE_PROPOSAL`, `DOCUMENT_SUMMARY`, `ENTITY_PROPOSAL`) against `trinity-core` using the exact same task contracts/schemas/validation BAGMAN already uses for the Mac model, and compare output quality/schema-validity against the already-accepted Mac-model baseline. Record the result (pass/fail per task, not just in aggregate) as a durable evidence artifact before authorizing any real traffic. `trinity-core` is the only Trinity alias ever authorised for this — no `trinity-fast`/`trinity-deep`/other Trinity alias may be substituted.
+6. **Initial operating procedure.** Document the operator/maintenance-mode procedure for invoking backlog overflow (who decides, what triggers a look, what the rollback/return-to-`MAC_LOCAL` path is) — a short runbook-style addition, not a new automated system.
+
+**Explicitly out of scope for this WO (do not build):** automatic/threshold-based escalation, any change to the accepted Mac model identity, any new distributed queue/broker technology, any GUI redesign beyond the tier-display update in item 4, any Trinity alias other than `trinity-core`.
+
+## 103.5 Branch record
+
+Documentation-only delta, branch `cd-6/gui-operations-foundation`, PR #6 (remains DRAFT/OPEN, unmerged). No application code, `config.yaml`, or Mac-appliance infrastructure changed. Commit reference recorded once pushed (see checkpoint report).
