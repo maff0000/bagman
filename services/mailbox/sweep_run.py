@@ -3,6 +3,42 @@ Mirrors ``services.xero.sync.XeroSyncRun``'s own role for the Xero
 domain exactly — a durable, terminal ledger row for one sweep attempt.
 See ``services/mailbox/sweep.py`` for the orchestration that creates
 and completes these.
+
+Stale-`RUNNING` recovery (Slice 3/4/5 governance-reconciliation delta)
+------------------------------------------------------------------------
+A real, independently-confirmed gap (found unanimously by parallel
+audits of this subsystem): unlike this exact codebase's own established
+pattern for an abandoned in-flight record (`ai.invocation
+.is_stale_running`/`recover_stale_invocation`, `ai.jobs.is_stale_claim`/
+`recover_stale_claim`), a `MailboxSweepRun` that reaches `RUNNING` had no
+path back to a terminal state if the process running `run_sweep` were
+killed (OOM, crash, forced restart) before it could call `complete_run`
+itself. `services.mailbox.lock.MailboxSweepLock`'s own lease
+(`DEFAULT_LEASE_DURATION_SECONDS`, 15 minutes) already self-heals so a
+NEW sweep can proceed — but the OLD `MailboxSweepRun` row stayed
+`RUNNING` forever, with no audit event and no reconciliation code path
+anywhere, permanently corrupting the durable "prove exactly what
+happened" ledger PID §98.8 requires, even though sweeping itself was
+never actually blocked.
+
+Fixed the same way the sibling patterns above already do it: a shared
+predicate (:func:`is_stale_running`) and a shared recovery transition
+(:func:`recover_stale_run`), invoked lazily by both concrete
+repositories at the one point staleness matters — `run_sweep` calling
+`create_run` for a mailbox whose PRIOR run is still (falsely) `RUNNING`
+(see `services/mailbox/sweep.py::run_sweep`'s own call site). A
+recovered run always targets `FAILED` (never `SUCCEEDED`/`PARTIAL`) —
+`ALLOWED_TRANSITIONS["RUNNING"]` has no dedicated `TIMED_OUT` status the
+way `AIInvocation` does, and reporting an abandoned run as anything but
+an honest failure would misrepresent what actually happened.
+
+This delta does not add a new audit-event emission for the recovery
+itself (a deliberate, bounded choice — see the reconciliation record in
+`PID.md` for why): the recovered row's own `error_code`/`error_detail`
+already make the ledger honest again (the actual defect being fixed),
+and adding a new audit-event mechanism here would require new
+`audit_repository` composition wiring this bounded governance delta
+does not otherwise need.
 """
 from __future__ import annotations
 
@@ -16,6 +52,7 @@ from core import identity
 from core.contract_validation import validate_against_contract
 from core.errors import InvalidStateTransitionError, NotFoundError, ValidationError
 from core.timestamps import to_contract_string, utc_now
+from services.mailbox.lock import DEFAULT_LEASE_DURATION_SECONDS
 
 _SCHEMA = "mailbox/bagman.mailbox_sweep_run.v1.schema.json"
 SCHEMA_VERSION = "bagman.mailbox_sweep_run.v1"
@@ -66,6 +103,24 @@ class SweepFailureReason:
     #: failure, distinct from a single folder's own delta-page failure
     #: — see `services/mailbox/sweep.py`'s own module docstring).
     FOLDER_DISCOVERY_FAILED = "FOLDER_DISCOVERY_FAILED"
+    #: Slice 3/4/5 governance-reconciliation delta — stamped on a
+    #: `MailboxSweepRun` discovered still `RUNNING` long after the
+    #: process that would have completed it is gone (see module
+    #: docstring's "Stale-`RUNNING` recovery" section). Distinct from
+    #: every other code above: this is never set by `run_sweep` itself,
+    #: only by :func:`recover_stale_run`.
+    STALE_RECOVERY_TIMEOUT = "STALE_RECOVERY_TIMEOUT"
+
+
+#: Bounded, deterministic stale-`RUNNING` threshold (module docstring's
+#: "Stale-`RUNNING` recovery" section) — twice
+#: `services.mailbox.lock.DEFAULT_LEASE_DURATION_SECONDS` (15 minutes),
+#: so a run is only ever reconciled once its own `MailboxSweepLock`
+#: lease has DEFINITELY already expired and could have been reclaimed
+#: by a different attempt — comfortable headroom against the lock's own
+#: expiry, never a race between "the lock says available" and "the run
+#: still looks legitimately in flight".
+STALE_RUNNING_THRESHOLD_SECONDS: float = DEFAULT_LEASE_DURATION_SECONDS * 2
 
 
 @dataclass(frozen=True)
@@ -150,6 +205,49 @@ def transition(run: MailboxSweepRun, new_status: str, **field_updates) -> Mailbo
     return updated
 
 
+def is_stale_running(run: MailboxSweepRun, *, now: Optional[datetime] = None) -> bool:
+    """True if ``run`` is still `RUNNING` and has been sitting there
+    longer than :data:`STALE_RUNNING_THRESHOLD_SECONDS` — the shared
+    predicate both concrete repositories use (module docstring's
+    "Stale-`RUNNING` recovery" section), mirroring
+    `ai.invocation.is_stale_running`'s own identical role exactly.
+
+    ``now`` is injectable purely for deterministic testing (construct a
+    run with an artificially old `started_at` and call this directly,
+    or freeze `now` instead of sleeping for real) — defaults to
+    :func:`core.timestamps.utc_now`.
+    """
+    if run.status != "RUNNING":
+        return False
+    now = now if now is not None else utc_now()
+    return (now - run.started_at).total_seconds() > STALE_RUNNING_THRESHOLD_SECONDS
+
+
+def recover_stale_run(run: MailboxSweepRun) -> MailboxSweepRun:
+    """Return the terminal `MailboxSweepRun` a stale, abandoned ``run``
+    (see :func:`is_stale_running`) is recovered into — always `FAILED`
+    (never `SUCCEEDED`/`PARTIAL`: an abandoned run must never be
+    reported as anything but an honest failure — module docstring's
+    "Stale-`RUNNING` recovery" section). Every other field
+    (`messages_seen`/`messages_new`/... ) is left exactly as it was at
+    the moment this run went stale — never fabricated to look like a
+    completed sweep.
+
+    Does not itself persist anything — callers (the two concrete
+    repositories) are responsible for that.
+    """
+    return transition(
+        run,
+        "FAILED",
+        error_code=SweepFailureReason.STALE_RECOVERY_TIMEOUT,
+        error_detail=(
+            f"recovered by the bounded stale-RUNNING backstop: started_at was older than "
+            f"STALE_RUNNING_THRESHOLD_SECONDS ({STALE_RUNNING_THRESHOLD_SECONDS}s) with no terminal "
+            "transition ever recorded — the process that would have completed this sweep is gone"
+        ),
+    )
+
+
 class MailboxSweepRunRepository(abc.ABC):
     @abc.abstractmethod
     def create_run(self, *, mailbox_id: str, trigger: str) -> MailboxSweepRun:
@@ -187,6 +285,24 @@ class MailboxSweepRunRepository(abc.ABC):
     @abc.abstractmethod
     def list_runs(self, *, mailbox_id: str, limit: Optional[int] = None) -> list[MailboxSweepRun]:
         """Most-recent-first, scoped to `mailbox_id`."""
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def recover_stale_runs(
+        self,
+        *,
+        mailbox_id: str,
+        staleness_threshold_seconds: float = STALE_RUNNING_THRESHOLD_SECONDS,
+        now: Optional[datetime] = None,
+    ) -> list[MailboxSweepRun]:
+        """Scan every `RUNNING` run for `mailbox_id` and recover any
+        that is stale per :func:`is_stale_running`, using
+        :func:`recover_stale_run` (module docstring's "Stale-`RUNNING`
+        recovery" section). Called lazily by
+        `services.mailbox.sweep.run_sweep`, right before it creates a
+        new run for this same mailbox — never as a scheduled/background
+        poll. Returns every recovered run (empty list if none were
+        stale) — never raises for "nothing to recover"."""
         raise NotImplementedError
 
 
@@ -270,3 +386,22 @@ class InMemoryMailboxSweepRunRepository(MailboxSweepRunRepository):
             reverse=True,
         )
         return runs if limit is None else runs[:limit]
+
+    def recover_stale_runs(
+        self,
+        *,
+        mailbox_id: str,
+        staleness_threshold_seconds: float = STALE_RUNNING_THRESHOLD_SECONDS,
+        now: Optional[datetime] = None,
+    ) -> list[MailboxSweepRun]:
+        now = now if now is not None else utc_now()
+        recovered: list[MailboxSweepRun] = []
+        for run in list(self._by_id.values()):
+            if run.mailbox_id != mailbox_id:
+                continue
+            if not is_stale_running(run, now=now):
+                continue
+            updated = recover_stale_run(run)
+            self._by_id[updated.sweep_run_id] = updated
+            recovered.append(updated)
+        return recovered

@@ -1,12 +1,16 @@
 # BAGMAN component manifest (CD-6 Slice 3: Mailbox Management; CD-6
-# Slice 4: first real Microsoft Graph mailbox adapter + sweep engine;
-# CD-6 architect amendment: two-stage discovery/domain-gate + governed
-# historical-ingestion boundary) for services/mailbox/.
+# Slice 4: first real Microsoft Graph mailbox adapter + sweep engine,
+# later joined by real IMAP (services/mailbox/imap/) and Gmail
+# (services/mailbox/gmail/) adapters — see the "Slice 3/4/5 governance
+# reconciliation" record in PID.md, which backfills this manifest to
+# match code that had already shipped without a matching manifest
+# update; CD-6 architect amendment: two-stage discovery/domain-gate +
+# governed historical-ingestion boundary) for services/mailbox/.
 # Validated by scripts/generate_architecture_memory.py against
 # contracts/manifest/bagman.component_manifest.v1.schema.json.
 
 id: BAGMAN.MAILBOX
-version: 4
+version: 5
 
 responsibility: >
   Own the operator-facing mailbox DEFINITION registry (MailboxSource) —
@@ -60,10 +64,17 @@ responsibility: >
   component even though the files are internally separated (see
   `services/mailbox/mailbox.py`'s own module docstring: "no Microsoft-
   specific OAuth logic inside the generic mailbox domain model" is a
-  file-layering discipline, not a component-boundary one). This is a
-  READ-ONLY integration against Microsoft mail: no mark-read, move,
-  delete, or send capability exists anywhere behind this component.
-  Email classification, AI, correction/learned rules, and any
+  file-layering discipline, not a component-boundary one). Two further
+  real provider adapters were added afterward, following the identical
+  pattern: `services/mailbox/imap/` (a generic IMAP/OAuth-capable
+  adapter, real `imaplib.IMAP4_SSL` with full certificate/hostname
+  verification, protocol-level read-only `EXAMINE`/`BODY.PEEK[...]` —
+  never a mutating IMAP verb) and `services/mailbox/gmail/` (Google
+  OAuth, `gmail.readonly`-scoped, read-only Gmail API calls only). This
+  is a READ-ONLY integration against every mail provider it speaks to:
+  no mark-read, move, delete, or send capability exists anywhere
+  behind this component, for any of the three adapters. Email
+  classification, AI, correction/learned rules, and any
   accounting-relevance decision are explicitly Slice 5's scope — no
   such field or code path exists anywhere in this component.
 
@@ -103,21 +114,23 @@ consumes:
 produces: []
 
 # No new third-party dependency: services/mailbox/microsoft/graph_client.py
-# speaks HTTP via stdlib urllib.request only, exactly like
-# services/xero/client.py (see that module's own "Dependency choice"
-# docstring section for the identical reasoning, applied here to the
-# Microsoft identity platform + Graph API instead of Xero's).
+# and services/mailbox/gmail/gmail_client.py both speak HTTP via stdlib
+# urllib.request only, exactly like services/xero/client.py (see that
+# module's own "Dependency choice" docstring section for the identical
+# reasoning); services/mailbox/imap/imap_client.py similarly uses only
+# stdlib imaplib/ssl/email.
 dependencies:
   - jsonschema
   - rfc3339-validator
 
-# CD-6 Slice 4: services/mailbox/microsoft/ makes real outbound calls
-# to Microsoft's identity platform (OAuth token endpoint) and Graph API
-# (delegated, read-only: /me, mail folder delta, message content) — the
-# same "provider adapter genuinely calls out" shape services/xero/'s
-# own external_access: true already establishes. No real Microsoft
-# Entra credentials exist yet at the time of this delivery; every test
-# exercises FakeMicrosoftOAuthClient/FakeMicrosoftGraphClient only.
+# CD-6 Slice 4/5: services/mailbox/microsoft/, services/mailbox/imap/,
+# and services/mailbox/gmail/ each make real outbound calls to their
+# respective provider (Microsoft identity platform + Graph API;
+# generic IMAP servers; Google OAuth + Gmail API) — the same "provider
+# adapter genuinely calls out" shape services/xero/'s own
+# external_access: true already establishes. Every test exercises each
+# adapter's own Fake* client only; real provider credentials are
+# supplied at deployment time, never committed.
 external_access: true
 
 # Note: `direct_email_access` is deliberately ABSENT from this list —

@@ -787,7 +787,7 @@ def test_historical_reprocess_with_fixed_metadata_headers_reaches_real_dmarc_pas
 
     reprocessed = reprocess_all_historical_candidates_for_domain(
         mailbox=h.mailbox, mailbox_source_id=h.source_id, sender_domain="newsupplier.com",
-        rule=rule, mailbox_domain_rule_repository=h.domain_rule_repo, adapter=h.adapter, message_repository=h.message_repo, needs_you_repository=h.needs_you_repo,
+        rule=rule, mailbox_domain_rule_repository=h.domain_rule_repo, adapter=h.adapter, sweep_lock=h.lock, message_repository=h.message_repo, needs_you_repository=h.needs_you_repo,
         api=h.api, object_store=h.object_store, scanner=h.scanner, actor_type="SYSTEM", actor_id="test",
     )
     assert len(reprocessed) == 1
@@ -835,7 +835,7 @@ def test_historical_reprocess_still_fails_closed_when_refreshed_headers_omit_rec
     )
     reprocessed = reprocess_all_historical_candidates_for_domain(
         mailbox=h.mailbox, mailbox_source_id=h.source_id, sender_domain="newsupplier.com",
-        rule=rule, mailbox_domain_rule_repository=h.domain_rule_repo, adapter=h.adapter, message_repository=h.message_repo, needs_you_repository=h.needs_you_repo,
+        rule=rule, mailbox_domain_rule_repository=h.domain_rule_repo, adapter=h.adapter, sweep_lock=h.lock, message_repository=h.message_repo, needs_you_repository=h.needs_you_repo,
         api=h.api, object_store=h.object_store, scanner=h.scanner, actor_type="SYSTEM", actor_id="test",
     )
     assert len(reprocessed) == 1
@@ -955,7 +955,7 @@ def test_reprocess_gmail_quota_governor_paces_only_actually_processed_candidates
 
     reprocessed = reprocess_all_historical_candidates_for_domain(
         mailbox=h.mailbox, mailbox_source_id=h.source_id, sender_domain="newsupplier.com",
-        rule=rule, mailbox_domain_rule_repository=h.domain_rule_repo, adapter=h.adapter,
+        rule=rule, mailbox_domain_rule_repository=h.domain_rule_repo, adapter=h.adapter, sweep_lock=h.lock,
         message_repository=h.message_repo, needs_you_repository=h.needs_you_repo,
         api=h.api, object_store=h.object_store, scanner=h.scanner, actor_type="SYSTEM", actor_id="test",
     )
@@ -1048,7 +1048,7 @@ def test_resolve_domain_review_allow_resume_after_interrupted_backfill_only_pace
     kwargs = dict(
         needs_you_repository=h.needs_you_repo, mailbox_message_repository=h.message_repo,
         mailbox_domain_rule_repository=h.domain_rule_repo, entity_repository=h.api.entity_repository,
-        api=h.api, object_store=h.object_store, scanner=h.scanner, adapter=h.adapter, mailbox=h.mailbox,
+        api=h.api, object_store=h.object_store, scanner=h.scanner, adapter=h.adapter, sweep_lock=h.lock, mailbox=h.mailbox,
         mailbox_id=h.mailbox.mailbox_id, mailbox_source_id=h.source_id, item_id=item.item_id,
         actor_type="SYSTEM", actor_id="test", decision="ALLOW", destination_entity_id=None,
         destination_mode="REVIEW_REQUIRED", match_mode="EXACT", processor_hint=None, sender_address=None,

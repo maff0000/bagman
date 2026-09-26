@@ -13,9 +13,10 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 from core import identity
-from core.errors import NotFoundError, PersistenceError, ValidationError
+from core.errors import ConflictError, NotFoundError, PersistenceError, ValidationError
 from core.contract_validation import validate_against_contract
 from core.timestamps import utc_now
+from persistence.postgres.db_errors import unique_violation_constraint
 from persistence.postgres.mailbox_message_models import MailboxMessageRow
 from persistence.postgres.session import get_engine, session_scope
 from services.mailbox.domain_rule import domain_in_scope, normalize_domain, subject_matches_predicate
@@ -189,6 +190,26 @@ class PostgresMailboxMessageRepository(MailboxMessageRepository):
         except (ValidationError, NotFoundError):
             raise
         except IntegrityError as exc:
+            # Slice 3/4/5 governance-reconciliation delta: a genuine
+            # concurrent-insert race on `uq_mailbox_messages_mailbox_provider_id`
+            # (two callers both observed "no existing row" and both
+            # tried to insert for the identical
+            # `(mailbox_id, immutable_provider_message_id)`) is a real,
+            # nameable conflict — not a generic persistence failure.
+            # Mirrors `persistence.postgres.mailbox_repository
+            # .PostgresMailboxSourceRepository.create_mailbox`'s own
+            # identical translation. Low real-world exposure (the
+            # per-mailbox `MailboxSweepLock` forecloses concurrent
+            # writers in normal operation) but a genuine defect in the
+            # error TYPE surfaced under a true race, independently
+            # found during the Slice 3/4/5 governance audit.
+            if unique_violation_constraint(exc) == "uq_mailbox_messages_mailbox_provider_id":
+                raise ConflictError(
+                    f"a MailboxMessage for mailbox_id={mailbox_id!r} "
+                    f"immutable_provider_message_id={immutable_provider_message_id!r} was created "
+                    "concurrently by another caller — this is a genuine race, not a persistence failure; "
+                    "retry to observe the now-existing row"
+                ) from exc
             raise PersistenceError(f"could not record MailboxMessage observation: {exc}") from exc
         except SQLAlchemyError as exc:
             raise PersistenceError(f"could not record MailboxMessage observation: {exc}") from exc
