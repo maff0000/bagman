@@ -3,7 +3,7 @@
 # contracts/manifest/bagman.component_manifest.v1.schema.json.
 
 id: BAGMAN.CORE
-version: 1
+version: 2
 
 responsibility: >
   Own canonical identity, timestamp, error, contract-validation, and
@@ -13,7 +13,17 @@ responsibility: >
   (core/api.py) that composes these with services/evidence/ to record
   every canonical write's audit event — including EVIDENCE_OBSERVED,
   which is emitted from here even though EvidenceItem itself is owned
-  by services/evidence/ (see the `produces` note below).
+  by services/evidence/ (see the `produces` note below). Also owns
+  core/text_matching.py (CD-6 Slice 5 WI-2) — the neutral, dependency-
+  free text-normalisation/predicate-matching primitives
+  (normalize_domain/normalize_address/domain_from_address/
+  normalize_subject_for_policy/subject_matches_predicate) extracted out
+  of services/mailbox/domain_rule.py so both mailbox-domain-rule policy
+  and evidence-classification-rule matching can depend on ONE shared
+  implementation rather than two independently-maintained copies. Not a
+  new canonical domain TYPE (nothing to add to `owns` below — these are
+  plain functions, the same style as core/identity.py/core/timestamps.py,
+  neither of which is listed in `owns` either).
 
 owns:
   - GovernedEntity

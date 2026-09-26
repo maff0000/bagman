@@ -52,6 +52,7 @@ from __future__ import annotations
 import os
 import threading
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -64,8 +65,34 @@ from ai.providers.litellm.client import LiteLLMClientProtocol
 from core import actor
 from core.api import BagmanCanonicalAPI
 from persistence.objects.store import EvidenceObjectStore
+from services.evidence.classification import EvidenceClassificationRepository
+from services.evidence.classification_rule import EvidenceClassificationRuleRepository
 from services.evidence.intake.intake import IntakeRepository
 from services.evidence.intake.scanner import EvidenceSafetyScanner, ScanResult, ScanVerdict
+from services.mailbox.cursor import MailboxFolderCursorRepository
+from services.mailbox.domain_rule import MailboxDomainRuleRepository
+from services.mailbox.lock import MailboxSweepLock
+from services.mailbox.mailbox import MailboxSourceRepository
+from services.mailbox.message import MailboxMessageRepository
+from services.mailbox.gmail.gmail_adapter import GmailMailboxAdapter
+from services.mailbox.gmail.gmail_client import GmailClientProtocol, GmailOAuthClientProtocol
+from services.mailbox.gmail.oauth_state import GmailOAuthStateRepository
+from services.mailbox.gmail.secrets import GmailTokenStoreProtocol
+from services.mailbox.imap.imap_adapter import ImapMailboxAdapter
+from services.mailbox.imap.imap_client import ImapClientProtocol
+from services.mailbox.microsoft.adapter import MicrosoftGraphMailboxAdapter
+from services.mailbox.microsoft.graph_client import MicrosoftGraphClientProtocol, MicrosoftOAuthClientProtocol
+from services.mailbox.microsoft.oauth_state import MailboxOAuthStateRepository as MailboxMicrosoftOAuthStateRepository
+from services.mailbox.microsoft.secrets import MicrosoftTokenStoreProtocol
+from services.mailbox.sweep_run import MailboxSweepRunRepository
+from services.needs_you.needs_you import NeedsYouRepository
+from services.xero.account import XeroAccountRepository
+from services.xero.client import XeroAccountingClientProtocol, XeroOAuthClientProtocol
+from services.xero.connection import XeroConnectionRepository
+from services.xero.oauth_state import OAuthStateRepository
+from services.xero.secrets import TokenStoreProtocol
+from services.xero.sync import XeroSyncRunRepository
+from services.xero.tenant_selection import PendingTenantSelectionStore
 
 #: Repo root, resolved once from this file's own location
 #: (``app/api/composition.py`` -> ``app/api`` -> ``app`` ->
@@ -294,6 +321,134 @@ class RuntimeComposition:
     #: full, preserved history of what it was and why it was
     #: superseded.
     claude_code_operator_runner: ClaudeCodeOperatorRunnerProtocol
+    #: CD-6 Slice 1 (PID §98.5) — the universal Needs You queue
+    #: repository. In-memory in development/test, a real
+    #: `PostgresNeedsYouRepository` (sharing the same `engine` as every
+    #: other Postgres-backed repository above) in production — never
+    #: mixed across modes, same discipline as `intake_repository`.
+    needs_you_repository: NeedsYouRepository
+    #: CD-6 Slice 2 (PID §98.4, architect spec §1-24) — the Xero
+    #: reference-data domain. In-memory in development/test, real
+    #: `Postgres*` implementations (sharing `engine`) in production —
+    #: same never-mixed-across-modes discipline as every repository
+    #: above. `xero_oauth_client`/`xero_accounting_client` are the real
+    #: `services.xero.client` adapters in production and
+    #: `services.xero.fake_client`'s deterministic substitutes in
+    #: development/test (this codebase's established `Fake*` pattern —
+    #: see `ai_invocation_repository`/`litellm_client` above for the
+    #: identical split). `xero_token_store` is `InMemoryTokenStore` in
+    #: development/test (a real dev machine has no
+    #: `/opt/bagman/secrets/xero/` directory at all) and `FileTokenStore`
+    #: in production.
+    xero_connection_repository: XeroConnectionRepository
+    xero_account_repository: XeroAccountRepository
+    xero_sync_run_repository: XeroSyncRunRepository
+    oauth_state_repository: OAuthStateRepository
+    xero_oauth_client: XeroOAuthClientProtocol
+    xero_accounting_client: XeroAccountingClientProtocol
+    xero_token_store: TokenStoreProtocol
+    #: Architect finding, real live acceptance run (Infosecurs +
+    #: NoustAI) — the governed multi-tenant-candidate selection broker
+    #: (see `services.xero.tenant_selection`'s own module docstring for
+    #: why this is the SAME implementation, never in-memory-vs-Postgres
+    #: split, in both development and production).
+    xero_pending_tenant_selection_store: PendingTenantSelectionStore
+    #: CD-6 Slice 3 (Mailbox Management, TAB 1 / Email) — the
+    #: mailbox-definition registry. In-memory in development/test, a
+    #: real `PostgresMailboxSourceRepository` (sharing `engine`) in
+    #: production — same never-mixed-across-modes discipline as every
+    #: repository above. No provider client is wired here at all (never
+    #: an `xero_oauth_client`-style adapter pair) — nothing in this
+    #: slice ever calls out to a mailbox provider, see
+    #: services/mailbox/mailbox.py's own module docstring.
+    mailbox_source_repository: MailboxSourceRepository
+    #: CD-6 Slice 4 (first real mailbox adapter + sweep engine) — the
+    #: Microsoft Graph provider adapter's own durable state, in-memory
+    #: in development/test, real `Postgres*` implementations (sharing
+    #: `engine`) in production — same never-mixed-across-modes
+    #: discipline as every repository above.
+    #: `microsoft_oauth_client`/`microsoft_graph_client` are the real
+    #: `services.mailbox.microsoft.graph_client` adapters in production
+    #: and `services.mailbox.microsoft.fake_client`'s deterministic
+    #: substitutes in development/test (mirrors
+    #: `xero_oauth_client`/`xero_accounting_client` above exactly — no
+    #: real Microsoft Entra app registration exists yet, PID/this
+    #: delivery's own stated constraint). `microsoft_mailbox_adapter` is
+    #: the one seam the HTTP router and the sweep engine both call
+    #: through — see `services/mailbox/microsoft/adapter.py`'s own
+    #: module docstring.
+    mailbox_message_repository: MailboxMessageRepository
+    mailbox_sweep_run_repository: MailboxSweepRunRepository
+    mailbox_folder_cursor_repository: MailboxFolderCursorRepository
+    mailbox_sweep_lock: MailboxSweepLock
+    mailbox_microsoft_oauth_state_repository: MailboxMicrosoftOAuthStateRepository
+    microsoft_oauth_client: MicrosoftOAuthClientProtocol
+    microsoft_graph_client: MicrosoftGraphClientProtocol
+    microsoft_token_store: MicrosoftTokenStoreProtocol
+    microsoft_mailbox_adapter: MicrosoftGraphMailboxAdapter
+    #: CD-6 GUI-operations-foundation follow-on WO (second mailbox
+    #: provider — plain IMAP for `matt@noust.ai`). Mirrors
+    #: `microsoft_graph_client`/`microsoft_mailbox_adapter` above exactly
+    #: — `FakeImapClient` in development/test (no real IMAP credentials
+    #: exist yet either — see `services.mailbox.imap.secrets`'s own
+    #: module docstring), the real network-speaking `ImapClient` in
+    #: production. `imap_mailbox_adapter` is the one seam the HTTP
+    #: router (`app/api/routers/mailboxes_imap.py`) and the SAME
+    #: provider-neutral `services.mailbox.sweep.run_sweep` engine both
+    #: call through — no separate sweep engine exists for IMAP. Reuses
+    #: EVERY other mailbox-domain repository above (`mailbox_message_repository`/
+    #: `mailbox_sweep_run_repository`/`mailbox_folder_cursor_repository`/
+    #: `mailbox_sweep_lock`/`mailbox_domain_rule_repository`) — those are
+    #: already provider-neutral and mailbox_id-scoped, never
+    #: provider-scoped.
+    imap_client: ImapClientProtocol
+    imap_mailbox_adapter: ImapMailboxAdapter
+    #: CD-6 GUI-operations-foundation follow-on WO — THIRD mailbox
+    #: provider (Gmail API, two independent accounts:
+    #: `mgs241171@gmail.com`/`matt.george.scott@gmail.com`). Mirrors
+    #: `microsoft_oauth_client`/`microsoft_graph_client`/
+    #: `microsoft_mailbox_adapter` above exactly — `FakeGmailOAuthClient`/
+    #: `FakeGmailClient` in development/test (no real Google Cloud OAuth
+    #: app exists yet either — see `services.mailbox.gmail.secrets`'s own
+    #: module docstring), the real network-speaking
+    #: `GmailOAuthClient`/`GmailClient` in production.
+    #: `mailbox_gmail_oauth_state_repository` is now Postgres-backed in
+    #: production (`PostgresMailboxGmailOAuthStateRepository`), exactly
+    #: like Microsoft's own `mailbox_microsoft_oauth_state_repository`
+    #: — CD-6 GUI-operations-foundation follow-on WO closed the prior
+    #: in-memory-in-production gap (a short-lived, in-flight
+    #: authorize->callback round trip must survive a container
+    #: restart/deploy, the same real operational scenario Microsoft's
+    #: own precedent was already built for). Development/test
+    #: composition still uses `InMemoryGmailOAuthStateRepository`
+    #: (unchanged). Reuses EVERY other mailbox-domain repository above
+    #: (mailbox_id-scoped, never provider-scoped).
+    mailbox_gmail_oauth_state_repository: GmailOAuthStateRepository
+    gmail_oauth_client: GmailOAuthClientProtocol
+    gmail_client: GmailClientProtocol
+    gmail_token_store: GmailTokenStoreProtocol
+    gmail_mailbox_adapter: GmailMailboxAdapter
+    #: CD-6 architect amendment (two-stage mail processing) — the
+    #: mailbox-specific domain-policy gate registry. In-memory in
+    #: development/test, a real `PostgresMailboxDomainRuleRepository`
+    #: (sharing `engine`) in production — same never-mixed-across-modes
+    #: discipline as every repository above.
+    mailbox_domain_rule_repository: MailboxDomainRuleRepository
+    #: CD-6 Slice 5 WI-2 — the deterministic classification-rule
+    #: registry and its derived classification records (WI-1 built both
+    #: domain models/repositories; WI-2 is the first delivery to wire
+    #: either into HTTP-reachable composition, via
+    #: `app/api/routers/evidence_classification.py`). In-memory in
+    #: development/test, real `Postgres*` implementations (sharing
+    #: `engine`) in production — same never-mixed-across-modes
+    #: discipline as every repository above.
+    #: `classification_repository` is constructed with
+    #: `evidence_repository`/`classification_rule_repository`/
+    #: `ai_invocation_repository` exactly like every other
+    #: WI-1-documented dependency shape (duck-typed — see that module's
+    #: own docstring).
+    classification_rule_repository: EvidenceClassificationRuleRepository
+    classification_repository: EvidenceClassificationRepository
 
 
 def _build_development_or_test(runtime_environment: str) -> RuntimeComposition:
@@ -301,13 +456,118 @@ def _build_development_or_test(runtime_environment: str) -> RuntimeComposition:
     from ai.providers.litellm.fake import FakeLiteLLMClient
     from persistence.objects.memory_store import InMemoryObjectStore
     from services.evidence.intake.intake import InMemoryIntakeRepository
+    from services.mailbox.cursor import InMemoryMailboxFolderCursorRepository
+    from services.mailbox.domain_rule import InMemoryMailboxDomainRuleRepository
+    from services.mailbox.lock import InMemoryMailboxSweepLock
+    from services.mailbox.mailbox import InMemoryMailboxSourceRepository
+    from services.mailbox.message import InMemoryMailboxMessageRepository
+    from services.mailbox.gmail.fake_gmail_client import FakeGmailClient, FakeGmailOAuthClient
+    from services.mailbox.gmail.gmail_adapter import GmailMailboxAdapter
+    from services.mailbox.gmail.oauth_state import InMemoryGmailOAuthStateRepository
+    from services.mailbox.gmail.secrets import InMemoryGmailTokenStore
+    from services.mailbox.imap.fake_imap_client import FakeImapClient
+    from services.mailbox.imap.imap_adapter import ImapMailboxAdapter
+    from services.mailbox.microsoft.adapter import MicrosoftGraphMailboxAdapter
+    from services.mailbox.microsoft.fake_client import FakeMicrosoftGraphClient, FakeMicrosoftOAuthClient
+    from services.mailbox.microsoft.oauth_state import InMemoryMailboxOAuthStateRepository
+    from services.mailbox.microsoft.secrets import InMemoryMicrosoftTokenStore
+    from services.mailbox.sweep_run import InMemoryMailboxSweepRunRepository
+    from services.needs_you.needs_you import InMemoryNeedsYouRepository
+    from services.xero.account import InMemoryXeroAccountRepository
+    from services.xero.connection import InMemoryXeroConnectionRepository
+    from services.xero.fake_client import FakeXeroAccountingClient, FakeXeroOAuthClient
+    from services.xero.oauth_state import InMemoryOAuthStateRepository
+    from services.xero.secrets import InMemoryTokenStore
+    from services.xero.sync import InMemoryXeroSyncRunRepository
+    from services.xero.tenant_selection import InMemoryPendingTenantSelectionStore
 
     api = BagmanCanonicalAPI()  # CD-2's own in-memory default construction
     object_store = InMemoryObjectStore()
     scanner = _AlwaysCleanDevelopmentScanner()
     intake_repository = InMemoryIntakeRepository()
+    needs_you_repository = InMemoryNeedsYouRepository()
+    xero_connection_repository = InMemoryXeroConnectionRepository()
+    xero_account_repository = InMemoryXeroAccountRepository()
+    xero_sync_run_repository = InMemoryXeroSyncRunRepository()
+    oauth_state_repository = InMemoryOAuthStateRepository()
+    # CD-6 Slice 2: no real Xero Developer App exists yet (PID §102.1's
+    # own stated constraint) — development/test composition ALWAYS uses
+    # the deterministic fakes, never the real network-speaking adapters,
+    # exactly like `litellm_client`/`claude_code_operator_runner` above.
+    xero_oauth_client = FakeXeroOAuthClient()
+    xero_accounting_client = FakeXeroAccountingClient()
+    xero_token_store = InMemoryTokenStore()
+    xero_pending_tenant_selection_store = InMemoryPendingTenantSelectionStore()
+    mailbox_source_repository = InMemoryMailboxSourceRepository()
 
-    ai_invocation_repository = InMemoryAIInvocationRepository()
+    # CD-6 Slice 4: no real Microsoft Entra app exists yet — development/
+    # test composition ALWAYS uses the deterministic fakes, never the
+    # real network-speaking adapters (same doctrine as xero_oauth_client/
+    # xero_accounting_client above).
+    mailbox_message_repository = InMemoryMailboxMessageRepository()
+    mailbox_sweep_run_repository = InMemoryMailboxSweepRunRepository()
+    mailbox_folder_cursor_repository = InMemoryMailboxFolderCursorRepository()
+    mailbox_sweep_lock = InMemoryMailboxSweepLock()
+    mailbox_microsoft_oauth_state_repository = InMemoryMailboxOAuthStateRepository()
+    mailbox_domain_rule_repository = InMemoryMailboxDomainRuleRepository()
+    microsoft_oauth_client = FakeMicrosoftOAuthClient()
+    microsoft_graph_client = FakeMicrosoftGraphClient()
+    microsoft_token_store = InMemoryMicrosoftTokenStore()
+    microsoft_mailbox_adapter = MicrosoftGraphMailboxAdapter(
+        oauth_client=microsoft_oauth_client,
+        graph_client=microsoft_graph_client,
+        token_store=microsoft_token_store,
+        mailbox_repository=mailbox_source_repository,
+    )
+
+    # CD-6 GUI-operations-foundation follow-on WO — second mailbox
+    # provider (plain IMAP, `matt@noust.ai`). No real IMAP credentials
+    # exist yet either — development/test composition ALWAYS uses the
+    # deterministic `FakeImapClient`, never the real network-speaking
+    # adapter (same doctrine as `microsoft_oauth_client`/
+    # `microsoft_graph_client` above).
+    imap_client = FakeImapClient()
+    imap_mailbox_adapter = ImapMailboxAdapter(client=imap_client, mailbox_repository=mailbox_source_repository)
+
+    # CD-6 GUI-operations-foundation follow-on WO — THIRD mailbox
+    # provider (Gmail API, two independent accounts). No real Google
+    # Cloud OAuth app exists yet — development/test composition ALWAYS
+    # uses the deterministic fakes, never the real network-speaking
+    # adapters (same doctrine as microsoft_oauth_client/
+    # microsoft_graph_client/imap_client above).
+    mailbox_gmail_oauth_state_repository = InMemoryGmailOAuthStateRepository()
+    gmail_oauth_client = FakeGmailOAuthClient()
+    gmail_client = FakeGmailClient()
+    gmail_token_store = InMemoryGmailTokenStore()
+    gmail_mailbox_adapter = GmailMailboxAdapter(
+        oauth_client=gmail_oauth_client,
+        gmail_client=gmail_client,
+        token_store=gmail_token_store,
+        mailbox_repository=mailbox_source_repository,
+    )
+
+    # CD-6 reliability delta: shares `api.audit_repository` so the
+    # bounded stale-RUNNING recovery backstop's own audit events land in
+    # the SAME in-memory audit trail every test/dev-mode caller already
+    # reads via `api.audit_repository` — see `ai.invocation`'s module
+    # docstring ("Stale-RUNNING recovery") and
+    # `AIInvocationRepository`'s own class docstring.
+    ai_invocation_repository = InMemoryAIInvocationRepository(audit_repository=api.audit_repository)
+
+    # CD-6 Slice 5 WI-2 — the deterministic classification-rule registry
+    # and its derived classification records, sharing `api.evidence_repository`/
+    # `ai_invocation_repository` exactly like every other cross-repository
+    # dependency in this function.
+    from services.evidence.classification import InMemoryEvidenceClassificationRepository
+    from services.evidence.classification_rule import InMemoryEvidenceClassificationRuleRepository
+
+    classification_rule_repository = InMemoryEvidenceClassificationRuleRepository()
+    classification_repository = InMemoryEvidenceClassificationRepository(
+        evidence_repository=api.evidence_repository,
+        rule_repository=classification_rule_repository,
+        ai_invocation_repository=ai_invocation_repository,
+    )
+
     # `default_response` closes the WI-4 dev-mode gap documented on
     # `_dev_mode_litellm_default_response` above — without it, a real
     # click on the GUI's "Run analysis" button in a live dev server
@@ -331,6 +591,35 @@ def _build_development_or_test(runtime_environment: str) -> RuntimeComposition:
         ai_invocation_repository=ai_invocation_repository,
         litellm_client=litellm_client,
         claude_code_operator_runner=claude_code_operator_runner,
+        needs_you_repository=needs_you_repository,
+        xero_connection_repository=xero_connection_repository,
+        xero_account_repository=xero_account_repository,
+        xero_sync_run_repository=xero_sync_run_repository,
+        oauth_state_repository=oauth_state_repository,
+        xero_oauth_client=xero_oauth_client,
+        xero_accounting_client=xero_accounting_client,
+        xero_token_store=xero_token_store,
+        xero_pending_tenant_selection_store=xero_pending_tenant_selection_store,
+        mailbox_source_repository=mailbox_source_repository,
+        mailbox_message_repository=mailbox_message_repository,
+        mailbox_sweep_run_repository=mailbox_sweep_run_repository,
+        mailbox_folder_cursor_repository=mailbox_folder_cursor_repository,
+        mailbox_sweep_lock=mailbox_sweep_lock,
+        mailbox_microsoft_oauth_state_repository=mailbox_microsoft_oauth_state_repository,
+        microsoft_oauth_client=microsoft_oauth_client,
+        microsoft_graph_client=microsoft_graph_client,
+        microsoft_token_store=microsoft_token_store,
+        microsoft_mailbox_adapter=microsoft_mailbox_adapter,
+        imap_client=imap_client,
+        imap_mailbox_adapter=imap_mailbox_adapter,
+        mailbox_gmail_oauth_state_repository=mailbox_gmail_oauth_state_repository,
+        gmail_oauth_client=gmail_oauth_client,
+        gmail_client=gmail_client,
+        gmail_token_store=gmail_token_store,
+        gmail_mailbox_adapter=gmail_mailbox_adapter,
+        mailbox_domain_rule_repository=mailbox_domain_rule_repository,
+        classification_rule_repository=classification_rule_repository,
+        classification_repository=classification_repository,
     )
 
 
@@ -348,10 +637,42 @@ def _build_production() -> RuntimeComposition:
         PostgresExternalReferenceRepository,
     )
     from persistence.postgres.intake_repository import PostgresIntakeRepository
+    from persistence.postgres.mailbox_domain_rule_repository import PostgresMailboxDomainRuleRepository
+    from persistence.postgres.mailbox_gmail_repository import PostgresMailboxGmailOAuthStateRepository
+    from persistence.postgres.mailbox_message_repository import PostgresMailboxMessageRepository
+    from persistence.postgres.mailbox_microsoft_repository import (
+        PostgresMailboxFolderCursorRepository,
+        PostgresMailboxMicrosoftOAuthStateRepository,
+        PostgresMailboxSweepLock,
+        PostgresMailboxSweepRunRepository,
+    )
+    from persistence.postgres.evidence_classification_repository import PostgresEvidenceClassificationRepository
+    from persistence.postgres.evidence_classification_rule_repository import (
+        PostgresEvidenceClassificationRuleRepository,
+    )
+    from persistence.postgres.mailbox_repository import PostgresMailboxSourceRepository
+    from persistence.postgres.needs_you_repository import PostgresNeedsYouRepository
     from persistence.postgres.provenance_repository import PostgresProvenanceRepository
     from persistence.postgres.session import get_engine
     from persistence.postgres.source_repository import PostgresSourceRepository
+    from persistence.postgres.xero_repository import (
+        PostgresOAuthStateRepository,
+        PostgresXeroAccountRepository,
+        PostgresXeroConnectionRepository,
+        PostgresXeroSyncRunRepository,
+    )
     from services.evidence.intake.scanner import ClamAVScanner
+    from services.mailbox.gmail.gmail_adapter import GmailMailboxAdapter
+    from services.mailbox.gmail.gmail_client import GmailClient, GmailOAuthClient
+    from services.mailbox.gmail.secrets import FileGmailTokenStore
+    from services.mailbox.imap.imap_adapter import ImapMailboxAdapter
+    from services.mailbox.imap.imap_client import ImapClient
+    from services.mailbox.microsoft.adapter import MicrosoftGraphMailboxAdapter
+    from services.mailbox.microsoft.graph_client import MicrosoftGraphClient, MicrosoftOAuthClient
+    from services.mailbox.microsoft.secrets import FileMicrosoftTokenStore
+    from services.xero.client import XeroAccountingClient, XeroOAuthClient
+    from services.xero.secrets import FileTokenStore
+    from services.xero.tenant_selection import InMemoryPendingTenantSelectionStore
 
     from ai.providers.litellm.client import DEFAULT_LITELLM_API_KEY_FILE, DEFAULT_LITELLM_ENDPOINT, LiteLLMClient
 
@@ -393,6 +714,10 @@ def _build_production() -> RuntimeComposition:
     # every other Postgres-backed repository above.
     intake_repository = PostgresIntakeRepository(engine)
 
+    # CD-6 Slice 1 (PID §98.5): durable Needs You repository, sharing
+    # the same engine as every other Postgres-backed repository above.
+    needs_you_repository = PostgresNeedsYouRepository(engine)
+
     # CD-4 WI-3: a real ClamAV scanner — configured from
     # BAGMAN_SCANNER_HOST/BAGMAN_SCANNER_PORT (mirroring the existing
     # env-var-driven MinIO configuration pattern above), defaulting to
@@ -417,7 +742,27 @@ def _build_production() -> RuntimeComposition:
     # LiteLLM gateway does not prevent composition from succeeding —
     # PID §48's own "evidence/runtime services remain usable even when
     # AI is unavailable").
-    ai_invocation_repository = PostgresAIInvocationRepository(engine)
+    # CD-6 reliability delta: shares `api.audit_repository`
+    # (`PostgresAuditRepository(engine)`, built above) so the bounded
+    # stale-RUNNING recovery backstop's own audit events land in the
+    # SAME `audit_events` table every other production audit event
+    # already writes to — see `ai.invocation`'s module docstring
+    # ("Stale-RUNNING recovery") and `AIInvocationRepository`'s own
+    # class docstring.
+    ai_invocation_repository = PostgresAIInvocationRepository(engine, audit_repository=api.audit_repository)
+
+    # CD-6 Slice 5 WI-2 — durable classification-rule registry and its
+    # derived classification records, sharing `engine`/`api.evidence_repository`/
+    # `ai_invocation_repository` exactly like every other Postgres-backed
+    # repository above.
+    classification_rule_repository = PostgresEvidenceClassificationRuleRepository(engine)
+    classification_repository = PostgresEvidenceClassificationRepository(
+        evidence_repository=api.evidence_repository,
+        rule_repository=classification_rule_repository,
+        ai_invocation_repository=ai_invocation_repository,
+        engine=engine,
+    )
+
     litellm_client = LiteLLMClient(
         endpoint=os.environ.get("BAGMAN_LITELLM_ENDPOINT", DEFAULT_LITELLM_ENDPOINT),
         api_key_file=os.environ.get("BAGMAN_LITELLM_API_KEY_FILE", DEFAULT_LITELLM_API_KEY_FILE),
@@ -433,6 +778,108 @@ def _build_production() -> RuntimeComposition:
     # attempted inside a real Ask BAGMAN request.
     claude_code_operator_runner = ClaudeCodeOperatorRunner()
 
+    # CD-6 Slice 2 (PID §98.4, architect spec §1-24): durable Xero
+    # repositories, sharing the same engine as every other Postgres-
+    # backed repository above, plus the two real adapters
+    # (`XeroOAuthClient`/`XeroAccountingClient`) and the real
+    # file-backed per-connection token store. Constructing any of these
+    # performs NO I/O itself (same "no eager I/O at construction"
+    # discipline as every other adapter in this function) — a missing
+    # Xero Developer App credential (no real one is provisioned yet,
+    # PID §102.1's own stated constraint) surfaces as a live, per-call
+    # `CONFIG_ERROR`/`XeroAppCredentials is None` outcome the first time
+    # a real OAuth call is attempted, never at composition/startup time.
+    xero_connection_repository = PostgresXeroConnectionRepository(engine)
+    xero_account_repository = PostgresXeroAccountRepository(engine)
+    xero_sync_run_repository = PostgresXeroSyncRunRepository(engine)
+    oauth_state_repository = PostgresOAuthStateRepository(engine)
+    xero_oauth_client = XeroOAuthClient()
+    xero_accounting_client = XeroAccountingClient()
+    xero_token_store = FileTokenStore()
+    # Deliberately the SAME in-memory implementation as development/test
+    # — see `services.xero.tenant_selection`'s own module docstring for
+    # why this bridge state is never Postgres- or file-backed in either
+    # mode.
+    xero_pending_tenant_selection_store = InMemoryPendingTenantSelectionStore()
+
+    # CD-6 Slice 3 (Mailbox Management): durable mailbox-definition
+    # registry, sharing the same engine as every other Postgres-backed
+    # repository above. No provider client/adapter is constructed here
+    # at all — nothing in this slice ever calls out to a mailbox
+    # provider (see services/mailbox/mailbox.py's own module
+    # docstring).
+    mailbox_source_repository = PostgresMailboxSourceRepository(engine)
+
+    # CD-6 Slice 4 (first real Microsoft Graph adapter + sweep engine):
+    # durable repositories sharing `engine`, plus the two real Microsoft
+    # adapters and the real file-backed per-mailbox token store — same
+    # "no eager I/O at construction, config errors surface honestly at
+    # first real call" discipline as every other adapter in this
+    # function. No real Microsoft Entra app credential is provisioned
+    # yet (this delivery's own stated constraint) — `is_configured()`
+    # returns False until the PL places one, exactly like Xero's own
+    # `is_configured()` today.
+    mailbox_message_repository = PostgresMailboxMessageRepository(engine)
+    mailbox_sweep_run_repository = PostgresMailboxSweepRunRepository(engine)
+    mailbox_folder_cursor_repository = PostgresMailboxFolderCursorRepository(engine)
+    mailbox_sweep_lock = PostgresMailboxSweepLock(engine)
+    mailbox_microsoft_oauth_state_repository = PostgresMailboxMicrosoftOAuthStateRepository(engine)
+    mailbox_domain_rule_repository = PostgresMailboxDomainRuleRepository(engine)
+    microsoft_oauth_client = MicrosoftOAuthClient()
+    microsoft_graph_client = MicrosoftGraphClient()
+    microsoft_token_store = FileMicrosoftTokenStore()
+    microsoft_mailbox_adapter = MicrosoftGraphMailboxAdapter(
+        oauth_client=microsoft_oauth_client,
+        graph_client=microsoft_graph_client,
+        token_store=microsoft_token_store,
+        mailbox_repository=mailbox_source_repository,
+    )
+
+    # CD-6 GUI-operations-foundation follow-on WO — second mailbox
+    # provider (plain IMAP, `matt@noust.ai`). The real `ImapClient`
+    # defaults its own credentials_provider to
+    # `services.mailbox.imap.secrets.read_noustai_imap_credentials`
+    # (no explicit wiring needed here — mirrors `MicrosoftOAuthClient()`'s
+    # own identical "no eager I/O, reads real config at first real call"
+    # construction above). Neither credential file exists on production
+    # yet (the operator provisions them independently of this deploy) —
+    # `is_configured()` returns `False` until they do, exactly like
+    # Microsoft's own `is_configured()` today.
+    imap_client = ImapClient()
+    imap_mailbox_adapter = ImapMailboxAdapter(client=imap_client, mailbox_repository=mailbox_source_repository)
+
+    # CD-6 GUI-operations-foundation follow-on WO — THIRD mailbox
+    # provider (Gmail API, two independent accounts:
+    # `mgs241171@gmail.com`/`matt.george.scott@gmail.com`). The real
+    # `GmailOAuthClient()`/`GmailClient()` default their own
+    # credentials_provider to
+    # `services.mailbox.gmail.secrets.read_gmail_app_credentials` (no
+    # explicit wiring needed here — mirrors `MicrosoftOAuthClient()`'s
+    # own identical "no eager I/O, reads real config at first real call"
+    # construction above). No real Google Cloud OAuth app is provisioned
+    # yet — `is_configured()` returns `False` until the PL places one,
+    # exactly like Microsoft's/IMAP's own `is_configured()` today.
+    # `mailbox_gmail_oauth_state_repository` is now Postgres-backed
+    # here, sharing `engine` with every other Postgres-backed repository
+    # in this function, exactly like `mailbox_microsoft_oauth_state_repository`
+    # above (CD-6 GUI-operations-foundation follow-on WO — Gmail OAuth
+    # state persistence correction; see
+    # `RuntimeComposition.mailbox_gmail_oauth_state_repository`'s own
+    # field docstring). No special-casing for a down/unreachable
+    # Postgres: this fails exactly the same way every other
+    # Postgres-backed repository constructed in this function already
+    # does — no silent in-memory fallback.
+    mailbox_gmail_oauth_state_repository = PostgresMailboxGmailOAuthStateRepository(engine)
+    gmail_oauth_client = GmailOAuthClient()
+    gmail_client = GmailClient()
+    gmail_token_store = FileGmailTokenStore()
+    gmail_mailbox_adapter = GmailMailboxAdapter(
+        oauth_client=gmail_oauth_client,
+        gmail_client=gmail_client,
+        token_store=gmail_token_store,
+        mailbox_repository=mailbox_source_repository,
+    )
+
     return RuntimeComposition(
         runtime_environment=_PRODUCTION,
         api=api,
@@ -443,6 +890,35 @@ def _build_production() -> RuntimeComposition:
         ai_invocation_repository=ai_invocation_repository,
         litellm_client=litellm_client,
         claude_code_operator_runner=claude_code_operator_runner,
+        needs_you_repository=needs_you_repository,
+        xero_connection_repository=xero_connection_repository,
+        xero_account_repository=xero_account_repository,
+        xero_sync_run_repository=xero_sync_run_repository,
+        oauth_state_repository=oauth_state_repository,
+        xero_oauth_client=xero_oauth_client,
+        xero_accounting_client=xero_accounting_client,
+        xero_token_store=xero_token_store,
+        xero_pending_tenant_selection_store=xero_pending_tenant_selection_store,
+        mailbox_source_repository=mailbox_source_repository,
+        mailbox_message_repository=mailbox_message_repository,
+        mailbox_sweep_run_repository=mailbox_sweep_run_repository,
+        mailbox_folder_cursor_repository=mailbox_folder_cursor_repository,
+        mailbox_sweep_lock=mailbox_sweep_lock,
+        mailbox_microsoft_oauth_state_repository=mailbox_microsoft_oauth_state_repository,
+        microsoft_oauth_client=microsoft_oauth_client,
+        microsoft_graph_client=microsoft_graph_client,
+        microsoft_token_store=microsoft_token_store,
+        microsoft_mailbox_adapter=microsoft_mailbox_adapter,
+        imap_client=imap_client,
+        imap_mailbox_adapter=imap_mailbox_adapter,
+        mailbox_gmail_oauth_state_repository=mailbox_gmail_oauth_state_repository,
+        gmail_oauth_client=gmail_oauth_client,
+        gmail_client=gmail_client,
+        gmail_token_store=gmail_token_store,
+        gmail_mailbox_adapter=gmail_mailbox_adapter,
+        mailbox_domain_rule_repository=mailbox_domain_rule_repository,
+        classification_rule_repository=classification_rule_repository,
+        classification_repository=classification_repository,
     )
 
 
@@ -483,14 +959,17 @@ def reset_composition_for_tests() -> None:
     re-read ``BAGMAN_RUNTIME_ENV`` and rebuild from scratch — used by
     ``tests/app_api/`` to exercise both composition modes, and the
     no-fallback proof, within a single test process. Also clears the
-    memoized ``MANUAL_UPLOAD`` source id (CD-4 WI-3) — a source id
-    memoized against one composition (e.g. a prior test's disposable
-    Postgres database) would otherwise be silently stale/invalid
-    against the NEXT composition this process builds."""
-    global _composition, _manual_upload_source_id
+    memoized ``MANUAL_UPLOAD`` source id (CD-4 WI-3) and the memoized
+    canonical-entity seed ids (CD-6 Slice 1) — either, memoized against
+    one composition (e.g. a prior test's disposable Postgres database),
+    would otherwise be silently stale/invalid against the NEXT
+    composition this process builds."""
+    global _composition, _manual_upload_source_id, _seed_entity_ids
     with _lock:
         _composition = None
         _manual_upload_source_id = None
+        _seed_entity_ids = None
+        _mailbox_source_ids.clear()
 
 
 # ---------------------------------------------------------------------
@@ -571,3 +1050,265 @@ def get_manual_upload_source_id(composition: "RuntimeComposition") -> str:
         )
         _manual_upload_source_id = source.source_id
         return _manual_upload_source_id
+
+
+# ---------------------------------------------------------------------
+# Stable canonical entity seed lifecycle (CD-6 Slice 1, PID §98.3)
+# ---------------------------------------------------------------------
+#
+# PID §98.3: "Select from canonical BAGMAN entities. Initial expected
+# entities: Infosecurs Limited, NoustAI Limited, Matthew Scott Personal
+# ... These labels must not be hardcoded as business truth in the UI.
+# They map to canonical entity IDs." CD-6's own dispatch is explicit
+# that the seed mechanism should "follow the exact pattern already used
+# for get_manual_upload_source_id/_MANUAL_UPLOAD_SOURCE_TYPE" above —
+# this section is that same lifecycle, applied to three well-known
+# GovernedEntity rows instead of one well-known Source row:
+#
+#   1. an in-process memoized {canonical_name: entity_id} dict (fast
+#      path, no query at all once warm) — mirrors
+#      _manual_upload_source_id's own cache;
+#   2. for each of the three canonical names, a read-only
+#      find_by_canonical_name() lookup (the entity may already exist —
+#      created by an earlier process, or an earlier request in this
+#      same process before the memoized value was set);
+#   3. only if not found, register_entity() creates it.
+#
+# `entity_type` values: "COMPANY" for the two Limiteds, "PERSON" for
+# the personal entity — both are the contract's own DOCUMENTED (open,
+# non-enum-enforced) "known initial values" for entity_type
+# (contracts/entity/bagman.entity.v1.schema.json's own description:
+# "Known initial values (documentation only, not an enforced closed
+# set): COMPANY, PERSON"), not new ad hoc types invented for this
+# delivery.
+#
+# Trigger point: resolved lazily the first time GET /internal/entities
+# is called (app/api/routers/internal.py) — never inside
+# get_composition() itself, consistent with this module's own
+# documented "no eager PostgreSQL I/O at composition-build time"
+# invariant (see this module's top-of-file docstring: constructing the
+# PostgreSQL-backed repositories never itself contacts the database).
+# A GUI that has not yet loaded the entity dropdown simply has not
+# triggered the seed yet — exactly the same lazy-resolution shape
+# get_manual_upload_source_id has always had for its first caller
+# (POST /internal/intake/evidence).
+#
+# Known limitation, stated plainly rather than silently accepted — same
+# class of gap _MANUAL_UPLOAD_SOURCE_TYPE's own docstring already
+# accepts for CD-4, for the identical reason: no database-level
+# uniqueness constraint on governed_entities.canonical_name backs this
+# (unlike needs_you_items' or intake_records' own real partial unique
+# indexes), so a genuine multi-PROCESS cold-start race could each
+# independently create a duplicate canonical-name row. Acceptable for
+# CD-6 Slice 1 for the same reason it was acceptable for CD-4's
+# MANUAL_UPLOAD source: BAGMAN runs as a single bagman-api process/
+# container (no multi-replica deployment exists yet), so the only race
+# that matters in practice is intra-process, fully closed by the
+# module-level lock below. Flagged here for whoever introduces
+# multi-replica bagman-api, not solved speculatively now.
+_SEED_ENTITY_TYPE_COMPANY = "COMPANY"
+_SEED_ENTITY_TYPE_PERSON = "PERSON"
+
+#: CD-6 architect amendment (email historical-ingestion boundary),
+#: SECOND CORRECTION (architect finding, 2026-09-18 — see
+#: `core.entity.GovernedEntity.historical_floor_override_at`'s own
+#: docstring, and `services/mailbox/bootstrap_policy.py`'s module
+#: docstring, for the full "clamp, not the answer" doctrine this fixes)
+#: — the REAL, architect-verified accounting-period configuration for
+#: each of the three canonical entities (cross-checked against
+#: Companies House's own public register — NOT invented). Recorded on
+#: `GovernedEntity` as the recurring `fiscal_year_start_month_day` rule
+#: (the field the real historical-ingestion bootstrap boundary is
+#: DERIVED from, per entity, at sweep time — never read as a stored
+#: literal) PLUS an OPTIONAL `historical_floor_override_at` CLAMP,
+#: which is `None` for two of the three entities and a real
+#: incorporation date for the third:
+#:
+#:   * Infosecurs Limited — override `None`. The naive previous-
+#:     completed-period derivation from `"11-01"` alone already gives
+#:     the correct answer (2024-11-01, as of "now" = 2026-09-18) —
+#:     incorporated 2021, long before any of this matters, so no clamp
+#:     is needed.
+#:   * NoustAI Limited — override stays `datetime(2025, 12, 5, ...)`,
+#:     its REAL, still-needed incorporation-date clamp: the naive
+#:     previous-period derivation from `"01-01"` alone would give
+#:     2025-01-01, which predates the company's own existence, so the
+#:     override must keep winning here (`max(override, naive) ==
+#:     override`).
+#:   * Matthew Scott Personal — override `None`. No commencement floor
+#:     applies to a person; the naive previous-tax-year derivation from
+#:     `"04-06"` alone already gives the correct answer (2025-04-06, as
+#:     of "now" = 2026-09-18).
+#:
+#: (canonical_name, display_name, entity_type, fiscal_year_start_month_day, historical_floor_override_at)
+SEED_ENTITIES: tuple[tuple[str, str, str, str, Optional[datetime]], ...] = (
+    (
+        "INFOSECURS_LIMITED",
+        "Infosecurs Limited",
+        _SEED_ENTITY_TYPE_COMPANY,
+        "11-01",
+        None,
+    ),
+    (
+        "NOUSTAI_LIMITED",
+        "NoustAI Limited",
+        _SEED_ENTITY_TYPE_COMPANY,
+        "01-01",
+        # Incorporated 5 Dec 2025 — see module section docstring above
+        # for why this is a genuine, still-needed clamp on the naive
+        # "01-01" period derivation, not the answer itself.
+        datetime(2025, 12, 5, tzinfo=timezone.utc),
+    ),
+    (
+        "MATTHEW_SCOTT_PERSONAL",
+        "Matthew Scott Personal",
+        _SEED_ENTITY_TYPE_PERSON,
+        "04-06",
+        None,
+    ),
+)
+
+_seed_entity_ids: Optional[dict[str, str]] = None
+
+
+def ensure_seed_entities(composition: "RuntimeComposition") -> dict[str, str]:
+    """Resolve (or, on first use, create) the three canonical
+    :data:`SEED_ENTITIES` rows (see module section docstring above).
+    Returns ``{canonical_name: entity_id}``, memoized for the life of
+    the process once every entity has been resolved."""
+    global _seed_entity_ids
+    if _seed_entity_ids is not None:
+        return _seed_entity_ids
+
+    with _lock:
+        if _seed_entity_ids is not None:
+            return _seed_entity_ids
+
+        resolved: dict[str, str] = {}
+        for canonical_name, display_name, entity_type, fiscal_year_start_month_day, historical_floor_override_at in SEED_ENTITIES:
+            existing = composition.api.entity_repository.find_by_canonical_name(canonical_name)
+            if existing is not None:
+                # PL-review finding: an entity registered before these
+                # two fields existed (every entity from CD-6 Slice 1,
+                # including all three already live on the production
+                # appliance) has them permanently None unless
+                # backfilled here — register_entity only ever sets
+                # them at creation time, and without this, the
+                # architect's own verified accounting-period rule
+                # could never actually reach the real entities, and
+                # compute_bootstrap_floor would refuse the historical
+                # sweep forever.
+                #
+                # SECOND-CORRECTION judgment call (architect finding,
+                # 2026-09-18): the backfill gate below deliberately
+                # checks `existing.fiscal_year_start_month_day is None`
+                # — NOT `existing.historical_floor_override_at is
+                # None`, which is what this gate checked before the
+                # rename. That old gate is now WRONG: two of the three
+                # canonical entities (Infosecurs, Matthew Scott
+                # Personal) legitimately have `historical_floor_
+                # override_at=None` FOREVER (see SEED_ENTITIES' own
+                # docstring above) — gating backfill on that field
+                # being None would mean their real, required
+                # `fiscal_year_start_month_day` rule could NEVER be
+                # backfilled by this function, since the gate would
+                # already read "already configured" from the moment of
+                # creation. `fiscal_year_start_month_day` is the
+                # correct "not yet configured" signal instead: it is
+                # required for every entity's own derivation (see
+                # `services.mailbox.sweep.compute_bootstrap_floor`) and
+                # is never legitimately left `None` once an entity is
+                # actually configured. Backfill-only: never overwrites
+                # a value that is already set (a real future operator
+                # correction is not this function's concern).
+                if existing.fiscal_year_start_month_day is None:
+                    existing = composition.api.entity_repository.set_accounting_period_configuration(
+                        existing.entity_id,
+                        fiscal_year_start_month_day=fiscal_year_start_month_day,
+                        historical_floor_override_at=historical_floor_override_at,
+                    )
+                resolved[canonical_name] = existing.entity_id
+                continue
+
+            entity = composition.api.register_entity(
+                entity_type=entity_type,
+                canonical_name=canonical_name,
+                display_name=display_name,
+                status="ACTIVE",
+                actor_type=actor.SYSTEM,
+                actor_id="bagman-entity-seed-bootstrap",
+                fiscal_year_start_month_day=fiscal_year_start_month_day,
+                historical_floor_override_at=historical_floor_override_at,
+                metadata={
+                    "note": "canonical entity seed, resolved-or-created once per process "
+                    "(CD-6 Slice 1, PID §98.3) — never re-created on a later call; "
+                    "fiscal_year_start_month_day/historical_floor_override_at set from the "
+                    "architect-verified accounting-period configuration (CD-6 architect "
+                    "amendment, email historical-ingestion boundary)"
+                },
+            )
+            resolved[canonical_name] = entity.entity_id
+
+        _seed_entity_ids = resolved
+        return _seed_entity_ids
+
+
+# ---------------------------------------------------------------------
+# Stable per-mailbox evidence Source lifecycle (CD-6 Slice 4)
+# ---------------------------------------------------------------------
+#
+# Mirrors `get_manual_upload_source_id`'s own resolve-or-create lifecycle
+# exactly (see that section's own docstring for the full "why lazy,
+# why memoized, why the known intra-process-only race is accepted"
+# reasoning — not repeated here), applied to one `Source` row PER
+# MAILBOX rather than one shared row for every manual upload. Keyed by
+# the well-known, closed pair (source_type="EMAIL_MAILBOX",
+# provider=<mailbox_id>) — `provider` is a plain string field with no
+# format constraint, and using the mailbox's own canonical id there
+# (rather than, say, its email address, which per
+# `services/mailbox/mailbox.py`'s own doctrine is never a fact this
+# module should encode identity around) keeps this lookup exact and
+# collision-free per mailbox without inventing a new field anywhere.
+
+_mailbox_source_ids: dict[str, str] = {}
+_mailbox_source_lock = threading.Lock()
+
+_MAILBOX_EVIDENCE_SOURCE_TYPE = "EMAIL_MAILBOX"
+
+
+def get_mailbox_source_id(composition: "RuntimeComposition", mailbox) -> str:
+    """Resolve (or, on first use, create) the single stable evidence
+    `Source` row for `mailbox` (a `services.mailbox.mailbox.MailboxSource`).
+    Memoized in-process for the life of this mailbox_id."""
+    cached = _mailbox_source_ids.get(mailbox.mailbox_id)
+    if cached is not None:
+        return cached
+
+    with _mailbox_source_lock:
+        cached = _mailbox_source_ids.get(mailbox.mailbox_id)
+        if cached is not None:
+            return cached
+
+        existing = composition.api.source_repository.find_by_provider(
+            source_type=_MAILBOX_EVIDENCE_SOURCE_TYPE, provider=mailbox.mailbox_id
+        )
+        if existing is not None:
+            _mailbox_source_ids[mailbox.mailbox_id] = existing.source_id
+            return existing.source_id
+
+        source = composition.api.register_source(
+            source_type=_MAILBOX_EVIDENCE_SOURCE_TYPE,
+            provider=mailbox.mailbox_id,
+            status="ACTIVE",
+            actor_type=actor.SYSTEM,
+            actor_id="bagman-mailbox-sweep-bootstrap",
+            governed_entity_hint=mailbox.default_entity_id,
+            metadata={
+                "note": "stable per-mailbox evidence source, resolved-or-created once per "
+                "process (CD-6 Slice 4) — never one Source per swept message",
+                "mailbox_id": mailbox.mailbox_id,
+                "provider_kind": mailbox.provider_kind,
+            },
+        )
+        _mailbox_source_ids[mailbox.mailbox_id] = source.source_id
+        return source.source_id

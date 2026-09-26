@@ -27,6 +27,7 @@ import dataclasses
 from datetime import datetime
 from typing import Any, Mapping, Optional, Union
 
+import sqlalchemy as sa
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import DataError, IntegrityError, SQLAlchemyError
 
@@ -40,6 +41,7 @@ from core.errors import (
     ValidationError,
 )
 from core.external_reference import ExternalReferenceRepository
+from core.text_matching import normalize_address, normalize_domain
 from core.timestamps import utc_now
 from persistence.postgres.db_errors import (
     is_foreign_key_violation,
@@ -49,10 +51,12 @@ from persistence.postgres.db_errors import (
 from persistence.postgres.models import EvidenceItemRow, ExternalReferenceRow
 from persistence.postgres.session import get_engine, session_scope
 from services.evidence.evidence import (
+    MAILBOX_EVIDENCE_TYPES,
     STATUSES,
     EvidenceItem,
     EvidenceRepository,
     ExternalReferenceHint,
+    _DEFAULT_CANDIDATE_LIMIT,
     _normalize_content_hash,
 )
 
@@ -347,3 +351,60 @@ class PostgresEvidenceRepository(EvidenceRepository):
             raise PersistenceError(f"could not assign entity to EvidenceItem: {exc}") from exc
 
         return updated
+
+    def find_candidate_evidence_for_sender(
+        self,
+        *,
+        sender_domain: str,
+        sender_address: Optional[str] = None,
+        limit: int = _DEFAULT_CANDIDATE_LIMIT,
+        offset: int = 0,
+    ) -> list[EvidenceItem]:
+        normalized_domain = normalize_domain(sender_domain)
+        normalized_address = normalize_address(sender_address) if sender_address else None
+
+        try:
+            with session_scope(self._engine) as session:
+                query = session.query(EvidenceItemRow).filter(
+                    EvidenceItemRow.metadata_.has_key("sender_address"),
+                    EvidenceItemRow.metadata_.has_key("subject"),
+                    # CD-6 Slice 5 WI-2 — a documented, non-authoritative
+                    # narrowing judgment call (see
+                    # services.evidence.evidence.MAILBOX_EVIDENCE_TYPES'
+                    # own docstring): restricts the SQL scan to
+                    # evidence_type == "EMAIL" (the only mailbox-shaped
+                    # evidence_type any real ingestion path writes today).
+                    # This is purely a performance narrowing — every
+                    # returned row is still re-tested in Python by the
+                    # caller (the observed-evidence guard) via
+                    # core.text_matching, never trusted as final truth.
+                    EvidenceItemRow.evidence_type.in_(MAILBOX_EVIDENCE_TYPES),
+                )
+                if normalized_address is not None:
+                    # Exact (case-insensitive) match — real narrowing,
+                    # not just a prefilter, but still re-verified in
+                    # Python by the caller.
+                    query = query.filter(
+                        sa.func.lower(EvidenceItemRow.metadata_["sender_address"].astext) == normalized_address
+                    )
+                else:
+                    # Loose SQL-level ILIKE prefilter only (never the
+                    # source of match truth — see this method's own ABC
+                    # docstring): "<anything>@<normalized_domain>",
+                    # escaped so a literal '%'/'_' in the domain (should
+                    # never occur for a real domain, but defends against
+                    # one anyway) is not treated as an ILIKE wildcard.
+                    escaped = normalized_domain.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+                    query = query.filter(
+                        EvidenceItemRow.metadata_["sender_address"].astext.ilike(f"%@{escaped}", escape="\\")
+                    )
+                query = query.order_by(
+                    EvidenceItemRow.received_at.desc(), EvidenceItemRow.evidence_id.desc()
+                )
+                if offset:
+                    query = query.offset(offset)
+                query = query.limit(limit)
+                rows = query.all()
+                return [_row_to_evidence(row) for row in rows]
+        except SQLAlchemyError as exc:
+            raise PersistenceError(f"could not query candidate EvidenceItem rows for sender: {exc}") from exc

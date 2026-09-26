@@ -1,0 +1,92 @@
+# Governed Mac-production compose override — CD-6 ClamAV reliability
+# hardening, governance delta (2026-09-23, Architect-directed).
+#
+# Captures the FINAL, already-proven-in-production ClamAV persistent-
+# storage topology from the live Mac mini M4 appliance
+# (/opt/bagman/app/compose/bagman.docker-compose.yml, not tracked in
+# this repository) in source control, as an explicit opt-in layer over
+# the base compose file — NOT a redesign of what was already accepted,
+# NOT a change to the base file, and NOT a second competing deployment
+# architecture. Apply alongside the base file, exactly like the
+# existing docker-compose.debug-ports.yml pattern:
+#
+#   docker compose -p bagman \
+#     -f deployment/compose/docker-compose.yml \
+#     -f deployment/compose/docker-compose.mac-production.yml \
+#     up -d
+#
+# Before applying on a clean appliance, the external volume below must
+# already exist — see ops/provision_clamav_volume.sh (idempotent,
+# never touches an already-populated volume).
+#
+# ARCHITECTURAL EXCEPTION (ClamAV definition storage ONLY — does not
+# weaken PostgreSQL/MinIO/secret/evidence persistence doctrine):
+# BAGMAN's general rule is host-backed named volumes under
+# /opt/bagman/data/, so persistent data is directly macOS-inspectable
+# and covered by the appliance's own backup discipline. bagman-scan's
+# virus-definition store is the ONE deliberate exception, forced by a
+# real platform limitation on this appliance, not a preference —
+# two secure bind-mount designs were tried and proven unusable first:
+#
+#   1. `chown` the host bind-mount path to the scanner's uid:gid
+#      (1000:1000): silently ineffective. Colima's `virtiofs` share
+#      for /opt/bagman does not preserve real host-side chown through
+#      to the guest — every file is always presented to Linux
+#      containers as owned by the real connecting macOS identity
+#      (confirmed via `id <the appliance's macOS admin account>`),
+#      never whatever uid/gid you actually chown to, host-level `sudo`
+#      chown included. Reproduced directly and repeatedly.
+#   2. A group-based fix instead of running anything as root — host
+#      directory `chmod 2770` (setgid, owner+group only, zero access
+#      to "other") plus a supplementary GID added to `bagman-scan`
+#      only, so the scanner's own non-root daemons could write via
+#      group membership: also failed, and not only for the scanner's
+#      own processes — Docker's OWN daemon-level bind-mount
+#      preparation (running as uid 0, no matching supplementary group)
+#      was rejected identically, reproducibly (3/3 identical
+#      failures). Root cause: this virtiofs implementation enforces
+#      real POSIX permission checks end-to-end with no root/
+#      DAC_OVERRIDE bypass for ANY guest-side actor, including
+#      dockerd itself — so no permission mode that excludes "other"
+#      access can work through it, for any process.
+#   World-writable (`0777`) is explicitly PROHIBITED and was never
+#   used as a final state at any point.
+#
+# Fix actually used: a genuine Docker-managed `local` volume (below).
+# It lives entirely on Colima's own VM disk and never crosses the
+# virtiofs host<->guest boundary, so ordinary POSIX chown/chmod work
+# exactly as expected — verified directly: the scanner's own non-root
+# `clamav` user (uid:gid 1000:1000) owns and writes its own files
+# (mode 640 files / 750 directories, NOT world-accessible), and a real
+# freshclam network database update (a genuine version bump, downloaded
+# fresh, tested, and installed) completed with zero permission errors.
+#
+# This exception is scoped to ClamAV definition data ONLY. That data
+# is not canonical (it is fully, automatically rebuildable by
+# freshclam from an empty volume) — unlike PostgreSQL, MinIO, secrets,
+# or evidence data, none of which this override touches, and none of
+# which this exception's reasoning extends to.
+
+services:
+  bagman-scan:
+    volumes:
+      - bagman-clamav-data:/var/lib/clamav
+    deploy:
+      resources:
+        limits:
+          # 2 GiB (Architect-approved 2026-09-22, option D = A+C, CD-6
+          # ClamAV reliability hardening). Colima's own VM memory
+          # allocation (6 GiB on the live appliance) is a separate,
+          # unrelated setting this override does not touch.
+          memory: 2048M
+
+volumes:
+  # `external: true` — this volume's lifecycle is deliberately NOT
+  # tied to `docker compose down`/`up` on this stack: it is
+  # provisioned once, explicitly, by ops/provision_clamav_volume.sh,
+  # and never auto-created or auto-removed by compose itself. This is
+  # what stops an ordinary `compose down` from silently discarding
+  # already-downloaded virus definitions — compose only ever attaches
+  # to an external volume, never creates or destroys one.
+  bagman-clamav-data:
+    external: true

@@ -56,8 +56,8 @@
     },
     "status": {
       "type": "string",
-      "enum": ["REQUESTED", "RUNNING", "SUCCEEDED", "FAILED", "REJECTED"],
-      "description": "Invocation lifecycle state (PID §28). Closed enum — `ai.invocation.ALLOWED_TRANSITIONS` is the single source of truth for which transitions between these values are valid; see that module's docstring for the exact state machine and the documented distinction between `REJECTED` (never dispatched to a provider at all — a pre-flight policy/contract refusal) and `RUNNING -> FAILED` (a dispatched call that errored, timed out, or produced output that failed structured validation)."
+      "enum": ["REQUESTED", "RUNNING", "SUCCEEDED", "FAILED", "REJECTED", "TIMED_OUT", "CANCELLED"],
+      "description": "Invocation lifecycle state (PID §28; `TIMED_OUT`/`CANCELLED` added by the CD-6 reliability delta, PID §100.14/§100.16). Closed enum — `ai.invocation.ALLOWED_TRANSITIONS` is the single source of truth for which transitions between these values are valid; see that module's docstring for the exact state machine, the documented distinction between `REJECTED` (never dispatched to a provider at all — a pre-flight policy/contract refusal) and `RUNNING -> FAILED` (a dispatched call that errored, or produced output that failed structured validation), and the further distinction of both from `TIMED_OUT` (BAGMAN's own bounded timeout fired — a live runner timeout, or the bounded stale-RUNNING recovery backstop discovering and closing out an abandoned row) and `CANCELLED` (an invocation explicitly cancelled by an operator action or a deliberate application-level decision, never a failure/timeout on its own)."
     },
     "correlation_id": {
       "$ref": "https://bagman.internal/contracts/common/bagman.identifier.v1.schema.json",
@@ -83,7 +83,7 @@
     },
     "input_references": {
       "type": "object",
-      "description": "Canonical references this invocation's input traces back to (PID §29) — e.g. `{\"evidence_id\": \"...\"}`, `{\"evidence_id\": \"...\", \"intake_id\": \"...\"}`. Open object (genuinely free-form: different tasks reference different canonical objects) but never opaque/disconnected from source evidence — `ai.invocation.derive_primary_input_reference` requires at least one of a fixed, documented set of recognised reference keys (`evidence_id`, `intake_id`, `entity_id`, in that precedence order) to be present, both to satisfy PID §29 and to identify the subject the one-active-invocation concurrency guard (PID §73) applies to.",
+      "description": "Canonical references this invocation's input traces back to (PID §29) — e.g. `{\"evidence_id\": \"...\"}`, `{\"evidence_id\": \"...\", \"intake_id\": \"...\"}`, or (CD-6 reliability delta, PID §98/§100) `{\"conversation_id\": \"...\"}` for a genuinely contextless Ask BAGMAN turn with no document/intake/entity attached. Open object (genuinely free-form: different tasks reference different canonical objects) but never opaque/disconnected from source evidence — `ai.invocation.derive_primary_input_reference` requires at least one of a fixed, documented set of recognised reference keys (`evidence_id`, `intake_id`, `entity_id`, `conversation_id`, in that precedence order — `conversation_id` deliberately last, see that function's own module docstring) to be present, both to satisfy PID §29 and to identify the subject the one-active-invocation concurrency guard (PID §73) applies to.",
       "additionalProperties": true
     },
     "prompt_contract_version": {

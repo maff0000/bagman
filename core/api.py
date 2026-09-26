@@ -59,6 +59,7 @@ from typing import Any, Mapping, Optional, Union
 from core import identity
 from core.audit import AuditEvent, AuditRepository, InMemoryAuditRepository
 from core.entity import EntityRepository, GovernedEntity, InMemoryEntityRepository
+from core.errors import ConflictError
 from core.external_reference import (
     ExternalReference,
     ExternalReferenceRepository,
@@ -121,6 +122,8 @@ class BagmanCanonicalAPI:
         metadata: Optional[Mapping[str, Any]] = None,
         correlation_id: Optional[str] = None,
         causation_id: Optional[str] = None,
+        fiscal_year_start_month_day: Optional[str] = None,
+        historical_floor_override_at: Optional[datetime] = None,
     ) -> GovernedEntity:
         resolved_correlation_id = correlation_id or identity.generate_id()
 
@@ -130,6 +133,8 @@ class BagmanCanonicalAPI:
             display_name=display_name,
             status=status,
             metadata=metadata,
+            fiscal_year_start_month_day=fiscal_year_start_month_day,
+            historical_floor_override_at=historical_floor_override_at,
         )
 
         self.record_audit_event(
@@ -301,6 +306,77 @@ class BagmanCanonicalAPI:
                 },
             )
         return reference
+
+    def assign_evidence_entity(
+        self,
+        *,
+        evidence_id: str,
+        entity_id: str,
+        actor_type: str,
+        actor_id: str,
+        correlation_id: Optional[str] = None,
+        causation_id: Optional[str] = None,
+    ) -> EvidenceItem:
+        """CD-6 GUI-operations-foundation follow-on WO (item E) — the
+        narrow, audited canonical operation that actually wires
+        ``EvidenceRepository.assign_entity`` (already implemented,
+        previously unwired by any real caller anywhere) into use.
+
+        Validates ``entity_id`` is a REAL, existing ``GovernedEntity``
+        first (mirrors every other "never trust a caller-supplied
+        entity_id without proving it real" check already established at
+        this same call boundary elsewhere in this codebase, e.g.
+        ``app/api/routers/xero.py::_require_entity``), then loads the
+        target ``EvidenceItem`` (``core.errors.NotFoundError`` if it does
+        not exist).
+
+        * ``entity_id`` currently ``None`` on the evidence item -> assign
+          it (via the existing ``EvidenceRepository.assign_entity``) and
+          record a real ``EVIDENCE_ENTITY_ASSIGNED`` audit event
+          (``subject_type="EvidenceItem"``, ``subject_id=evidence_id``,
+          payload carrying ``entity_id``).
+        * the SAME ``entity_id`` already assigned -> idempotent no-op;
+          returns the current, unchanged ``EvidenceItem`` (a genuine
+          double-submit/retry of the same assignment must complete
+          cleanly, and no audit event is re-emitted for a no-op).
+        * a DIFFERENT ``entity_id`` already assigned -> raises
+          ``core.errors.ConflictError`` loudly — reassignment/correction
+          is an explicit, NOT-built-here governed workflow (architect's
+          own instruction), never silently overwritten here.
+        """
+        # Real existence check, before anything else — never trust a
+        # caller-supplied entity_id without proving it real first.
+        self.entity_repository.get_entity(entity_id)
+
+        current = self.evidence_repository.get_evidence(evidence_id)
+
+        if current.entity_id == entity_id:
+            # Idempotent no-op — a genuine retry/double-submit of the
+            # exact same assignment must complete cleanly.
+            return current
+
+        if current.entity_id is not None:
+            raise ConflictError(
+                f"EvidenceItem '{evidence_id}' already has a DIFFERENT entity_id "
+                f"('{current.entity_id}') assigned; reassignment to '{entity_id}' is an explicit, "
+                "separate, NOT-built-here governed correction workflow — refusing to silently "
+                "overwrite an already-resolved entity assignment"
+            )
+
+        updated = self.evidence_repository.assign_entity(evidence_id, entity_id)
+
+        resolved_correlation_id = correlation_id or identity.generate_id()
+        self.record_audit_event(
+            event_type="EVIDENCE_ENTITY_ASSIGNED",
+            actor_type=actor_type,
+            actor_id=actor_id,
+            subject_type="EvidenceItem",
+            subject_id=evidence_id,
+            correlation_id=resolved_correlation_id,
+            causation_id=causation_id,
+            payload={"entity_id": entity_id},
+        )
+        return updated
 
     def record_provenance(
         self,

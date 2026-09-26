@@ -1,0 +1,85 @@
+{
+  "_synthetic_notice": "SYNTHETIC TEST DATA — NOT REAL EVIDENCE. Every sender/subject/body/company/ticker/amount below is fabricated for CD-6 DOCUMENT_TYPE_PROPOSAL v3 challenge-set testing only (BAGMAN PID.md §8/§15 Test E). No real evidence_id, no real brokerage, no real customer or account ever appears here.",
+  "items": [
+    {
+      "id": "synth-future-01-takeover-future-close",
+      "label_family": "future_corporate_event",
+      "sender": "corporate-actions@synthetic-brokerplatform.example",
+      "subject": "FYI: Takeover Notification — SYNTH Holdings PLC (Ticker: SYNH)",
+      "body": "SYNTHETIC TEST FIXTURE — fabricated for BAGMAN testing only.\n\nAccount: ACCT-SYN-000101\n\nStatus: ANNOUNCED\n\nThis is an informational notice from the Synthetic Corporate Events Feed. Fictional Acquirer Holdings Ltd has announced a proposed takeover offer for SYNTH Holdings PLC (Ticker: SYNH). The offer has not yet completed.\n\nExpected completion date: 2027-03-15 (subject to shareholder and regulatory approval).\n\nNo action has been taken on your account in connection with this notice. This message is provided for informational purposes only and does not itself reflect any completed transaction.",
+      "expected_document_type": "NON_ACCOUNTING_DOCUMENT"
+    },
+    {
+      "id": "synth-future-02-merger-announcement",
+      "label_family": "future_corporate_event",
+      "sender": "notices@synthetic-investplatform.example",
+      "subject": "Merger Announcement: Fictional Widgets Corp and Synthetic Gadgets Inc",
+      "body": "SYNTHETIC TEST FIXTURE — fabricated for BAGMAN testing only.\n\nAccount reference: ACCT-SYN-000202\n\nStatus: ANNOUNCED\n\nFictional Widgets Corp (Ticker: FWCX) and Synthetic Gadgets Inc (Ticker: SGIX) have jointly announced a proposed merger of equals. The transaction is expected to close in approximately two quarters, subject to customary closing conditions and regulatory clearance.\n\nNo shares or cash have moved into or out of your account as a result of this announcement. This is a general corporate-event notice, not a record of a completed transaction.",
+      "expected_document_type": "NON_ACCOUNTING_DOCUMENT"
+    },
+    {
+      "id": "synth-future-03-tender-offer-info",
+      "label_family": "future_corporate_event",
+      "sender": "corporate-actions@synthetic-brokerplatform.example",
+      "subject": "Tender Offer Information — Synthetic Materials Group (Ticker: SMGX)",
+      "body": "SYNTHETIC TEST FIXTURE — fabricated for BAGMAN testing only.\n\nAccount: ACCT-SYN-000303\n\nStatus: ANNOUNCED\n\nA third party has commenced a tender offer for shares of Synthetic Materials Group (Ticker: SMGX). This message is for informational purposes only, describing the terms of the pending offer. The tender offer window is scheduled to close on 2027-05-01.\n\nYou have not yet tendered any shares, and no securities or cash have moved in your account in connection with this offer.",
+      "expected_document_type": "NON_ACCOUNTING_DOCUMENT"
+    },
+    {
+      "id": "synth-future-04-scheduled-stock-split",
+      "label_family": "future_corporate_event",
+      "sender": "notices@synthetic-investplatform.example",
+      "subject": "Scheduled Corporate Action: Upcoming Stock Split — Synthetic Robotics Ltd",
+      "body": "SYNTHETIC TEST FIXTURE — fabricated for BAGMAN testing only.\n\nAccount: ACCT-SYN-000404\n\nStatus: SCHEDULED\n\nSynthetic Robotics Ltd (Ticker: SROX) has announced a scheduled 2-for-1 stock split, expected to take effect on 2027-02-10. This notice is provided ahead of the effective date for informational purposes.\n\nYour holdings have not yet been adjusted. No shares have been credited or debited to your account as of this notice.",
+      "expected_document_type": "NON_ACCOUNTING_DOCUMENT"
+    },
+    {
+      "id": "synth-future-05-general-analyst-fyi",
+      "label_family": "future_corporate_event",
+      "sender": "research@synthetic-brokerplatform.example",
+      "subject": "Corporate Events Weekly FYI — Sector Watchlist Update",
+      "body": "SYNTHETIC TEST FIXTURE — fabricated for BAGMAN testing only.\n\nThis is a general informational bulletin from the Synthetic Corporate Events Feed summarising several pending, not-yet-completed corporate actions across your watchlist, including two proposed mergers and one scheduled rights issue, all marked Status: ANNOUNCED with expected future effective dates.\n\nNo account-level cash or security movement has occurred as a result of this bulletin. This is commentary/analyst-style content, not a record of a completed transaction.",
+      "expected_document_type": "NON_ACCOUNTING_DOCUMENT"
+    },
+    {
+      "id": "synth-executed-01-currency-conversion-completed",
+      "label_family": "executed_broker_activity",
+      "sender": "notices@synthetic-brokerplatform.example",
+      "subject": "Currency Conversion Completed — Account ACCT-SYN-000505",
+      "body": "SYNTHETIC TEST FIXTURE — fabricated for BAGMAN testing only.\n\nAccount: ACCT-SYN-000505\n\nThis notice confirms that a currency conversion was completed on your account on 2026-08-14. USD 1,250.00 was converted to GBP 985.32 at an executed rate of 0.7883. The converted funds have already been posted to your account balance.\n\nThis transaction has fully settled; no further action is required.",
+      "expected_document_type": "BROKER_ACTIVITY_NOTICE"
+    },
+    {
+      "id": "synth-executed-02-deposit-posted",
+      "label_family": "executed_broker_activity",
+      "sender": "notices@synthetic-investplatform.example",
+      "subject": "Deposit Activity Update — Funds Posted",
+      "body": "SYNTHETIC TEST FIXTURE — fabricated for BAGMAN testing only.\n\nAccount: ACCT-SYN-000606\n\nA deposit of GBP 5,000.00 was received and has been posted to your account as of 2026-09-02. The funds are now available in your account balance and this deposit has been fully processed.\n\nNo further action is required regarding this completed deposit.",
+      "expected_document_type": "BROKER_ACTIVITY_NOTICE"
+    },
+    {
+      "id": "synth-executed-03-withdrawal-processed",
+      "label_family": "executed_broker_activity",
+      "sender": "notices@synthetic-brokerplatform.example",
+      "subject": "Withdrawal Processed — Account ACCT-SYN-000707",
+      "body": "SYNTHETIC TEST FIXTURE — fabricated for BAGMAN testing only.\n\nAccount: ACCT-SYN-000707\n\nYour withdrawal request for GBP 750.00 was processed and completed on 2026-09-10. The funds have already been sent to your registered bank account and this withdrawal is now fully settled.\n\nThis is a record of a completed cash movement out of your account.",
+      "expected_document_type": "BROKER_ACTIVITY_NOTICE"
+    },
+    {
+      "id": "synth-executed-04-trade-confirmation-executed",
+      "label_family": "executed_broker_activity",
+      "sender": "trade-confirmations@synthetic-brokerplatform.example",
+      "subject": "Trade Confirmation — Executed Order, Account ACCT-SYN-000808",
+      "body": "SYNTHETIC TEST FIXTURE — fabricated for BAGMAN testing only.\n\nAccount: ACCT-SYN-000808\n\nThis confirms that your order to BUY 100 shares of Synthetic Cloud Services Ltd (Ticker: SCSX) was executed on 2026-09-18 at a price of GBP 12.40 per share, for a total consideration of GBP 1,240.00. The trade has settled and the shares have been credited to your account.\n\nThis is a confirmation of one already-executed, completed trade.",
+      "expected_document_type": "BROKER_ACTIVITY_NOTICE"
+    },
+    {
+      "id": "synth-executed-05-corporate-action-cash-movement-completed",
+      "label_family": "executed_broker_activity",
+      "sender": "corporate-actions@synthetic-investplatform.example",
+      "subject": "Corporate Action Completed — Cash Dividend Credited",
+      "body": "SYNTHETIC TEST FIXTURE — fabricated for BAGMAN testing only.\n\nAccount: ACCT-SYN-000909\n\nThe previously scheduled cash dividend for Synthetic Utilities Group (Ticker: SUGX) has now been paid. GBP 42.50 was credited to your account on 2026-09-20 in respect of your holding. This corporate action has fully completed and the cash movement has already taken effect on your account.\n\nNo further action is required; this is a record of a completed account-level cash movement.",
+      "expected_document_type": "BROKER_ACTIVITY_NOTICE"
+    }
+  ]
+}

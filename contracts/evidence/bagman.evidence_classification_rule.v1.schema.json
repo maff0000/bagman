@@ -1,0 +1,151 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://bagman.internal/contracts/evidence/bagman.evidence_classification_rule.v1.schema.json",
+  "title": "BAGMAN EvidenceClassificationRule",
+  "description": "A deterministic, operator-governed document-classification rule (CD-6 Slice 5 WI-1 — see services.evidence.classification_rule's own module docstring). A SEPARATE governed authority from bagman.mailbox_domain_rule.v1 — never sharing its identity space or closed vocabularies. sender_scope_type/subject_predicate_type are this module's OWN closed sets. No ATTACHMENT_FILENAME sender scope exists in V1 — there is no governed attachment-extraction pipeline yet. Semantic fields (sender_scope_type, sender_scope_value, subject_predicate_type, subject_predicate_value, document_type) are set once at creation and never mutated; only status/retired_at ever change, via a single one-way ACTIVE -> RETIRED transition.",
+  "type": "object",
+  "properties": {
+    "rule_id": {
+      "$ref": "https://bagman.internal/contracts/common/bagman.identifier.v1.schema.json",
+      "description": "Canonical BAGMAN identifier for this rule row."
+    },
+    "sender_scope_type": {
+      "type": "string",
+      "enum": ["EXACT_SENDER_DOMAIN", "EXACT_SENDER_ADDRESS"],
+      "description": "Deliberately exactly two values in V1 — no ATTACHMENT_FILENAME scope (see module docstring)."
+    },
+    "sender_scope_value": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The normalised sender domain or sender address this rule matches, depending on sender_scope_type — see the conditional format rules below."
+    },
+    "subject_predicate_type": {
+      "type": "string",
+      "enum": ["EXACT", "STARTS_WITH"],
+      "description": "This module's own closed predicate-type vocabulary (identical values to bagman.mailbox_domain_rule.v1's own EXACT_DOMAIN_SUBJECT tier, but a separate closed set belonging to this authority). No CONTAINS, no regex, no glob."
+    },
+    "subject_predicate_value": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The predicate's own comparison value, always stored in canonical normalised form (Unicode NFKC, casefolded, stripped, internal whitespace collapsed — see services.mailbox.domain_rule.normalize_subject_for_policy, reused directly by this module)."
+    },
+    "document_type": {
+      "type": "string",
+      "enum": [
+        "SUPPLIER_INVOICE",
+        "RECEIPT",
+        "ORDER_CONFIRMATION",
+        "REFUND_CONFIRMATION",
+        "BROKER_STATEMENT",
+        "BROKER_ACTIVITY_NOTICE",
+        "NON_ACCOUNTING_DOCUMENT",
+        "UNKNOWN"
+      ],
+      "description": "The same closed V1 document-type vocabulary as bagman.evidence_classification.v1 — this rule's own governed answer for what document_type a matching message should be classified as."
+    },
+    "status": {
+      "type": "string",
+      "enum": ["ACTIVE", "RETIRED"],
+      "description": "A single one-way lifecycle: ACTIVE -> RETIRED only, never the reverse in V1. To express a changed decision: retire this rule, then create a brand new rule row (optionally pointing its own supersedes_rule_id back at this one)."
+    },
+    "source": {
+      "type": "string",
+      "enum": ["OPERATOR", "BAGMAN_PROPOSED"],
+      "description": "Who/what proposed this rule. 'OPERATOR' — a human approved this rule directly. 'BAGMAN_PROPOSED' — forward-declared for a future automated-proposal producer; no producer exists in this delivery."
+    },
+    "supersedes_rule_id": {
+      "oneOf": [
+        { "$ref": "https://bagman.internal/contracts/common/bagman.identifier.v1.schema.json" },
+        { "type": "null" }
+      ],
+      "description": "The prior rule row this rule replaces, if any. Null for a rule that is not itself a replacement of an earlier rule."
+    },
+    "created_at": {
+      "$ref": "https://bagman.internal/contracts/common/bagman.utc_timestamp.v1.schema.json",
+      "description": "UTC timestamp this rule row was created."
+    },
+    "approved_at": {
+      "$ref": "https://bagman.internal/contracts/common/bagman.utc_timestamp.v1.schema.json",
+      "description": "UTC timestamp this rule was approved by its source. Always populated at creation in this delivery (no unapproved-and-pending rule state is persisted in V1)."
+    },
+    "retired_at": {
+      "oneOf": [
+        { "$ref": "https://bagman.internal/contracts/common/bagman.utc_timestamp.v1.schema.json" },
+        { "type": "null" }
+      ],
+      "description": "UTC timestamp this rule was retired. Non-null if and only if status == 'RETIRED'."
+    },
+    "schema_version": {
+      "allOf": [
+        { "$ref": "https://bagman.internal/contracts/common/bagman.schema_version.v1.schema.json" }
+      ],
+      "const": "bagman.evidence_classification_rule.v1",
+      "description": "Must literally equal \"bagman.evidence_classification_rule.v1\"."
+    }
+  },
+  "required": [
+    "rule_id",
+    "sender_scope_type",
+    "sender_scope_value",
+    "subject_predicate_type",
+    "subject_predicate_value",
+    "document_type",
+    "status",
+    "source",
+    "supersedes_rule_id",
+    "created_at",
+    "approved_at",
+    "retired_at",
+    "schema_version"
+  ],
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "description": "status == RETIRED requires a real retired_at; status == ACTIVE requires retired_at to be null — mirrors bagman.mailbox_domain_rule.v1's own match_mode-conditional allOf/if/then pattern, applied here to the status/retired_at pair.",
+      "if": {
+        "properties": { "status": { "const": "RETIRED" } },
+        "required": ["status"]
+      },
+      "then": {
+        "properties": {
+          "retired_at": { "$ref": "https://bagman.internal/contracts/common/bagman.utc_timestamp.v1.schema.json" }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "status": { "const": "ACTIVE" } },
+        "required": ["status"]
+      },
+      "then": {
+        "properties": {
+          "retired_at": { "type": "null" }
+        }
+      }
+    },
+    {
+      "description": "sender_scope_type == EXACT_SENDER_ADDRESS requires sender_scope_value to look like an email address — reuses bagman.mailbox_domain_rule.v1's own sender_address pattern verbatim.",
+      "if": {
+        "properties": { "sender_scope_type": { "const": "EXACT_SENDER_ADDRESS" } },
+        "required": ["sender_scope_type"]
+      },
+      "then": {
+        "properties": {
+          "sender_scope_value": { "type": "string", "minLength": 3, "pattern": "^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$" }
+        }
+      }
+    },
+    {
+      "description": "sender_scope_type == EXACT_SENDER_DOMAIN requires sender_scope_value to look like a bare domain — reuses bagman.mailbox_domain_rule.v1's own sender_domain pattern verbatim.",
+      "if": {
+        "properties": { "sender_scope_type": { "const": "EXACT_SENDER_DOMAIN" } },
+        "required": ["sender_scope_type"]
+      },
+      "then": {
+        "properties": {
+          "sender_scope_value": { "type": "string", "minLength": 1, "pattern": "^[^\\s@]+\\.[^\\s@]+$" }
+        }
+      }
+    }
+  ]
+}

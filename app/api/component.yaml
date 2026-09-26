@@ -100,6 +100,27 @@ responsibility: >
   area — still plain vanilla ES modules served by the same
   `StaticFiles` mount, no build step, no new runtime/dependency.
 
+  CD-6 Slice 1 (PID §98, "GUI Operations Foundation") additionally owns:
+  a real premium application shell (extending the existing token system
+  in app/api/static/style.css and the existing tab system in
+  app/api/static/shell/shell.js — never replacing either), the
+  universal Needs You queue HTTP surface (GET /internal/needs-you, GET
+  /internal/needs-you/{id}, POST /internal/needs-you/{id}/resolve --
+  app/api/routers/needs_you.py, new file), the cross-BAGMAN activity/
+  audit stream (GET /internal/activity -- app/api/routers/activity.py,
+  new file), a new GET /internal/entities read route plus the
+  idempotent canonical three-entity seed lifecycle
+  (app/api/composition.py's own "Stable canonical entity seed
+  lifecycle" section -- mirrors the existing MANUAL_UPLOAD Source
+  lifecycle exactly), and one new hook inside the EXISTING governed
+  intake endpoint
+  (app/api/routers/intake.py::_create_needs_you_item_for_accepted_evidence)
+  that raises exactly one COMPANY_REQUIRED Needs You item the moment an
+  intake attempt reaches REGISTERED -- never a second, parallel upload/
+  registration path. No mailbox/Graph/IMAP/Gmail, Xero OAuth/posting, or
+  bank-feed code is introduced by this slice (PID §98.11 Slice 1 scope
+  boundary).
+
 owns: []
 
 # What app/api/ actually imports: core.api.BagmanCanonicalAPI and
@@ -133,6 +154,7 @@ consumes:
   - BAGMAN.CORE
   - BAGMAN.SERVICES.EVIDENCE
   - BAGMAN.EVIDENCE.INTAKE
+  - BAGMAN.NEEDS_YOU
   - BAGMAN.PERSISTENCE.POSTGRES
   - BAGMAN.PERSISTENCE.OBJECTS
   - BAGMAN.AI
@@ -151,6 +173,13 @@ consumes:
 # INTAKE_COMPLETED, INTAKE_FAILED) — via core.api.BagmanCanonicalAPI
 # .record_audit_event(), not a new repository, but the event TYPES
 # themselves are minted here, not inside core/ or services/evidence/.
+# CD-6 Slice 1 adds NEEDS_YOU_ITEM_CREATED (minted by
+# app/api/routers/intake.py's own new hook, threaded onto the SAME
+# intake correlation chain) and NEEDS_YOU_ITEM_RESOLVED/
+# NEEDS_YOU_ITEM_DISMISSED (minted by app/api/routers/needs_you.py's
+# own resolve endpoint) — same "event types minted at the orchestration
+# layer, not inside services/needs_you/" doctrine as every intake event
+# above (see services/needs_you/component.yaml's own `produces: []`).
 produces:
   - INTAKE_RECEIVED
   - INTAKE_VALIDATION_STARTED
@@ -161,6 +190,9 @@ produces:
   - EVIDENCE_REGISTERED
   - INTAKE_COMPLETED
   - INTAKE_FAILED
+  - NEEDS_YOU_ITEM_CREATED
+  - NEEDS_YOU_ITEM_RESOLVED
+  - NEEDS_YOU_ITEM_DISMISSED
 
 dependencies:
   - fastapi

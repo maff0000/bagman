@@ -39,8 +39,10 @@ from datetime import datetime, timezone
 
 #: Extra fields a call site may attach via `extra={...}`; included in
 #: the rendered JSON only when actually present on the LogRecord (never
-#: rendered as a literal `null`/empty placeholder).
-_OPTIONAL_EXTRA_FIELDS = ("correlation_id", "canonical_object_id", "event_type", "component")
+#: rendered as a literal `null`/empty placeholder). `duration_ms` is
+#: used by `app/api/main.py::correlation_id_middleware`'s own sanitized
+#: request-completion log line (see module docstring above).
+_OPTIONAL_EXTRA_FIELDS = ("correlation_id", "canonical_object_id", "event_type", "component", "duration_ms")
 
 #: A stack trace is genuinely useful server-side but can be long;
 #: capped defensively so one runaway traceback can never dominate a log
@@ -91,11 +93,39 @@ def configure_logging(level: str = "INFO") -> None:
     handler.setFormatter(_JsonFormatter())
     root.addHandler(handler)
 
-    # uvicorn's own loggers otherwise emit their own (non-JSON) access
-    # line format; route them through the same JSON formatter/handler
-    # rather than suppressing them, so container logs stay one
-    # consistent shape end to end.
-    for logger_name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
+    # uvicorn's own loggers otherwise emit their own (non-JSON) log line
+    # format; route "uvicorn"/"uvicorn.error" (startup/shutdown/
+    # exception logging — no per-request query strings) through the
+    # same JSON formatter/handler rather than suppressing them, so
+    # container logs stay one consistent shape end to end.
+    for logger_name in ("uvicorn", "uvicorn.error"):
         uvicorn_logger = logging.getLogger(logger_name)
         uvicorn_logger.handlers.clear()
         uvicorn_logger.propagate = True
+
+    # "uvicorn.access" is DIFFERENT: its own per-request LogRecord's
+    # `message` already contains the FULL raw request target, INCLUDING
+    # the query string (e.g. Google's/Microsoft's/Xero's own OAuth
+    # callback `?code=...&state=...`), by the time it is emitted —
+    # merely re-routing it through the JSON formatter above would wrap
+    # that raw request line in JSON, NOT redact it (the real leak a live
+    # Gmail OAuth attempt hit: the full callback URL, code and state
+    # included, ended up verbatim in this container's plaintext logs).
+    # This logger is therefore DISABLED entirely, never merely
+    # reformatted: `disabled = True` makes `logging.Logger.handle()`
+    # return immediately, before `callHandlers` (and therefore before
+    # any handler on this logger OR any ancestor it would otherwise
+    # propagate to, including the root handler configured above) ever
+    # sees the record — genuinely effective, not merely "looks right";
+    # `handlers.clear()` + `propagate = False` are redundant belt-and-
+    # suspenders on top of that, not the primary mechanism. See
+    # `tests/app_api/test_access_log_sanitization.py` for the empirical,
+    # canary-based proof this holds. `app/api/main.py
+    # ::correlation_id_middleware` emits BAGMAN's own sanitized
+    # request-completion log line in its place — method + URL PATH ONLY
+    # (never `request.url.query`/any query string, for ANY route, not
+    # just OAuth ones) + status code + duration.
+    access_logger = logging.getLogger("uvicorn.access")
+    access_logger.handlers.clear()
+    access_logger.propagate = False
+    access_logger.disabled = True

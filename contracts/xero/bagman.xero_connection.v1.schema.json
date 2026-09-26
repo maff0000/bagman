@@ -1,0 +1,114 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://bagman.internal/contracts/xero/bagman.xero_connection.v1.schema.json",
+  "title": "BAGMAN XeroConnection",
+  "description": "Canonical mapping of one BAGMAN `GovernedEntity` (a company) to one Xero organisation/tenant (CD-6 Slice 2, PID §98.4/§102, architect spec §2/§17). At most one `XeroConnection` exists per `entity_id`, and at most one exists per `tenant_id` once populated (both enforced as real database-level unique constraints, not merely by this contract — see `persistence/postgres/xero_models.py`) — a company maps to at most one Xero organisation, and a Xero organisation is never silently mapped to more than one BAGMAN company (architect spec §17's explicit anti-cross-mapping instruction; a future delivery may relax the second direction, deliberately, with its own migration). Never carries a raw OAuth token value of any kind (`token_expires_at` is metadata only) — see `services/xero/connection.py`'s module docstring for where the actual access/refresh tokens are stored instead.", "type": "object",
+  "properties": {
+    "xero_connection_id": {
+      "$ref": "https://bagman.internal/contracts/common/bagman.identifier.v1.schema.json",
+      "description": "Canonical BAGMAN identifier for this connection row."
+    },
+    "entity_id": {
+      "$ref": "https://bagman.internal/contracts/common/bagman.identifier.v1.schema.json",
+      "description": "The BAGMAN `GovernedEntity` this connection belongs to. Immutable once set — a connection is never re-pointed at a different entity; disconnect and create a fresh one instead."
+    },
+    "provider": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The external accounting-system provider this connection speaks to. Deliberately an OPEN string field at the CONTRACT layer (never a closed JSON Schema `enum`/`const` naming a specific external provider brand) — this repository's own `tests/integration/test_architecture_boundaries.py::test_no_schema_file_hardcodes_a_provider_name_inside_a_structural_constraint` forbids exactly that (a real external-provider brand token baked into a schema structural constraint), the same rule that already keeps `source/bagman.source.v1.schema.json`'s own `provider` field open despite listing `XERO` as one of its documented example values. CD-6 Slice 2's own domain layer (`services/xero/connection.py`) separately enforces a CLOSED, single-value Python-level set (`PROVIDERS = frozenset({\"XERO\"})`, extensible later without a contract redesign) — mirroring `ai.invocation.PROVIDERS`'s closed-set doctrine at the application layer, while this field stays open at the contract layer for the same reason `source.provider` does. Currently always `\"XERO\"`."
+    },
+    "tenant_id": {
+      "oneOf": [
+        { "type": "string", "minLength": 1 },
+        { "type": "null" }
+      ],
+      "description": "The external provider's own organisation/tenant identifier (Xero's `tenantId` from `GET /connections`), resolved SERVER-SIDE only — never taken from browser/client input (architect spec §3's explicit anti-tenant-substitution instruction). `null` while `status` is `PENDING` (the OAuth exchange has not yet completed) or after a `DISCONNECTED`/`REVOKED` transition that intentionally clears it (see `services/xero/connection.py` for exactly which transitions preserve vs. clear this field)."
+    },
+    "tenant_name": {
+      "oneOf": [
+        { "type": "string", "minLength": 1 },
+        { "type": "null" }
+      ],
+      "description": "A SNAPSHOT of the Xero organisation's display name, refreshed on each successful connection check/sync — NOT canonical identity (`tenant_id` is); display-only, may lag reality between syncs."
+    },
+    "status": {
+      "type": "string",
+      "enum": ["PENDING", "CONNECTED", "DISCONNECTED", "REVOKED", "ERROR"],
+      "description": "This connection's own closed state machine (see `services/xero/connection.py::ALLOWED_TRANSITIONS` for the full, documented transition table): `PENDING` (an OAuth flow was initiated for this entity but has not yet completed), `CONNECTED` (a real tenant is mapped and usable), `DISCONNECTED` (an operator explicitly disconnected it), `REVOKED` (Xero itself rejected/revoked access — detected via a 401/403 on a live call, distinct from an operator-initiated disconnect), `ERROR` (a real, ongoing fault — e.g. persistent token-refresh failure — distinct from a transient single-sync failure, which does not by itself change this field; see `services/xero/sync.py`)."
+    },
+    "connected_at": {
+      "oneOf": [
+        { "$ref": "https://bagman.internal/contracts/common/bagman.utc_timestamp.v1.schema.json" },
+        { "type": "null" }
+      ],
+      "description": "UTC timestamp of the most recent transition into `CONNECTED`. `null` if never yet connected."
+    },
+    "last_successful_sync_at": {
+      "oneOf": [
+        { "$ref": "https://bagman.internal/contracts/common/bagman.utc_timestamp.v1.schema.json" },
+        { "type": "null" }
+      ],
+      "description": "UTC timestamp of the most recent reference-data sync run that reached `SUCCEEDED` for this connection. `null` if none has ever succeeded. Drives the GUI's/operator's staleness signal (see `services/xero/sync.py::is_stale`)."
+    },
+    "last_attempted_sync_at": {
+      "oneOf": [
+        { "$ref": "https://bagman.internal/contracts/common/bagman.utc_timestamp.v1.schema.json" },
+        { "type": "null" }
+      ],
+      "description": "UTC timestamp of the most recent sync ATTEMPT, successful or not — distinct from `last_successful_sync_at` so a run of failures is visible even while the last successful projection is still being served (architect spec §5/§20's 'never silently replace last-known-good data' requirement made observable)."
+    },
+    "token_expires_at": {
+      "oneOf": [
+        { "$ref": "https://bagman.internal/contracts/common/bagman.utc_timestamp.v1.schema.json" },
+        { "type": "null" }
+      ],
+      "description": "UTC expiry of the currently-held access token — METADATA ONLY, used to decide when to pre-emptively refresh. Never the token value itself, which never appears anywhere in this contract, in an audit-event payload, or in a GUI response (architect spec §24's 'no credentials in browser storage', taken further here as 'no credentials anywhere this contract's instances travel')."
+    },
+    "created_at": {
+      "$ref": "https://bagman.internal/contracts/common/bagman.utc_timestamp.v1.schema.json",
+      "description": "UTC timestamp this connection row was first created (at OAuth-connect initiation, in `PENDING`)."
+    },
+    "updated_at": {
+      "$ref": "https://bagman.internal/contracts/common/bagman.utc_timestamp.v1.schema.json",
+      "description": "UTC timestamp of the most recent change to this row (any field, not only `status`)."
+    },
+    "error_detail": {
+      "oneOf": [
+        { "type": "string" },
+        { "type": "null" }
+      ],
+      "description": "Short, safe, NON-SECRET description of the current `ERROR`/`REVOKED` condition (e.g. 'token refresh failed: invalid_grant', '403 from GET /connections'). Never a raw token, header, or full provider response body. `null` outside `ERROR`/`REVOKED`."
+    },
+    "metadata": {
+      "type": "object",
+      "description": "Free-form, non-secret context (e.g. the last `GET /connections` `tenantType` observed). Display/context only.",
+      "additionalProperties": true,
+      "default": {}
+    },
+    "schema_version": {
+      "allOf": [
+        { "$ref": "https://bagman.internal/contracts/common/bagman.schema_version.v1.schema.json" }
+      ],
+      "const": "bagman.xero_connection.v1",
+      "description": "Must literally equal `\"bagman.xero_connection.v1\"`."
+    }
+  },
+  "required": [
+    "xero_connection_id",
+    "entity_id",
+    "provider",
+    "tenant_id",
+    "tenant_name",
+    "status",
+    "connected_at",
+    "last_successful_sync_at",
+    "last_attempted_sync_at",
+    "token_expires_at",
+    "created_at",
+    "updated_at",
+    "error_detail",
+    "metadata",
+    "schema_version"
+  ],
+  "additionalProperties": false
+}

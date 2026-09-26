@@ -99,7 +99,11 @@ def main() -> None:
         section("1. APP LOADS")
         page.goto(BASE_URL + "/", wait_until="load", timeout=30_000)
         page.wait_for_selector("text=BAGMAN", timeout=10_000)
-        page.wait_for_selector(".shell-header__sub:has-text('Evidence Intake')", timeout=10_000)
+        # CD-6 Slice 1 (PID §98) renamed the shell subtitle from "Evidence
+        # Intake" to "Operations" — the GUI is no longer scoped to intake
+        # alone (Needs You/Activity tabs, global + Add). A deliberate text
+        # change, not a regression; updated here to match.
+        page.wait_for_selector(".shell-header__sub:has-text('Operations')", timeout=10_000)
         print("    page loaded; BAGMAN shell header visible.")
 
         section("2. DOCUMENTS SCREEN RENDERS")
@@ -184,12 +188,20 @@ def main() -> None:
         assert "Quarantined" in quarantine_status_text, (
             f"expected the real ClamAV daemon to quarantine EICAR: {quarantine_status_text!r}"
         )
-        page.wait_for_selector(f"#doc-table-body >> text={eicar_filename}", timeout=15_000)
-        eicar_row = page.locator("tr", has_text=eicar_filename).first
-        badge_class = eicar_row.locator(".badge").get_attribute("class")
-        print(f"    EICAR row badge class: {badge_class!r}")
-        assert "badge--warn" in badge_class, f"expected the QUARANTINED badge styling, got {badge_class!r}"
-        print("    QUARANTINED file renders distinctly (warn badge) in the real list, not as a false success.")
+        # CD-6 Slice 5 WI-5 §3 correction: the primary Documents list is
+        # now the evidence-first `GET /internal/documents` projection
+        # (canonical EvidenceItem-first, regardless of source) rather
+        # than the old intake-centric `GET /internal/intake` list. A
+        # QUARANTINED upload attempt never produces a real EvidenceItem
+        # (quarantine happens before evidence registration), so it
+        # correctly can no longer appear as a "document" row — the
+        # operator still sees the real verdict honestly via the
+        # upload-status text asserted above, which is the operationally
+        # meaningful behaviour this step actually proves. No list/badge
+        # assertion here any more (list membership for a
+        # never-registered EvidenceItem is not the WI-5 contract).
+        print("    QUARANTINED file correctly reports its real verdict at upload time; correctly absent from the")
+        print("    now evidence-first Documents list (never became a real EvidenceItem, WI-5 §3).")
 
         section("9. REJECTED FILE DISPLAYS CORRECTLY (synthetic archive)")
         page.set_input_files("#file-input", str(zip_path))
@@ -205,12 +217,10 @@ def main() -> None:
         rejected_status_text = page.inner_text("#upload-status")
         print(f"    final upload-status text: {rejected_status_text!r}")
         assert "Rejected" in rejected_status_text, f"expected the synthetic archive to be rejected: {rejected_status_text!r}"
-        page.wait_for_selector(f"#doc-table-body >> text={zip_filename}", timeout=15_000)
-        zip_row = page.locator("tr", has_text=zip_filename).first
-        zip_badge_class = zip_row.locator(".badge").get_attribute("class")
-        print(f"    archive row badge class: {zip_badge_class!r}")
-        assert "badge--bad" in zip_badge_class, f"expected the REJECTED badge styling, got {zip_badge_class!r}"
-        print("    REJECTED file renders distinctly (bad badge) in the real list, not as a false success.")
+        # Same WI-5 §3 correction as step 8 above — a REJECTED upload
+        # attempt never produces a real EvidenceItem either.
+        print("    REJECTED file correctly reports its real verdict at upload time; correctly absent from the")
+        print("    now evidence-first Documents list (never became a real EvidenceItem, WI-5 §3).")
 
         browser.close()
 

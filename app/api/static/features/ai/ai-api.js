@@ -27,11 +27,27 @@ export const AI_API = {
 //: exactly the kind of thing an operator reviewing one document wants
 //: to see alongside its type/summary, and it shares the same
 //: `{evidence_id}` input shape as the other two).
+// CD-6 Slice 5 WI-5 §21/§63 — `DOCUMENT_TYPE_PROPOSAL` v1 removed from
+// this list: canonical document classification now goes through the
+// governed WI-3 orchestrator (`features/documents/classification-api.js
+// ::classifyWithBagman`, "Classify with BAGMAN" on the detail panel),
+// never a new "Run analysis: Document type" v1 button. `DOCUMENT_SUMMARY`
+// and `ENTITY_PROPOSAL` are unchanged — the generic AI panel/Ask BAGMAN
+// keep working exactly as before, and historical v1 invocation CARDS
+// still render fine (driven by real AIInvocation history via
+// `listInvocationsForEvidence`, not this array).
 export const DOCUMENT_BACKGROUND_TASKS = [
-  { task_id: "DOCUMENT_TYPE_PROPOSAL", task_version: 1, label: "Document type" },
   { task_id: "DOCUMENT_SUMMARY", task_version: 1, label: "Summary" },
   { task_id: "ENTITY_PROPOSAL", task_version: 1, label: "Entity hint" },
 ];
+
+/** `GET /internal/ai/invocations/{id}` — the full AIInvocation record
+ * (WI-5 §17's "Why BAGMAN thinks this": `output.signals`/
+ * `output.warnings`/`output.confidence`/`capability_alias`/
+ * `provider_model`). */
+export function getInvocation(aiInvocationId) {
+  return apiGet(AI_API.invocationOne(aiInvocationId));
+}
 
 /** `POST /internal/ai/tasks` — dispatch one BACKGROUND task against
  * `evidence_id`. Synchronous (the fetch IS the "Running…" duration —
@@ -100,11 +116,17 @@ export function getAiHealth() {
 /** `POST /internal/operator/chat` — Ask BAGMAN (PID §42-44). `context`
  * is whichever of `evidence_id`/`intake_id`/`entity_id` is attached (at
  * most one is normally set from the GUI's own "Ask BAGMAN about this"
- * entry point — see `agent/bagman/orchestrator.py`'s own module
- * docstring: at least one is REQUIRED by this backend today, a real,
- * documented WI-3 scope boundary this GUI surfaces honestly rather
- * than papering over — see features/ai/ask-bagman.js). */
-export function sendOperatorChat({ message, actorId, evidenceId, intakeId, entityId, correlationId }) {
+ * entry point). `conversationId`/`source` (CD-6 reliability delta, PID
+ * §98/§100): `conversationId` is the GUI-generated "this open Ask
+ * BAGMAN drawer session" id (see features/ai/ask-bagman.js) — the
+ * backend's own conversation-scoped fallback subject when none of
+ * `evidence_id`/`intake_id`/`entity_id` is attached, which is exactly
+ * what fixed the previously-real, previously-documented "general chat
+ * has no evidence_id" 422 for a bare "hi bagman" message (see
+ * `ai.invocation.derive_primary_input_reference`'s own module
+ * docstring for the full history). `source` records which UI surface
+ * this call came from. */
+export function sendOperatorChat({ message, actorId, evidenceId, intakeId, entityId, correlationId, conversationId, source }) {
   return apiPost(AI_API.operatorChat, {
     message,
     actor_type: "USER",
@@ -113,5 +135,7 @@ export function sendOperatorChat({ message, actorId, evidenceId, intakeId, entit
     evidence_id: evidenceId || null,
     intake_id: intakeId || null,
     entity_id: entityId || null,
+    conversation_id: conversationId || null,
+    source: source || null,
   });
 }

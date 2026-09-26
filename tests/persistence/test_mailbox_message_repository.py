@@ -1,0 +1,503 @@
+"""CD-6 Slice 4 PostgreSQL persistence proofs for
+``persistence/postgres/mailbox_message_repository.py`` against a REAL,
+disposable PostgreSQL container (mirrors
+``tests/persistence/test_mailbox_repository.py``'s own style/rigor).
+"""
+from __future__ import annotations
+
+from datetime import datetime, timezone
+
+import pytest
+
+from core import identity
+from persistence.postgres.mailbox_message_models import MailboxMessageRow
+from persistence.postgres.mailbox_message_repository import PostgresMailboxMessageRepository
+from persistence.postgres.session import get_engine, session_scope
+from services.mailbox.gmail.gmail_adapter import _to_message_summary
+from services.mailbox.gmail.gmail_client import GmailMessageMetadata
+from services.mailbox.mailbox import PROVIDER_GOOGLE_GMAIL
+from services.mailbox.message import FOLDER_INBOX, FOLDER_JUNK, INGESTION_STATUS_INGESTED, INGESTION_STATUS_VANISHED
+
+
+def _mailbox_id() -> str:
+    return identity.generate_id()
+
+
+def _observe(repo, *, mailbox_id, msg_id="msg-1", folder=FOLDER_INBOX, status=INGESTION_STATUS_INGESTED, evidence_id=None):
+    return repo.record_observation(
+        mailbox_id=mailbox_id,
+        provider_kind="MICROSOFT_GRAPH",
+        immutable_provider_message_id=msg_id,
+        internet_message_id="<a@b>",
+        observed_folder=folder,
+        subject="Hi",
+        sender_address="s@x.com",
+        sender_display_name="S",
+        received_at=datetime.now(timezone.utc),
+        has_attachments=False,
+        ingestion_status=status,
+        evidence_id=evidence_id,
+    )
+
+
+def test_message_persists_and_is_retrievable_via_a_fresh_repository_instance(fresh_engine):
+    repo = PostgresMailboxMessageRepository()
+    mailbox_id = _mailbox_id()
+    message, created = _observe(repo, mailbox_id=mailbox_id)
+    assert created is True
+
+    fresh_repo = PostgresMailboxMessageRepository(engine=fresh_engine)
+    fetched = fresh_repo.get_message(message.mailbox_message_id)
+    assert fetched.immutable_provider_message_id == "msg-1"
+
+
+def test_uq_constraint_backs_canonical_uniqueness_at_the_database_level():
+    repo = PostgresMailboxMessageRepository()
+    mailbox_id = _mailbox_id()
+    first, created1 = _observe(repo, mailbox_id=mailbox_id, msg_id="dup-id")
+    second, created2 = _observe(repo, mailbox_id=mailbox_id, msg_id="dup-id", folder=FOLDER_JUNK)
+    assert created1 is True
+    assert created2 is False
+    assert first.mailbox_message_id == second.mailbox_message_id
+
+    with session_scope(get_engine()) as session:
+        rows = session.query(MailboxMessageRow).filter_by(mailbox_id=mailbox_id, immutable_provider_message_id="dup-id").all()
+        assert len(rows) == 1
+
+
+def test_different_mailboxes_never_collide_at_database_level():
+    repo = PostgresMailboxMessageRepository()
+    mailbox_a = _mailbox_id()
+    mailbox_b = _mailbox_id()
+    _observe(repo, mailbox_id=mailbox_a, msg_id="shared")
+    _observe(repo, mailbox_id=mailbox_b, msg_id="shared")
+    assert len(repo.list_messages(mailbox_id=mailbox_a)) == 1
+    assert len(repo.list_messages(mailbox_id=mailbox_b)) == 1
+
+
+def test_find_by_provider_id_round_trips():
+    repo = PostgresMailboxMessageRepository()
+    mailbox_id = _mailbox_id()
+    _observe(repo, mailbox_id=mailbox_id, msg_id="find-me")
+    found = repo.find_by_provider_id(mailbox_id, "find-me")
+    assert found is not None
+    assert found.immutable_provider_message_id == "find-me"
+    assert repo.find_by_provider_id(mailbox_id, "not-there") is None
+
+
+def test_ingested_status_is_never_downgraded_by_a_later_lesser_replay():
+    repo = PostgresMailboxMessageRepository()
+    mailbox_id = _mailbox_id()
+    evidence_id = identity.generate_id()
+    _observe(repo, mailbox_id=mailbox_id, msg_id="rank-test", status=INGESTION_STATUS_INGESTED, evidence_id=evidence_id)
+    updated, _ = _observe(repo, mailbox_id=mailbox_id, msg_id="rank-test", status=INGESTION_STATUS_VANISHED)
+    assert updated.ingestion_status == INGESTION_STATUS_INGESTED
+    assert updated.evidence_id == evidence_id
+
+
+def test_discovery_fields_are_preserved_on_a_benign_reobservation_that_omits_them():
+    """Second latent defect fix (WO instruction) — at the Postgres layer
+    too: a re-observation that omits discovery_candidate/
+    discovery_reason/discovery_checked_at must not blank an already-set
+    value on the existing row."""
+    repo = PostgresMailboxMessageRepository()
+    mailbox_id = _mailbox_id()
+    checked_at = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    first, _ = repo.record_observation(
+        mailbox_id=mailbox_id,
+        provider_kind="MICROSOFT_GRAPH",
+        immutable_provider_message_id="m1",
+        internet_message_id="<m1@b>",
+        observed_folder=FOLDER_INBOX,
+        subject="Invoice",
+        sender_address="billing@vendor.com",
+        sender_display_name="Vendor",
+        received_at=datetime.now(timezone.utc),
+        has_attachments=False,
+        ingestion_status="CHECKED_NOT_CANDIDATE",
+        sender_domain="vendor.com",
+        discovery_candidate=True,
+        discovery_reason="subject contains keyword 'invoice'",
+        discovery_checked_at=checked_at,
+    )
+    assert first.discovery_candidate is True
+
+    second, created = repo.record_observation(
+        mailbox_id=mailbox_id,
+        provider_kind="MICROSOFT_GRAPH",
+        immutable_provider_message_id="m1",
+        internet_message_id="<m1@b>",
+        observed_folder=FOLDER_INBOX,
+        subject="Invoice",
+        sender_address="billing@vendor.com",
+        sender_display_name="Vendor",
+        received_at=datetime.now(timezone.utc),
+        has_attachments=False,
+        ingestion_status="CHECKED_NOT_CANDIDATE",
+        sender_domain="vendor.com",
+    )
+    assert created is False
+    assert second.discovery_candidate is True
+    assert second.discovery_reason == "subject contains keyword 'invoice'"
+    assert second.discovery_checked_at == checked_at
+
+
+def test_list_messages_most_recent_first_scoped_to_mailbox():
+    repo = PostgresMailboxMessageRepository()
+    mailbox_id = _mailbox_id()
+    _observe(repo, mailbox_id=mailbox_id, msg_id="m1")
+    _observe(repo, mailbox_id=mailbox_id, msg_id="m2")
+    items = repo.list_messages(mailbox_id=mailbox_id)
+    assert {m.immutable_provider_message_id for m in items} == {"m1", "m2"}
+
+
+def test_get_message_not_found_raises():
+    from core.errors import NotFoundError
+
+    repo = PostgresMailboxMessageRepository()
+    with pytest.raises(NotFoundError):
+        repo.get_message(identity.generate_id())
+
+
+# ---------------------------------------------------------------------
+# list_candidate_messages_for_domain (operational addendum, ahead of
+# the first real large historical sweep)
+# ---------------------------------------------------------------------
+
+
+def _observe_candidate(
+    repo, *, mailbox_id, msg_id, sender_domain, status="CHECKED_NOT_CANDIDATE", discovery_candidate=True
+):
+    return repo.record_observation(
+        mailbox_id=mailbox_id,
+        provider_kind="MICROSOFT_GRAPH",
+        immutable_provider_message_id=msg_id,
+        internet_message_id=f"<{msg_id}@b>",
+        observed_folder=FOLDER_INBOX,
+        subject="Invoice",
+        sender_address=f"billing@{sender_domain}",
+        sender_display_name="Vendor",
+        received_at=datetime.now(timezone.utc),
+        has_attachments=False,
+        ingestion_status=status,
+        sender_domain=sender_domain,
+        discovery_candidate=discovery_candidate,
+        discovery_reason="subject contains keyword 'invoice'" if discovery_candidate else None,
+    )
+
+
+def test_list_candidate_messages_for_domain_filters_mailbox_domain_and_status(fresh_engine):
+    repo = PostgresMailboxMessageRepository()
+    mailbox_id = _mailbox_id()
+    other_mailbox_id = _mailbox_id()
+    _observe_candidate(repo, mailbox_id=mailbox_id, msg_id="eligible", sender_domain="vendor.com")
+    _observe_candidate(repo, mailbox_id=mailbox_id, msg_id="eligible-2", sender_domain="VENDOR.COM")
+    _observe_candidate(repo, mailbox_id=mailbox_id, msg_id="other-domain", sender_domain="other.example")
+    _observe_candidate(repo, mailbox_id=other_mailbox_id, msg_id="other-mailbox", sender_domain="vendor.com")
+    _observe_candidate(
+        repo, mailbox_id=mailbox_id, msg_id="already-ingested", sender_domain="vendor.com",
+        status=INGESTION_STATUS_INGESTED,
+    )
+
+    fresh_repo = PostgresMailboxMessageRepository(engine=fresh_engine)
+    results = fresh_repo.list_candidate_messages_for_domain(mailbox_id=mailbox_id, sender_domain="Vendor.com")
+    assert {m.immutable_provider_message_id for m in results} == {"eligible", "eligible-2"}
+    assert all(m.mailbox_id == mailbox_id for m in results)
+
+
+def test_list_candidate_messages_for_domain_requires_discovery_candidate_true_at_the_sql_level(fresh_engine):
+    """Second CD-6 architect amendment (persisted discovery decision) —
+    an IGNORED-domain message and an ordinary non-credible UNKNOWN-domain
+    message can share the identical CHECKED_NOT_CANDIDATE status a real
+    candidate has; only `discovery_candidate is True` (filtered in SQL,
+    not Python) may make a message eligible for back-processing."""
+    repo = PostgresMailboxMessageRepository()
+    mailbox_id = _mailbox_id()
+    _observe_candidate(repo, mailbox_id=mailbox_id, msg_id="real-candidate", sender_domain="vendor.com", discovery_candidate=True)
+    _observe_candidate(repo, mailbox_id=mailbox_id, msg_id="ignored-domain", sender_domain="vendor.com", discovery_candidate=None)
+    _observe_candidate(repo, mailbox_id=mailbox_id, msg_id="non-credible", sender_domain="vendor.com", discovery_candidate=False)
+
+    fresh_repo = PostgresMailboxMessageRepository(engine=fresh_engine)
+    results = fresh_repo.list_candidate_messages_for_domain(mailbox_id=mailbox_id, sender_domain="vendor.com")
+    assert {m.immutable_provider_message_id for m in results} == {"real-candidate"}
+
+
+# ---------------------------------------------------------------------
+# `include_subdomains` (historical-candidate-scoping defect fix) — the
+# Postgres repository's own direct proof, mirroring the in-memory
+# repository's own equivalent tests in
+# `tests/integration/test_mailbox_message_domain.py`.
+# ---------------------------------------------------------------------
+
+
+def test_list_candidate_messages_for_domain_default_omitted_include_subdomains_is_exact_only(fresh_engine):
+    repo = PostgresMailboxMessageRepository()
+    mailbox_id = _mailbox_id()
+    _observe_candidate(repo, mailbox_id=mailbox_id, msg_id="exact", sender_domain="example.com")
+    _observe_candidate(repo, mailbox_id=mailbox_id, msg_id="sub", sender_domain="billing.example.com")
+
+    fresh_repo = PostgresMailboxMessageRepository(engine=fresh_engine)
+    results = fresh_repo.list_candidate_messages_for_domain(mailbox_id=mailbox_id, sender_domain="example.com")
+    assert {m.immutable_provider_message_id for m in results} == {"exact"}
+
+
+def test_list_candidate_messages_for_domain_include_subdomains_true_includes_single_and_multi_level(fresh_engine):
+    repo = PostgresMailboxMessageRepository()
+    mailbox_id = _mailbox_id()
+    _observe_candidate(repo, mailbox_id=mailbox_id, msg_id="exact", sender_domain="example.com")
+    _observe_candidate(repo, mailbox_id=mailbox_id, msg_id="single-level", sender_domain="billing.example.com")
+    _observe_candidate(repo, mailbox_id=mailbox_id, msg_id="multi-level", sender_domain="receipts.eu.example.com")
+
+    fresh_repo = PostgresMailboxMessageRepository(engine=fresh_engine)
+    results = fresh_repo.list_candidate_messages_for_domain(
+        mailbox_id=mailbox_id, sender_domain="example.com", include_subdomains=True
+    )
+    assert {m.immutable_provider_message_id for m in results} == {"exact", "single-level", "multi-level"}
+
+
+def test_list_candidate_messages_for_domain_include_subdomains_true_never_matches_lookalike_domain(fresh_engine):
+    """The critical boundary case, proven against the real Postgres
+    repository too: `notexample.com` must never match `example.com`,
+    even with `include_subdomains=True`."""
+    repo = PostgresMailboxMessageRepository()
+    mailbox_id = _mailbox_id()
+    _observe_candidate(repo, mailbox_id=mailbox_id, msg_id="lookalike", sender_domain="notexample.com")
+    _observe_candidate(repo, mailbox_id=mailbox_id, msg_id="exact", sender_domain="example.com")
+
+    fresh_repo = PostgresMailboxMessageRepository(engine=fresh_engine)
+    results = fresh_repo.list_candidate_messages_for_domain(
+        mailbox_id=mailbox_id, sender_domain="example.com", include_subdomains=True
+    )
+    assert {m.immutable_provider_message_id for m in results} == {"exact"}
+
+
+# ---------------------------------------------------------------------
+# CD-6 GUI-operations-foundation follow-on WO (item A) —
+# `sender_address_observed` (the real backstop behind an `EXACT_ADDRESS`
+# `MailboxDomainRule`: an operator must never be able to pre-authorize
+# an address BAGMAN has never actually seen mail from).
+# ---------------------------------------------------------------------
+
+
+def test_sender_address_observed_is_true_for_a_real_observed_address(fresh_engine):
+    repo = PostgresMailboxMessageRepository()
+    mailbox_id = _mailbox_id()
+    repo.record_observation(
+        mailbox_id=mailbox_id, provider_kind="MICROSOFT_GRAPH", immutable_provider_message_id="msg-1",
+        internet_message_id="<a@b>", observed_folder=FOLDER_INBOX, subject="Hi",
+        sender_address="Billing@Vendor.com", sender_display_name="Vendor",
+        received_at=datetime.now(timezone.utc), has_attachments=False,
+        ingestion_status=INGESTION_STATUS_INGESTED,
+    )
+
+    fresh_repo = PostgresMailboxMessageRepository(engine=fresh_engine)
+    # Case-insensitive — the real, stored address was "Billing@Vendor.com".
+    assert fresh_repo.sender_address_observed(mailbox_id, "billing@vendor.com") is True
+    assert fresh_repo.sender_address_observed(mailbox_id, "BILLING@VENDOR.COM") is True
+
+
+def test_sender_address_observed_is_false_for_an_unobserved_address(fresh_engine):
+    repo = PostgresMailboxMessageRepository()
+    mailbox_id = _mailbox_id()
+    repo.record_observation(
+        mailbox_id=mailbox_id, provider_kind="MICROSOFT_GRAPH", immutable_provider_message_id="msg-1",
+        internet_message_id="<a@b>", observed_folder=FOLDER_INBOX, subject="Hi",
+        sender_address="billing@vendor.com", sender_display_name="Vendor",
+        received_at=datetime.now(timezone.utc), has_attachments=False,
+        ingestion_status=INGESTION_STATUS_INGESTED,
+    )
+
+    fresh_repo = PostgresMailboxMessageRepository(engine=fresh_engine)
+    assert fresh_repo.sender_address_observed(mailbox_id, "someone-else@vendor.com") is False
+
+
+def test_sender_address_observed_is_scoped_to_the_mailbox(fresh_engine):
+    repo = PostgresMailboxMessageRepository()
+    mailbox_id = _mailbox_id()
+    other_mailbox_id = _mailbox_id()
+    repo.record_observation(
+        mailbox_id=mailbox_id, provider_kind="MICROSOFT_GRAPH", immutable_provider_message_id="msg-1",
+        internet_message_id="<a@b>", observed_folder=FOLDER_INBOX, subject="Hi",
+        sender_address="billing@vendor.com", sender_display_name="Vendor",
+        received_at=datetime.now(timezone.utc), has_attachments=False,
+        ingestion_status=INGESTION_STATUS_INGESTED,
+    )
+
+    fresh_repo = PostgresMailboxMessageRepository(engine=fresh_engine)
+    assert fresh_repo.sender_address_observed(other_mailbox_id, "billing@vendor.com") is False
+
+
+# -- Defect A: full crash-reproduction end-to-end, against real Postgres -
+
+
+def test_non_utc_date_header_message_records_cleanly_end_to_end(fresh_engine):
+    """Reproduces the exact PL-proven live crash scenario end-to-end:
+    a real Gmail message whose `Date` header carries a non-UTC numeric
+    offset (extremely common in real email — the sender's own local
+    timezone) must flow all the way through `_to_message_summary` →
+    `services/mailbox/sweep.py`'s own `msg.received_at or resolved_now`
+    resolution → `PostgresMailboxMessageRepository.record_observation`
+    → `MailboxMessage.to_dict()` (which calls
+    `core.timestamps.ensure_utc` and previously raised `ValueError` for
+    exactly this input) WITHOUT raising. Before the fix in
+    `services/mailbox/gmail/gmail_adapter.py::_to_message_summary`, this
+    test would fail with `ValueError: canonical BAGMAN time must be UTC
+    (zero offset); got offset -1 day, 20:00:00` (or similar)."""
+    date_header = "Mon, 21 Sep 2026 16:10:52 -0400 (EDT)"
+    raw_headers = [
+        {"name": "Subject", "value": "Invoice #4471"},
+        {"name": "From", "value": "Vendor <billing@vendor.com>"},
+        {"name": "Message-ID", "value": "<crash-repro@vendor.com>"},
+        {"name": "Date", "value": date_header},
+    ]
+    metadata = GmailMessageMetadata(
+        message_id="18abcrash1234",
+        raw_headers=raw_headers,
+        label_ids=("INBOX",),
+        internal_date=datetime(2026, 9, 21, 20, 15, 0, tzinfo=timezone.utc),
+    )
+
+    # Step 1: adapter-level parse (this is where the defect lived).
+    summary = _to_message_summary(metadata)
+    assert summary.received_at is not None
+
+    # Step 2: the SAME resolution `services/mailbox/sweep.py` applies at
+    # every `record_observation` call site — `msg.received_at or
+    # resolved_now`. `summary.received_at` is truthy here (not None), so
+    # the `or resolved_now` fallback never triggers, exactly mirroring
+    # production.
+    resolved_now = datetime.now(timezone.utc)
+    received_at = summary.received_at or resolved_now
+    assert received_at == summary.received_at
+
+    # Step 3: durable persistence + `to_dict()`'s own `ensure_utc` gate —
+    # against a REAL, disposable Postgres instance, not a mock.
+    repo = PostgresMailboxMessageRepository()
+    mailbox_id = _mailbox_id()
+    message, created = repo.record_observation(
+        mailbox_id=mailbox_id,
+        provider_kind=PROVIDER_GOOGLE_GMAIL,
+        immutable_provider_message_id=summary.immutable_id,
+        internet_message_id=summary.internet_message_id,
+        observed_folder=FOLDER_INBOX,
+        subject=summary.subject,
+        sender_address=summary.sender_address,
+        sender_display_name=summary.sender_display_name,
+        received_at=received_at,
+        has_attachments=summary.has_attachments,
+        ingestion_status=INGESTION_STATUS_INGESTED,
+    )
+    assert created is True
+
+    # No ValueError — proves the exact crash scenario is closed
+    # end-to-end, not just at the adapter-unit level.
+    rendered = message.to_dict()
+    assert rendered["received_at"].endswith("Z")
+
+    fresh_repo = PostgresMailboxMessageRepository(engine=fresh_engine)
+    fetched = fresh_repo.get_message(message.mailbox_message_id)
+    assert fetched.received_at.utcoffset().total_seconds() == 0
+    fetched.to_dict()  # must not raise
+
+
+# ---------------------------------------------------------------------
+# Deterministic subject-aware mailbox domain policy (CD-6 GUI-operations-
+# foundation follow-on WO) — `subject_predicate_observed` (the real
+# backstop behind a new EXACT_DOMAIN_SUBJECT MailboxDomainRule created
+# via the generic policy-rules endpoint: an operator must never be able
+# to pre-authorize a predicate BAGMAN has never actually seen matching
+# mail for).
+# ---------------------------------------------------------------------
+
+from services.mailbox.domain_rule import SUBJECT_PREDICATE_EXACT, SUBJECT_PREDICATE_STARTS_WITH  # noqa: E402
+
+
+def test_subject_predicate_observed_true_for_exact_match(fresh_engine):
+    repo = PostgresMailboxMessageRepository()
+    mailbox_id = _mailbox_id()
+    repo.record_observation(
+        mailbox_id=mailbox_id, provider_kind="MICROSOFT_GRAPH", immutable_provider_message_id="msg-1",
+        internet_message_id="<a@b>", observed_folder=FOLDER_INBOX, subject="Monthly  Statement",
+        sender_address="billing@vantage.example", sender_display_name="Vantage",
+        received_at=datetime.now(timezone.utc), has_attachments=False,
+        ingestion_status=INGESTION_STATUS_INGESTED, sender_domain="vantage.example",
+    )
+
+    fresh_repo = PostgresMailboxMessageRepository(engine=fresh_engine)
+    assert fresh_repo.subject_predicate_observed(
+        mailbox_id=mailbox_id, sender_domain="vantage.example",
+        predicate_type=SUBJECT_PREDICATE_EXACT, predicate_value="monthly statement",
+    ) is True
+
+
+def test_subject_predicate_observed_true_for_any_ingestion_status():
+    """"Has this predicate EVER matched a real message here" — not about
+    current eligibility, unlike `list_candidate_messages_for_domain`."""
+    repo = PostgresMailboxMessageRepository()
+    mailbox_id = _mailbox_id()
+    repo.record_observation(
+        mailbox_id=mailbox_id, provider_kind="MICROSOFT_GRAPH", immutable_provider_message_id="msg-1",
+        internet_message_id="<a@b>", observed_folder=FOLDER_INBOX, subject="Monthly Statement",
+        sender_address="billing@vantage.example", sender_display_name="Vantage",
+        received_at=datetime.now(timezone.utc), has_attachments=False,
+        ingestion_status=INGESTION_STATUS_VANISHED, sender_domain="vantage.example",
+    )
+    assert repo.subject_predicate_observed(
+        mailbox_id=mailbox_id, sender_domain="vantage.example",
+        predicate_type=SUBJECT_PREDICATE_EXACT, predicate_value="monthly statement",
+    ) is True
+
+
+def test_subject_predicate_observed_true_for_starts_with_match():
+    repo = PostgresMailboxMessageRepository()
+    mailbox_id = _mailbox_id()
+    repo.record_observation(
+        mailbox_id=mailbox_id, provider_kind="MICROSOFT_GRAPH", immutable_provider_message_id="msg-1",
+        internet_message_id="<a@b>", observed_folder=FOLDER_INBOX, subject="Order confirmed: iPad",
+        sender_address="ebay@ebay.example", sender_display_name="eBay",
+        received_at=datetime.now(timezone.utc), has_attachments=False,
+        ingestion_status=INGESTION_STATUS_INGESTED, sender_domain="ebay.example",
+    )
+    assert repo.subject_predicate_observed(
+        mailbox_id=mailbox_id, sender_domain="ebay.example",
+        predicate_type=SUBJECT_PREDICATE_STARTS_WITH, predicate_value="order confirmed:",
+    ) is True
+
+
+def test_subject_predicate_observed_false_for_never_matching_predicate():
+    repo = PostgresMailboxMessageRepository()
+    mailbox_id = _mailbox_id()
+    repo.record_observation(
+        mailbox_id=mailbox_id, provider_kind="MICROSOFT_GRAPH", immutable_provider_message_id="msg-1",
+        internet_message_id="<a@b>", observed_folder=FOLDER_INBOX, subject="porsche targa, Porsche: 2 NEW!",
+        sender_address="seller@ebay.example", sender_display_name="eBay",
+        received_at=datetime.now(timezone.utc), has_attachments=False,
+        ingestion_status=INGESTION_STATUS_INGESTED, sender_domain="ebay.example",
+    )
+    assert repo.subject_predicate_observed(
+        mailbox_id=mailbox_id, sender_domain="ebay.example",
+        predicate_type=SUBJECT_PREDICATE_STARTS_WITH, predicate_value="order confirmed:",
+    ) is False
+
+
+def test_subject_predicate_observed_scoped_to_exact_domain_and_mailbox():
+    repo = PostgresMailboxMessageRepository()
+    mailbox_id = _mailbox_id()
+    other_mailbox_id = _mailbox_id()
+    repo.record_observation(
+        mailbox_id=mailbox_id, provider_kind="MICROSOFT_GRAPH", immutable_provider_message_id="msg-1",
+        internet_message_id="<a@b>", observed_folder=FOLDER_INBOX, subject="Monthly Statement",
+        sender_address="billing@vantage.example", sender_display_name="Vantage",
+        received_at=datetime.now(timezone.utc), has_attachments=False,
+        ingestion_status=INGESTION_STATUS_INGESTED, sender_domain="vantage.example",
+    )
+    # Different mailbox — never observed there.
+    assert repo.subject_predicate_observed(
+        mailbox_id=other_mailbox_id, sender_domain="vantage.example",
+        predicate_type=SUBJECT_PREDICATE_EXACT, predicate_value="monthly statement",
+    ) is False
+    # Different (sub)domain — subject predicates are exact-domain only.
+    assert repo.subject_predicate_observed(
+        mailbox_id=mailbox_id, sender_domain="mail.vantage.example",
+        predicate_type=SUBJECT_PREDICATE_EXACT, predicate_value="monthly statement",
+    ) is False

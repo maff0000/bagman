@@ -57,6 +57,16 @@ COPY alembic/ ./alembic/
 COPY alembic.ini ./alembic.ini
 COPY VERSION ./VERSION
 
+# CD-6 Slice 5 WI-6: scripts/reprocess_evidence_classification.py and
+# scripts/evaluate_document_classifier.py are real, governed operator
+# CLI tools meant to run inside this exact container
+# (`docker exec bagman-api python3 scripts/<name>.py ...`), both in
+# dev and in production — they were previously entirely absent from
+# every built image (this directory was deliberately excluded above
+# for runtime leanness), which would have made them un-runnable
+# exactly where they are meant to run.
+COPY scripts/ ./scripts/
+
 # CD-5 Gate-2 closure (2026-09-16, PID §97): the real `claude` native
 # binary the bounded headless operator runner
 # (agent/claude_code/runner.py) execs. Staged into

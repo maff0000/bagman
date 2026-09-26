@@ -28,6 +28,7 @@ from core import identity
 from core.contract_validation import validate_against_contract
 from core.errors import ImmutabilityViolationError, NotFoundError, ValidationError
 from core.external_reference import ExternalReferenceRepository
+from core.text_matching import domain_from_address, normalize_address, normalize_domain
 from core.timestamps import to_contract_string, utc_now
 
 _SCHEMA = "evidence/bagman.evidence.v1.schema.json"
@@ -44,6 +45,24 @@ STATUSES = frozenset({"OBSERVED", "REGISTERED", "AVAILABLE", "SUPERSEDED", "QUAR
 #: separately by the `register_evidence` call itself and combined with
 #: this triple to form the full composite uniqueness tuple (PID §10/§34).
 ExternalReferenceHint = Tuple[str, str, str]
+
+#: CD-6 Slice 5 WI-2 — the `evidence_type` value every real mailbox
+#: ingestion path uses today (see
+#: `services.mailbox.microsoft.evidence_ingest.ingest_email_evidence`'s
+#: own `register_evidence(evidence_type="EMAIL", ...)` call; the IMAP/
+#: Gmail adapters mirror this exactly). Used purely as an additional,
+#: NARROWING SQL-level filter by
+#: `find_candidate_evidence_for_sender` below — never trusted as the
+#: sole/authoritative test of "is this evidence mailbox-shaped" (that
+#: would require a real join to `sources.source_type`, which this
+#: narrow WI-2 addition does not attempt — see that method's own
+#: docstring for the full reasoning this is a documented, non-blocking
+#: judgment call).
+MAILBOX_EVIDENCE_TYPES = frozenset({"EMAIL"})
+
+#: Default bound for `find_candidate_evidence_for_sender` when a caller
+#: does not specify one — genuinely bounded, never "load everything".
+_DEFAULT_CANDIDATE_LIMIT = 200
 
 
 def _normalize_content_hash(content_hash: Union[str, Mapping[str, str]]) -> dict:
@@ -164,6 +183,60 @@ class EvidenceRepository(abc.ABC):
 
     @abc.abstractmethod
     def assign_entity(self, evidence_id: str, entity_id: str) -> EvidenceItem:
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def find_candidate_evidence_for_sender(
+        self,
+        *,
+        sender_domain: str,
+        sender_address: Optional[str] = None,
+        limit: int = _DEFAULT_CANDIDATE_LIMIT,
+        offset: int = 0,
+    ) -> list[EvidenceItem]:
+        """CD-6 Slice 5 WI-2, paginated as of the 2026-09-25 correctness
+        delta — one PAGE (bounded to ``limit`` rows, offset by
+        ``offset``) of a NARROWING candidate query for the
+        classification-rule observed-evidence guard/preview
+        (``services.evidence.classification_matcher``): every
+        ``EvidenceItem`` whose ``metadata`` carries both
+        ``sender_address`` and ``subject`` keys, AND whose
+        ``metadata['sender_address']`` plausibly belongs to
+        ``sender_domain`` (exactly, normalised) — or, when
+        ``sender_address`` is also supplied, whose
+        ``metadata['sender_address']`` exactly equals it (normalised) —
+        most-recently-``received_at``-first (with ``evidence_id`` as a
+        deterministic tie-breaker), ``limit`` rows starting at ``offset``.
+
+        ``limit`` is a PAGE SIZE, not a total result cap: a caller that
+        needs an EXHAUSTIVE answer (e.g. "does any match exist at all",
+        or "the true match_count") calls this method repeatedly with
+        increasing ``offset`` until a page returns fewer than ``limit``
+        rows — see ``services.evidence.classification_observation``'s
+        own module docstring, "Exhaustive truth, bounded processing",
+        for the doctrine this exists to serve. This method itself never
+        loads the whole corpus in one query regardless of how many
+        pages a caller ultimately walks.
+
+        This is a NARROWING optimisation only, never the source of
+        match truth: the Postgres implementation applies a loose
+        SQL-level ``ILIKE``/JSONB-key-presence filter to avoid a full
+        table scan as the evidence corpus grows, but the CALLER (the
+        observed-evidence guard) is responsible for re-testing every
+        returned candidate through the same normalisation/matching
+        logic (``core.text_matching``) before counting it as a real
+        match — a divergence between SQL ``ILIKE`` and the Python
+        normaliser must never silently misclassify (WO's own explicit
+        instruction). ``sender_domain`` itself is assumed already
+        normalised by the caller (mirrors every other method on this
+        repository's own "caller normalises first" discipline);
+        ``sender_address``, if given, is normalised here defensively.
+
+        Never returns more than ``limit`` rows — there is no
+        ``limit=None`` "unbounded" mode on this method (unlike
+        ``list_evidence``): a generic "list every EvidenceItem" query is
+        deliberately NOT what this method is for.
+        """
         raise NotImplementedError
 
 
@@ -336,3 +409,37 @@ class InMemoryEvidenceRepository(EvidenceRepository):
 
         self._by_id[evidence_id] = updated
         return updated
+
+    def find_candidate_evidence_for_sender(
+        self,
+        *,
+        sender_domain: str,
+        sender_address: Optional[str] = None,
+        limit: int = _DEFAULT_CANDIDATE_LIMIT,
+        offset: int = 0,
+    ) -> list[EvidenceItem]:
+        normalized_address = normalize_address(sender_address) if sender_address else None
+        candidates: list[EvidenceItem] = []
+        for item in self._by_id.values():
+            raw_sender = item.metadata.get("sender_address")
+            raw_subject = item.metadata.get("subject")
+            if not raw_sender or not raw_subject:
+                continue
+            try:
+                item_address = normalize_address(raw_sender)
+                item_domain = domain_from_address(item_address)
+            except ValidationError:
+                continue
+            if normalized_address is not None:
+                if item_address != normalized_address:
+                    continue
+            elif item_domain != normalize_domain(sender_domain):
+                continue
+            candidates.append(item)
+
+        # Deterministic order FIRST, then page — offset/limit must slice
+        # a stable ordering or pagination could skip/duplicate rows
+        # across calls (the exact bug a real "ORDER BY ... LIMIT ...
+        # OFFSET ..." query would also need to avoid).
+        candidates.sort(key=lambda i: (i.received_at, i.evidence_id), reverse=True)
+        return candidates[offset : offset + limit]

@@ -39,11 +39,21 @@ container (never just read off the DDL) in
 `tests/persistence/test_ai_invocation_repository.py`.
 
 Because the index is PARTIAL (`WHERE status IN (...)`), any number of
-TERMINAL rows (`SUCCEEDED`/`FAILED`/`REJECTED`) may share the same
-`(task_id, task_version, primary_input_reference)` — that is exactly
-what PID §74's retry doctrine requires: an unbounded sequence of
-terminal-then-new retries over time, each its own fully auditable row,
-never overwritten.
+TERMINAL rows (`SUCCEEDED`/`FAILED`/`REJECTED`/`TIMED_OUT`/`CANCELLED`
+— the last two added by the CD-6 reliability delta, PID §98/§100; the
+partial index's own `WHERE status IN ('REQUESTED', 'RUNNING')` clause
+did not need to change, since it already names the two NON-terminal
+states by inclusion rather than naming the terminal ones by exclusion)
+may share the same `(task_id, task_version, primary_input_reference)`
+— that is exactly what PID §74's retry doctrine requires: an unbounded
+sequence of terminal-then-new retries over time, each its own fully
+auditable row, never overwritten. `status` itself is a plain `String`
+column with no database-level `CHECK` constraint enumerating the
+closed set (`ai.invocation.STATUSES` is the application-level source
+of truth) — so adding `TIMED_OUT`/`CANCELLED` needed no DDL change to
+this column itself, only to `primary_input_reference`'s generated
+expression above (see its own docstring) for the new `conversation_id`
+fallback key.
 
 Documented edge case: if `input_references` contains NONE of the three
 recognised keys, the generated column evaluates to SQL `NULL`, and
@@ -103,12 +113,18 @@ _UUID = UUID(as_uuid=False)
 #: The exact SQL expression backing `primary_input_reference` below —
 #: MUST stay in lockstep with
 #: `ai.invocation.PRIMARY_INPUT_REFERENCE_KEYS`'s precedence order
-#: (`evidence_id`, `intake_id`, `entity_id`). If that Python tuple ever
-#: changes, this expression must change with it in the same migration.
+#: (`evidence_id`, `intake_id`, `entity_id`, `conversation_id` — the
+#: last added by the CD-6 reliability delta, PID §98/§100, deliberately
+#: LAST in precedence, see `ai.invocation.derive_primary_input_reference`'s
+#: own module docstring for the reasoning). If that Python tuple ever
+#: changes, this expression must change with it in the same migration
+#: — see `alembic/versions/` for the migration that updated this
+#: GENERATED column's expression from its original 3-key form.
 _PRIMARY_INPUT_REFERENCE_SQL_EXPRESSION = (
     "COALESCE(input_references->>'evidence_id', "
     "input_references->>'intake_id', "
-    "input_references->>'entity_id')"
+    "input_references->>'entity_id', "
+    "input_references->>'conversation_id')"
 )
 
 

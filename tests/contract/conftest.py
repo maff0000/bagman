@@ -51,6 +51,8 @@ def make_entity(new_id, now_str) -> Callable[..., dict]:
             "display_name": "Example Systems Ltd",
             "status": "ACTIVE",
             "created_at": now_str(),
+            "fiscal_year_start_month_day": None,
+            "historical_floor_override_at": None,
             "metadata": {},
         }
         instance.update(overrides)
@@ -209,6 +211,104 @@ def make_ai_invocation(new_id, now_str) -> Callable[..., dict]:
             "usage_metadata": {},
             "latency_ms": None,
             "schema_version": "bagman.ai_invocation.v1",
+        }
+        instance.update(overrides)
+        return instance
+
+    return _make
+
+
+@pytest.fixture
+def make_mailbox_domain_rule(new_id, now_str) -> Callable[..., dict]:
+    """Factory for a minimal valid `bagman.mailbox_domain_rule.v1`
+    instance dict (CD-6 architect amendment; extended by the CD-6
+    GUI-operations-foundation follow-on WO's three-state policy model +
+    `EXACT_ADDRESS`/`EXACT_DOMAIN_SUBJECT` match modes, and hardened by
+    this delivery's own match_mode-conditional `allOf`/`if`/`then`
+    schema rules). Defaults to the simplest valid shape — a plain
+    domain-level `EXACT`/`BLACKLIST` rule, `sender_address` and both
+    subject-predicate fields `None` — callers pass `match_mode`-specific
+    overrides (`sender_address`, `subject_predicate_type`,
+    `subject_predicate_value`, `policy`, `destination_*`) to build any
+    of the other three match-mode shapes."""
+
+    def _make(**overrides: Any) -> dict:
+        instance = {
+            "rule_id": new_id(),
+            "mailbox_id": new_id(),
+            "sender_domain": "vendor.com",
+            "sender_address": None,
+            "match_mode": "EXACT",
+            "policy": "BLACKLIST",
+            "destination_entity_id": None,
+            "destination_mode": None,
+            "source": "OPERATOR",
+            "processor_hint": None,
+            "approved_at": now_str(),
+            "created_at": now_str(),
+            "updated_at": now_str(),
+            "last_seen_at": now_str(),
+            "subject_predicate_type": None,
+            "subject_predicate_value": None,
+            "schema_version": "bagman.mailbox_domain_rule.v1",
+        }
+        instance.update(overrides)
+        return instance
+
+    return _make
+
+
+@pytest.fixture
+def make_evidence_classification(new_id, now_str) -> Callable[..., dict]:
+    """Factory for a minimal valid `bagman.evidence_classification.v1`
+    instance dict (CD-6 Slice 5 WI-1). Defaults to the simplest valid
+    shape — a DETERMINISTIC_RULE-sourced CLASSIFIED SUPPLIER_INVOICE —
+    callers pass source-specific overrides to build any of the other
+    valid shapes."""
+
+    def _make(**overrides: Any) -> dict:
+        instance = {
+            "classification_id": new_id(),
+            "evidence_id": new_id(),
+            "classification_type": "DOCUMENT_TYPE",
+            "document_type": "SUPPLIER_INVOICE",
+            "status": "CLASSIFIED",
+            "source": "DETERMINISTIC_RULE",
+            "confidence": None,
+            "rule_id": new_id(),
+            "ai_invocation_id": None,
+            "operator_action_id": None,
+            "reason_codes": [],
+            "supersedes_classification_id": None,
+            "created_at": now_str(),
+            "schema_version": "bagman.evidence_classification.v1",
+        }
+        instance.update(overrides)
+        return instance
+
+    return _make
+
+
+@pytest.fixture
+def make_evidence_classification_rule(new_id, now_str) -> Callable[..., dict]:
+    """Factory for a minimal valid `bagman.evidence_classification_rule.v1`
+    instance dict (CD-6 Slice 5 WI-1)."""
+
+    def _make(**overrides: Any) -> dict:
+        instance = {
+            "rule_id": new_id(),
+            "sender_scope_type": "EXACT_SENDER_DOMAIN",
+            "sender_scope_value": "vendor.com",
+            "subject_predicate_type": "EXACT",
+            "subject_predicate_value": "monthly statement",
+            "document_type": "SUPPLIER_INVOICE",
+            "status": "ACTIVE",
+            "source": "OPERATOR",
+            "supersedes_rule_id": None,
+            "created_at": now_str(),
+            "approved_at": now_str(),
+            "retired_at": None,
+            "schema_version": "bagman.evidence_classification_rule.v1",
         }
         instance.update(overrides)
         return instance

@@ -43,10 +43,21 @@ def test_task_registry_has_exactly_the_four_pid_section_21_tasks_plus_wi3s_ask_b
     # new task rather than a reuse of OPERATOR_DOCUMENT_REVIEW) — the
     # registry is deliberately OPEN by design (this module's own
     # docstring), so this is an expected, additive registry growth, not
-    # a WI-1 regression.
+    # a WI-1 regression. CD-6 Slice 5 WI-3 additively registers a 6th
+    # entry, DOCUMENT_TYPE_PROPOSAL v2 (the governed AI document
+    # classifier) — v1 stays registered and untouched (Slice-5 WI-3
+    # §3), the new entry sits alongside it under the SAME task_id at a
+    # distinct task_version, exactly the additive growth this test's
+    # own name already anticipates. A CD-6 follow-up ("AI classifier
+    # boundary correction") additively registers a 7th entry,
+    # DOCUMENT_TYPE_PROPOSAL v3 (a targeted BROKER_ACTIVITY_NOTICE/
+    # NON_ACCOUNTING_DOCUMENT prompt-wording fix) — v1/v2 stay
+    # registered and untouched, same additive pattern.
     assert set(TASK_REGISTRY.keys()) == {
         ("DOCUMENT_SUMMARY", 1),
         ("DOCUMENT_TYPE_PROPOSAL", 1),
+        ("DOCUMENT_TYPE_PROPOSAL", 2),
+        ("DOCUMENT_TYPE_PROPOSAL", 3),
         ("ENTITY_PROPOSAL", 1),
         ("OPERATOR_DOCUMENT_REVIEW", 1),
         ("ASK_BAGMAN", 1),

@@ -272,6 +272,209 @@ DOCUMENT_TYPE_PROPOSAL_V1 = TaskContract(
 )
 
 
+#: The exact closed V2 canonical `proposed_type` vocabulary (CD-6 Slice
+#: 5 WI-3 §5) — identical, verbatim, to Slice-5 V1's own closed
+#: `document_type` vocabulary
+#: (`services.evidence.classification.DOCUMENT_TYPES`). Duplicated here
+#: (rather than imported) deliberately: `ai/` never imports
+#: `services.evidence.*` (see this repo's own
+#: `core`/`services`-never-imports-`app`/`persistence` boundary
+#: discipline, and `ai.gateway.background`'s own "no `app.api
+#: .composition` import inside `ai/gateway/` or `services/`" note) — the
+#: two modules are independently governed contracts that happen to
+#: share a vocabulary by design (WI-3 §5's own explicit instruction),
+#: not one importing the other. A future drift between the two lists
+#: would be a real defect; `tests/integration/test_document_type_proposal_v2.py`
+#: asserts they stay in lockstep.
+DOCUMENT_TYPE_PROPOSAL_V2_CANONICAL_TYPES: tuple[str, ...] = (
+    "SUPPLIER_INVOICE",
+    "RECEIPT",
+    "ORDER_CONFIRMATION",
+    "REFUND_CONFIRMATION",
+    "BROKER_STATEMENT",
+    "BROKER_ACTIVITY_NOTICE",
+    "NON_ACCOUNTING_DOCUMENT",
+    "UNKNOWN",
+)
+
+#: CD-6 Slice 5 WI-3 §12 — v2's `input_references` shape carries enough
+#: immutable provenance to identify EXACTLY what classifier input was
+#: analyzed, without ever carrying the document content itself.
+#: `evidence_id` is also what `ai.invocation.derive_primary_input_reference`
+#: keys the one-active-invocation-per-subject concurrency guard on (PID
+#: §73) — it is first in `PRIMARY_INPUT_REFERENCE_KEYS`' precedence
+#: order, so this task's subject is always its `evidence_id`.
+_DOCUMENT_TYPE_PROPOSAL_V2_INPUT_SCHEMA: Mapping[str, Any] = {
+    "type": "object",
+    "properties": {
+        "evidence_id": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Canonical evidence_id this proposal reasons about (PID §29).",
+        },
+        "evidence_content_hash": {
+            "type": "string",
+            "minLength": 1,
+            "description": "The referenced EvidenceItem's own content_hash value — immutable provenance for exactly which stored bytes were analyzed.",
+        },
+        "classification_context_version": {
+            "type": "string",
+            "minLength": 1,
+            "description": "The context-builder contract version that produced the evidence content sent to the model (e.g. 'bagman.evidence_classification_context.v1') — see services.evidence.classification_context.",
+        },
+        "classification_context_hash": {
+            "type": "string",
+            "minLength": 1,
+            "description": "SHA-256 of the exact bounded, rendered context string sent to the model — never the context text itself.",
+        },
+        "classifier_fingerprint": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Deterministic SHA-256 fingerprint of (task_id, task_version, prompt_contract_version, preferred_capability, classification_context_version, evidence_id, evidence_content_hash, classification_context_hash) — see services.evidence.classification_ai_fingerprint. Used for automatic-invocation idempotency/reuse (WI-3 §25).",
+        },
+    },
+    "required": [
+        "evidence_id",
+        "evidence_content_hash",
+        "classification_context_version",
+        "classification_context_hash",
+        "classifier_fingerprint",
+    ],
+    "additionalProperties": False,
+}
+
+#: CD-6 Slice 5 WI-3 §6 — bounded output shape, distinct from
+#: `_common_confidence_signals_warnings_properties()` (that shared
+#: helper's `signals`/`warnings` are UNBOUNDED, which §6 explicitly
+#: forbids for v2: "Bound: signal/warning item count; individual string
+#: size"). `proposed_type` is a closed `enum` (never v1's open
+#: `pattern`-based field) — the model contract itself must generate
+#: canonical vocabulary, never a translation layer applied after the
+#: fact (§5).
+_DOCUMENT_TYPE_PROPOSAL_V2_OUTPUT_SCHEMA: Mapping[str, Any] = {
+    "type": "object",
+    "properties": {
+        "proposed_type": {
+            "type": "string",
+            "enum": list(DOCUMENT_TYPE_PROPOSAL_V2_CANONICAL_TYPES),
+            "description": (
+                "Proposed canonical document type — MUST be exactly one of Slice-5 V1's own "
+                "closed document_type vocabulary (WI-3 §5). Never a generic INVOICE/STATEMENT/"
+                "CONTRACT/BILL/OTHER value. Use UNKNOWN when the evidence context is insufficient."
+            ),
+        },
+        "confidence": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1,
+            "description": (
+                "Model self-reported confidence that proposed_type correctly describes the "
+                "supplied bounded evidence context (WI-3 §7). This is NOT authorization to "
+                "auto-accept the classification — no confidence threshold anywhere in this "
+                "task contract promotes AI output to canonical accepted truth."
+            ),
+        },
+        "signals": {
+            "type": "array",
+            "maxItems": 10,
+            "items": {"type": "string", "maxLength": 300},
+            "description": "Short, evidence-based justifications for the proposal — bounded item count and string length (WI-3 §6).",
+        },
+        "warnings": {
+            "type": "array",
+            "maxItems": 10,
+            "items": {"type": "string", "maxLength": 300},
+            "description": "Short caveats/uncertainty a reviewer should see — bounded item count and string length (WI-3 §6).",
+        },
+    },
+    "required": ["proposed_type", "confidence", "signals", "warnings"],
+    "additionalProperties": False,
+}
+
+#: CD-6 Slice 5 WI-3 — the first canonical, governed AI document
+#: classifier. Registered ADDITIVELY alongside `DOCUMENT_TYPE_PROPOSAL_V1`
+#: (untouched, still v1's own open/generic vocabulary — WI-3 §3) under
+#: the SAME `task_id` but a distinct `task_version` — `TASK_REGISTRY`
+#: is already keyed by `(task_id, task_version)`, so this is purely
+#: additive. Uses `bagman-core` (WI-3 §4: "not bagman-fast, for the
+#: first canonical classifier") — no alias escalation/fallback; if
+#: bagman-core fails, `ai.gateway.background.run_background_task`
+#: fails the invocation honestly (its own module contract already
+#: guarantees this — WI-3 adds no new fallback logic).
+DOCUMENT_TYPE_PROPOSAL_V2 = TaskContract(
+    task_id="DOCUMENT_TYPE_PROPOSAL",
+    task_version=2,
+    role="BACKGROUND",
+    preferred_capability="bagman-core",
+    input_schema=_DOCUMENT_TYPE_PROPOSAL_V2_INPUT_SCHEMA,
+    output_schema=_DOCUMENT_TYPE_PROPOSAL_V2_OUTPUT_SCHEMA,
+    timeout_seconds=30,
+    confidence_policy={
+        "meaning": (
+            "The model's self-reported confidence that proposed_type correctly describes the "
+            "supplied bounded evidence context (WI-3 §7) — not a claim about ground truth beyond "
+            "that context, and never an auto-acceptance authorization."
+        ),
+        "notes": (
+            "No fixed pass/fail threshold is enforced by this task contract or by the WI-3 "
+            "classification orchestrator — every AI proposal is persisted as "
+            "source=AI_PROPOSAL/status=REVIEW_REQUIRED (or UNCLASSIFIABLE for UNKNOWN), never "
+            "silently promoted to status=CLASSIFIED regardless of confidence value (PID §55; WI-3 §2)."
+        ),
+    },
+    data_policy="LOCAL_OK",
+)
+
+
+#: CD-6 follow-up (post-Slice-5, "AI classifier boundary correction") —
+#: a NEW prompt-contract version fixing one genuine semantic ambiguity
+#: found by a 46-item fixed shadow evaluation of v2: v2's own
+#: BROKER_ACTIVITY_NOTICE wording never explicitly required the discrete
+#: event it describes to have ALREADY occurred/been executed/settled,
+#: so a forward-looking, not-yet-executed corporate-action announcement
+#: (e.g. a "FYI: Takeover Notification" from a third-party corporate-
+#: events feed) could be — and once was — misclassified as
+#: BROKER_ACTIVITY_NOTICE instead of NON_ACCOUNTING_DOCUMENT. v2 itself
+#: is left byte-for-byte untouched (immutable historical classifier
+#: meaning — WI-3's own "never edit an existing vN.md file's wording in
+#: place" discipline, `ai/prompts/loader.py`'s module docstring) — v3 is
+#: registered ADDITIVELY, alongside v1 and v2, under the SAME task_id,
+#: reusing v2's own input/output schema shapes verbatim (the CONTEXT
+#: shape this task consumes, and the closed eight-value canonical
+#: vocabulary it must produce, are both completely unchanged — only the
+#: system prompt's own wording changes, see
+#: `ai/prompts/document_type_proposal/v3.md`). `timeout_seconds` stays
+#: at v2's own 30 (explicitly not touched by this delivery), and
+#: `data_policy` stays `LOCAL_OK` (matching V1/V2's own convention:
+#: routine document/entity analysis routed to the BAGMAN-exclusive
+#: Mac-mini tier, PID §52 — no reason found to depart from it for a
+#: same-tier, same-provider, wording-only prompt fix).
+DOCUMENT_TYPE_PROPOSAL_V3 = TaskContract(
+    task_id="DOCUMENT_TYPE_PROPOSAL",
+    task_version=3,
+    role="BACKGROUND",
+    preferred_capability="bagman-core",
+    input_schema=_DOCUMENT_TYPE_PROPOSAL_V2_INPUT_SCHEMA,
+    output_schema=_DOCUMENT_TYPE_PROPOSAL_V2_OUTPUT_SCHEMA,
+    timeout_seconds=30,
+    confidence_policy={
+        "meaning": (
+            "The model's self-reported confidence that proposed_type correctly describes the "
+            "supplied bounded evidence context — not a claim about ground truth beyond that "
+            "context, and never an auto-acceptance authorization (identical meaning to v2's own "
+            "confidence_policy; only the underlying prompt wording changed)."
+        ),
+        "notes": (
+            "No fixed pass/fail threshold is enforced by this task contract or by the "
+            "classification orchestrator — every AI proposal is persisted as "
+            "source=AI_PROPOSAL/status=REVIEW_REQUIRED (or UNCLASSIFIABLE for UNKNOWN), never "
+            "silently promoted to status=CLASSIFIED regardless of confidence value (PID §55)."
+        ),
+    },
+    data_policy="LOCAL_OK",
+)
+
+
 _ENTITY_PROPOSAL_OUTPUT_SCHEMA: Mapping[str, Any] = {
     "type": "object",
     "properties": {
@@ -388,8 +591,30 @@ _ASK_BAGMAN_INPUT_SCHEMA: Mapping[str, Any] = {
             "oneOf": [{"type": "string", "minLength": 1}, {"type": "null"}],
             "description": "Canonical entity_id in context, if the operator is asking about a specific GovernedEntity.",
         },
+        "conversation_id": {
+            "oneOf": [{"type": "string", "minLength": 1}, {"type": "null"}],
+            "description": (
+                "CD-6 reliability delta (PID §98/§100): a GUI-generated identifier for ONE open "
+                "Ask BAGMAN drawer session (see `app/api/static/features/ai/ask-bagman.js`) — the "
+                "conversation-scoped subject `ai.invocation.derive_primary_input_reference` falls "
+                "back to (last in precedence) when none of `evidence_id`/`intake_id`/`entity_id` is "
+                "present, so a genuinely contextless 'hi bagman' turn is still traceable to a real "
+                "canonical subject instead of being rejected outright."
+            ),
+        },
+        "source": {
+            "type": "string",
+            "minLength": 1,
+            "description": (
+                "CD-6 reliability delta (PID §98/§100): a simple, honest literal recording which UI "
+                "surface originated this call, e.g. `\"ask_bagman_drawer\"` — part of the full "
+                "provenance list the architect specified for every Ask BAGMAN turn. Not a closed "
+                "taxonomy (deliberately open, like `task_id`/`event_type` elsewhere) — `\"unknown\"` "
+                "is used when a caller does not supply one."
+            ),
+        },
     },
-    "required": ["message", "evidence_id", "intake_id", "entity_id"],
+    "required": ["message", "evidence_id", "intake_id", "entity_id", "conversation_id", "source"],
     "additionalProperties": False,
 }
 
@@ -446,11 +671,19 @@ _ASK_BAGMAN_OUTPUT_SCHEMA: Mapping[str, Any] = {
 #: this comment once pointed to, was removed 2026-09-16 — see the CD-5
 #: evidence file §6n) for the full "general chat has no evidence_id"
 #: tension this task's `input_schema` resolves: `evidence_id`/`intake_id`/
-#: `entity_id` are each optional (nullable), but
+#: `entity_id`/`conversation_id` are each optional (nullable), but
 #: `ai.invocation.derive_primary_input_reference` still requires at
-#: least one non-null — a genuinely subject-less "what needs my
-#: attention?" query is explicitly out of WI-3's scope (documented,
-#: not silently papered over).
+#: least one non-null. CD-6 reliability delta (PID §98/§100) added
+#: `conversation_id` (last in precedence) and `source` specifically so
+#: a genuinely subject-less "hi bagman"/"what needs my attention?"
+#: query — the architect's own explicit ruling that "an
+#: operator-originated conversational message is itself a valid
+#: traceable input" — is no longer out of scope; a truly bare call with
+#: not even a `conversation_id` still correctly raises `ValidationError`
+#: (there is no recognised subject at all to key the concurrency guard
+#: on), but the GUI's own Ask BAGMAN drawer always supplies one now
+#: (see `app/api/static/features/ai/ask-bagman.js`), so this is no
+#: longer reachable from ordinary GUI use.
 ASK_BAGMAN_V1 = TaskContract(
     task_id="ASK_BAGMAN",
     task_version=1,
@@ -479,6 +712,8 @@ TASK_REGISTRY: Mapping[tuple[str, int], TaskContract] = {
     for contract in (
         DOCUMENT_SUMMARY_V1,
         DOCUMENT_TYPE_PROPOSAL_V1,
+        DOCUMENT_TYPE_PROPOSAL_V2,
+        DOCUMENT_TYPE_PROPOSAL_V3,
         ENTITY_PROPOSAL_V1,
         OPERATOR_DOCUMENT_REVIEW_V1,
         ASK_BAGMAN_V1,

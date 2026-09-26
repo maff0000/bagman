@@ -40,6 +40,7 @@ from pydantic import BaseModel
 from ai.gateway.background import run_background_task
 from ai.invocation import BACKGROUND_CAPABILITY_ALIASES
 from app.api.composition import get_composition
+from core.errors import ValidationError
 
 router = APIRouter(prefix="/internal/ai")
 
@@ -47,6 +48,19 @@ router = APIRouter(prefix="/internal/ai")
 #: verbatim from app/api/routers/intake.py / internal.py.
 _DEFAULT_PAGE_SIZE = 50
 _MAX_PAGE_SIZE = 200
+
+#: CD-6 Slice 5 WI-3 §22 — `DOCUMENT_TYPE_PROPOSAL` v2 must NEVER be
+#: reachable through this generic surface. This router's own
+#: `_resolve_evidence_content` (see its docstring above) is a
+#: best-effort raw-byte UTF-8 decode — exactly the unsafe path v2's
+#: whole reason for existing (a governed, versioned, bounded
+#: `services.evidence.classification_context` builder) replaces. v1
+#: remains fully callable here, unchanged (WI-3 §22's own explicit
+#: "V1 remains unchanged" instruction) — only this one, exact
+#: `(task_id, task_version)` pair is refused; see
+#: `tests/integration/test_architecture_boundaries.py`'s
+#: request-level proof of this rejection.
+_GENERIC_PATH_FORBIDDEN_TASKS: frozenset[tuple[str, int]] = frozenset({("DOCUMENT_TYPE_PROPOSAL", 2)})
 
 
 # ---------------------------------------------------------------------
@@ -105,6 +119,17 @@ def _resolve_evidence_content(composition, input_references: dict[str, Any]) -> 
 
 @router.post("/tasks")
 async def create_background_task(payload: RunBackgroundTaskRequest) -> dict:
+    if (payload.task_id, payload.task_version) in _GENERIC_PATH_FORBIDDEN_TASKS:
+        raise ValidationError(
+            f"task '{payload.task_id}' v{payload.task_version} may not be invoked through this "
+            "generic POST /internal/ai/tasks surface (CD-6 Slice 5 WI-3 §22) — it requires the "
+            "governed Slice-5 classification surface instead: POST "
+            "/internal/evidence/{evidence_id}/classifications/ai-preview or "
+            ".../orchestrated, which build the bounded, versioned evidence-classification "
+            "context this task's input_schema requires, rather than this router's own "
+            "best-effort raw-byte UTF-8 decode"
+        )
+
     composition = get_composition()
     evidence_content = _resolve_evidence_content(composition, payload.input_references)
 

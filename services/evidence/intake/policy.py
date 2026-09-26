@@ -213,3 +213,33 @@ class IntakePolicy:
 #: a smaller test-only size limit) construct their own
 #: ``IntakePolicy(...)`` rather than mutating this one (it is frozen).
 DEFAULT_INTAKE_POLICY = IntakePolicy()
+
+
+#: CD-6 Slice 4 addition — the one new accepted content type this
+#: delivery needs: an email's raw, original MIME bytes (architect spec:
+#: "if the existing CD-4 manual-upload content-type policy doesn't
+#: accept message/rfc822, extend it deliberately... a separate, still-
+#: governed, still-scanned ingestion function/parameter, not a loosened
+#: universal rule"). Deliberately NOT added to
+#: :data:`DEFAULT_ACCEPTED_MIME_TYPES` above — that set governs the
+#: browser-facing, untrusted-uploader-reported-filename manual-upload
+#: path (``services.evidence.intake.validation_pipeline``, driven by
+#: byte-sniffing `services.evidence.intake.content_sniffing.sniff`,
+#: which has no magic-byte signature for RFC 822 text at all — an
+#: uploaded `.eml` file would sniff as `text/plain` today, which is a
+#: separate, pre-existing, out-of-scope gap this delivery does not
+#: touch). This constant instead governs the DISTINCT, adapter-driven,
+#: internal trusted-ingestion path
+#: (``services.mailbox.microsoft.evidence_ingest.ingest_email_evidence``),
+#: which already KNOWS its content is a raw email fetched directly from
+#: Microsoft Graph's own `/$value` message-content operation — it never
+#: guesses from a browser-supplied filename/extension, and never widens
+#: what the ordinary manual-upload endpoint itself accepts.
+EMAIL_MESSAGE_MIME_TYPE = "message/rfc822"
+
+#: The trusted-ingestion path's own governed accepted-type set — today
+#: exactly one type. Kept as its own named, documented constant (rather
+#: than inlining the string at the one call site) so a future adapter
+#: extending this same trusted path has one obvious place to add a
+#: type, and so a test can assert on it directly.
+TRUSTED_INGESTION_ACCEPTED_MIME_TYPES = frozenset({EMAIL_MESSAGE_MIME_TYPE})

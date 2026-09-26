@@ -5,19 +5,49 @@
 # Added retroactively by CD-3 WI-3 — WI-2 (which built this component)
 # shipped without a manifest; this is the first work item to introduce
 # component.yaml validation/projection for it.
+#
+# CD-6 MinIO withdrawal WO (2026-09-24): the responsibility text below
+# was updated to state the provider-swap explicitly — see that WO's
+# evidence for the full record (old MinIO tag withdrawn upstream,
+# unpatched CVEs in the whole community-edition line; replaced with
+# SeaweedFS 4.47, pinned by digest, in
+# `deployment/compose/docker-compose.yml`). No code in this directory
+# changed: `MinIOObjectStore`/`MinIOConfig` (names deliberately
+# retained — a cosmetic rename is out of scope for this delivery) are
+# still the sole boto3-based `EvidenceObjectStore` implementation, and
+# they remain completely unaware which S3-compatible provider they are
+# actually talking to — that is the whole point of PID §53's
+# abstraction boundary, proven concretely by this swap rather than
+# merely asserted.
 
 id: BAGMAN.PERSISTENCE.OBJECTS
-version: 2
+version: 3
 
 responsibility: >
   Own the EvidenceObjectStore abstraction (put/put_prefixed/get/exists/
   verify_hash) for durable, immutable, content-addressed
-  original-evidence-bytes storage, its MinIO/S3-compatible boto3
-  implementation, and — added by WI-3 — a narrow in-memory reference
-  implementation used only by the runtime composition root's
-  development/test mode. Core/domain code never depends on a
-  storage-provider SDK directly (PID §53); this component is the only
-  place that does. CD-4 WI-2 added `put_prefixed()` plus the
+  original-evidence-bytes storage — the canonical interface is this
+  S3-compatible abstraction, never a specific provider's own API
+  surface. `MinIOObjectStore`/`MinIOConfig` (names retained from CD-3
+  WI-2 for continuity, not renamed by the CD-6 MinIO withdrawal WO)
+  are its one boto3-based, S3-compatible-protocol implementation, plus
+  — added by WI-3 — a narrow in-memory reference implementation used
+  only by the runtime composition root's development/test mode.
+  Core/domain code never depends on a storage-provider SDK directly
+  (PID §53); this component is the only place that does. The CURRENT
+  runtime provider behind that boto3 client, as configured in
+  `deployment/compose/docker-compose.yml`'s `bagman-objects` service,
+  is SeaweedFS 4.47 (the original MinIO release line this component
+  was built against is now withdrawn/unmaintained upstream) — this is
+  a swappable deployment/configuration choice, not something this
+  component's code is hard-wired to: `MinIOObjectStore` speaks only
+  the S3 protocol via `boto3`, never anything MinIO-specific, so any
+  other S3-compatible provider works identically. Evidence immutability
+  and hash-integrity verification (PID §17/§18) are enforced entirely
+  by this component's own code (the hash-check-before-write in `put()`/
+  `put_prefixed()`, the re-hash-on-read in `get()`, the byte-for-byte
+  compare in `verify_hash()`) — never assumed from whatever provider is
+  configured underneath. CD-4 WI-2 added `put_prefixed()` plus the
   `quarantine_object_key()`/`staging_object_key()` sibling key-shape
   helpers (PID §21/§22): quarantined material and an ACCEPTED intake's
   staged bytes are stored under `quarantine/<id>/<hash>` /

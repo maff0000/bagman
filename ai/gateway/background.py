@@ -187,7 +187,7 @@ def run_background_task(
 
     invocation = repository.transition_status(invocation.ai_invocation_id, "RUNNING")
 
-    prompt_contract_version = resolve_prompt_contract_version(task_id)
+    prompt_contract_version = resolve_prompt_contract_version(task_id, task_version)
     system_instructions = load_system_prompt(task_id, prompt_contract_version)
 
     result = litellm_client.complete(

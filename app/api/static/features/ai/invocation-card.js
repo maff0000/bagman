@@ -174,7 +174,10 @@ export function renderInvocationCard(invocation, options = {}) {
     card.appendChild(box);
   }
 
-  const terminal = invocation.status === "FAILED" || invocation.status === "REJECTED";
+  // Every terminal failure-shaped state offers Retry (CD-6 reliability
+  // delta added TIMED_OUT/CANCELLED to the closed set alongside the
+  // original FAILED/REJECTED — PID §100).
+  const terminal = ["FAILED", "REJECTED", "TIMED_OUT", "CANCELLED"].includes(invocation.status);
   if (terminal && typeof options.onRetry === "function") {
     card.appendChild(
       el("div", { class: "ai-card__actions" }, [
