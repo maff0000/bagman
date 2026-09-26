@@ -38,7 +38,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from ai.gateway.background import run_background_task
-from ai.invocation import BACKGROUND_CAPABILITY_ALIASES
+from ai.invocation import CAPABILITY_ALIAS_BACKENDS
 from app.api.composition import get_composition
 from core.errors import ValidationError
 
@@ -61,6 +61,22 @@ _MAX_PAGE_SIZE = 200
 #: `tests/integration/test_architecture_boundaries.py`'s
 #: request-level proof of this rejection.
 _GENERIC_PATH_FORBIDDEN_TASKS: frozenset[tuple[str, int]] = frozenset({("DOCUMENT_TYPE_PROPOSAL", 2)})
+
+#: CD-6 §103 Inference Architecture Ruling, PID §103.4 item 4's own
+#: "GUI/status-display" instruction: `/internal/ai/health` only ever
+#: live-health-checks the Mac-mini-resident aliases — `trinity-core`
+#: (CD-6 §103) is backlog/overflow-only, reached exclusively through
+#: the bounded, operator-invoked `scripts.process_background_job_overflow`
+#: procedure, never a routine per-request routing choice, so it is
+#: deliberately NEVER included in this live-checked tier (the smallest
+#: reasonable GUI change this ruling requires — collapsing the display
+#: to the two real Mac profiles plus a note that Trinity overflow is
+#: backlog-only, not a larger redesign). Derived from
+#: `ai.invocation.CAPABILITY_ALIAS_BACKENDS` (the single source of
+#: truth), never a second, hand-maintained alias list.
+_MAC_LOCAL_HEALTH_CHECKED_ALIASES = frozenset(
+    alias for alias, backend in CAPABILITY_ALIAS_BACKENDS.items() if backend == "MAC_LOCAL"
+)
 
 
 # ---------------------------------------------------------------------
@@ -247,20 +263,37 @@ async def ai_health() -> dict:
     operator-intelligence surface — and can fail/recover completely
     independently of the LiteLLM background gateway (PID §46-48's own
     "distinct failure classes" doctrine).
+
+    CD-6 §103 Inference Architecture Ruling: `checks` only ever
+    live-health-checks the Mac-mini-resident aliases
+    (`_MAC_LOCAL_HEALTH_CHECKED_ALIASES`) — `trinity-core` is
+    deliberately NOT one of these keys any more (previously
+    `bagman-deep` was, back when it denoted a routine escalation tier;
+    that tier is retired). Trinity overflow is backlog/maintenance-mode
+    only, reached exclusively through the bounded, operator-invoked
+    `scripts.process_background_job_overflow` procedure — it is never a
+    routine, continuously-health-checked routing tier, so surfacing it
+    here as if it were would be misleading, not merely redundant. A
+    separate, always-present `trinity_core_overflow` key instead
+    documents its actual status honestly.
     """
     composition = get_composition()
     gateway_reachable = composition.litellm_client.is_available()
     status_value = "ok" if gateway_reachable else "unreachable"
     checks: dict[str, str] = {
-        alias.replace("-", "_"): status_value for alias in sorted(BACKGROUND_CAPABILITY_ALIASES)
+        alias.replace("-", "_"): status_value for alias in sorted(_MAC_LOCAL_HEALTH_CHECKED_ALIASES)
     }
     checks["claude_code"] = (
         "ok" if composition.claude_code_operator_runner.is_available() else "unreachable"
     )
     return {
         "checks": checks,
+        "trinity_core_overflow": (
+            "backlog/overflow only (CD-6 §103) — never a live-health-checked routine tier; "
+            "processed only via the bounded scripts.process_background_job_overflow operator procedure"
+        ),
         "granularity": (
-            "gateway-wide for bagman-*: all three keys reflect one shared LiteLLM-gateway "
+            "gateway-wide for bagman-*: both keys reflect one shared LiteLLM-gateway "
             "reachability signal, not independently-measured per-alias health "
             "(see ai/providers/litellm/client.py::LiteLLMClient.is_available); 'claude_code' is "
             "a genuinely separate, independently-measured signal for the sole authoritative "

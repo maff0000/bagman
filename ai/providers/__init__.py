@@ -9,8 +9,15 @@ architecture-history note for the superseded intermediate states):
 ``ai/providers/litellm/`` speaks to a dedicated, BAGMAN-exclusive Mac
 AI appliance (its own LiteLLM + PostgreSQL, not the shared Trinity
 installation this package originally targeted) for `bagman-fast`/
-`bagman-core`, escalating via the same appliance to Trinity compute
-for `bagman-deep`. Nothing outside a provider's own
+`bagman-core` (two generation PROFILES against BAGMAN's one
+permanently-resident Mac-mini model — CD-6 §103 Inference Architecture
+Ruling). The same appliance also fronts `trinity-core` — CD-6 §103's
+sole authorised Trinity alias, backlog/overflow processing only (`ai.jobs`),
+never a routine per-request escalation; this RETIRES the earlier
+`bagman-deep` tier, which routed to a genuinely different, heavier
+Trinity-hosted model as a routine escalation (no live task contract
+ever used it — see `ai.invocation.BACKGROUND_CAPABILITY_ALIASES`'s own
+docstring for the full history). Nothing outside a provider's own
 subpackage may construct an HTTP request to that provider directly
 (PID §6/§70) — ``ai/gateway/`` (background tasks) and ``agent/``
 (the Claude operator path) orchestrate against these adapters'

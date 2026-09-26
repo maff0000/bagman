@@ -7,12 +7,19 @@ in full before changing anything here): BAGMAN never calls the Mac
 mini, Ollama/MLX/llama.cpp, or Trinity compute directly. It calls
 HELM's dedicated, BAGMAN-exclusive Mac AI appliance — its own LiteLLM
 + PostgreSQL, not the shared Trinity LiteLLM installation this module
-originally targeted at CD-5's initial dispatch — with one of exactly
-three BAGMAN-owned logical aliases (``bagman-fast``/``bagman-core``/
-``bagman-deep``) and lets that gateway decide the physical backend
-(the dedicated Mac model for `fast`/`core`, escalating to Trinity
-compute for `deep`). This module's own mechanical enforcement of that
-boundary is :func:`validate_capability_alias`, called before ANY HTTP
+originally targeted at CD-5's initial dispatch — with one of BAGMAN's
+current closed-set logical aliases (CD-6 §103 Inference Architecture
+Ruling: ``bagman-fast``/``bagman-core`` — two generation profiles
+against the one dedicated Mac-resident model — plus ``trinity-core``,
+reached only for bounded backlog/overflow processing via
+``scripts.process_background_job_overflow``, never a routine per-task
+alias; the original third alias, ``bagman-deep``, routed to a
+genuinely different/heavier Trinity model as a routine escalation
+tier and has since been retired — see ``ai.invocation
+.BACKGROUND_CAPABILITY_ALIASES``'s own docstring for the full,
+preserved history) and lets that gateway decide the physical backend.
+This module's own mechanical enforcement of that boundary is
+:func:`validate_capability_alias`, called before ANY HTTP
 request is ever constructed (PID §5's raw-model-name-lockdown
 mitigation — independently reconfirmed against the final appliance,
 which rejects a raw physical model name with its own `403
@@ -22,7 +29,7 @@ Wire protocol (PID §50, independently re-verified during this WI)
 --------------------------------------------------------------------
 ``POST {endpoint}/v1/chat/completions`` with header
 ``Authorization: Bearer <virtual key>`` and a JSON body
-``{"model": "<bagman-fast|bagman-core|bagman-deep>", "messages": [...]}}``
+``{"model": "<bagman-fast|bagman-core|trinity-core>", "messages": [...]}}``
 — the standard OpenAI-compatible chat-completions shape LiteLLM already
 exposes for every alias it fronts. The response is normalised into
 :class:`LiteLLMCompletionResult` (PID §70) — nothing outside this
@@ -520,7 +527,10 @@ class LiteLLMClient:
         GATEWAY-WIDE, not per-alias: the existing LiteLLM installation
         exposes no per-alias health endpoint BAGMAN can probe cheaply,
         so this single check is the only reachability signal available
-        for all of `bagman-fast`/`bagman-core`/`bagman-deep` — see
+        for `bagman-fast`/`bagman-core` (CD-6 §103: the health endpoint
+        deliberately does not live-check `trinity-core`, which is
+        backlog/overflow-only, never a routine tier — see that
+        constant's own docstring) — see
         `app/api/routers/ai.py`'s `/internal/ai/health` handler, which
         states this same granularity limit in its own response rather
         than fabricating a false per-alias distinction.

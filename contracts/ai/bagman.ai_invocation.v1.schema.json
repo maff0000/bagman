@@ -31,10 +31,15 @@
     },
     "capability_alias": {
       "oneOf": [
-        { "type": "string", "enum": ["bagman-fast", "bagman-core", "bagman-deep"] },
+        { "type": "string", "enum": ["bagman-fast", "bagman-core", "trinity-core"] },
         { "type": "null" }
       ],
-      "description": "For a `BACKGROUND` invocation: the exact BAGMAN-specific LiteLLM alias requested (PID §9) — always one of the closed set `bagman-fast`/`bagman-core`/`bagman-deep`, NEVER a `trinity-*` alias and NEVER a raw/physical model name (PID §5/§10). For an `OPERATOR` invocation: always `null` — Claude is not reached via a LiteLLM alias at all (PID §8), so this field carries no meaning for that role; the Claude model actually used is instead recorded, audit-only, in `provider_model` (per BAGMAN_OPERATOR_MODEL configuration, PID §18). The `role`-conditioned `allOf`/`if`/`then` rules below enforce this cross-field correspondence structurally, not merely by convention."
+      "description": "For a `BACKGROUND` invocation: the exact BAGMAN-specific LiteLLM alias requested (PID §9), always one of the closed set `bagman-fast`/`bagman-core`/`trinity-core`, NEVER a raw/physical model name (PID §5/§10). `bagman-fast`/`bagman-core` are generation PROFILES against BAGMAN's one permanently-resident Mac-mini model (CD-6 §103 Inference Architecture Ruling) — never separate model identities. `trinity-core` (CD-6 §103) is the SOLE authorised Trinity alias, reached only for backlog/overflow processing via the durable `ai.jobs` mechanism, never as a routine per-request escalation; no other `trinity-*` alias is ever permitted. History, preserved per this project's convention: this enum previously included `bagman-deep`, which routed to a genuinely different, heavier Trinity-hosted model as a routine escalation tier — CD-6 §103 RETIRED that tier (no live task contract ever used it) in favour of the explicit `trinity-core` overflow mechanism above. For an `OPERATOR` invocation: always `null` — Claude is not reached via a LiteLLM alias at all (PID §8), so this field carries no meaning for that role; the Claude model actually used is instead recorded, audit-only, in `provider_model` (per BAGMAN_OPERATOR_MODEL configuration, PID §18). The `role`-conditioned `allOf`/`if`/`then` rules below enforce this cross-field correspondence structurally, not merely by convention."
+    },
+    "inference_backend": {
+      "type": "string",
+      "enum": ["MAC_LOCAL", "TRINITY_CORE_OVERFLOW"],
+      "description": "Which physical inference backend actually served this BACKGROUND invocation (CD-6 §103 Inference Architecture Ruling) — MAC_LOCAL (the dedicated Mac mini, the normal/default path) or TRINITY_CORE_OVERFLOW (Trinity's own LiteLLM, backlog/overflow only, reached exclusively via the trinity-core alias). Always MAC_LOCAL for an OPERATOR-role invocation (Claude's path is unaffected by this field). AUDIT-ONLY: nothing in ai/ reads this field to make a routing decision after the fact — the backend was already explicitly chosen, by BAGMAN's own code, before this invocation was created."
     },
     "provider_model": {
       "oneOf": [
@@ -160,6 +165,7 @@
     "role",
     "provider",
     "capability_alias",
+    "inference_backend",
     "provider_model",
     "started_at",
     "completed_at",
@@ -185,7 +191,7 @@
       },
       "then": {
         "properties": {
-          "capability_alias": { "type": "string", "enum": ["bagman-fast", "bagman-core", "bagman-deep"] }
+          "capability_alias": { "type": "string", "enum": ["bagman-fast", "bagman-core", "trinity-core"] }
         }
       }
     },

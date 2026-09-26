@@ -283,12 +283,60 @@ ROLES = frozenset({"OPERATOR", "BACKGROUND"})
 PROVIDERS = frozenset({"LITELLM", "ANTHROPIC"})
 
 #: THE single closed-set source of truth for BAGMAN's background
-#: capability aliases (PID §9). Every later work item's alias
-#: validation must import and use THIS constant — never redefine a
-#: parallel list, and never add a `trinity-*` value here (PID §9's own
-#: explicit prohibition; see `tests/integration/test_architecture_boundaries.py`
-#: for the repo-wide `trinity-*` absence check WI-5 is expected to add).
-BACKGROUND_CAPABILITY_ALIASES: frozenset[str] = frozenset({"bagman-fast", "bagman-core", "bagman-deep"})
+#: capability aliases (PID §9; CD-6 §103 Inference Architecture Ruling,
+#: 2026-09-26). Every later work item's alias validation must import
+#: and use THIS constant — never redefine a parallel list.
+#:
+#: History, preserved per this project's own "mark superseded, never
+#: delete" convention: this frozenset originally read
+#: `{"bagman-fast", "bagman-core", "bagman-deep"}`, with `bagman-deep`
+#: routing to a genuinely different, heavier Trinity-hosted model as a
+#: routine per-task escalation tier, and PID §9 forbade any `trinity-*`
+#: value here outright. CD-6 §103's Architect ruling RETIRED
+#: `bagman-deep` as a permanent tier (no live task contract ever set
+#: `preferred_capability="bagman-deep"`, so this was a config/alias/
+#: test/doc cleanup only, never a business-logic migration — see
+#: `PID.md` §103.2) and introduced exactly ONE authorised Trinity
+#: alias, `trinity-core`, reached only for backlog/overflow processing
+#: through the new `ai.jobs` durable job mechanism — never as a live
+#: per-request routing choice, and never hidden inside LiteLLM's own
+#: routing (PID §103 point 6). `trinity-core` is the sole exception to
+#: PID §9's original blanket "no trinity-*" prohibition; no other
+#: Trinity alias of any name is ever authorised — see
+#: :data:`CAPABILITY_ALIAS_BACKENDS`, which pins exactly which physical
+#: backend each of these three aliases resolves to, and
+#: `tests/integration/test_architecture_boundaries.py`'s repo-wide
+#: sweep, which still forbids every OTHER `trinity-*` literal.
+BACKGROUND_CAPABILITY_ALIASES: frozenset[str] = frozenset({"bagman-fast", "bagman-core", "trinity-core"})
+
+#: BAGMAN's own explicit `MAC_LOCAL` / `TRINITY_CORE_OVERFLOW`
+#: backend-selection vocabulary (CD-6 §103 Inference Architecture
+#: Ruling, point 6): BAGMAN's own code makes this decision explicitly,
+#: never LiteLLM's routing rules. Default is always `MAC_LOCAL` (see
+#: :data:`DEFAULT_INFERENCE_BACKEND`).
+InferenceBackend = Literal["MAC_LOCAL", "TRINITY_CORE_OVERFLOW"]
+INFERENCE_BACKENDS: frozenset[str] = frozenset({"MAC_LOCAL", "TRINITY_CORE_OVERFLOW"})
+
+#: Which inference backend each closed-set BACKGROUND capability alias
+#: actually resolves to today (PID §103) — the single source of truth
+#: used to structurally cross-check that an AIInvocation's
+#: capability_alias and inference_backend are never recorded
+#: inconsistently with each other. `ai.jobs` also imports this directly
+#: (rather than redefining a parallel mapping) to cross-validate that
+#: every `BackgroundJob` names `capability_alias="trinity-core"`
+#: exactly when `inference_backend="TRINITY_CORE_OVERFLOW"`.
+CAPABILITY_ALIAS_BACKENDS: dict[str, str] = {
+    "bagman-fast": "MAC_LOCAL",
+    "bagman-core": "MAC_LOCAL",
+    "trinity-core": "TRINITY_CORE_OVERFLOW",
+}
+
+#: Default backend for every BACKGROUND invocation unless a caller
+#: explicitly overrides it (CD-6 §103 point 6: "Default is always
+#: MAC_LOCAL"). Every historical AIInvocation row (created before this
+#: field existed) is also, honestly, `MAC_LOCAL` — see the Alembic
+#: migration that added this column's `server_default`.
+DEFAULT_INFERENCE_BACKEND: str = "MAC_LOCAL"
 
 #: Recognised `input_references` keys, in the precedence order
 #: :func:`derive_primary_input_reference` checks them. `conversation_id`
@@ -479,13 +527,28 @@ def derive_primary_input_reference(input_references: Mapping[str, Any]) -> str:
 
 
 def validate_role_provider_capability_pairing(
-    *, role: str, provider: str, capability_alias: Optional[str]
+    *,
+    role: str,
+    provider: str,
+    capability_alias: Optional[str],
+    inference_backend: str = DEFAULT_INFERENCE_BACKEND,
 ) -> None:
     """Enforce CD-5's locked role/provider/alias pairing (PID §2/§8):
     `OPERATOR` is served only by the `ANTHROPIC` adapter and never
     carries a `capability_alias`; `BACKGROUND` is served only by the
     `LITELLM` adapter and always carries one of
     :data:`BACKGROUND_CAPABILITY_ALIASES`.
+
+    CD-6 §103 addition: also enforces that `inference_backend` is one
+    of :data:`INFERENCE_BACKENDS`, and — for `BACKGROUND` — that it
+    matches EXACTLY what :data:`CAPABILITY_ALIAS_BACKENDS` says
+    `capability_alias` resolves to (e.g. `capability_alias="trinity-core"`
+    with `inference_backend="MAC_LOCAL"` is a structural
+    inconsistency, not a mere mismatch, and is rejected). `OPERATOR`'s
+    `inference_backend` is validated explicitly too, rather than
+    silently ignored for that role: Claude's operator path is
+    unaffected by this whole ruling, so it must always be `MAC_LOCAL`
+    — never left to carry unexamined, possibly-wrong meaning.
 
     Raised as a plain `core.errors.ValidationError` rather than a new
     dedicated error type — a PL judgment call (documented here per the
@@ -499,6 +562,11 @@ def validate_role_provider_capability_pairing(
         raise ValidationError(f"role '{role}' is not one of the closed set {sorted(ROLES)} (PID §8)")
     if provider not in PROVIDERS:
         raise ValidationError(f"provider '{provider}' is not one of the closed set {sorted(PROVIDERS)} (PID §6/§8)")
+    if inference_backend not in INFERENCE_BACKENDS:
+        raise ValidationError(
+            f"inference_backend '{inference_backend}' is not one of the closed set "
+            f"{sorted(INFERENCE_BACKENDS)} (PID §103)"
+        )
 
     if role == "BACKGROUND":
         if provider != "LITELLM":
@@ -511,6 +579,14 @@ def validate_role_provider_capability_pairing(
                 f"a BACKGROUND invocation's capability_alias must be one of "
                 f"{sorted(BACKGROUND_CAPABILITY_ALIASES)} (PID §9); got {capability_alias!r}"
             )
+        expected_backend = CAPABILITY_ALIAS_BACKENDS.get(capability_alias)
+        if inference_backend != expected_backend:
+            raise ValidationError(
+                f"capability_alias {capability_alias!r} resolves to inference_backend "
+                f"{expected_backend!r} (PID §103), but inference_backend={inference_backend!r} was given — "
+                "an AIInvocation's capability_alias and inference_backend must never be recorded "
+                "inconsistently with each other"
+            )
     else:  # role == "OPERATOR"
         if provider != "ANTHROPIC":
             raise ValidationError(
@@ -520,6 +596,11 @@ def validate_role_provider_capability_pairing(
             raise ValidationError(
                 "an OPERATOR invocation's capability_alias must be null — Claude is never "
                 f"reached via a LiteLLM alias (PID §8); got {capability_alias!r}"
+            )
+        if inference_backend != "MAC_LOCAL":
+            raise ValidationError(
+                f"an OPERATOR invocation's inference_backend must be 'MAC_LOCAL' — Claude's operator "
+                f"path is unaffected by the CD-6 §103 ruling; got {inference_backend!r}"
             )
 
 
@@ -544,6 +625,14 @@ class AIInvocation:
     actor_id: str
     input_references: Mapping[str, Any]
     capability_alias: Optional[str] = None
+    #: `MAC_LOCAL` / `TRINITY_CORE_OVERFLOW` (CD-6 §103) — which
+    #: physical inference backend actually served this invocation.
+    #: AUDIT-ONLY (PID §103 point 8): nothing in `ai/` reads this field
+    #: to make a routing decision — the backend was already explicitly
+    #: chosen, by BAGMAN's own code, before this invocation was ever
+    #: created. Always `"MAC_LOCAL"` for every historical row (created
+    #: before this field existed) and for every OPERATOR invocation.
+    inference_backend: str = DEFAULT_INFERENCE_BACKEND
     provider_model: Optional[str] = None
     completed_at: Optional[datetime] = None
     prompt_contract_version: Optional[str] = None
@@ -565,6 +654,7 @@ class AIInvocation:
             "role": self.role,
             "provider": self.provider,
             "capability_alias": self.capability_alias,
+            "inference_backend": self.inference_backend,
             "provider_model": self.provider_model,
             "started_at": to_contract_string(self.started_at),
             "completed_at": to_contract_string(self.completed_at) if self.completed_at is not None else None,
@@ -592,8 +682,8 @@ def transition(invocation: AIInvocation, new_status: str, **field_updates: Any) 
     `output`, `confidence`, `validation_result`, `error_code`,
     `usage_metadata`, `latency_ms`, `prompt_contract_version`. Identity
     fields established at creation (`task_id`, `task_version`, `role`,
-    `provider`, `capability_alias`, `correlation_id`, `actor_type`,
-    `actor_id`, `input_references`, `started_at`) are never legitimate
+    `provider`, `capability_alias`, `inference_backend`, `correlation_id`,
+    `actor_type`, `actor_id`, `input_references`, `started_at`) are never legitimate
     `field_updates` targets — passing one raises `ValidationError` just
     like any other unrecognised field name would (this module does not
     special-case reject them individually; `dataclasses.replace` simply
@@ -680,11 +770,14 @@ class AIInvocationRepository(abc.ABC):
         actor_id: str,
         correlation_id: Optional[str] = None,
         prompt_contract_version: Optional[str] = None,
+        inference_backend: str = DEFAULT_INFERENCE_BACKEND,
     ) -> AIInvocation:
         """Create a new `AIInvocation` in `REQUESTED` (PID §28).
 
-        Enforces, in order: the role/provider/capability_alias pairing
-        (see :func:`validate_role_provider_capability_pairing`), that
+        Enforces, in order: the role/provider/capability_alias/
+        inference_backend pairing (see
+        :func:`validate_role_provider_capability_pairing` — CD-6 §103
+        added `inference_backend`'s own cross-check), that
         `input_references` yields a `derive_primary_input_reference`,
         a bounded stale-`RUNNING` recovery pass (CD-6 reliability delta
         — see module docstring: if the subject's existing "active" row
@@ -701,6 +794,12 @@ class AIInvocationRepository(abc.ABC):
         correlation or, more commonly, a continuation of one already
         established upstream (e.g. by evidence intake, PID §58), in
         which case the caller supplies it explicitly.
+
+        `inference_backend` (CD-6 §103 addition) defaults to
+        `"MAC_LOCAL"` — fully backward compatible for every existing
+        caller that does not pass it, matching every historical
+        invocation's true reality (BAGMAN had no other backend before
+        this ruling).
         """
         raise NotImplementedError
 
@@ -865,8 +964,11 @@ class InMemoryAIInvocationRepository(AIInvocationRepository):
         actor_id: str,
         correlation_id: Optional[str] = None,
         prompt_contract_version: Optional[str] = None,
+        inference_backend: str = DEFAULT_INFERENCE_BACKEND,
     ) -> AIInvocation:
-        validate_role_provider_capability_pairing(role=role, provider=provider, capability_alias=capability_alias)
+        validate_role_provider_capability_pairing(
+            role=role, provider=provider, capability_alias=capability_alias, inference_backend=inference_backend
+        )
 
         if not actor.is_valid(actor_type):
             raise ValidationError(
@@ -902,6 +1004,7 @@ class InMemoryAIInvocationRepository(AIInvocationRepository):
                 role=role,
                 provider=provider,
                 capability_alias=capability_alias,
+                inference_backend=inference_backend,
                 status="REQUESTED",
                 started_at=utc_now(),
                 correlation_id=correlation_id if correlation_id is not None else identity.generate_id(),

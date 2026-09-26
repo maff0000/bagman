@@ -227,20 +227,22 @@ def test_ai_health_reports_gateway_wide_checks_for_every_alias(dev_client):
     response = dev_client.get("/internal/ai/health")
     assert response.status_code == 200
     body = response.json()
+    # CD-6 §103 Inference Architecture Ruling: `bagman-deep` is retired
+    # and `trinity-core` is deliberately NOT in this live-checked tier
+    # at all (backlog/overflow only — see `trinity_core_overflow` key).
     assert body["checks"] == {
         "bagman_fast": "ok",
         "bagman_core": "ok",
-        "bagman_deep": "ok",
         "claude_code": "ok",
     }
     assert "gateway-wide" in body["granularity"]
+    assert "backlog" in body["trinity_core_overflow"]
 
     composition.litellm_client.set_available(False)
     response = dev_client.get("/internal/ai/health")
     assert response.json()["checks"] == {
         "bagman_fast": "unreachable",
         "bagman_core": "unreachable",
-        "bagman_deep": "unreachable",
         "claude_code": "ok",
     }
 

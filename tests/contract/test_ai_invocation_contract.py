@@ -78,15 +78,28 @@ def test_provider_is_a_closed_enum(make_ai_invocation):
         validate_against_contract(instance, SCHEMA)
 
 
-@pytest.mark.parametrize("valid_alias", ["bagman-fast", "bagman-core", "bagman-deep"])
+@pytest.mark.parametrize("valid_alias", ["bagman-fast", "bagman-core", "trinity-core"])
 def test_every_background_capability_alias_is_accepted(make_ai_invocation, valid_alias):
     instance = make_ai_invocation(capability_alias=valid_alias)
     validate_against_contract(instance, SCHEMA)
 
 
-def test_a_trinity_star_alias_is_rejected(make_ai_invocation):
-    """PID §9: BAGMAN's own aliases only — never a `trinity-*` alias."""
-    instance = make_ai_invocation(capability_alias="trinity-fast")
+def test_bagman_deep_is_no_longer_a_valid_capability_alias(make_ai_invocation):
+    """CD-6 §103 Inference Architecture Ruling: `bagman-deep` is
+    RETIRED — no longer a member of the closed `capability_alias` enum
+    at all (see `ai.invocation.BACKGROUND_CAPABILITY_ALIASES`'s own
+    docstring for the full history)."""
+    instance = make_ai_invocation(capability_alias="bagman-deep")
+    with pytest.raises(ValidationError):
+        validate_against_contract(instance, SCHEMA)
+
+
+@pytest.mark.parametrize("bad_alias", ["trinity-fast", "trinity-deep", "trinity-embed"])
+def test_a_forbidden_trinity_star_alias_is_rejected(make_ai_invocation, bad_alias):
+    """PID §9/CD-6 §103: `trinity-core` is the SOLE authorised Trinity
+    alias (see `test_every_background_capability_alias_is_accepted`
+    above) — every other `trinity-*` alias remains rejected."""
+    instance = make_ai_invocation(capability_alias=bad_alias)
     with pytest.raises(ValidationError):
         validate_against_contract(instance, SCHEMA)
 
@@ -107,6 +120,30 @@ def test_background_role_requires_a_non_null_capability_alias(make_ai_invocation
 
 def test_operator_role_requires_a_null_capability_alias(make_ai_invocation):
     instance = make_ai_invocation(role="OPERATOR", provider="ANTHROPIC", capability_alias="bagman-fast")
+    with pytest.raises(ValidationError):
+        validate_against_contract(instance, SCHEMA)
+
+
+# ---------------------------------------------------------------------
+# inference_backend (CD-6 §103 Inference Architecture Ruling)
+# ---------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("valid_backend", ["MAC_LOCAL", "TRINITY_CORE_OVERFLOW"])
+def test_every_inference_backend_value_is_accepted(make_ai_invocation, valid_backend):
+    instance = make_ai_invocation(inference_backend=valid_backend)
+    validate_against_contract(instance, SCHEMA)
+
+
+def test_inference_backend_is_a_closed_enum_rejecting_unknown_values(make_ai_invocation):
+    instance = make_ai_invocation(inference_backend="SOMETHING_MADE_UP")
+    with pytest.raises(ValidationError):
+        validate_against_contract(instance, SCHEMA)
+
+
+def test_inference_backend_is_a_required_field(make_ai_invocation):
+    instance = make_ai_invocation()
+    del instance["inference_backend"]
     with pytest.raises(ValidationError):
         validate_against_contract(instance, SCHEMA)
 

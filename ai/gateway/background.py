@@ -91,13 +91,52 @@ about outcome 2a/2b above: `json.loads` + `validate_task_output`
 against that exact same schema remain mandatory and unconditional — a
 provider claiming/attempting structured-output support is never
 treated as sufficient proof of a conforming response.
+
+Backend-override parameters (CD-6 §103 Inference Architecture Ruling)
+------------------------------------------------------------------------
+`capability_alias_override`/`inference_backend` are new, OPTIONAL
+keyword-only parameters, added so `scripts.process_background_job_overflow`
+(the ONE, bounded, operator-invoked overflow processor PID §103.4 item
+6 requires) can reuse this exact same function to actually execute a
+`trinity-core` overflow job — the same provider call, invocation
+lifecycle, structured-output validation, and audit-event discipline
+this function already provides for the normal `MAC_LOCAL` path, never
+a second, parallel reimplementation.
+
+This is a deliberate, minimal-delta design choice (option (a) of two
+considered — see this delivery's own report for the other): adding two
+optional parameters here, threaded through into both
+`repository.create_invocation(...)` and
+`litellm_client.complete(capability_alias=...)`, is a smaller and
+cleaner change than building a second function that duplicates this
+one's ~180 lines of four-outcome handling via a shared private helper.
+
+**Both existing callers (`app/api/routers/ai.py`,
+`services/evidence/classification_orchestrator.py`) are UNCHANGED** —
+neither ever passes these new parameters, so `capability_alias_override`
+stays `None` and `inference_backend` stays at its default `"MAC_LOCAL"`
+for both, exactly reproducing today's behaviour bit-for-bit (proven by
+`tests/security/test_ai_litellm_alias_lockdown.py
+::test_run_background_task_capability_alias_comes_only_from_task_contract_or_explicit_override`,
+which checks `invocation.inference_backend == "MAC_LOCAL"` for a call
+that does not pass either new parameter, alongside the override case).
+
+When `capability_alias_override` IS supplied (only
+`scripts.process_background_job_overflow` does this today), it is used
+INSTEAD of `task_contract.preferred_capability` as the alias passed to
+BOTH `repository.create_invocation(capability_alias=...)` and
+`litellm_client.complete(capability_alias=...)` — the task's own
+input/output schema, prompt, and validation are otherwise completely
+unaffected (PID §103's own "BAGMAN's request architecture is never bent
+around the overflow model — trinity-core must conform to it, not the
+reverse").
 """
 from __future__ import annotations
 
 import json
 from typing import Any, Callable, Mapping, Optional
 
-from ai.invocation import AIInvocation, AIInvocationRepository
+from ai.invocation import DEFAULT_INFERENCE_BACKEND, AIInvocation, AIInvocationRepository
 from ai.prompts.loader import load_system_prompt, resolve_prompt_contract_version
 from ai.providers.litellm.client import LiteLLMClientProtocol, LiteLLMOutcomeStatus
 from ai.tasks import ValidationResult, get_task_contract, validate_task_output
@@ -123,9 +162,21 @@ def run_background_task(
     repository: AIInvocationRepository,
     litellm_client: LiteLLMClientProtocol,
     record_audit_event: RecordAuditEvent,
+    capability_alias_override: Optional[str] = None,
+    inference_backend: str = DEFAULT_INFERENCE_BACKEND,
 ) -> AIInvocation:
     """Run one BACKGROUND task attempt end-to-end. See module docstring
     for the full four-outcome contract.
+
+    `capability_alias_override`/`inference_backend` (CD-6 §103, see
+    module docstring's "Backend-override parameters" section) are new,
+    OPTIONAL, keyword-only parameters. Neither existing caller
+    (`app/api/routers/ai.py`, `services/evidence/classification_orchestrator.py`)
+    passes either — both keep today's exact behaviour: the alias comes
+    from `task_contract.preferred_capability` and `inference_backend`
+    defaults to `"MAC_LOCAL"`. Only `scripts.process_background_job_overflow`
+    supplies `capability_alias_override="trinity-core"` /
+    `inference_backend="TRINITY_CORE_OVERFLOW"` today.
 
     Raises:
         core.errors.ValidationError: `task_id`/`task_version` names an
@@ -153,6 +204,16 @@ def run_background_task(
             f"(PID §22): {'; '.join(input_errors)}"
         )
 
+    # capability_alias_override, when supplied, is used INSTEAD of the
+    # task's own preferred_capability (see module docstring's
+    # "Backend-override parameters" section) — this is the ONE place
+    # that decision is made; every downstream use of the alias below
+    # reads it back off `invocation.capability_alias`, never
+    # re-deriving it a second way.
+    effective_capability_alias = (
+        capability_alias_override if capability_alias_override is not None else task_contract.preferred_capability
+    )
+
     # core.errors.ActiveInvocationConflictError propagates uncaught here
     # — see module docstring outcome 4. Nothing is audited for a
     # rejected-before-creation conflict; there is no AIInvocation row to
@@ -162,11 +223,12 @@ def run_background_task(
         task_version=task_version,
         role="BACKGROUND",
         provider="LITELLM",
-        capability_alias=task_contract.preferred_capability,
+        capability_alias=effective_capability_alias,
         input_references=input_references,
         actor_type=actor_type,
         actor_id=actor_id,
         correlation_id=correlation_id,
+        inference_backend=inference_backend,
     )
 
     requested_event = record_audit_event(

@@ -43,6 +43,7 @@ EXPECTED_TABLES = {
     "mailbox_gmail_oauth_states",  # CD-6 GUI-operations-foundation follow-on WO (Gmail OAuth state persistence)
     "evidence_classification_rules",  # CD-6 Slice 5 WI-1
     "evidence_classifications",  # CD-6 Slice 5 WI-1
+    "background_jobs",  # CD-6 §103 Inference Architecture Ruling
 }
 
 
@@ -106,6 +107,7 @@ def test_xero_migration_downgrade_genuinely_undoes_the_upgrade(postgres_containe
         "mailbox_gmail_oauth_states",  # CD-6 GUI-ops-foundation follow-on WO, chained downstream of f7c3a58b1e9d
         "evidence_classification_rules",  # CD-6 Slice 5 WI-1, chained downstream of a1c4e8f2d6b7
         "evidence_classifications",  # CD-6 Slice 5 WI-1, chained downstream of a1c4e8f2d6b7
+        "background_jobs",  # CD-6 §103 Inference Architecture Ruling, chained downstream of b4d8f1a92c65
     }
     try:
         command.downgrade(cfg, "712c5a2aab92")
@@ -146,6 +148,7 @@ def test_mailbox_migration_downgrade_genuinely_undoes_the_upgrade(postgres_conta
         "mailbox_gmail_oauth_states",  # CD-6 GUI-ops-foundation follow-on WO, chained downstream of f7c3a58b1e9d
         "evidence_classification_rules",  # CD-6 Slice 5 WI-1, chained downstream of a1c4e8f2d6b7
         "evidence_classifications",  # CD-6 Slice 5 WI-1, chained downstream of a1c4e8f2d6b7
+        "background_jobs",  # CD-6 §103 Inference Architecture Ruling, chained downstream of b4d8f1a92c65
     }
     try:
         command.downgrade(cfg, "5e8c1f42b9a7")
@@ -175,6 +178,7 @@ def test_mailbox_microsoft_sweep_migration_downgrade_genuinely_undoes_the_upgrad
         "mailbox_gmail_oauth_states",  # CD-6 GUI-ops-foundation follow-on WO, chained downstream of f7c3a58b1e9d
         "evidence_classification_rules",  # CD-6 Slice 5 WI-1, chained downstream of a1c4e8f2d6b7
         "evidence_classifications",  # CD-6 Slice 5 WI-1, chained downstream of a1c4e8f2d6b7
+        "background_jobs",  # CD-6 §103 Inference Architecture Ruling, chained downstream of b4d8f1a92c65
     }
     try:
         command.downgrade(cfg, "a3d7c1f9e246")

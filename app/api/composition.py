@@ -61,6 +61,7 @@ from sqlalchemy.engine import Engine
 from agent.claude_code.fake import FakeClaudeCodeOperatorRunner
 from agent.claude_code.runner import ClaudeCodeOperatorRunner, ClaudeCodeOperatorRunnerProtocol
 from ai.invocation import AIInvocationRepository
+from ai.jobs import BackgroundJobRepository
 from ai.providers.litellm.client import LiteLLMClientProtocol
 from core import actor
 from core.api import BagmanCanonicalAPI
@@ -305,6 +306,15 @@ class RuntimeComposition:
     #: (fake in development/test, real adapter in production).
     ai_invocation_repository: AIInvocationRepository
     litellm_client: LiteLLMClientProtocol
+    #: CD-6 §103 Inference Architecture Ruling — the durable,
+    #: Postgres-backed job repository for Trinity backlog/overflow
+    #: processing (`ai.jobs`). In-memory in development/test, a real
+    #: `PostgresBackgroundJobRepository` (sharing `engine`) in
+    #: production — same never-mixed-across-modes discipline as every
+    #: repository above. Wired only for `scripts.process_background_job_overflow`
+    #: today — no HTTP router reads it yet (this ruling's own "bounded
+    #: operator/maintenance-mode procedure, not a background service").
+    background_job_repository: BackgroundJobRepository
     #: CD-5 Gate-2 closure (2026-09-16, PID §97) — the ONE, sole
     #: authoritative operator-intelligence seam
     #: `agent.claude_code.orchestrator.handle_operator_message` uses.
@@ -453,6 +463,7 @@ class RuntimeComposition:
 
 def _build_development_or_test(runtime_environment: str) -> RuntimeComposition:
     from ai.invocation import InMemoryAIInvocationRepository
+    from ai.jobs import InMemoryBackgroundJobRepository
     from ai.providers.litellm.fake import FakeLiteLLMClient
     from persistence.objects.memory_store import InMemoryObjectStore
     from services.evidence.intake.intake import InMemoryIntakeRepository
@@ -554,6 +565,12 @@ def _build_development_or_test(runtime_environment: str) -> RuntimeComposition:
     # `AIInvocationRepository`'s own class docstring.
     ai_invocation_repository = InMemoryAIInvocationRepository(audit_repository=api.audit_repository)
 
+    # CD-6 §103 Inference Architecture Ruling — the durable job
+    # repository for Trinity backlog/overflow processing, sharing
+    # `api.audit_repository` exactly like `ai_invocation_repository`
+    # above (same stale-claim-recovery audit-emission discipline).
+    background_job_repository = InMemoryBackgroundJobRepository(audit_repository=api.audit_repository)
+
     # CD-6 Slice 5 WI-2 — the deterministic classification-rule registry
     # and its derived classification records, sharing `api.evidence_repository`/
     # `ai_invocation_repository` exactly like every other cross-repository
@@ -590,6 +607,7 @@ def _build_development_or_test(runtime_environment: str) -> RuntimeComposition:
         scanner=scanner,
         ai_invocation_repository=ai_invocation_repository,
         litellm_client=litellm_client,
+        background_job_repository=background_job_repository,
         claude_code_operator_runner=claude_code_operator_runner,
         needs_you_repository=needs_you_repository,
         xero_connection_repository=xero_connection_repository,
@@ -630,6 +648,7 @@ def _build_production() -> RuntimeComposition:
     # ever imported by something that actually needs MinIO.
     from persistence.objects.minio_store import MinIOConfig, MinIOObjectStore
     from persistence.postgres.ai_invocation_repository import PostgresAIInvocationRepository
+    from persistence.postgres.background_job_repository import PostgresBackgroundJobRepository
     from persistence.postgres.audit_repository import PostgresAuditRepository
     from persistence.postgres.entity_repository import PostgresEntityRepository
     from persistence.postgres.evidence_repository import PostgresEvidenceRepository
@@ -750,6 +769,12 @@ def _build_production() -> RuntimeComposition:
     # ("Stale-RUNNING recovery") and `AIInvocationRepository`'s own
     # class docstring.
     ai_invocation_repository = PostgresAIInvocationRepository(engine, audit_repository=api.audit_repository)
+
+    # CD-6 §103 Inference Architecture Ruling — the durable job
+    # repository for Trinity backlog/overflow processing, sharing
+    # `engine`/`api.audit_repository` exactly like
+    # `ai_invocation_repository` above.
+    background_job_repository = PostgresBackgroundJobRepository(engine, audit_repository=api.audit_repository)
 
     # CD-6 Slice 5 WI-2 — durable classification-rule registry and its
     # derived classification records, sharing `engine`/`api.evidence_repository`/
@@ -889,6 +914,7 @@ def _build_production() -> RuntimeComposition:
         scanner=scanner,
         ai_invocation_repository=ai_invocation_repository,
         litellm_client=litellm_client,
+        background_job_repository=background_job_repository,
         claude_code_operator_runner=claude_code_operator_runner,
         needs_you_repository=needs_you_repository,
         xero_connection_repository=xero_connection_repository,
