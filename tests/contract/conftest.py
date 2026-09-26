@@ -196,6 +196,7 @@ def make_ai_invocation(new_id, now_str) -> Callable[..., dict]:
             "role": "BACKGROUND",
             "provider": "LITELLM",
             "capability_alias": "bagman-fast",
+            "inference_backend": "MAC_LOCAL",
             "provider_model": None,
             "started_at": now_str(),
             "completed_at": None,

@@ -203,9 +203,11 @@ def main() -> None:
 
     section("NO SILENT CROSS-TIER FALLBACK")
     # The recorded alias on each invocation is EXACTLY the one this
-    # script requested — never silently substituted for bagman-deep or
-    # any other alias merely because the Mac-mini tier's own call
-    # failed.
+    # script requested — never silently substituted for another alias
+    # (historically `bagman-deep`, now RETIRED per CD-6 §103 Inference
+    # Architecture Ruling — Trinity is reached only via the separate
+    # `trinity-core` backlog/overflow mechanism, never a per-request
+    # fallback) merely because the Mac-mini tier's own call failed.
     print(f"    fast invocation capability_alias: {fast_invocation['capability_alias']} (expected bagman-fast)")
     print(f"    core invocation capability_alias: {core_invocation['capability_alias']} (expected bagman-core)")
     print("    CONFIRMED: no silent cross-tier/cross-provider substitution occurred.")

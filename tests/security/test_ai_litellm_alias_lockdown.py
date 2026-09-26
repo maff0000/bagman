@@ -22,7 +22,24 @@ from core.errors import ValidationError
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 
+#: Every `trinity-*` alias — used only by the narrow, WI-2-scoped
+#: "no literal in THESE files" check below
+#: (`test_no_trinity_star_alias_literal_in_this_wis_new_files`), which
+#: still forbids ALL of them (including `trinity-core`) since none of
+#: `ai/providers`/`ai/gateway`/`ai/prompts`/`app/api/routers/ai.py`
+#: ever hardcodes a Trinity alias literal — they operate generically
+#: via `ai.invocation.BACKGROUND_CAPABILITY_ALIASES`/a caller-supplied
+#: variable, never a literal string.
 _TRINITY_STAR_ALIASES = ["trinity-fast", "trinity-core", "trinity-deep", "trinity-embed"]
+
+#: CD-6 §103 Inference Architecture Ruling: `trinity-core` is now the
+#: SOLE authorised Trinity alias — no longer forbidden. Every OTHER
+#: `trinity-*` alias remains rejected by `validate_capability_alias`
+#: (used by the parametrized rejection tests below, which must NOT
+#: include `trinity-core` any more — see
+#: `test_trinity_core_is_now_accepted_not_rejected` for the positive
+#: proof of the opposite).
+_STILL_FORBIDDEN_TRINITY_ALIASES = ["trinity-fast", "trinity-deep", "trinity-embed"]
 _RAW_MODEL_NAMES = ["gemma-3-12b", "llama3.1:8b", "gpt-4o", "claude-3-5-sonnet-20241022"]
 
 
@@ -80,13 +97,20 @@ def test_run_background_task_request_has_no_field_naming_a_schema_or_response_fo
 # ---------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("bad_alias", _TRINITY_STAR_ALIASES + _RAW_MODEL_NAMES)
+@pytest.mark.parametrize("bad_alias", _STILL_FORBIDDEN_TRINITY_ALIASES + _RAW_MODEL_NAMES)
 def test_validate_capability_alias_rejects_trinity_star_and_raw_model_names(bad_alias):
     with pytest.raises(ValidationError):
         validate_capability_alias(bad_alias)
 
 
-@pytest.mark.parametrize("bad_alias", _TRINITY_STAR_ALIASES + _RAW_MODEL_NAMES)
+def test_trinity_core_is_now_accepted_not_rejected():
+    """CD-6 §103: `trinity-core` is the sole authorised Trinity alias —
+    the positive counterpart to the parametrized rejection test above,
+    which must no longer include it."""
+    validate_capability_alias("trinity-core")  # must not raise
+
+
+@pytest.mark.parametrize("bad_alias", _STILL_FORBIDDEN_TRINITY_ALIASES + _RAW_MODEL_NAMES)
 def test_fake_client_also_rejects_the_same_forbidden_values(bad_alias):
     """The fake client used by every ordinary test/dev composition must
     never be more permissive than the real one — both call the same
@@ -107,7 +131,7 @@ def test_validate_capability_alias_uses_the_single_source_of_truth_constant():
     — no hand-maintained parallel list that could silently drift."""
     for alias in BACKGROUND_CAPABILITY_ALIASES:
         validate_capability_alias(alias)  # must not raise
-    assert BACKGROUND_CAPABILITY_ALIASES == frozenset({"bagman-fast", "bagman-core", "bagman-deep"})
+    assert BACKGROUND_CAPABILITY_ALIASES == frozenset({"bagman-fast", "bagman-core", "trinity-core"})
 
 
 # ---------------------------------------------------------------------
@@ -155,17 +179,67 @@ def test_provider_model_is_never_read_in_the_background_gateway_routing_path():
         )
 
 
-def test_run_background_task_capability_alias_comes_only_from_task_contract():
-    """Confirms, by source inspection, that `create_invocation`'s
-    `capability_alias=` argument is `task_contract.preferred_capability`
-    — never any caller-supplied value."""
-    path = REPO_ROOT / "ai" / "gateway" / "background.py"
-    source = path.read_text(encoding="utf-8")
-    assert "capability_alias=task_contract.preferred_capability" in source, (
-        "expected run_background_task's create_invocation(...) call to pass "
-        "capability_alias=task_contract.preferred_capability literally — routing must be "
-        "decided entirely by the registered TaskContract, never a caller-supplied value"
+def test_run_background_task_capability_alias_comes_only_from_task_contract_or_explicit_override():
+    """Behavioural proof (CD-6 §103 replaced the old pure source-text
+    match here: `capability_alias_override`/`inference_backend` are new
+    optional keyword-only parameters on `run_background_task` — see
+    `ai/gateway/background.py`'s own module docstring's "Backend-
+    override parameters" section — so a literal
+    `capability_alias=task_contract.preferred_capability` substring no
+    longer appears verbatim in the source).
+
+    Proves BOTH halves of the invariant this test's own name (and PID
+    §77's "no prompt-controlled provider/model/alias name") actually
+    cares about: (1) the two EXISTING callers, which never pass
+    `capability_alias_override`, still get EXACTLY
+    `task_contract.preferred_capability` — never any other value; (2)
+    the override, when explicitly supplied (only
+    `scripts.process_background_job_overflow` does this today), is used
+    verbatim — never silently ignored or re-derived a second way."""
+    from ai.invocation import InMemoryAIInvocationRepository
+    from ai.gateway.background import run_background_task
+    from ai.providers.litellm.fake import FakeLiteLLMClient
+    from ai.tasks import get_task_contract
+    from core.audit import InMemoryAuditRepository
+
+    task_id, task_version = "DOCUMENT_TYPE_PROPOSAL", 1
+    task_contract = get_task_contract(task_id, task_version)
+    audit = InMemoryAuditRepository()
+
+    def _run(*, capability_alias_override=None, inference_backend="MAC_LOCAL", evidence_id):
+        repo = InMemoryAIInvocationRepository(audit_repository=audit)
+        fake = FakeLiteLLMClient()
+        expected_alias = capability_alias_override or task_contract.preferred_capability
+        fake.queue_success(
+            capability_alias=expected_alias,
+            content='{"proposed_type": "INVOICE", "confidence": 0.5, "signals": [], "warnings": []}',
+        )
+        return run_background_task(
+            task_id=task_id,
+            task_version=task_version,
+            input_references={"evidence_id": evidence_id},
+            evidence_content="irrelevant",
+            actor_type="SYSTEM",
+            actor_id="test-harness",
+            correlation_id=None,
+            repository=repo,
+            litellm_client=fake,
+            record_audit_event=audit.record_audit_event,
+            capability_alias_override=capability_alias_override,
+            inference_backend=inference_backend,
+        )
+
+    # (1) no override supplied — existing-caller behaviour, unchanged.
+    default_invocation = _run(evidence_id="ev-default")
+    assert default_invocation.capability_alias == task_contract.preferred_capability
+    assert default_invocation.inference_backend == "MAC_LOCAL"
+
+    # (2) override supplied — used verbatim, never silently ignored.
+    overridden_invocation = _run(
+        capability_alias_override="trinity-core", inference_backend="TRINITY_CORE_OVERFLOW", evidence_id="ev-override"
     )
+    assert overridden_invocation.capability_alias == "trinity-core"
+    assert overridden_invocation.inference_backend == "TRINITY_CORE_OVERFLOW"
 
 
 def test_run_background_task_output_schema_comes_only_from_task_contract():
@@ -194,7 +268,9 @@ def _iter_new_files():
     for rel in _NEW_AI_FILE_ROOTS:
         path = REPO_ROOT / rel
         if path.is_dir():
-            yield from sorted(p for p in path.rglob("*") if p.is_file())
+            yield from sorted(
+                p for p in path.rglob("*") if p.is_file() and "__pycache__" not in p.parts
+            )
         elif path.is_file():
             yield path
 
@@ -204,12 +280,24 @@ def test_no_trinity_star_alias_literal_in_this_wis_new_files():
     tests must assert that no BAGMAN source file references a
     `trinity-*` alias at all, only `bagman-*`.' This is the narrow,
     WI-2-scoped check (this WI's own new files only) — WI-5 owns the
-    full repo-wide sweep per WI-1's own report."""
+    full repo-wide sweep per WI-1's own report.
+
+    CD-6 §103 Inference Architecture Ruling update: `trinity-core` is
+    now the sole authorised Trinity alias
+    (`_STILL_FORBIDDEN_TRINITY_ALIASES` excludes it, unlike
+    `_TRINITY_STAR_ALIASES` above, which is still used for the
+    REJECTION-behaviour parametrisation only) — none of THESE
+    particular files (`ai/providers`, `ai/gateway`, `ai/prompts`,
+    `app/api/routers/ai.py`) ever hardcode it as a literal anyway (they
+    operate generically via `ai.invocation.BACKGROUND_CAPABILITY_ALIASES`/
+    a caller-supplied variable, or mention it only in prose describing
+    the override mechanism), but this check still forbids every OTHER
+    `trinity-*` literal here, exactly as before."""
     violations = []
     for path in _iter_new_files():
         text = path.read_text(encoding="utf-8", errors="replace")
         lowered = text.lower()
-        for bad_alias in _TRINITY_STAR_ALIASES:
+        for bad_alias in _STILL_FORBIDDEN_TRINITY_ALIASES:
             if bad_alias in lowered:
                 violations.append(f"{path.relative_to(REPO_ROOT)} contains {bad_alias!r}")
 

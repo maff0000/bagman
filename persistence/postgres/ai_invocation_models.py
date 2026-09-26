@@ -154,6 +154,13 @@ class AIInvocationRow(Base):
     role: Mapped[str] = mapped_column(String, nullable=False)
     provider: Mapped[str] = mapped_column(String, nullable=False)
     capability_alias: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    # CD-6 §103 Inference Architecture Ruling: `MAC_LOCAL` /
+    # `TRINITY_CORE_OVERFLOW`, audit-only (see ai.invocation.AIInvocation
+    # .inference_backend's own docstring). `server_default="MAC_LOCAL"`
+    # matches historical reality — every row created before this column
+    # existed really was served by the Mac mini (see the Alembic
+    # migration that added it).
+    inference_backend: Mapped[str] = mapped_column(String, nullable=False, server_default="MAC_LOCAL")
     provider_model: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)

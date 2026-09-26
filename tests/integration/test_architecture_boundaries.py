@@ -598,19 +598,30 @@ def test_no_forbidden_mailbox_or_provider_sdk_imported_anywhere_in_the_repo():
 # application source file in the repository, not just ai/providers/
 # ai/gateway/ai/prompts/app/api/routers/ai.py.
 #
+# CD-6 §103 Inference Architecture Ruling update: `trinity-core` is now
+# the SOLE authorised Trinity alias (`ai.invocation.BACKGROUND_CAPABILITY_ALIASES`),
+# legitimately referenced throughout application source
+# (`ai/invocation.py`, `ai/jobs.py`, `contracts/ai/bagman.ai_invocation.v1.schema.json`,
+# `scripts/process_background_job_overflow.py`, ...) — it is REMOVED
+# from this forbidden list below (was present when this sweep was first
+# written, back when PID §9 forbade every `trinity-*` value with no
+# exception). Every OTHER `trinity-*` alias remains forbidden
+# everywhere in application source, exactly as before.
+#
 # Deliberately EXCLUDES `tests/` itself: several existing test files
-# legitimately use `trinity-fast`/`trinity-core`/`trinity-deep`/
-# `trinity-embed` as literal ADVERSARIAL/NEGATIVE fixture values (e.g.
+# legitimately use `trinity-fast`/`trinity-deep`/`trinity-embed` as
+# literal ADVERSARIAL/NEGATIVE fixture values (e.g.
 # `tests/integration/test_litellm_client.py`'s own
 # "reject every forbidden alias" parametrisation, `tests/contract/
 # test_ai_invocation_contract.py`'s "this value must fail contract
 # validation" fixture) — a test proving BAGMAN rejects a trinity-*
 # alias necessarily contains that string once, and that is correct,
 # not a violation. What matters is that no APPLICATION source file
-# (everything BAGMAN actually ships/runs) contains one.
+# (everything BAGMAN actually ships/runs) contains one of the STILL
+# forbidden aliases.
 # ---------------------------------------------------------------------
 
-_TRINITY_STAR_ALIASES_REPO_WIDE = ["trinity-fast", "trinity-core", "trinity-deep", "trinity-embed"]
+_TRINITY_STAR_ALIASES_REPO_WIDE = ["trinity-fast", "trinity-deep", "trinity-embed"]
 _APPLICATION_SOURCE_ROOTS = (
     "ai",
     "agent",
@@ -629,13 +640,16 @@ _APPLICATION_SOURCE_ROOTS = (
 
 
 def test_no_trinity_star_alias_literal_anywhere_in_application_source():
-    """PID §9/§75/§87/§92: no `trinity-fast`/`trinity-core`/`trinity-deep`/
-    `trinity-embed` literal may exist anywhere in BAGMAN's own shipped
-    application source — only `bagman-fast`/`bagman-core`/`bagman-deep`
-    (`ai.invocation.BACKGROUND_CAPABILITY_ALIASES`) are ever permitted.
-    Scans every file (not just `.py`) under the application-source
-    roots, so a stray reference in a `.yml`/`.md`/`.json`/`.sh` file
-    would be caught too, not just a Python import."""
+    """PID §9/§75/§87/§92 (CD-6 §103 update): no `trinity-fast`/
+    `trinity-deep`/`trinity-embed` literal may exist anywhere in
+    BAGMAN's own shipped application source — only
+    `bagman-fast`/`bagman-core`/`trinity-core`
+    (`ai.invocation.BACKGROUND_CAPABILITY_ALIASES`) are ever permitted;
+    `trinity-core` is the sole authorised Trinity alias (CD-6 §103) and
+    is deliberately NOT in this forbidden list any more. Scans every
+    file (not just `.py`) under the application-source roots, so a
+    stray reference in a `.yml`/`.md`/`.json`/`.sh` file would be
+    caught too, not just a Python import."""
     violations: list[str] = []
     for root_name in _APPLICATION_SOURCE_ROOTS:
         root = REPO_ROOT / root_name

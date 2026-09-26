@@ -56,6 +56,7 @@ from sqlalchemy.exc import DataError, IntegrityError, SQLAlchemyError
 from ai.invocation import (
     AIInvocation,
     AIInvocationRepository,
+    DEFAULT_INFERENCE_BACKEND,
     STALE_RECOVERY_AUDIT_EVENT_TYPE,
     STALE_RUNNING_THRESHOLD_SECONDS,
     derive_primary_input_reference,
@@ -92,6 +93,7 @@ def _row_to_invocation(row: AIInvocationRow) -> AIInvocation:
         role=row.role,
         provider=row.provider,
         capability_alias=row.capability_alias,
+        inference_backend=row.inference_backend,
         provider_model=row.provider_model,
         started_at=row.started_at,
         completed_at=row.completed_at,
@@ -118,6 +120,7 @@ def _row_from_invocation(candidate: AIInvocation) -> AIInvocationRow:
         role=candidate.role,
         provider=candidate.provider,
         capability_alias=candidate.capability_alias,
+        inference_backend=candidate.inference_backend,
         provider_model=candidate.provider_model,
         started_at=candidate.started_at,
         completed_at=candidate.completed_at,
@@ -237,11 +240,14 @@ class PostgresAIInvocationRepository(AIInvocationRepository):
         actor_id: str,
         correlation_id: Optional[str] = None,
         prompt_contract_version: Optional[str] = None,
+        inference_backend: str = DEFAULT_INFERENCE_BACKEND,
     ) -> AIInvocation:
         # Every domain-level shape/pairing/subject-derivation rule
         # lives in exactly ONE place (`ai.invocation`), reused here
         # rather than duplicated.
-        validate_role_provider_capability_pairing(role=role, provider=provider, capability_alias=capability_alias)
+        validate_role_provider_capability_pairing(
+            role=role, provider=provider, capability_alias=capability_alias, inference_backend=inference_backend
+        )
         if not actor.is_valid(actor_type):
             raise ValidationError(
                 f"actor_type '{actor_type}' is not one of the closed set {sorted(actor.ALL)} (PID §14)"
@@ -279,6 +285,7 @@ class PostgresAIInvocationRepository(AIInvocationRepository):
                 role=role,
                 provider=provider,
                 capability_alias=capability_alias,
+                inference_backend=inference_backend,
                 status="REQUESTED",
                 started_at=utc_now(),
                 correlation_id=correlation_id if correlation_id is not None else identity.generate_id(),

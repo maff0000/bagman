@@ -43,11 +43,17 @@ BAGMAN's chosen closed set is exactly PID §51's own suggested vocabulary
 as-is with no reason found to depart from it:
 
 * ``LOCAL_OK`` — safe to route to the dedicated, BAGMAN-exclusive
-  Mac-mini tier (and, when a task's routing genuinely escalates,
-  Trinity compute) via `bagman-fast`/`bagman-core`/`bagman-deep`. All
-  three CD-5 `BACKGROUND` tasks use this: routine document/entity
-  analysis is exactly the "local-first background privacy" case PID
-  §52 describes.
+  Mac-mini tier via `bagman-fast`/`bagman-core` (two generation
+  PROFILES against the one permanently-resident Mac model — CD-6 §103
+  Inference Architecture Ruling). All three CD-5 `BACKGROUND` tasks use
+  this: routine document/entity analysis is exactly the "local-first
+  background privacy" case PID §52 describes. (Historical note: this
+  policy originally also named `bagman-deep`, a routine Trinity-hosted
+  escalation tier CD-6 §103 RETIRED — no live task contract ever set
+  `preferred_capability="bagman-deep"`, so its retirement changed
+  nothing about which tasks use `LOCAL_OK`. Trinity is now
+  backlog/overflow-only, reached via the separate `ai.jobs` durable job
+  mechanism, never through a task's own `preferred_capability`.)
 * ``CLOUD_OPERATOR_OK`` — safe to send to Claude (BAGMAN's one
   authorised cloud operator provider, under Matt's own Anthropic key,
   PID §13/§17) but not to any other cloud provider. `OPERATOR_DOCUMENT_REVIEW`
@@ -108,10 +114,13 @@ class TaskContract:
     task_version: int
     role: TaskRole
     #: For a `BACKGROUND` task: one of `BACKGROUND_CAPABILITY_ALIASES`
-    #: — the alias this task is normally routed to (WI-2's gateway may
-    #: still escalate to `bagman-deep` under its own policy; this is
-    #: the task's PREFERRED/default capability, not an unbreakable
-    #: pin). For an `OPERATOR` task: always `None` — the same
+    #: — the alias this task is normally routed to (this is the task's
+    #: PREFERRED/default capability, not an unbreakable pin; CD-6 §103
+    #: Inference Architecture Ruling: no task registered here sets this
+    #: to `trinity-core` — Trinity overflow is reached only via the
+    #: separate `ai.jobs` durable job mechanism, an explicit
+    #: operator-invoked decision, never a task's own routine
+    #: `preferred_capability`). For an `OPERATOR` task: always `None` — the same
     #: null-for-OPERATOR sentinel `AIInvocation.capability_alias` uses,
     #: since Claude is never reached via a LiteLLM alias (PID §8).
     preferred_capability: Optional[str]

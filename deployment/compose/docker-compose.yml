@@ -362,11 +362,23 @@ services:
       # locked three-tier topology (PID §2/§8/§9) always named as
       # BAGMAN's primary background tier, now fronted by its own
       # dedicated LiteLLM installation instead of sharing Trinity's.
-      # This is still alias-only routing
-      # (bagman-fast/bagman-core/bagman-deep — never a raw model name,
-      # never the Mac mini's own Ollama port 11434 directly) — nothing
-      # about `ai/providers/litellm/client.py`'s own contract changes,
-      # only which real gateway process this env var points at.
+      # This is still alias-only routing (bagman-fast/bagman-core —
+      # never a raw model name, never the Mac mini's own Ollama port
+      # 11434 directly) — nothing about
+      # `ai/providers/litellm/client.py`'s own contract changes, only
+      # which real gateway process this env var points at.
+      #
+      # CD-6 §103 Inference Architecture Ruling update (2026-09-26):
+      # `bagman-deep` (a routine Trinity-hosted escalation tier, no
+      # live task contract ever used it) is RETIRED. This same gateway
+      # config also fronts the new `trinity-core` alias — CD-6 §103's
+      # sole authorised Trinity alias, reached ONLY for backlog/
+      # overflow processing via the bounded, operator-invoked
+      # `scripts/process_background_job_overflow.py` procedure, never a
+      # routine per-request escalation. The `bagman-deep` -> Trinity
+      # entry in the Mac's own `bagman-ai-gateway` `config.yaml`
+      # (deployment-level, not in this repo) is repurposed/renamed to
+      # `trinity-core` by the PL separately, out of this WO's scope.
       #
       # Verified live before this change (2026-09-16, PL's own direct
       # check, not merely relayed): `GET

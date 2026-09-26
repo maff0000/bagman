@@ -55,7 +55,12 @@ def test_validate_capability_alias_accepts_every_closed_set_member(alias):
     "bad_alias",
     [
         "trinity-fast",
-        "trinity-core",
+        # CD-6 §103: "trinity-core" is retired from this forbidden list —
+        # it is now the sole authorised Trinity alias (see
+        # test_validate_capability_alias_accepts_every_closed_set_member
+        # above, which already parametrizes over the live
+        # BACKGROUND_CAPABILITY_ALIASES closed set and therefore already
+        # covers it).
         "trinity-deep",
         "trinity-embed",
         "gemma-3-12b",
@@ -275,10 +280,14 @@ def test_fake_client_returns_queued_success_and_records_the_call():
 
 
 def test_fake_client_returns_queued_failure():
+    # CD-6 §103: `bagman-deep` is retired; `trinity-core` (the sole
+    # authorised Trinity overflow alias) is used here instead — this
+    # test only exercises FakeLiteLLMClient's generic queue/failure
+    # mechanics, never anything `bagman-deep`-specific.
     fake = FakeLiteLLMClient()
-    fake.queue_failure(capability_alias="bagman-deep", status=LiteLLMOutcomeStatus.TIMEOUT, error_detail="slow")
+    fake.queue_failure(capability_alias="trinity-core", status=LiteLLMOutcomeStatus.TIMEOUT, error_detail="slow")
     result = fake.complete(
-        capability_alias="bagman-deep",
+        capability_alias="trinity-core",
         system_instructions="sys",
         evidence_content="evidence",
         output_schema=_SAMPLE_OUTPUT_SCHEMA,

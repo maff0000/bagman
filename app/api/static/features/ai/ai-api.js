@@ -107,8 +107,12 @@ export async function countPendingInvocations() {
   return { ok: true, count: requestedCount + runningCount, capped };
 }
 
-/** `GET /internal/ai/health` — Claude / bagman-fast / bagman-core /
- * bagman-deep reachability (PID §46-48). */
+/** `GET /internal/ai/health` — Claude / bagman-fast / bagman-core
+ * reachability (PID §46-48). CD-6 §103 Inference Architecture Ruling:
+ * `bagman-deep` is retired; Trinity overflow (`trinity-core`) is
+ * backlog/maintenance-mode only and deliberately NOT one of this
+ * endpoint's live-health-checked keys — see its own `checks` response
+ * shape and separate `trinity_core_overflow` status note. */
 export function getAiHealth() {
   return apiGet(AI_API.health);
 }

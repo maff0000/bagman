@@ -3,6 +3,30 @@
 finding and the authorised per-request output_schema delta in
 `ai/providers/litellm/client.py`/`ai/gateway/background.py`).
 
+**PARTIALLY DEPRECATED (CD-6 §103 Inference Architecture Ruling,
+2026-09-26)**: section 4 below ("bagman-deep — reconfirm existing GREEN
+path unaffected by this delta") exercises `bagman-deep`, a routine
+Trinity-hosted escalation tier CD-6 §103 has now RETIRED — see
+`ai.invocation.BACKGROUND_CAPABILITY_ALIASES`'s own docstring for the
+full history. Calling `capability_alias='bagman-deep'` today would
+correctly be REJECTED by `ai.providers.litellm.client
+.validate_capability_alias` (it is no longer a member of the closed
+set) — this section's own "GREEN — unaffected"/"REGRESSED" verdict
+language no longer means what it did when this script was written; do
+NOT run this script and interpret section 4's outcome as meaningful
+without updating it first. Sections 1-3 (`bagman-fast`/`bagman-core`
+structured-output proofs) are UNCHANGED and still valid — `bagman-fast`/
+`bagman-core` are unaffected by this ruling (still the same two
+generation profiles against the same Mac-resident model). This
+section is preserved as historical evidence (this project's own
+"never delete, only mark superseded" convention), not rewritten to
+target `trinity-core` instead — that decision (and the required
+one-time `trinity-core` compatibility validation, PID §103.4 item 5) is
+explicitly the PL's own separate, later, live step; see this
+delivery's own report for why this particular section was left alone
+rather than mechanically adapted like `trinity_escalation_live_proof.py`
+was.
+
 Real, directly-runnable script (see `tests/acceptance/README.md`). No
 mocks: drives the REAL running Docker Compose stack's REAL `bagman-api`
 container against HELM's real dedicated BAGMAN AI appliance
@@ -163,7 +187,17 @@ def main() -> None:
     core_results = _run_batch(task_id="ENTITY_PROPOSAL", alias="bagman-core", tag=tag, count=20)
     core_all_ok = _summarise("ENTITY_PROPOSAL (bagman-core)", core_results)
 
-    section("4. bagman-deep — reconfirm existing GREEN path unaffected by this delta")
+    # DEPRECATED (CD-6 §103, 2026-09-26): bagman-deep is RETIRED — see
+    # this module's own docstring's prominent deprecation note above.
+    # `client.complete(capability_alias='bagman-deep', ...)` below will
+    # now correctly raise ValidationError before any network I/O
+    # (validate_capability_alias's closed-set check) rather than
+    # exercising a live GREEN path — this section is preserved as
+    # historical evidence only, not runnable-and-meaningful today.
+    # TODO(PL): decide whether to retarget this section at
+    # `trinity-core` as part of the separate, later, live
+    # trinity-core compatibility validation (PID §103.4 item 5).
+    section("4. bagman-deep — reconfirm existing GREEN path unaffected by this delta [DEPRECATED, see module docstring]")
     deep_script = (
         "import json, os\n"
         "from ai.providers.litellm.client import LiteLLMClient\n"
