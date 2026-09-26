@@ -1466,3 +1466,40 @@ def test_wi6_evaluate_script_never_calls_persist_true():
     text = _WI6_EVALUATE_MODULE_PATH.read_text(encoding="utf-8")
     assert "persist=True" not in text
     assert "persist=False" in text
+
+
+# ---------------------------------------------------------------------
+# CD-6 follow-up ("AI classifier boundary correction") — the new
+# `--ai-only` evaluation path added to this SAME script (Task 4) gets
+# its own, extended boundary proofs: never any classification/rule/
+# NeedsYou write (already covered above, since those tests scan the
+# WHOLE file's text), and — going further, since this path is fully
+# disposable by design — never even an `AIInvocation` row either.
+# ---------------------------------------------------------------------
+
+
+def test_wi6_evaluate_script_ai_only_path_never_creates_an_ai_invocation_row():
+    """The `--ai-only` path (`evaluate_item_ai_only`/
+    `run_ai_only_evaluation`) calls `litellm_client.complete()` directly
+    and validates with `ai.tasks.validate_task_output` — it never calls
+    `ai.gateway.background.run_background_task` (which would create a
+    real, durable `AIInvocation` row via a repository) and never calls
+    any repository's own `create_invocation(` directly either, so it can
+    never create an `AIInvocation` row for either a real evidence_id or
+    a synthetic challenge-set fixture."""
+    text = _WI6_EVALUATE_MODULE_PATH.read_text(encoding="utf-8")
+    forbidden_tokens = ("run_background_task(", "create_invocation(")
+    violations = [token for token in forbidden_tokens if token in text]
+    assert violations == [], "\n".join(violations)
+
+
+def test_wi6_evaluate_script_ai_only_path_functions_exist_and_are_importable():
+    """A cheap, direct proof that Task 4's new surface actually exists
+    with the expected names (a real import, not just a text grep) —
+    catches an accidental rename/removal that the text-scan tests above
+    would not."""
+    import scripts.evaluate_document_classifier as evl
+
+    assert callable(evl.load_challenge_set)
+    assert callable(evl.evaluate_item_ai_only)
+    assert callable(evl.run_ai_only_evaluation)

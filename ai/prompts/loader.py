@@ -44,6 +44,7 @@ _TASK_PROMPT_VERSIONS: dict[tuple[str, int], str] = {
     ("DOCUMENT_SUMMARY", 1): "v1",
     ("DOCUMENT_TYPE_PROPOSAL", 1): "v1",
     ("DOCUMENT_TYPE_PROPOSAL", 2): "v2",
+    ("DOCUMENT_TYPE_PROPOSAL", 3): "v3",
     ("ENTITY_PROPOSAL", 1): "v1",
 }
 

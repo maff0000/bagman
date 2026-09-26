@@ -426,6 +426,55 @@ DOCUMENT_TYPE_PROPOSAL_V2 = TaskContract(
 )
 
 
+#: CD-6 follow-up (post-Slice-5, "AI classifier boundary correction") —
+#: a NEW prompt-contract version fixing one genuine semantic ambiguity
+#: found by a 46-item fixed shadow evaluation of v2: v2's own
+#: BROKER_ACTIVITY_NOTICE wording never explicitly required the discrete
+#: event it describes to have ALREADY occurred/been executed/settled,
+#: so a forward-looking, not-yet-executed corporate-action announcement
+#: (e.g. a "FYI: Takeover Notification" from a third-party corporate-
+#: events feed) could be — and once was — misclassified as
+#: BROKER_ACTIVITY_NOTICE instead of NON_ACCOUNTING_DOCUMENT. v2 itself
+#: is left byte-for-byte untouched (immutable historical classifier
+#: meaning — WI-3's own "never edit an existing vN.md file's wording in
+#: place" discipline, `ai/prompts/loader.py`'s module docstring) — v3 is
+#: registered ADDITIVELY, alongside v1 and v2, under the SAME task_id,
+#: reusing v2's own input/output schema shapes verbatim (the CONTEXT
+#: shape this task consumes, and the closed eight-value canonical
+#: vocabulary it must produce, are both completely unchanged — only the
+#: system prompt's own wording changes, see
+#: `ai/prompts/document_type_proposal/v3.md`). `timeout_seconds` stays
+#: at v2's own 30 (explicitly not touched by this delivery), and
+#: `data_policy` stays `LOCAL_OK` (matching V1/V2's own convention:
+#: routine document/entity analysis routed to the BAGMAN-exclusive
+#: Mac-mini tier, PID §52 — no reason found to depart from it for a
+#: same-tier, same-provider, wording-only prompt fix).
+DOCUMENT_TYPE_PROPOSAL_V3 = TaskContract(
+    task_id="DOCUMENT_TYPE_PROPOSAL",
+    task_version=3,
+    role="BACKGROUND",
+    preferred_capability="bagman-core",
+    input_schema=_DOCUMENT_TYPE_PROPOSAL_V2_INPUT_SCHEMA,
+    output_schema=_DOCUMENT_TYPE_PROPOSAL_V2_OUTPUT_SCHEMA,
+    timeout_seconds=30,
+    confidence_policy={
+        "meaning": (
+            "The model's self-reported confidence that proposed_type correctly describes the "
+            "supplied bounded evidence context — not a claim about ground truth beyond that "
+            "context, and never an auto-acceptance authorization (identical meaning to v2's own "
+            "confidence_policy; only the underlying prompt wording changed)."
+        ),
+        "notes": (
+            "No fixed pass/fail threshold is enforced by this task contract or by the "
+            "classification orchestrator — every AI proposal is persisted as "
+            "source=AI_PROPOSAL/status=REVIEW_REQUIRED (or UNCLASSIFIABLE for UNKNOWN), never "
+            "silently promoted to status=CLASSIFIED regardless of confidence value (PID §55)."
+        ),
+    },
+    data_policy="LOCAL_OK",
+)
+
+
 _ENTITY_PROPOSAL_OUTPUT_SCHEMA: Mapping[str, Any] = {
     "type": "object",
     "properties": {
@@ -664,6 +713,7 @@ TASK_REGISTRY: Mapping[tuple[str, int], TaskContract] = {
         DOCUMENT_SUMMARY_V1,
         DOCUMENT_TYPE_PROPOSAL_V1,
         DOCUMENT_TYPE_PROPOSAL_V2,
+        DOCUMENT_TYPE_PROPOSAL_V3,
         ENTITY_PROPOSAL_V1,
         OPERATOR_DOCUMENT_REVIEW_V1,
         ASK_BAGMAN_V1,

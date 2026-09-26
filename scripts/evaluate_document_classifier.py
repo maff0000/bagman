@@ -97,6 +97,54 @@ Usage
 This process expects `BAGMAN_RUNTIME_ENV`/DB/object-store/LiteLLM env
 vars already set — see `scripts/reprocess_evidence_classification.py`'s
 own module docstring for the identical `get_composition()` convention.
+
+AI-only mode — `--ai-only` (CD-6 follow-up, testing v3 in isolation)
+------------------------------------------------------------------------
+A second, real deterministic rule (created separately, not this
+module's concern) can now short-circuit `classify_evidence` for exactly
+the corporate-event family v3's own prompt fix targets — which makes
+the ordinary shadow path above the WRONG tool for judging whether
+`DOCUMENT_TYPE_PROPOSAL` v3 (or any other `task_version`) itself
+resolved that boundary correctly: a deterministic match would report a
+`DETERMINISTIC` outcome and never reach the model at all.
+
+`--ai-only` adds a second, additive evaluation mode that bypasses
+`classify_evidence` ENTIRELY — it never calls it, never touches
+deterministic rules, and never persists anything. It instead: builds
+the bounded evidence-classification context
+(`services.evidence.classification_context.build_evidence_classification_context`
+— the exact same builder the real orchestrator uses), resolves the task
+contract for the given `--task-version` (`ai.tasks.get_task_contract`),
+resolves that version's own prompt asset (`ai.prompts.loader`), calls
+`litellm_client.complete(...)` directly, and validates the response with
+the exact same `ai.tasks.validate_task_output` the real gateway uses.
+It never calls `ai.gateway.background.run_background_task` and never
+creates an `AIInvocation`/`EvidenceClassification`/
+`EvidenceClassificationRule`/`NeedsYouItem` row of any kind, for either
+of its two accepted input shapes:
+
+* `--manifest-file` — the SAME `{evidence_id, expected_document_type,
+  label_family}` manifest shape as the shadow mode above, naming real,
+  already-registered `EvidenceItem`s; their content is read via the same
+  `evidence_repository`/`object_store` the orchestrator itself uses.
+* `--challenge-set-file` — a NEW, purely synthetic/inline shape: a JSON
+  object with an `"items"` array of `{sender, subject, body,
+  expected_document_type, label_family}` entries that do not correspond
+  to any real, registered `EvidenceItem` at all (see
+  `tests/fixtures/document_type_proposal_v3_challenge_set_synthetic.json`)
+  — evaluated by building a synthetic, duck-typed evidence input and
+  driving it straight through the same context builder's `text/plain`
+  path, with zero repository/object-store reach.
+
+Exactly one of `--manifest-file`/`--challenge-set-file` must be supplied
+together with `--ai-only`; `--task-version` selects which
+`DOCUMENT_TYPE_PROPOSAL` contract version to invoke (default: the
+shadow mode's own `AI_TASK_VERSION`, currently 2) — e.g.:
+
+    python3 scripts/evaluate_document_classifier.py \\
+        --runtime-dir /opt/bagman/runtime/classification-runs \\
+        --ai-only --task-version 3 \\
+        --challenge-set-file tests/fixtures/document_type_proposal_v3_challenge_set_synthetic.json
 """
 from __future__ import annotations
 
@@ -107,16 +155,23 @@ import statistics
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Any, Iterable, Mapping, Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import os  # noqa: E402
 
+from ai.prompts.loader import load_system_prompt, resolve_prompt_contract_version  # noqa: E402
+from ai.providers.litellm.client import LiteLLMOutcomeStatus  # noqa: E402
+from ai.tasks import get_task_contract, validate_task_output  # noqa: E402
 from core import identity  # noqa: E402
 from core.errors import ActiveInvocationConflictError  # noqa: E402
 from core.timestamps import to_contract_string, utc_now  # noqa: E402
-from services.evidence.classification import SOURCE_DETERMINISTIC_RULE  # noqa: E402
+from services.evidence.classification import DOCUMENT_TYPE_UNKNOWN, SOURCE_DETERMINISTIC_RULE  # noqa: E402
+from services.evidence.classification_context import (  # noqa: E402
+    OUTCOME_BUILT as _CONTEXT_OUTCOME_BUILT,
+    build_evidence_classification_context,
+)
 from services.evidence.classification_orchestrator import (  # noqa: E402
     AI_TASK_ID,
     AI_TASK_VERSION,
@@ -180,6 +235,46 @@ def load_manifest(path: str) -> list[dict]:
 
 def _manifest_file_sha256(path: str) -> str:
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def load_challenge_set(path: str) -> list[dict]:
+    """Load a synthetic/inline challenge-set fixture file for `--ai-only`
+    mode (Task 4/5) — a JSON OBJECT (never a bare array, so a genuinely
+    synthetic-content marker can live in the same file — see
+    `tests/fixtures/document_type_proposal_v3_challenge_set_synthetic.json`)
+    with an `"items"` array of `{sender, subject, body,
+    expected_document_type}` entries (`label_family` optional). These
+    entries do NOT name any real, registered `EvidenceItem` — deliberately
+    a distinct, honestly-named loader from `load_manifest` above rather
+    than one loader silently guessing the caller's intent from shape.
+    """
+    raw_text = Path(path).read_text(encoding="utf-8")
+    try:
+        raw = json.loads(raw_text)
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"error: challenge-set file '{path}' is not valid JSON: {exc}") from exc
+    if not isinstance(raw, dict) or not isinstance(raw.get("items"), list) or not raw["items"]:
+        raise SystemExit(
+            f"error: challenge-set file '{path}' must be a JSON object with a non-empty 'items' array"
+        )
+
+    required_keys = ("sender", "subject", "body", "expected_document_type")
+    items = []
+    for i, entry in enumerate(raw["items"]):
+        if not isinstance(entry, dict) or not all(key in entry for key in required_keys):
+            raise SystemExit(
+                f"error: challenge-set entry #{i} in '{path}' must be an object with at least {required_keys}"
+            )
+        items.append(
+            {
+                "sender": entry["sender"],
+                "subject": entry["subject"],
+                "body": entry["body"],
+                "expected_document_type": entry["expected_document_type"],
+                "label_family": entry.get("label_family"),
+            }
+        )
+    return items
 
 
 # ---------------------------------------------------------------------
@@ -385,6 +480,167 @@ def evaluate_item(
 
 
 # ---------------------------------------------------------------------
+# AI-only evaluation (`--ai-only`) — Task 4: a version-aware evaluation
+# path that bypasses `classify_evidence`'s deterministic-first check
+# ENTIRELY, so a real deterministic rule for the exact family under
+# test can never mask whether the AI TASK ITSELF resolved a
+# classification boundary correctly. Reuses the SAME context builder,
+# task contract lookup, prompt loader, LiteLLM client, and
+# `validate_task_output` structured-output validation the real
+# gateway/orchestrator use — never a second, hand-rolled prompt or
+# classifier. Deliberately never calls `ai.gateway.background
+# .run_background_task` (which would create a real, durable
+# `AIInvocation` row via a repository) — every call in this section is
+# fully disposable, for both a real registered `EvidenceItem` and a
+# synthetic/inline challenge-set fixture alike, which is a strictly
+# safer (and simpler) property than the WO's own "may create real
+# AIInvocation rows" allowance for the real-evidence case; see this
+# script's own architecture-boundary test for the proof.
+# ---------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _SyntheticEvidenceInput:
+    """A minimal, duck-typed evidence-shaped input for AI-only
+    evaluation of inline synthetic content — never a real, registered
+    `EvidenceItem`. Carries only the two attributes
+    `services.evidence.classification_context.build_evidence_classification_context`
+    actually reads (`.mime_type`/`.metadata`), so that exact context
+    builder is reused verbatim for synthetic content too, with zero
+    second/hand-rolled context-rendering logic."""
+
+    mime_type: str
+    metadata: Mapping[str, Any]
+
+
+def _is_synthetic_item(item: dict) -> bool:
+    return "evidence_id" not in item
+
+
+def _build_ai_only_context(item: dict, *, evidence_repository, object_store):
+    """Build the bounded classification context for one `--ai-only`-mode
+    item — either a real, already-registered `EvidenceItem`
+    (`evidence_id` present, resolved via the SAME
+    `evidence_repository`/`object_store`/`build_evidence_classification_context`
+    the real orchestrator uses), or a synthetic/inline challenge-set
+    fixture (`sender`/`subject`/`body` present, no real evidence row or
+    object-store read at all)."""
+    if _is_synthetic_item(item):
+        synthetic = _SyntheticEvidenceInput(
+            mime_type="text/plain",
+            metadata={"sender_address": item["sender"], "subject": item["subject"]},
+        )
+        raw_content = item["body"].encode("utf-8")
+        return build_evidence_classification_context(evidence=synthetic, raw_content=raw_content)
+
+    evidence = evidence_repository.get_evidence(item["evidence_id"])
+    if not evidence.storage_reference:
+        from services.evidence.classification_context import ClassificationContextBuildResult, OUTCOME_CONTEXT_UNSUPPORTED
+
+        return ClassificationContextBuildResult(
+            outcome=OUTCOME_CONTEXT_UNSUPPORTED,
+            unsupported_reason="EvidenceItem has no stored content (storage_reference is empty)",
+        )
+    raw_content = object_store.get(evidence.storage_reference)
+    return build_evidence_classification_context(evidence=evidence, raw_content=raw_content)
+
+
+def evaluate_item_ai_only(
+    item: dict,
+    *,
+    task_version: int,
+    litellm_client,
+    evidence_repository=None,
+    object_store=None,
+) -> ItemResult:
+    """Task 4's per-item core: never calls `classify_evidence` (so a
+    deterministic rule can never short-circuit this path) — builds
+    context, resolves `(AI_TASK_ID, task_version)`'s task contract and
+    prompt asset, calls `litellm_client.complete()` directly, and
+    validates the result with `ai.tasks.validate_task_output`. `item` is
+    either the existing `{evidence_id, expected_document_type,
+    label_family}` manifest shape, or the new synthetic
+    `{sender, subject, body, expected_document_type, label_family}`
+    challenge-set shape (see `load_challenge_set`) — `evidence_repository`/
+    `object_store` are only ever consulted for the former.
+    """
+    evidence_id = item.get("evidence_id")
+    expected = item["expected_document_type"]
+    label_family = item.get("label_family")
+    identifier = evidence_id if evidence_id is not None else f"synthetic:{item.get('subject', '?')!r}"
+
+    context_result = _build_ai_only_context(item, evidence_repository=evidence_repository, object_store=object_store)
+    if context_result.outcome != _CONTEXT_OUTCOME_BUILT:
+        return ItemResult(
+            evidence_id=identifier, expected_document_type=expected, label_family=label_family,
+            outcome=OUTCOME_CONTEXT_UNSUPPORTED, bucket=BUCKET_CONTEXT_UNSUPPORTED, actual_document_type=None,
+            correct=None, ai_invocation_id=None, new_invocation=None, latency_ms=None, matched_rule_id=None,
+            error_code=None, unsupported_reason=context_result.unsupported_reason,
+        )
+    context = context_result.context
+
+    task_contract = get_task_contract(AI_TASK_ID, task_version)
+    prompt_contract_version = resolve_prompt_contract_version(AI_TASK_ID, task_version)
+    system_instructions = load_system_prompt(AI_TASK_ID, prompt_contract_version)
+
+    result = litellm_client.complete(
+        capability_alias=task_contract.preferred_capability,
+        system_instructions=system_instructions,
+        evidence_content=context.rendered_context,
+        output_schema=task_contract.output_schema,
+        timeout_seconds=float(task_contract.timeout_seconds),
+    )
+
+    if result.status != LiteLLMOutcomeStatus.OK:
+        return ItemResult(
+            evidence_id=identifier, expected_document_type=expected, label_family=label_family,
+            outcome=OUTCOME_AI_INVOCATION_FAILED, bucket=BUCKET_AI_FAILURE, actual_document_type=None,
+            correct=None, ai_invocation_id=None, new_invocation=None, latency_ms=result.latency_ms,
+            matched_rule_id=None, error_code=f"LITELLM_{result.status.value}", unsupported_reason=None,
+        )
+
+    try:
+        parsed_output = json.loads(result.content or "")
+    except (json.JSONDecodeError, TypeError) as exc:
+        return ItemResult(
+            evidence_id=identifier, expected_document_type=expected, label_family=label_family,
+            outcome=OUTCOME_AI_INVOCATION_FAILED, bucket=BUCKET_AI_FAILURE, actual_document_type=None,
+            correct=None, ai_invocation_id=None, new_invocation=None, latency_ms=result.latency_ms,
+            matched_rule_id=None, error_code="OUTPUT_NOT_JSON", unsupported_reason=str(exc),
+        )
+
+    validation_result = validate_task_output(task_contract, parsed_output)
+    if not validation_result.valid:
+        return ItemResult(
+            evidence_id=identifier, expected_document_type=expected, label_family=label_family,
+            outcome=OUTCOME_AI_INVOCATION_FAILED, bucket=BUCKET_AI_FAILURE, actual_document_type=None,
+            correct=None, ai_invocation_id=None, new_invocation=None, latency_ms=result.latency_ms,
+            matched_rule_id=None, error_code="OUTPUT_SCHEMA_INVALID",
+            unsupported_reason="; ".join(validation_result.errors),
+        )
+
+    proposed_type = parsed_output.get("proposed_type")
+    is_unknown = proposed_type == DOCUMENT_TYPE_UNKNOWN
+    outcome = OUTCOME_AI_PROPOSAL_UNCLASSIFIABLE if is_unknown else OUTCOME_AI_PROPOSAL_REVIEW_REQUIRED
+
+    return ItemResult(
+        evidence_id=identifier,
+        expected_document_type=expected,
+        label_family=label_family,
+        outcome=outcome,
+        bucket=BUCKET_AI,
+        actual_document_type=proposed_type,
+        correct=(proposed_type == expected),
+        ai_invocation_id=None,
+        new_invocation=None,
+        latency_ms=result.latency_ms,
+        matched_rule_id=None,
+        error_code=None,
+        unsupported_reason=None,
+    )
+
+
+# ---------------------------------------------------------------------
 # Aggregation / report
 # ---------------------------------------------------------------------
 
@@ -423,6 +679,8 @@ def build_report(
     completed_at,
     task_contract_preferred_capability: Optional[str],
     prompt_contract_version: Optional[str],
+    task_version: int = AI_TASK_VERSION,
+    mode: str = "SHADOW_CLASSIFY_EVIDENCE",
 ) -> dict:
     overall_total = 0
     overall_correct = 0
@@ -528,8 +786,9 @@ def build_report(
         "started_at": to_contract_string(started_at),
         "completed_at": to_contract_string(completed_at),
         "deployed_git_commit": os.environ.get("BAGMAN_GIT_COMMIT", "unknown"),
+        "mode": mode,
         "task_id": AI_TASK_ID,
-        "task_version": AI_TASK_VERSION,
+        "task_version": task_version,
         "preferred_capability": task_contract_preferred_capability,
         "prompt_contract_version": prompt_contract_version,
         "manifest_file": manifest_file,
@@ -647,6 +906,68 @@ def run_evaluation(
     )
 
 
+def run_ai_only_evaluation(
+    *,
+    items: list[dict],
+    task_version: int,
+    litellm_client,
+    evidence_repository=None,
+    object_store=None,
+    manifest_file: str,
+    run_id: Optional[str] = None,
+) -> dict:
+    """Task 4's dependency-injected core for `--ai-only` mode — the
+    version-aware, deterministic-bypassing sibling of `run_evaluation`
+    above. Never calls `classify_evidence`, never touches
+    `get_composition()` itself, and (unlike `run_evaluation`) needs no
+    `rule_repository`/`classification_repository`/`ai_invocation_repository`/
+    `audit_repository`/`record_audit_event`/`needs_you_repository` at
+    all — this function structurally cannot write any of those rows,
+    because it never accepts a dependency capable of doing so.
+    `evidence_repository`/`object_store` are only required when `items`
+    names real, already-registered `EvidenceItem`s (manifest shape); a
+    purely synthetic challenge-set run needs neither (both stay `None`).
+    Reuses `build_report` unchanged beyond its own additive
+    `task_version`/`mode` parameters, so the report shape stays
+    identical to the shadow-mode report above."""
+    run_id = run_id or identity.generate_id()
+    started_at = utc_now()
+
+    results = [
+        evaluate_item_ai_only(
+            item,
+            task_version=task_version,
+            litellm_client=litellm_client,
+            evidence_repository=evidence_repository,
+            object_store=object_store,
+        )
+        for item in items
+    ]
+
+    completed_at = utc_now()
+
+    preferred_capability = None
+    prompt_contract_version = None
+    try:
+        task_contract = get_task_contract(AI_TASK_ID, task_version)
+        preferred_capability = task_contract.preferred_capability
+        prompt_contract_version = resolve_prompt_contract_version(AI_TASK_ID, task_version)
+    except Exception:  # noqa: BLE001 - report metadata only; never let this fail the whole evaluation
+        pass
+
+    return build_report(
+        results,
+        manifest_file=manifest_file,
+        run_id=run_id,
+        started_at=started_at,
+        completed_at=completed_at,
+        task_contract_preferred_capability=preferred_capability,
+        prompt_contract_version=prompt_contract_version,
+        task_version=task_version,
+        mode="AI_ONLY_DIRECT",
+    )
+
+
 # ---------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------
@@ -661,8 +982,37 @@ def _parse_args(argv: Optional[Iterable[str]]) -> argparse.Namespace:
     )
     parser.add_argument(
         "--manifest-file",
-        required=True,
-        help="path to a JSON array of {evidence_id, expected_document_type, label_family} — must live outside Git for production runs",
+        default=None,
+        help=(
+            "path to a JSON array of {evidence_id, expected_document_type, label_family} — must live "
+            "outside Git for production runs. Required in the default shadow mode; in --ai-only mode, "
+            "supply exactly one of --manifest-file/--challenge-set-file"
+        ),
+    )
+    parser.add_argument(
+        "--challenge-set-file",
+        default=None,
+        help=(
+            "--ai-only mode only: path to a JSON object with an 'items' array of {sender, subject, body, "
+            "expected_document_type, label_family} synthetic fixtures that do NOT name any real, "
+            "registered EvidenceItem (see tests/fixtures/document_type_proposal_v3_challenge_set_synthetic.json)"
+        ),
+    )
+    parser.add_argument(
+        "--ai-only",
+        action="store_true",
+        help=(
+            "Task 4: bypass classify_evidence's deterministic-first check entirely and invoke "
+            "DOCUMENT_TYPE_PROPOSAL at --task-version directly (litellm_client.complete() + "
+            "validate_task_output only — creates no AIInvocation/EvidenceClassification/"
+            "EvidenceClassificationRule/NeedsYouItem row of any kind)"
+        ),
+    )
+    parser.add_argument(
+        "--task-version",
+        type=int,
+        default=AI_TASK_VERSION,
+        help="DOCUMENT_TYPE_PROPOSAL task_version to invoke in --ai-only mode (default: %(default)s) — ignored outside --ai-only mode",
     )
     parser.add_argument("--actor-type", default="SYSTEM")
     parser.add_argument("--actor-id", default="evaluate-document-classifier")
@@ -675,6 +1025,15 @@ def _parse_args(argv: Optional[Iterable[str]]) -> argparse.Namespace:
         parser.error("--runtime-dir is required (or set BAGMAN_CLASSIFICATION_RUNTIME_DIR) — no default path is ever assumed")
     args.runtime_dir = runtime_dir
 
+    if args.ai_only:
+        if bool(args.manifest_file) == bool(args.challenge_set_file):
+            parser.error("--ai-only requires exactly one of --manifest-file or --challenge-set-file")
+    else:
+        if args.challenge_set_file:
+            parser.error("--challenge-set-file is only valid together with --ai-only")
+        if not args.manifest_file:
+            parser.error("--manifest-file is required (unless --ai-only is used with --challenge-set-file)")
+
     return args
 
 
@@ -683,28 +1042,48 @@ def main(argv: Optional[list[str]] = None) -> int:
     runtime_dir = Path(args.runtime_dir)
     runtime_dir.mkdir(parents=True, exist_ok=True)
 
-    items = load_manifest(args.manifest_file)
-
     from app.api.composition import get_composition  # local import: keeps this module importable/testable with zero env vars set
 
     composition = get_composition()
 
-    report = run_evaluation(
-        items=items,
-        evidence_repository=composition.api.evidence_repository,
-        rule_repository=composition.classification_rule_repository,
-        classification_repository=composition.classification_repository,
-        ai_invocation_repository=composition.ai_invocation_repository,
-        litellm_client=composition.litellm_client,
-        object_store=composition.object_store,
-        audit_repository=composition.api.audit_repository,
-        record_audit_event=composition.api.record_audit_event,
-        needs_you_repository=composition.needs_you_repository,
-        actor_type=args.actor_type,
-        actor_id=args.actor_id,
-        correlation_id=args.correlation_id,
-        manifest_file=args.manifest_file,
-    )
+    if args.ai_only:
+        if args.challenge_set_file:
+            items = load_challenge_set(args.challenge_set_file)
+            source_file = args.challenge_set_file
+            evidence_repository = None
+            object_store = None
+        else:
+            items = load_manifest(args.manifest_file)
+            source_file = args.manifest_file
+            evidence_repository = composition.api.evidence_repository
+            object_store = composition.object_store
+
+        report = run_ai_only_evaluation(
+            items=items,
+            task_version=args.task_version,
+            litellm_client=composition.litellm_client,
+            evidence_repository=evidence_repository,
+            object_store=object_store,
+            manifest_file=source_file,
+        )
+    else:
+        items = load_manifest(args.manifest_file)
+        report = run_evaluation(
+            items=items,
+            evidence_repository=composition.api.evidence_repository,
+            rule_repository=composition.classification_rule_repository,
+            classification_repository=composition.classification_repository,
+            ai_invocation_repository=composition.ai_invocation_repository,
+            litellm_client=composition.litellm_client,
+            object_store=composition.object_store,
+            audit_repository=composition.api.audit_repository,
+            record_audit_event=composition.api.record_audit_event,
+            needs_you_repository=composition.needs_you_repository,
+            actor_type=args.actor_type,
+            actor_id=args.actor_id,
+            correlation_id=args.correlation_id,
+            manifest_file=args.manifest_file,
+        )
 
     report_path = runtime_dir / f"evaluate-document-classifier-{report['run_id']}-report.json"
     report_path.write_text(json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")
