@@ -2020,6 +2020,31 @@ Four additional real defects were found — by the architect, from direct live t
 
 A fresh, independent Auditor (no inherited Engineer/PL reasoning) is being dispatched next, scoped per architect instruction to: canonical company selector, Xero OAuth lifecycle, deterministic tenant resolution, cross-company tenant isolation, token handling, account projection, sync failure/last-known-good semantics, GUI disconnected/stale/error states, the real two-company live evidence above, no-Xero-write-capability, and exact-head CI. PR #6 remains DRAFT; no merge; Slice 3 not started.
 
+### 102.6 Documentation backfill — bounded Xero-assisted supplier-domain correlation (governance gap found and closed, 2026-09-26)
+
+The independent Slice 2 Auditor (§102.7 below) found that `services/xero/supplier_correlation.py` (805 lines) and `client.py`'s corresponding read-only expansion (`list_contacts`/`list_purchase_invoices`/`list_bank_transactions`, three new read-only OAuth scopes) are real code already in this PR/branch, self-described in their own docstrings and in `services/xero/component.yaml`'s manifest as a "CD-6 architect-authorized addendum" — but this addendum was never given its own narrative entry here in `PID.md`. This is recorded now, as a documentation backfill, not as new work:
+
+**What it is:** a bounded, on-demand, non-AI correlation aid. Phase A historical mailbox discovery produced 90 OPEN `MAILBOX_DOMAIN_REVIEW` Needs You items with no extra context beyond "this domain sent N candidate messages." This module reads Xero's own Contacts/Invoices/BankTransactions transiently (never persisted — no new canonical Xero table), correlates them against each still-OPEN item's own sender domain via `ContactID` only (never fuzzy name matching), and attaches the result to that item's own `metadata` as a review aid — never an auto-decision, never auto-approving anything. Lives in `services/xero/` (not `services/mailbox/`/`services/needs_you/`, both of which explicitly prohibit `direct_xero_access` in their own manifests) for exactly that reason — a real, manifest-documented placement decision, not an arbitrary one.
+
+**Still strictly read-only**: confirmed independently by the Slice 2 Auditor (§102.7) via direct source inspection — this module makes zero direct HTTP calls of its own; it only consumes the same read-only `XeroAccountingClient`, which the Auditor confirmed has exactly one `POST` call site in the entire module (the OAuth token exchange itself, not the Accounting API). `xero_write_endpoints` remains listed under `services/xero/component.yaml`'s own `prohibited:` section, unchanged.
+
+No further action required — this section exists solely so a future reader of this PID does not have to reconstruct an already-real, already-authorized, already-correctly-bounded piece of code from the diff alone.
+
+### 102.7 Slice 2 independent Auditor verdict (2026-09-26) — `SLICE2_GREEN_CONFIRMED`
+
+A fresh, independent Auditor (no inherited Engineer/PL reasoning, own disposable worktree, own fresh test venv) adversarially re-verified Slice 2 end to end, treating every prior claim in §102.1-102.5 as a hypothesis to re-derive, not a fact to repeat:
+
+- **No write/posting capability** — confirmed by direct source inspection: exactly one `POST` call site in `services/xero/client.py` (the OAuth token exchange), every Accounting-API call is `GET`.
+- **OAuth state anti-replay + secret-file permissions** — re-confirmed genuinely race-safe by reading the actual locking code (real `threading.Lock`/`SELECT...FOR UPDATE`, re-validated under the lock, not merely asserted), and secret files are `0600` from the `os.open()` creation syscall itself, live-verified on the Mac.
+- **Deterministic tenant resolution + cross-company isolation** — all three claimed unique constraints (`uq_xero_connections_entity_id`, `uq_xero_connections_tenant_id` partial-unique, `uq_xero_accounts_tenant_account`) independently confirmed present in the migration AND live against the real production database; the Auditor ran its own `GROUP BY entity_id, tenant_id` query directly (not trusting §102.5's own reported numbers) and reproduced exactly 2 groups, 51/87 rows, zero cross-contamination.
+- **Pending-tenant-selection broker** — `mark_resolved()` confirmed absent repo-wide (zero occurrences); `consume()` confirmed to be a genuine atomic removal, not a mark-and-retain.
+- **Full test suite, independently run from a clean venv**: **2389 passed, 24 skipped, 0 failed.**
+- **`gitleaks detect`**: clean.
+- **Live Mac re-verification (read-only only — no write/restart/delete of any kind)**: both real Xero connections confirmed CONNECTED with distinct tenant_ids; token file permissions re-confirmed (0700 dirs/0600 files); CI confirmed green at exact head `91a4e2a2241ccb3b235e4fdc7fe28fe962803a8f`.
+- Two non-blocking gaps flagged by the Auditor, both closed by the PL before adjudication: (1) §102.6 above backfills the `supplier_correlation.py` documentation gap; (2) the Auditor could not itself grep live container logs for credential-shaped strings under its own permissions — the PL did so directly afterward (2,089 real, recent `bagman-api` log lines, zero `access_token`/`refresh_token`/`client_secret`/bearer-token/JWT-shaped matches), closing the gap the Auditor's own static-review-only finding had left open.
+
+**Verdict accepted by the PL: `SLICE2_GREEN_CONFIRMED`. No material, unresolved defect found. PR #6's Slice 1 + Slice 2 + CD-6 Slice 5 (evidence classification, WI-1 through WI-6) + the CD-6 §103 inference-architecture ruling documentation are ready for merge to `main`. Slice 3 (TAB 1 mailbox management) was never started and is explicitly deferred to a future delivery — not part of this merge.**
+
 ---
 
 # 103. Inference Architecture Ruling — Model Invariance, `bagman-deep` Retirement, Trinity Backlog-Only (Architect ruling, 2026-09-26)
