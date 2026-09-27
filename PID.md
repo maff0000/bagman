@@ -2304,9 +2304,9 @@ Behaviour, all confirmed by new regression tests:
 - No access token, refresh token, or client secret ever appears in any response body or audit-event payload.
 - IMAP untouched (out of scope; no defect found there).
 
-10 new regression tests (5 per provider). Full suite: 2518 passed, 24 skipped, 0 failed (was 2508 before this delta); `gitleaks` clean. Independent Auditor (fresh context) confirmed all 8 architect-required behaviours against the actual code and re-ran the tests directly — verdict **GREEN**. PR #13 (`mailbox/test-action-refresh-fix`) merged to `main` at merge commit `670c11c` (content commit `bc875b3`).
+10 new regression tests (5 per provider). Full suite: 2518 passed, 24 skipped, 0 failed (was 2508 before this delta); `gitleaks` clean. Independent Auditor (fresh context) confirmed all 8 architect-required behaviours against the actual code and re-ran the tests directly — verdict **GREEN**. PR #13 (`mailbox/test-action-refresh-fix`) merged to `main` manually by the architect at merge commit `670c11cbfff032d4c90fe7cc20bc59fcbd6d1d4b` — verified two-parent merge topology (parent 1: prior tip `9b2c837521e8e27c2c4653b6640d29f5f141b895`; parent 2: audited PR head `bc875b31c81fe3901fec813b6594928cfe10faf7`). Post-merge CI on the exact canonical merge SHA independently reconfirmed GREEN (`Security` workflow, `conclusion:success`) before any deployment proceeded.
 
-## 106.4 Canonical production deployment and verification
+## 106.4 Canonical production deployment and verification (first pass, pre-manual-merge-confirmation)
 
 Canonical production image `bagman-api:main-670c11c` built and deployed — migration head unchanged, no new migration in this delta.
 
@@ -2318,6 +2318,15 @@ Live verification (genuinely expired tokens, not synthetic — all 3 real access
 
 **Full production reconciliation** (immediately before this deployment sequence → after): `MailboxSource=4`, `MailboxMessage=25056`, `MailboxSweepRun=9`, `MailboxDomainRule=32`, `NeedsYou 332/395`, `EvidenceItem=689`, `EvidenceClassification=18` — every value identical, zero unexplained drift. `connection_state` unchanged (`CONNECTED`) for all 4 mailboxes throughout. No historical sweep was run, no domain rule changed, no Needs You item created by any action in this whole sequence.
 
-## 106.5 Verdict
+## 106.5 Canonical post-merge re-verification (architect-witnessed manual merge)
 
-**CLOSED GREEN** for both mailboxes. Root cause for Microsoft and Gmail was identical and is recorded accurately here: the original Test implementation was intentionally non-mutating and therefore did not refresh expired OAuth access tokens, which caused healthy, idle OAuth mailboxes to appear disconnected. The production refresh credentials themselves were valid throughout — this is not, and must not be read as, an OAuth credential incident. The rule-engine condition expansion (§104.6/§105.1) remains untouched and unstarted.
+Matt merged PR #13 manually and issued a formal post-merge gate WO: confirm CI on the exact canonical merge SHA before any deploy, then re-verify.
+
+- **Post-merge CI gate**: `Security` workflow on `670c11cbfff032d4c90fe7cc20bc59fcbd6d1d4b` — `status:completed, conclusion:success` (confirmed via both the check-runs and workflow-runs APIs before proceeding).
+- **Canonical image provenance re-confirmed**: the Mac's `/opt/bagman/app/src` checkout was at `670c11cbfff032d4c90fe7cc20bc59fcbd6d1d4b` (matching `origin/main` exactly) at build time; the running `bagman-api` container's image tag (`bagman-api:main-670c11c`) traces to that exact checkout — no rebuild was needed since the §106.4 deployment was already from this identical commit.
+- **Live re-verification** (again against genuinely, naturally expired tokens — ~75 minutes after §106.4's own refresh): Microsoft Test → `ok:true`; both Gmail Tests → `ok:true`; all three `expires_at` files advanced to new future timestamps (Microsoft → `2026-09-27T18:42:24Z`, Gmail → `2026-09-27T18:29:05Z`/`18:29:05Z`), proving a genuine refresh on each call, not a cached result.
+- **Reconciliation** (before this re-verification pass → after, now also including `AIInvocation`/`BackgroundJob`): `MailboxSource=4`, `MailboxMessage=25056`, `MailboxSweepRun=9`, `MailboxDomainRule=32`, `NeedsYou 332/395`, `EvidenceItem=689`, `EvidenceClassification=18`, `AIInvocation=375`, `BackgroundJob=4` — every value identical, zero drift. `connection_state=CONNECTED` unchanged for all 4 mailboxes. No new sweep run, no new message, no new Needs You item, no domain-rule change. `docker logs` over the window: zero credential-shaped lines.
+
+## 106.6 Verdict
+
+**CLOSED GREEN** for both mailboxes, confirmed twice — once at initial deployment (§106.4) and once under the architect's own formal post-merge re-verification gate against the exact canonical two-parent merge SHA (§106.5). Root cause for Microsoft and Gmail was identical and is recorded accurately here: the original Test implementation was intentionally non-mutating and therefore did not refresh expired OAuth access tokens, which caused healthy, idle OAuth mailboxes to appear disconnected. The production refresh credentials themselves were valid throughout — this is not, and must not be read as, an OAuth credential incident. The rule-engine condition expansion (§104.6/§105.1) remains untouched and unstarted.
