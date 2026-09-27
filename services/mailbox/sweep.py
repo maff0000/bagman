@@ -938,6 +938,15 @@ def run_sweep(
     )
 
     with sweep_lock.held(mailbox.mailbox_id):
+        # Bounded, lazy stale-RUNNING recovery (Slice 3/4/5 governance-
+        # reconciliation delta) — BEFORE creating this attempt's own new
+        # run, reconcile any PRIOR run for this mailbox abandoned by a
+        # process that died mid-sweep (see
+        # services.mailbox.sweep_run's own module docstring). Safe here
+        # specifically because we already hold this mailbox's own
+        # sweep_lock, so no OTHER sweep can be genuinely in flight for it
+        # right now.
+        sweep_run_repository.recover_stale_runs(mailbox_id=mailbox.mailbox_id)
         run = sweep_run_repository.create_run(mailbox_id=mailbox.mailbox_id, trigger=trigger)
 
         folders_attempted: list[dict] = []
@@ -2070,6 +2079,7 @@ def reprocess_all_historical_candidates_for_domain(
     api: _EvidenceAPIProtocol,
     object_store: _ObjectStoreProtocol,
     scanner: EvidenceSafetyScanner,
+    sweep_lock: MailboxSweepLock,
     actor_type: str,
     actor_id: str,
     correlation_id: Optional[str] = None,
@@ -2176,10 +2186,27 @@ def reprocess_all_historical_candidates_for_domain(
     candidate exists for this domain, or none of the discovered
     candidates are actually governed by this rule.
 
+    Concurrency (Slice 3/4/5 governance-reconciliation delta)
+    ------------------------------------------------------------------
+    This function previously took no `sweep_lock` at all — a real,
+    independently-confirmed gap: nothing prevented it from running
+    concurrently with a live `run_sweep` (or another concurrent
+    approval) for the SAME mailbox, which could duplicate
+    `MAILBOX_DOMAIN_REVIEW` Needs You items via
+    `services.mailbox.sweep._find_open_domain_review_item`'s own
+    app-level-only dedup (no equivalent DB constraint exists for that
+    specific item type — see the reconciliation record in `PID.md`).
+    Fixed the same way `run_sweep` already protects itself: acquiring
+    the SAME per-mailbox `services.mailbox.lock.MailboxSweepLock`
+    before touching anything.
+
     Raises:
         core.errors.ConflictError: `mailbox` is not ACTIVE+CONNECTED
             (same defensive backstop as `run_sweep`'s own precondition;
             checked ONCE here, up front, never per-message).
+        services.mailbox.lock.MailboxSweepLockError: a concurrent
+            sweep/reprocess of the SAME mailbox is already in progress
+            (mirrors `run_sweep`'s own identical guard).
     """
     if mailbox.status != "ACTIVE" or mailbox.connection_state != CONNECTION_STATE_CONNECTED:
         raise ConflictError(
@@ -2187,44 +2214,45 @@ def reprocess_all_historical_candidates_for_domain(
             "candidates (reconnect the mailbox before approving this domain review item)"
         )
 
-    include_subdomains = rule.match_mode == MATCH_MODE_INCLUDE_SUBDOMAINS
-    candidates = message_repository.list_candidate_messages_for_domain(
-        mailbox_id=mailbox.mailbox_id, sender_domain=sender_domain, include_subdomains=include_subdomains
-    )
+    with sweep_lock.held(mailbox.mailbox_id):
+        include_subdomains = rule.match_mode == MATCH_MODE_INCLUDE_SUBDOMAINS
+        candidates = message_repository.list_candidate_messages_for_domain(
+            mailbox_id=mailbox.mailbox_id, sender_domain=sender_domain, include_subdomains=include_subdomains
+        )
 
-    results: list[MailboxMessage] = []
-    for candidate in candidates:
-        effective_rule = mailbox_domain_rule_repository.find_for_sender(
-            mailbox_id=candidate.mailbox_id,
-            sender_domain=candidate.sender_domain,
-            sender_address=candidate.sender_address,
-            subject=candidate.subject,
-        )
-        if effective_rule is None or effective_rule.rule_id != rule.rule_id:
-            # A different, more-specific rule actually governs this
-            # candidate (or, defensively, none does) — skip entirely,
-            # no side effects, and never appear in `results`.
-            continue
-        results.append(
-            _reprocess_one_message(
-                mailbox=mailbox,
-                mailbox_source_id=mailbox_source_id,
-                message_id=candidate.mailbox_message_id,
-                rule=effective_rule,
-                adapter=adapter,
-                message_repository=message_repository,
-                needs_you_repository=needs_you_repository,
-                api=api,
-                object_store=object_store,
-                scanner=scanner,
-                actor_type=actor_type,
-                actor_id=actor_id,
-                correlation_id=correlation_id,
-                now=now,
-                sleep_fn=sleep_fn,
+        results: list[MailboxMessage] = []
+        for candidate in candidates:
+            effective_rule = mailbox_domain_rule_repository.find_for_sender(
+                mailbox_id=candidate.mailbox_id,
+                sender_domain=candidate.sender_domain,
+                sender_address=candidate.sender_address,
+                subject=candidate.subject,
             )
-        )
-    return results
+            if effective_rule is None or effective_rule.rule_id != rule.rule_id:
+                # A different, more-specific rule actually governs this
+                # candidate (or, defensively, none does) — skip entirely,
+                # no side effects, and never appear in `results`.
+                continue
+            results.append(
+                _reprocess_one_message(
+                    mailbox=mailbox,
+                    mailbox_source_id=mailbox_source_id,
+                    message_id=candidate.mailbox_message_id,
+                    rule=effective_rule,
+                    adapter=adapter,
+                    message_repository=message_repository,
+                    needs_you_repository=needs_you_repository,
+                    api=api,
+                    object_store=object_store,
+                    scanner=scanner,
+                    actor_type=actor_type,
+                    actor_id=actor_id,
+                    correlation_id=correlation_id,
+                    now=now,
+                    sleep_fn=sleep_fn,
+                )
+            )
+        return results
 
 
 def process_security_reviewed_message_once(

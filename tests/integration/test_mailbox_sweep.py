@@ -691,6 +691,32 @@ def test_concurrent_sweep_of_the_same_mailbox_declines_cleanly(h):
         h.lock.release(h.mailbox.mailbox_id, token)
 
 
+def test_historical_reprocess_declines_cleanly_when_a_live_sweep_holds_the_lock(h):
+    """Slice 3/4/5 governance-reconciliation delta: `reprocess_all_historical_candidates_for_domain`
+    previously took no `sweep_lock` at all, so nothing prevented it
+    running concurrently with a live `run_sweep` for the SAME mailbox
+    — a real, independently-found race that could duplicate
+    `MAILBOX_DOMAIN_REVIEW` Needs You items. Now mirrors `run_sweep`'s
+    own identical guard."""
+    from services.mailbox.sweep import reprocess_all_historical_candidates_for_domain
+
+    rule = h.domain_rule_repo.upsert_rule(
+        mailbox_id=h.mailbox.mailbox_id, sender_domain="vendor.com", match_mode="EXACT", policy="MUST_READ",
+        destination_entity_id=None, destination_mode="REVIEW_REQUIRED", source="OPERATOR",
+    )
+    token = h.lock.try_acquire(h.mailbox.mailbox_id)
+    try:
+        with pytest.raises(MailboxSweepLockError):
+            reprocess_all_historical_candidates_for_domain(
+                mailbox=h.mailbox, mailbox_source_id=h.source_id, sender_domain="vendor.com",
+                rule=rule, mailbox_domain_rule_repository=h.domain_rule_repo, adapter=h.adapter,
+                sweep_lock=h.lock, message_repository=h.message_repo, needs_you_repository=h.needs_you_repo,
+                api=h.api, object_store=h.object_store, scanner=h.scanner, actor_type="SYSTEM", actor_id="test",
+            )
+    finally:
+        h.lock.release(h.mailbox.mailbox_id, token)
+
+
 # ---------------------------------------------------------------------
 # Audit events
 # ---------------------------------------------------------------------
@@ -870,7 +896,7 @@ def test_reprocess_all_historical_candidates_ingests_the_triggering_message_imme
     h.graph_client.queue_content_result(_content())
     reprocessed = reprocess_all_historical_candidates_for_domain(
         mailbox=h.mailbox, mailbox_source_id=h.source_id, sender_domain="vendor.com",
-        rule=rule, mailbox_domain_rule_repository=h.domain_rule_repo, adapter=h.adapter, message_repository=h.message_repo, needs_you_repository=h.needs_you_repo, api=h.api, object_store=h.object_store,
+        rule=rule, mailbox_domain_rule_repository=h.domain_rule_repo, adapter=h.adapter, sweep_lock=h.lock, message_repository=h.message_repo, needs_you_repository=h.needs_you_repo, api=h.api, object_store=h.object_store,
         scanner=h.scanner, actor_type="SYSTEM", actor_id="test",
     )
     assert len(reprocessed) == 1
@@ -904,7 +930,7 @@ def test_historical_reprocess_fixed_destination_assigns_real_entity_id_to_eviden
     h.graph_client.queue_content_result(_content())
     reprocessed = reprocess_all_historical_candidates_for_domain(
         mailbox=h.mailbox, mailbox_source_id=h.source_id, sender_domain="vendor.com",
-        rule=rule, mailbox_domain_rule_repository=h.domain_rule_repo, adapter=h.adapter, message_repository=h.message_repo, needs_you_repository=h.needs_you_repo, api=h.api, object_store=h.object_store,
+        rule=rule, mailbox_domain_rule_repository=h.domain_rule_repo, adapter=h.adapter, sweep_lock=h.lock, message_repository=h.message_repo, needs_you_repository=h.needs_you_repo, api=h.api, object_store=h.object_store,
         scanner=h.scanner, actor_type="SYSTEM", actor_id="test",
     )
     assert len(reprocessed) == 1
@@ -928,7 +954,7 @@ def test_reprocess_all_historical_candidates_is_idempotent_on_a_double_submit_of
     h.graph_client.queue_content_result(_content())
     first = reprocess_all_historical_candidates_for_domain(
         mailbox=h.mailbox, mailbox_source_id=h.source_id, sender_domain="vendor.com",
-        rule=rule, mailbox_domain_rule_repository=h.domain_rule_repo, adapter=h.adapter, message_repository=h.message_repo, needs_you_repository=h.needs_you_repo, api=h.api, object_store=h.object_store,
+        rule=rule, mailbox_domain_rule_repository=h.domain_rule_repo, adapter=h.adapter, sweep_lock=h.lock, message_repository=h.message_repo, needs_you_repository=h.needs_you_repo, api=h.api, object_store=h.object_store,
         scanner=h.scanner, actor_type="SYSTEM", actor_id="test",
     )
     assert len(first) == 1
@@ -940,7 +966,7 @@ def test_reprocess_all_historical_candidates_is_idempotent_on_a_double_submit_of
     # second time round.
     second = reprocess_all_historical_candidates_for_domain(
         mailbox=h.mailbox, mailbox_source_id=h.source_id, sender_domain="vendor.com",
-        rule=rule, mailbox_domain_rule_repository=h.domain_rule_repo, adapter=h.adapter, message_repository=h.message_repo, needs_you_repository=h.needs_you_repo, api=h.api, object_store=h.object_store,
+        rule=rule, mailbox_domain_rule_repository=h.domain_rule_repo, adapter=h.adapter, sweep_lock=h.lock, message_repository=h.message_repo, needs_you_repository=h.needs_you_repo, api=h.api, object_store=h.object_store,
         scanner=h.scanner, actor_type="SYSTEM", actor_id="test",
     )
     assert second == []
@@ -995,7 +1021,7 @@ def test_reprocess_all_historical_candidates_back_processes_every_historical_can
 
     reprocessed = reprocess_all_historical_candidates_for_domain(
         mailbox=h.mailbox, mailbox_source_id=h.source_id, sender_domain="vendor.com",
-        rule=rule, mailbox_domain_rule_repository=h.domain_rule_repo, adapter=h.adapter, message_repository=h.message_repo, needs_you_repository=h.needs_you_repo, api=h.api, object_store=h.object_store,
+        rule=rule, mailbox_domain_rule_repository=h.domain_rule_repo, adapter=h.adapter, sweep_lock=h.lock, message_repository=h.message_repo, needs_you_repository=h.needs_you_repo, api=h.api, object_store=h.object_store,
         scanner=h.scanner, actor_type="SYSTEM", actor_id="test",
     )
     assert len(reprocessed) == 3
@@ -1077,7 +1103,7 @@ def test_reprocess_mixed_domain_only_back_processes_actual_candidates_never_ever
 
     reprocessed = reprocess_all_historical_candidates_for_domain(
         mailbox=h.mailbox, mailbox_source_id=h.source_id, sender_domain="vendor.com",
-        rule=rule, mailbox_domain_rule_repository=h.domain_rule_repo, adapter=h.adapter, message_repository=h.message_repo, needs_you_repository=h.needs_you_repo, api=h.api, object_store=h.object_store,
+        rule=rule, mailbox_domain_rule_repository=h.domain_rule_repo, adapter=h.adapter, sweep_lock=h.lock, message_repository=h.message_repo, needs_you_repository=h.needs_you_repo, api=h.api, object_store=h.object_store,
         scanner=h.scanner, actor_type="SYSTEM", actor_id="test",
     )
     # Exactly 3 messages returned/reprocessed — NEVER 7.
@@ -1099,7 +1125,7 @@ def test_reprocess_mixed_domain_only_back_processes_actual_candidates_never_ever
     # candidates were never eligible and still aren't.
     second_call = reprocess_all_historical_candidates_for_domain(
         mailbox=h.mailbox, mailbox_source_id=h.source_id, sender_domain="vendor.com",
-        rule=rule, mailbox_domain_rule_repository=h.domain_rule_repo, adapter=h.adapter, message_repository=h.message_repo, needs_you_repository=h.needs_you_repo, api=h.api, object_store=h.object_store,
+        rule=rule, mailbox_domain_rule_repository=h.domain_rule_repo, adapter=h.adapter, sweep_lock=h.lock, message_repository=h.message_repo, needs_you_repository=h.needs_you_repo, api=h.api, object_store=h.object_store,
         scanner=h.scanner, actor_type="SYSTEM", actor_id="test",
     )
     assert second_call == []
@@ -1148,7 +1174,7 @@ def test_exact_address_backfill_only_processes_the_approved_address_not_the_whol
     h.graph_client.queue_content_result(_content())
     reprocessed = reprocess_all_historical_candidates_for_domain(
         mailbox=h.mailbox, mailbox_source_id=h.source_id, sender_domain="vendor.com",
-        rule=rule, mailbox_domain_rule_repository=h.domain_rule_repo, adapter=h.adapter,
+        rule=rule, mailbox_domain_rule_repository=h.domain_rule_repo, adapter=h.adapter, sweep_lock=h.lock,
         message_repository=h.message_repo, needs_you_repository=h.needs_you_repo, api=h.api,
         object_store=h.object_store, scanner=h.scanner, actor_type="SYSTEM", actor_id="test",
     )
@@ -1191,7 +1217,7 @@ def test_exact_address_backfill_processes_every_candidate_from_the_same_approved
     h.graph_client.queue_content_result(_content())
     reprocessed = reprocess_all_historical_candidates_for_domain(
         mailbox=h.mailbox, mailbox_source_id=h.source_id, sender_domain="vendor.com",
-        rule=rule, mailbox_domain_rule_repository=h.domain_rule_repo, adapter=h.adapter,
+        rule=rule, mailbox_domain_rule_repository=h.domain_rule_repo, adapter=h.adapter, sweep_lock=h.lock,
         message_repository=h.message_repo, needs_you_repository=h.needs_you_repo, api=h.api,
         object_store=h.object_store, scanner=h.scanner, actor_type="SYSTEM", actor_id="test",
     )
@@ -1236,7 +1262,7 @@ def test_exact_domain_approval_skips_a_more_specific_pre_existing_address_overri
     h.graph_client.queue_content_result(_content())
     reprocessed = reprocess_all_historical_candidates_for_domain(
         mailbox=h.mailbox, mailbox_source_id=h.source_id, sender_domain="vendor.com",
-        rule=rule, mailbox_domain_rule_repository=h.domain_rule_repo, adapter=h.adapter,
+        rule=rule, mailbox_domain_rule_repository=h.domain_rule_repo, adapter=h.adapter, sweep_lock=h.lock,
         message_repository=h.message_repo, needs_you_repository=h.needs_you_repo, api=h.api,
         object_store=h.object_store, scanner=h.scanner, actor_type="SYSTEM", actor_id="test",
     )
@@ -1281,7 +1307,7 @@ def test_include_subdomains_backfill_reaches_subdomain_candidates_and_excludes_l
         h.graph_client.queue_content_result(_content())
     reprocessed = reprocess_all_historical_candidates_for_domain(
         mailbox=h.mailbox, mailbox_source_id=h.source_id, sender_domain="example.com",
-        rule=rule, mailbox_domain_rule_repository=h.domain_rule_repo, adapter=h.adapter,
+        rule=rule, mailbox_domain_rule_repository=h.domain_rule_repo, adapter=h.adapter, sweep_lock=h.lock,
         message_repository=h.message_repo, needs_you_repository=h.needs_you_repo, api=h.api,
         object_store=h.object_store, scanner=h.scanner, actor_type="SYSTEM", actor_id="test",
     )
@@ -1332,7 +1358,7 @@ def test_include_subdomains_skips_a_more_specific_pre_existing_child_domain_over
     h.graph_client.queue_content_result(_content())
     reprocessed = reprocess_all_historical_candidates_for_domain(
         mailbox=h.mailbox, mailbox_source_id=h.source_id, sender_domain="example.com",
-        rule=rule, mailbox_domain_rule_repository=h.domain_rule_repo, adapter=h.adapter,
+        rule=rule, mailbox_domain_rule_repository=h.domain_rule_repo, adapter=h.adapter, sweep_lock=h.lock,
         message_repository=h.message_repo, needs_you_repository=h.needs_you_repo, api=h.api,
         object_store=h.object_store, scanner=h.scanner, actor_type="SYSTEM", actor_id="test",
     )
@@ -1376,7 +1402,7 @@ def test_include_subdomains_skips_a_more_specific_pre_existing_address_override(
     h.graph_client.queue_content_result(_content())
     reprocessed = reprocess_all_historical_candidates_for_domain(
         mailbox=h.mailbox, mailbox_source_id=h.source_id, sender_domain="example.com",
-        rule=rule, mailbox_domain_rule_repository=h.domain_rule_repo, adapter=h.adapter,
+        rule=rule, mailbox_domain_rule_repository=h.domain_rule_repo, adapter=h.adapter, sweep_lock=h.lock,
         message_repository=h.message_repo, needs_you_repository=h.needs_you_repo, api=h.api,
         object_store=h.object_store, scanner=h.scanner, actor_type="SYSTEM", actor_id="test",
     )
@@ -1422,7 +1448,7 @@ def test_include_subdomains_skips_a_more_specific_pre_existing_graylist_override
     h.graph_client.queue_content_result(_content())
     reprocessed = reprocess_all_historical_candidates_for_domain(
         mailbox=h.mailbox, mailbox_source_id=h.source_id, sender_domain="example.com",
-        rule=rule, mailbox_domain_rule_repository=h.domain_rule_repo, adapter=h.adapter,
+        rule=rule, mailbox_domain_rule_repository=h.domain_rule_repo, adapter=h.adapter, sweep_lock=h.lock,
         message_repository=h.message_repo, needs_you_repository=h.needs_you_repo, api=h.api,
         object_store=h.object_store, scanner=h.scanner, actor_type="SYSTEM", actor_id="test",
     )
@@ -1475,7 +1501,7 @@ def test_reprocess_results_ordering_is_received_at_ascending_among_processed_onl
         h.graph_client.queue_content_result(_content())
     reprocessed = reprocess_all_historical_candidates_for_domain(
         mailbox=h.mailbox, mailbox_source_id=h.source_id, sender_domain="vendor.com",
-        rule=rule, mailbox_domain_rule_repository=h.domain_rule_repo, adapter=h.adapter,
+        rule=rule, mailbox_domain_rule_repository=h.domain_rule_repo, adapter=h.adapter, sweep_lock=h.lock,
         message_repository=h.message_repo, needs_you_repository=h.needs_you_repo, api=h.api,
         object_store=h.object_store, scanner=h.scanner, actor_type="SYSTEM", actor_id="test",
     )
@@ -1517,7 +1543,7 @@ def test_reprocess_idempotency_holds_with_effective_rule_filtering_and_skipped_c
     h.graph_client.queue_content_result(_content())
     first = reprocess_all_historical_candidates_for_domain(
         mailbox=h.mailbox, mailbox_source_id=h.source_id, sender_domain="vendor.com",
-        rule=rule, mailbox_domain_rule_repository=h.domain_rule_repo, adapter=h.adapter,
+        rule=rule, mailbox_domain_rule_repository=h.domain_rule_repo, adapter=h.adapter, sweep_lock=h.lock,
         message_repository=h.message_repo, needs_you_repository=h.needs_you_repo, api=h.api,
         object_store=h.object_store, scanner=h.scanner, actor_type="SYSTEM", actor_id="test",
     )
@@ -1531,7 +1557,7 @@ def test_reprocess_idempotency_holds_with_effective_rule_filtering_and_skipped_c
     # more-specific BLACKLIST address rule).
     second = reprocess_all_historical_candidates_for_domain(
         mailbox=h.mailbox, mailbox_source_id=h.source_id, sender_domain="vendor.com",
-        rule=rule, mailbox_domain_rule_repository=h.domain_rule_repo, adapter=h.adapter,
+        rule=rule, mailbox_domain_rule_repository=h.domain_rule_repo, adapter=h.adapter, sweep_lock=h.lock,
         message_repository=h.message_repo, needs_you_repository=h.needs_you_repo, api=h.api,
         object_store=h.object_store, scanner=h.scanner, actor_type="SYSTEM", actor_id="test",
     )
@@ -1553,7 +1579,7 @@ def test_reprocess_idempotency_holds_with_effective_rule_filtering_and_skipped_c
     h.graph_client.queue_content_result(_content())
     third = reprocess_all_historical_candidates_for_domain(
         mailbox=h.mailbox, mailbox_source_id=h.source_id, sender_domain="vendor.com",
-        rule=address_rule, mailbox_domain_rule_repository=h.domain_rule_repo, adapter=h.adapter,
+        rule=address_rule, mailbox_domain_rule_repository=h.domain_rule_repo, adapter=h.adapter, sweep_lock=h.lock,
         message_repository=h.message_repo, needs_you_repository=h.needs_you_repo, api=h.api,
         object_store=h.object_store, scanner=h.scanner, actor_type="SYSTEM", actor_id="test",
     )
@@ -1590,7 +1616,7 @@ def test_historical_reprocess_fetches_headers_before_any_mime_fetch_and_passes_t
     h.graph_client.queue_content_result(_content())
     reprocessed = reprocess_all_historical_candidates_for_domain(
         mailbox=h.mailbox, mailbox_source_id=h.source_id, sender_domain="vendor.com",
-        rule=rule, mailbox_domain_rule_repository=h.domain_rule_repo, adapter=h.adapter, message_repository=h.message_repo, needs_you_repository=h.needs_you_repo, api=h.api, object_store=h.object_store,
+        rule=rule, mailbox_domain_rule_repository=h.domain_rule_repo, adapter=h.adapter, sweep_lock=h.lock, message_repository=h.message_repo, needs_you_repository=h.needs_you_repo, api=h.api, object_store=h.object_store,
         scanner=h.scanner, actor_type="SYSTEM", actor_id="test",
     )
     assert len(reprocessed) == 1
@@ -1630,7 +1656,7 @@ def test_historical_reprocess_auth_fail_never_fetches_mime_and_marks_security_re
     )
     reprocessed = reprocess_all_historical_candidates_for_domain(
         mailbox=h.mailbox, mailbox_source_id=h.source_id, sender_domain="vendor.com",
-        rule=rule, mailbox_domain_rule_repository=h.domain_rule_repo, adapter=h.adapter, message_repository=h.message_repo, needs_you_repository=h.needs_you_repo, api=h.api, object_store=h.object_store,
+        rule=rule, mailbox_domain_rule_repository=h.domain_rule_repo, adapter=h.adapter, sweep_lock=h.lock, message_repository=h.message_repo, needs_you_repository=h.needs_you_repo, api=h.api, object_store=h.object_store,
         scanner=h.scanner, actor_type="SYSTEM", actor_id="test",
     )
     assert len(reprocessed) == 1
@@ -1658,7 +1684,7 @@ def test_historical_reprocess_auth_unknown_never_fetches_mime_and_marks_security
     h.graph_client.queue_headers_result(GraphMessageHeadersResult(status=GraphOutcomeStatus.OK, raw_headers=()))
     reprocessed = reprocess_all_historical_candidates_for_domain(
         mailbox=h.mailbox, mailbox_source_id=h.source_id, sender_domain="vendor.com",
-        rule=rule, mailbox_domain_rule_repository=h.domain_rule_repo, adapter=h.adapter, message_repository=h.message_repo, needs_you_repository=h.needs_you_repo, api=h.api, object_store=h.object_store,
+        rule=rule, mailbox_domain_rule_repository=h.domain_rule_repo, adapter=h.adapter, sweep_lock=h.lock, message_repository=h.message_repo, needs_you_repository=h.needs_you_repo, api=h.api, object_store=h.object_store,
         scanner=h.scanner, actor_type="SYSTEM", actor_id="test",
     )
     assert len(reprocessed) == 1
@@ -1707,7 +1733,7 @@ def test_historical_back_process_splits_passed_and_failed_auth_within_the_same_r
 
     reprocessed = reprocess_all_historical_candidates_for_domain(
         mailbox=h.mailbox, mailbox_source_id=h.source_id, sender_domain="vendor.com",
-        rule=rule, mailbox_domain_rule_repository=h.domain_rule_repo, adapter=h.adapter, message_repository=h.message_repo, needs_you_repository=h.needs_you_repo, api=h.api, object_store=h.object_store,
+        rule=rule, mailbox_domain_rule_repository=h.domain_rule_repo, adapter=h.adapter, sweep_lock=h.lock, message_repository=h.message_repo, needs_you_repository=h.needs_you_repo, api=h.api, object_store=h.object_store,
         scanner=h.scanner, actor_type="SYSTEM", actor_id="test",
     )
     assert len(reprocessed) == 3
@@ -3247,7 +3273,7 @@ def test_resolve_domain_review_allow_open_full_success_all_candidates_ingested_r
     result = resolve_domain_review(
         needs_you_repository=h.needs_you_repo, mailbox_message_repository=h.message_repo,
         mailbox_domain_rule_repository=h.domain_rule_repo, entity_repository=h.api.entity_repository,
-        api=h.api, object_store=h.object_store, scanner=h.scanner, adapter=h.adapter, mailbox=h.mailbox,
+        api=h.api, object_store=h.object_store, scanner=h.scanner, adapter=h.adapter, sweep_lock=h.lock, mailbox=h.mailbox,
         mailbox_id=h.mailbox.mailbox_id, mailbox_source_id=h.source_id, item_id=item.item_id,
         actor_type="SYSTEM", actor_id="test", decision="ALLOW", destination_entity_id=None,
         destination_mode="REVIEW_REQUIRED", match_mode="EXACT", processor_hint=None, sender_address=None,
@@ -3297,7 +3323,7 @@ def test_resolve_domain_review_allow_failure_on_first_candidate_propagates_and_r
     kwargs = dict(
         needs_you_repository=h.needs_you_repo, mailbox_message_repository=h.message_repo,
         mailbox_domain_rule_repository=h.domain_rule_repo, entity_repository=h.api.entity_repository,
-        api=h.api, object_store=h.object_store, scanner=h.scanner, adapter=h.adapter, mailbox=h.mailbox,
+        api=h.api, object_store=h.object_store, scanner=h.scanner, adapter=h.adapter, sweep_lock=h.lock, mailbox=h.mailbox,
         mailbox_id=h.mailbox.mailbox_id, mailbox_source_id=h.source_id, item_id=item.item_id,
         actor_type="SYSTEM", actor_id="test", decision="ALLOW", destination_entity_id=None,
         destination_mode="REVIEW_REQUIRED", match_mode="EXACT", processor_hint=None, sender_address=None,
@@ -3365,7 +3391,7 @@ def test_resolve_domain_review_allow_failure_on_middle_candidate_never_attempts_
     kwargs = dict(
         needs_you_repository=h.needs_you_repo, mailbox_message_repository=h.message_repo,
         mailbox_domain_rule_repository=h.domain_rule_repo, entity_repository=h.api.entity_repository,
-        api=h.api, object_store=h.object_store, scanner=h.scanner, adapter=h.adapter, mailbox=h.mailbox,
+        api=h.api, object_store=h.object_store, scanner=h.scanner, adapter=h.adapter, sweep_lock=h.lock, mailbox=h.mailbox,
         mailbox_id=h.mailbox.mailbox_id, mailbox_source_id=h.source_id, item_id=item.item_id,
         actor_type="SYSTEM", actor_id="test", decision="ALLOW", destination_entity_id=None,
         destination_mode="REVIEW_REQUIRED", match_mode="EXACT", processor_hint=None, sender_address=None,
@@ -3423,7 +3449,7 @@ def test_resolve_domain_review_allow_failure_on_final_candidate_then_retry_touch
     kwargs = dict(
         needs_you_repository=h.needs_you_repo, mailbox_message_repository=h.message_repo,
         mailbox_domain_rule_repository=h.domain_rule_repo, entity_repository=h.api.entity_repository,
-        api=h.api, object_store=h.object_store, scanner=h.scanner, adapter=h.adapter, mailbox=h.mailbox,
+        api=h.api, object_store=h.object_store, scanner=h.scanner, adapter=h.adapter, sweep_lock=h.lock, mailbox=h.mailbox,
         mailbox_id=h.mailbox.mailbox_id, mailbox_source_id=h.source_id, item_id=item.item_id,
         actor_type="SYSTEM", actor_id="test", decision="ALLOW", destination_entity_id=None,
         destination_mode="REVIEW_REQUIRED", match_mode="EXACT", processor_hint=None, sender_address=None,
@@ -3469,7 +3495,7 @@ def test_resolve_domain_review_allow_resolved_identical_after_full_success_is_a_
     kwargs = dict(
         needs_you_repository=h.needs_you_repo, mailbox_message_repository=h.message_repo,
         mailbox_domain_rule_repository=h.domain_rule_repo, entity_repository=h.api.entity_repository,
-        api=h.api, object_store=h.object_store, scanner=h.scanner, adapter=h.adapter, mailbox=h.mailbox,
+        api=h.api, object_store=h.object_store, scanner=h.scanner, adapter=h.adapter, sweep_lock=h.lock, mailbox=h.mailbox,
         mailbox_id=h.mailbox.mailbox_id, mailbox_source_id=h.source_id, item_id=item.item_id,
         actor_type="SYSTEM", actor_id="test", decision="ALLOW", destination_entity_id=None,
         destination_mode="REVIEW_REQUIRED", match_mode="EXACT", processor_hint=None, sender_address=None,
@@ -3534,7 +3560,7 @@ def test_resolve_domain_review_allow_legacy_stranded_state_self_heals_without_re
     result = resolve_domain_review(
         needs_you_repository=h.needs_you_repo, mailbox_message_repository=h.message_repo,
         mailbox_domain_rule_repository=h.domain_rule_repo, entity_repository=h.api.entity_repository,
-        api=h.api, object_store=h.object_store, scanner=h.scanner, adapter=h.adapter, mailbox=h.mailbox,
+        api=h.api, object_store=h.object_store, scanner=h.scanner, adapter=h.adapter, sweep_lock=h.lock, mailbox=h.mailbox,
         mailbox_id=h.mailbox.mailbox_id, mailbox_source_id=h.source_id, item_id=item.item_id,
         actor_type="SYSTEM", actor_id="test", decision="ALLOW", destination_entity_id=None,
         destination_mode="REVIEW_REQUIRED", match_mode="EXACT", processor_hint=None, sender_address=None,
@@ -3579,7 +3605,7 @@ def test_resolve_domain_review_allow_open_item_conflicts_on_a_pre_existing_diffe
         resolve_domain_review(
             needs_you_repository=h.needs_you_repo, mailbox_message_repository=h.message_repo,
             mailbox_domain_rule_repository=h.domain_rule_repo, entity_repository=h.api.entity_repository,
-            api=h.api, object_store=h.object_store, scanner=h.scanner, adapter=h.adapter, mailbox=h.mailbox,
+            api=h.api, object_store=h.object_store, scanner=h.scanner, adapter=h.adapter, sweep_lock=h.lock, mailbox=h.mailbox,
             mailbox_id=h.mailbox.mailbox_id, mailbox_source_id=h.source_id, item_id=item.item_id,
             actor_type="SYSTEM", actor_id="test", decision="ALLOW", destination_entity_id=None,
             destination_mode="REVIEW_REQUIRED", match_mode="EXACT", processor_hint=None, sender_address=None,
@@ -3637,7 +3663,7 @@ def test_resolve_domain_review_allow_mixed_governed_outcomes_in_one_batch_never_
     result = resolve_domain_review(
         needs_you_repository=h.needs_you_repo, mailbox_message_repository=h.message_repo,
         mailbox_domain_rule_repository=h.domain_rule_repo, entity_repository=h.api.entity_repository,
-        api=h.api, object_store=h.object_store, scanner=h.scanner, adapter=h.adapter, mailbox=h.mailbox,
+        api=h.api, object_store=h.object_store, scanner=h.scanner, adapter=h.adapter, sweep_lock=h.lock, mailbox=h.mailbox,
         mailbox_id=h.mailbox.mailbox_id, mailbox_source_id=h.source_id, item_id=item.item_id,
         actor_type="SYSTEM", actor_id="test", decision="ALLOW", destination_entity_id=None,
         destination_mode="REVIEW_REQUIRED", match_mode="EXACT", processor_hint=None, sender_address=None,
@@ -3672,7 +3698,7 @@ def test_resolve_domain_review_ignore_regression_never_calls_backfill_and_resolv
     result = resolve_domain_review(
         needs_you_repository=h.needs_you_repo, mailbox_message_repository=h.message_repo,
         mailbox_domain_rule_repository=h.domain_rule_repo, entity_repository=h.api.entity_repository,
-        api=h.api, object_store=h.object_store, scanner=h.scanner, adapter=h.adapter, mailbox=h.mailbox,
+        api=h.api, object_store=h.object_store, scanner=h.scanner, adapter=h.adapter, sweep_lock=h.lock, mailbox=h.mailbox,
         mailbox_id=h.mailbox.mailbox_id, mailbox_source_id=h.source_id, item_id=item.item_id,
         actor_type="SYSTEM", actor_id="test", decision="IGNORE", destination_entity_id=None,
         destination_mode=None, match_mode="EXACT", processor_hint=None, sender_address=None,
@@ -3706,7 +3732,7 @@ def test_resolve_domain_review_keep_gray_regression_stays_open_unaffected_by_ite
     result = resolve_domain_review(
         needs_you_repository=h.needs_you_repo, mailbox_message_repository=h.message_repo,
         mailbox_domain_rule_repository=h.domain_rule_repo, entity_repository=h.api.entity_repository,
-        api=h.api, object_store=h.object_store, scanner=h.scanner, adapter=h.adapter, mailbox=h.mailbox,
+        api=h.api, object_store=h.object_store, scanner=h.scanner, adapter=h.adapter, sweep_lock=h.lock, mailbox=h.mailbox,
         mailbox_id=h.mailbox.mailbox_id, mailbox_source_id=h.source_id, item_id=item.item_id,
         actor_type="SYSTEM", actor_id="test", decision="KEEP_GRAY", destination_entity_id=None,
         destination_mode=None, match_mode="EXACT", processor_hint=None, sender_address=None,
@@ -3757,7 +3783,7 @@ def test_resolve_domain_review_allow_resume_after_middle_failure_still_respects_
     kwargs = dict(
         needs_you_repository=h.needs_you_repo, mailbox_message_repository=h.message_repo,
         mailbox_domain_rule_repository=h.domain_rule_repo, entity_repository=h.api.entity_repository,
-        api=h.api, object_store=h.object_store, scanner=h.scanner, adapter=h.adapter, mailbox=h.mailbox,
+        api=h.api, object_store=h.object_store, scanner=h.scanner, adapter=h.adapter, sweep_lock=h.lock, mailbox=h.mailbox,
         mailbox_id=h.mailbox.mailbox_id, mailbox_source_id=h.source_id, item_id=item.item_id,
         actor_type="SYSTEM", actor_id="test", decision="ALLOW", destination_entity_id=None,
         destination_mode="REVIEW_REQUIRED", match_mode="EXACT", processor_hint=None, sender_address=None,
@@ -3841,7 +3867,7 @@ def test_reprocess_header_rate_limited_retries_once_then_succeeds():
     result = resolve_domain_review(
         needs_you_repository=h.needs_you_repo, mailbox_message_repository=h.message_repo,
         mailbox_domain_rule_repository=h.domain_rule_repo, entity_repository=h.api.entity_repository,
-        api=h.api, object_store=h.object_store, scanner=h.scanner, adapter=h.adapter, mailbox=h.mailbox,
+        api=h.api, object_store=h.object_store, scanner=h.scanner, adapter=h.adapter, sweep_lock=h.lock, mailbox=h.mailbox,
         mailbox_id=h.mailbox.mailbox_id, mailbox_source_id=h.source_id, item_id=item.item_id,
         actor_type="SYSTEM", actor_id="test", decision="ALLOW", destination_entity_id=None,
         destination_mode="REVIEW_REQUIRED", match_mode="EXACT", processor_hint=None, sender_address=None,
@@ -3882,7 +3908,7 @@ def test_reprocess_content_rate_limited_retries_once_then_succeeds():
     result = resolve_domain_review(
         needs_you_repository=h.needs_you_repo, mailbox_message_repository=h.message_repo,
         mailbox_domain_rule_repository=h.domain_rule_repo, entity_repository=h.api.entity_repository,
-        api=h.api, object_store=h.object_store, scanner=h.scanner, adapter=h.adapter, mailbox=h.mailbox,
+        api=h.api, object_store=h.object_store, scanner=h.scanner, adapter=h.adapter, sweep_lock=h.lock, mailbox=h.mailbox,
         mailbox_id=h.mailbox.mailbox_id, mailbox_source_id=h.source_id, item_id=item.item_id,
         actor_type="SYSTEM", actor_id="test", decision="ALLOW", destination_entity_id=None,
         destination_mode="REVIEW_REQUIRED", match_mode="EXACT", processor_hint=None, sender_address=None,
@@ -3929,7 +3955,7 @@ def test_reprocess_header_double_rate_limited_is_a_genuine_interruption_never_a_
         resolve_domain_review(
             needs_you_repository=h.needs_you_repo, mailbox_message_repository=h.message_repo,
             mailbox_domain_rule_repository=h.domain_rule_repo, entity_repository=h.api.entity_repository,
-            api=h.api, object_store=h.object_store, scanner=h.scanner, adapter=h.adapter, mailbox=h.mailbox,
+            api=h.api, object_store=h.object_store, scanner=h.scanner, adapter=h.adapter, sweep_lock=h.lock, mailbox=h.mailbox,
             mailbox_id=h.mailbox.mailbox_id, mailbox_source_id=h.source_id, item_id=item.item_id,
             actor_type="SYSTEM", actor_id="test", decision="ALLOW", destination_entity_id=None,
             destination_mode="REVIEW_REQUIRED", match_mode="EXACT", processor_hint=None, sender_address=None,
@@ -3986,7 +4012,7 @@ def test_reprocess_content_double_rate_limited_is_a_genuine_interruption_never_a
         resolve_domain_review(
             needs_you_repository=h.needs_you_repo, mailbox_message_repository=h.message_repo,
             mailbox_domain_rule_repository=h.domain_rule_repo, entity_repository=h.api.entity_repository,
-            api=h.api, object_store=h.object_store, scanner=h.scanner, adapter=h.adapter, mailbox=h.mailbox,
+            api=h.api, object_store=h.object_store, scanner=h.scanner, adapter=h.adapter, sweep_lock=h.lock, mailbox=h.mailbox,
             mailbox_id=h.mailbox.mailbox_id, mailbox_source_id=h.source_id, item_id=item.item_id,
             actor_type="SYSTEM", actor_id="test", decision="ALLOW", destination_entity_id=None,
             destination_mode="REVIEW_REQUIRED", match_mode="EXACT", processor_hint=None, sender_address=None,
@@ -4048,7 +4074,7 @@ def test_resolve_domain_review_allow_resumability_survives_a_rate_limited_conten
     kwargs = dict(
         needs_you_repository=h.needs_you_repo, mailbox_message_repository=h.message_repo,
         mailbox_domain_rule_repository=h.domain_rule_repo, entity_repository=h.api.entity_repository,
-        api=h.api, object_store=h.object_store, scanner=h.scanner, adapter=h.adapter, mailbox=h.mailbox,
+        api=h.api, object_store=h.object_store, scanner=h.scanner, adapter=h.adapter, sweep_lock=h.lock, mailbox=h.mailbox,
         mailbox_id=h.mailbox.mailbox_id, mailbox_source_id=h.source_id, item_id=item.item_id,
         actor_type="SYSTEM", actor_id="test", decision="ALLOW", destination_entity_id=None,
         destination_mode="REVIEW_REQUIRED", match_mode="EXACT", processor_hint=None, sender_address=None,
@@ -4181,7 +4207,7 @@ def test_historical_effective_rule_scoping_with_subject_cohort():
     result = resolve_domain_review(
         needs_you_repository=h.needs_you_repo, mailbox_message_repository=h.message_repo,
         mailbox_domain_rule_repository=h.domain_rule_repo, entity_repository=h.api.entity_repository,
-        api=h.api, object_store=h.object_store, scanner=h.scanner, adapter=h.adapter, mailbox=h.mailbox,
+        api=h.api, object_store=h.object_store, scanner=h.scanner, adapter=h.adapter, sweep_lock=h.lock, mailbox=h.mailbox,
         mailbox_id=h.mailbox.mailbox_id, mailbox_source_id=h.source_id, item_id=item.item_id,
         actor_type="SYSTEM", actor_id="test", decision="ALLOW", destination_entity_id=None,
         destination_mode="REVIEW_REQUIRED", match_mode="EXACT_DOMAIN_SUBJECT", processor_hint=None,
@@ -4254,7 +4280,7 @@ def test_subject_scoped_allow_partial_resumability():
     kwargs = dict(
         needs_you_repository=h.needs_you_repo, mailbox_message_repository=h.message_repo,
         mailbox_domain_rule_repository=h.domain_rule_repo, entity_repository=h.api.entity_repository,
-        api=h.api, object_store=h.object_store, scanner=h.scanner, adapter=h.adapter, mailbox=h.mailbox,
+        api=h.api, object_store=h.object_store, scanner=h.scanner, adapter=h.adapter, sweep_lock=h.lock, mailbox=h.mailbox,
         mailbox_id=h.mailbox.mailbox_id, mailbox_source_id=h.source_id, item_id=item.item_id,
         actor_type="SYSTEM", actor_id="test", decision="ALLOW", destination_entity_id=None,
         destination_mode="REVIEW_REQUIRED", match_mode="EXACT_DOMAIN_SUBJECT", processor_hint=None,
@@ -4306,7 +4332,7 @@ def test_subject_scoped_allow_partial_resumability():
     broad_result = resolve_domain_review(
         needs_you_repository=h.needs_you_repo, mailbox_message_repository=h.message_repo,
         mailbox_domain_rule_repository=h.domain_rule_repo, entity_repository=h.api.entity_repository,
-        api=h.api, object_store=h.object_store, scanner=h.scanner, adapter=h.adapter, mailbox=h.mailbox,
+        api=h.api, object_store=h.object_store, scanner=h.scanner, adapter=h.adapter, sweep_lock=h.lock, mailbox=h.mailbox,
         mailbox_id=h.mailbox.mailbox_id, mailbox_source_id=h.source_id, item_id=item.item_id,
         actor_type="SYSTEM", actor_id="test", decision="IGNORE", destination_entity_id=None,
         destination_mode=None, match_mode="EXACT", processor_hint=None, sender_address=None,
@@ -4337,7 +4363,7 @@ def test_existing_full_domain_allow_never_made_partial_by_this_change():
     result = resolve_domain_review(
         needs_you_repository=h.needs_you_repo, mailbox_message_repository=h.message_repo,
         mailbox_domain_rule_repository=h.domain_rule_repo, entity_repository=h.api.entity_repository,
-        api=h.api, object_store=h.object_store, scanner=h.scanner, adapter=h.adapter, mailbox=h.mailbox,
+        api=h.api, object_store=h.object_store, scanner=h.scanner, adapter=h.adapter, sweep_lock=h.lock, mailbox=h.mailbox,
         mailbox_id=h.mailbox.mailbox_id, mailbox_source_id=h.source_id, item_id=item.item_id,
         actor_type="SYSTEM", actor_id="test", decision="ALLOW", destination_entity_id=None,
         destination_mode="REVIEW_REQUIRED", match_mode="EXACT", processor_hint=None, sender_address=None,
@@ -4382,7 +4408,7 @@ def test_vantage_acceptance_fixture_five_statement_candidates_residual_zero_reso
     result = resolve_domain_review(
         needs_you_repository=h.needs_you_repo, mailbox_message_repository=h.message_repo,
         mailbox_domain_rule_repository=h.domain_rule_repo, entity_repository=h.api.entity_repository,
-        api=h.api, object_store=h.object_store, scanner=h.scanner, adapter=h.adapter, mailbox=h.mailbox,
+        api=h.api, object_store=h.object_store, scanner=h.scanner, adapter=h.adapter, sweep_lock=h.lock, mailbox=h.mailbox,
         mailbox_id=h.mailbox.mailbox_id, mailbox_source_id=h.source_id, item_id=item.item_id,
         actor_type="SYSTEM", actor_id="test", decision="ALLOW", destination_entity_id=entity_id,
         destination_mode="FIXED", match_mode="EXACT_DOMAIN_SUBJECT", processor_hint=None, sender_address=None,
@@ -4431,7 +4457,7 @@ def test_ebay_acceptance_fixture_starts_with_predicate_positive_and_negative():
     result = resolve_domain_review(
         needs_you_repository=h.needs_you_repo, mailbox_message_repository=h.message_repo,
         mailbox_domain_rule_repository=h.domain_rule_repo, entity_repository=h.api.entity_repository,
-        api=h.api, object_store=h.object_store, scanner=h.scanner, adapter=h.adapter, mailbox=h.mailbox,
+        api=h.api, object_store=h.object_store, scanner=h.scanner, adapter=h.adapter, sweep_lock=h.lock, mailbox=h.mailbox,
         mailbox_id=h.mailbox.mailbox_id, mailbox_source_id=h.source_id, item_id=item.item_id,
         actor_type="SYSTEM", actor_id="test", decision="ALLOW", destination_entity_id=None,
         destination_mode="REVIEW_REQUIRED", match_mode="EXACT_DOMAIN_SUBJECT", processor_hint=None,
@@ -4486,7 +4512,7 @@ def test_subject_blacklist_via_domain_review_requires_no_provider_fetch_and_sync
     result = resolve_domain_review(
         needs_you_repository=h.needs_you_repo, mailbox_message_repository=h.message_repo,
         mailbox_domain_rule_repository=h.domain_rule_repo, entity_repository=h.api.entity_repository,
-        api=h.api, object_store=h.object_store, scanner=h.scanner, adapter=h.adapter, mailbox=h.mailbox,
+        api=h.api, object_store=h.object_store, scanner=h.scanner, adapter=h.adapter, sweep_lock=h.lock, mailbox=h.mailbox,
         mailbox_id=h.mailbox.mailbox_id, mailbox_source_id=h.source_id, item_id=item.item_id,
         actor_type="SYSTEM", actor_id="test", decision="IGNORE", destination_entity_id=None,
         destination_mode=None, match_mode="EXACT_DOMAIN_SUBJECT", processor_hint=None, sender_address=None,
@@ -4520,7 +4546,7 @@ def test_subject_scoped_graylist_rejected_via_domain_review():
         resolve_domain_review(
             needs_you_repository=h.needs_you_repo, mailbox_message_repository=h.message_repo,
             mailbox_domain_rule_repository=h.domain_rule_repo, entity_repository=h.api.entity_repository,
-            api=h.api, object_store=h.object_store, scanner=h.scanner, adapter=h.adapter, mailbox=h.mailbox,
+            api=h.api, object_store=h.object_store, scanner=h.scanner, adapter=h.adapter, sweep_lock=h.lock, mailbox=h.mailbox,
             mailbox_id=h.mailbox.mailbox_id, mailbox_source_id=h.source_id, item_id=item.item_id,
             actor_type="SYSTEM", actor_id="test", decision="KEEP_GRAY", destination_entity_id=None,
             destination_mode=None, match_mode="EXACT_DOMAIN_SUBJECT", processor_hint=None, sender_address=None,
@@ -4548,7 +4574,7 @@ def test_allow_subject_rule_rejected_when_no_currently_eligible_candidate_matche
         resolve_domain_review(
             needs_you_repository=h.needs_you_repo, mailbox_message_repository=h.message_repo,
             mailbox_domain_rule_repository=h.domain_rule_repo, entity_repository=h.api.entity_repository,
-            api=h.api, object_store=h.object_store, scanner=h.scanner, adapter=h.adapter, mailbox=h.mailbox,
+            api=h.api, object_store=h.object_store, scanner=h.scanner, adapter=h.adapter, sweep_lock=h.lock, mailbox=h.mailbox,
             mailbox_id=h.mailbox.mailbox_id, mailbox_source_id=h.source_id, item_id=item.item_id,
             actor_type="SYSTEM", actor_id="test", decision="ALLOW", destination_entity_id=None,
             destination_mode="REVIEW_REQUIRED", match_mode="EXACT_DOMAIN_SUBJECT", processor_hint=None,
@@ -4604,7 +4630,7 @@ def test_subject_rule_previous_policy_audit_is_none_under_a_broader_domain_black
     result = resolve_domain_review(
         needs_you_repository=h.needs_you_repo, mailbox_message_repository=h.message_repo,
         mailbox_domain_rule_repository=h.domain_rule_repo, entity_repository=h.api.entity_repository,
-        api=h.api, object_store=h.object_store, scanner=h.scanner, adapter=h.adapter, mailbox=h.mailbox,
+        api=h.api, object_store=h.object_store, scanner=h.scanner, adapter=h.adapter, sweep_lock=h.lock, mailbox=h.mailbox,
         mailbox_id=h.mailbox.mailbox_id, mailbox_source_id=h.source_id, item_id=item.item_id,
         actor_type="SYSTEM", actor_id="test", decision="ALLOW", destination_entity_id=None,
         destination_mode="REVIEW_REQUIRED", match_mode="EXACT_DOMAIN_SUBJECT", processor_hint=None,
@@ -4645,7 +4671,7 @@ def test_subject_rule_transition_blacklist_to_must_read_reports_truthful_previou
     base_kwargs = dict(
         needs_you_repository=h.needs_you_repo, mailbox_message_repository=h.message_repo,
         mailbox_domain_rule_repository=h.domain_rule_repo, entity_repository=h.api.entity_repository,
-        api=h.api, object_store=h.object_store, scanner=h.scanner, adapter=h.adapter, mailbox=h.mailbox,
+        api=h.api, object_store=h.object_store, scanner=h.scanner, adapter=h.adapter, sweep_lock=h.lock, mailbox=h.mailbox,
         mailbox_id=h.mailbox.mailbox_id, mailbox_source_id=h.source_id, item_id=item.item_id,
         actor_type="SYSTEM", actor_id="test", processor_hint=None, sender_address=None,
         match_mode="EXACT_DOMAIN_SUBJECT", subject_predicate_type="STARTS_WITH", subject_predicate_value="Marketing",
@@ -4704,7 +4730,7 @@ def test_subject_rule_transition_must_read_to_blacklist_reports_truthful_previou
     base_kwargs = dict(
         needs_you_repository=h.needs_you_repo, mailbox_message_repository=h.message_repo,
         mailbox_domain_rule_repository=h.domain_rule_repo, entity_repository=h.api.entity_repository,
-        api=h.api, object_store=h.object_store, scanner=h.scanner, adapter=h.adapter, mailbox=h.mailbox,
+        api=h.api, object_store=h.object_store, scanner=h.scanner, adapter=h.adapter, sweep_lock=h.lock, mailbox=h.mailbox,
         mailbox_id=h.mailbox.mailbox_id, mailbox_source_id=h.source_id, item_id=item.item_id,
         actor_type="SYSTEM", actor_id="test", processor_hint=None, sender_address=None,
         match_mode="EXACT_DOMAIN_SUBJECT", subject_predicate_type="STARTS_WITH",
@@ -4756,7 +4782,7 @@ def test_plain_domain_level_rule_previous_policy_audit_remains_truthful_after_fi
     base_kwargs = dict(
         needs_you_repository=h.needs_you_repo, mailbox_message_repository=h.message_repo,
         mailbox_domain_rule_repository=h.domain_rule_repo, entity_repository=h.api.entity_repository,
-        api=h.api, object_store=h.object_store, scanner=h.scanner, adapter=h.adapter, mailbox=h.mailbox,
+        api=h.api, object_store=h.object_store, scanner=h.scanner, adapter=h.adapter, sweep_lock=h.lock, mailbox=h.mailbox,
         mailbox_id=h.mailbox.mailbox_id, mailbox_source_id=h.source_id, item_id=item.item_id,
         actor_type="SYSTEM", actor_id="test", match_mode="EXACT", processor_hint=None, sender_address=None,
     )
@@ -4817,7 +4843,7 @@ def test_subject_blacklist_partial_residual_idempotent_retry():
     kwargs = dict(
         needs_you_repository=h.needs_you_repo, mailbox_message_repository=h.message_repo,
         mailbox_domain_rule_repository=h.domain_rule_repo, entity_repository=h.api.entity_repository,
-        api=h.api, object_store=h.object_store, scanner=h.scanner, adapter=h.adapter, mailbox=h.mailbox,
+        api=h.api, object_store=h.object_store, scanner=h.scanner, adapter=h.adapter, sweep_lock=h.lock, mailbox=h.mailbox,
         mailbox_id=h.mailbox.mailbox_id, mailbox_source_id=h.source_id, item_id=item.item_id,
         actor_type="SYSTEM", actor_id="test", decision="IGNORE", destination_entity_id=None,
         destination_mode=None, match_mode="EXACT_DOMAIN_SUBJECT", processor_hint=None, sender_address=None,
@@ -4855,7 +4881,7 @@ def test_subject_blacklist_partial_residual_idempotent_retry():
     third = resolve_domain_review(
         needs_you_repository=h.needs_you_repo, mailbox_message_repository=h.message_repo,
         mailbox_domain_rule_repository=h.domain_rule_repo, entity_repository=h.api.entity_repository,
-        api=h.api, object_store=h.object_store, scanner=h.scanner, adapter=h.adapter, mailbox=h.mailbox,
+        api=h.api, object_store=h.object_store, scanner=h.scanner, adapter=h.adapter, sweep_lock=h.lock, mailbox=h.mailbox,
         mailbox_id=h.mailbox.mailbox_id, mailbox_source_id=h.source_id, item_id=item.item_id,
         actor_type="SYSTEM", actor_id="test", decision="IGNORE", destination_entity_id=None,
         destination_mode=None, match_mode="EXACT", processor_hint=None, sender_address=None,
@@ -4894,7 +4920,7 @@ def test_subject_blacklist_repeat_with_different_processor_hint_is_a_genuine_sec
     base_kwargs = dict(
         needs_you_repository=h.needs_you_repo, mailbox_message_repository=h.message_repo,
         mailbox_domain_rule_repository=h.domain_rule_repo, entity_repository=h.api.entity_repository,
-        api=h.api, object_store=h.object_store, scanner=h.scanner, adapter=h.adapter, mailbox=h.mailbox,
+        api=h.api, object_store=h.object_store, scanner=h.scanner, adapter=h.adapter, sweep_lock=h.lock, mailbox=h.mailbox,
         mailbox_id=h.mailbox.mailbox_id, mailbox_source_id=h.source_id, item_id=item.item_id,
         actor_type="SYSTEM", actor_id="test", decision="IGNORE", destination_entity_id=None,
         destination_mode=None, match_mode="EXACT_DOMAIN_SUBJECT", sender_address=None,
@@ -4970,7 +4996,7 @@ def test_subject_allow_resolved_identical_vantage_replay_self_heals_without_422(
     kwargs = dict(
         needs_you_repository=h.needs_you_repo, mailbox_message_repository=h.message_repo,
         mailbox_domain_rule_repository=h.domain_rule_repo, entity_repository=h.api.entity_repository,
-        api=h.api, object_store=h.object_store, scanner=h.scanner, adapter=h.adapter, mailbox=h.mailbox,
+        api=h.api, object_store=h.object_store, scanner=h.scanner, adapter=h.adapter, sweep_lock=h.lock, mailbox=h.mailbox,
         mailbox_id=h.mailbox.mailbox_id, mailbox_source_id=h.source_id, item_id=item.item_id,
         actor_type="SYSTEM", actor_id="test", decision="ALLOW", destination_entity_id=entity_id,
         destination_mode="FIXED", match_mode="EXACT_DOMAIN_SUBJECT", processor_hint=None, sender_address=None,
@@ -5041,7 +5067,7 @@ def test_subject_allow_open_identical_replay_with_zero_current_matches_resumes_w
     kwargs = dict(
         needs_you_repository=h.needs_you_repo, mailbox_message_repository=h.message_repo,
         mailbox_domain_rule_repository=h.domain_rule_repo, entity_repository=h.api.entity_repository,
-        api=h.api, object_store=h.object_store, scanner=h.scanner, adapter=h.adapter, mailbox=h.mailbox,
+        api=h.api, object_store=h.object_store, scanner=h.scanner, adapter=h.adapter, sweep_lock=h.lock, mailbox=h.mailbox,
         mailbox_id=h.mailbox.mailbox_id, mailbox_source_id=h.source_id, item_id=item.item_id,
         actor_type="SYSTEM", actor_id="test", decision="ALLOW", destination_entity_id=None,
         destination_mode="REVIEW_REQUIRED", match_mode="EXACT_DOMAIN_SUBJECT", processor_hint=None,
@@ -5110,7 +5136,7 @@ def test_subject_allow_new_decision_zero_match_rejected_before_any_mutation():
         resolve_domain_review(
             needs_you_repository=h.needs_you_repo, mailbox_message_repository=h.message_repo,
             mailbox_domain_rule_repository=h.domain_rule_repo, entity_repository=h.api.entity_repository,
-            api=h.api, object_store=h.object_store, scanner=h.scanner, adapter=h.adapter, mailbox=h.mailbox,
+            api=h.api, object_store=h.object_store, scanner=h.scanner, adapter=h.adapter, sweep_lock=h.lock, mailbox=h.mailbox,
             mailbox_id=h.mailbox.mailbox_id, mailbox_source_id=h.source_id, item_id=item.item_id,
             actor_type="SYSTEM", actor_id="test", decision="ALLOW", destination_entity_id=None,
             destination_mode="REVIEW_REQUIRED", match_mode="EXACT_DOMAIN_SUBJECT", processor_hint=None,
@@ -5168,7 +5194,7 @@ def test_subject_allow_transition_zero_match_rejected_existing_blacklist_untouch
         resolve_domain_review(
             needs_you_repository=h.needs_you_repo, mailbox_message_repository=h.message_repo,
             mailbox_domain_rule_repository=h.domain_rule_repo, entity_repository=h.api.entity_repository,
-            api=h.api, object_store=h.object_store, scanner=h.scanner, adapter=h.adapter, mailbox=h.mailbox,
+            api=h.api, object_store=h.object_store, scanner=h.scanner, adapter=h.adapter, sweep_lock=h.lock, mailbox=h.mailbox,
             mailbox_id=h.mailbox.mailbox_id, mailbox_source_id=h.source_id, item_id=item.item_id,
             actor_type="SYSTEM", actor_id="test", decision="ALLOW", destination_entity_id=None,
             destination_mode="REVIEW_REQUIRED", match_mode="EXACT_DOMAIN_SUBJECT", processor_hint=None,

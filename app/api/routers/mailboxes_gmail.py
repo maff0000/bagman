@@ -482,6 +482,7 @@ def _resolve_gmail_domain_review_core(
         object_store=composition.object_store,
         scanner=composition.scanner,
         adapter=composition.gmail_mailbox_adapter,
+        sweep_lock=composition.mailbox_sweep_lock,
         mailbox=mailbox,
         mailbox_id=mailbox_id,
         mailbox_source_id=mailbox_source_id,

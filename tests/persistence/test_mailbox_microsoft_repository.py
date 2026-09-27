@@ -19,7 +19,7 @@ from persistence.postgres.mailbox_microsoft_repository import (
 )
 from services.mailbox.lock import MailboxSweepLockError
 from services.mailbox.microsoft.oauth_state import consume_state
-from services.mailbox.sweep_run import TRIGGER_MANUAL
+from services.mailbox.sweep_run import STALE_RUNNING_THRESHOLD_SECONDS, SweepFailureReason, TRIGGER_MANUAL
 
 
 def _mailbox_id() -> str:
@@ -52,6 +52,44 @@ def test_sweep_run_persists_and_completes(fresh_engine):
     fetched = fresh_repo.get_run(run.sweep_run_id)
     assert fetched.messages_seen == 3
     assert list(fetched.folders_attempted) == folders_attempted
+
+
+def test_recover_stale_runs_against_real_postgres_recovers_only_the_stale_row(fresh_engine):
+    """Slice 3/4/5 governance-reconciliation delta: real, DB-backed
+    proof that a `MailboxSweepRun` abandoned by a killed process (never
+    reaching `complete_run`) is genuinely recovered to `FAILED` — the
+    real defect this delta closes (see `services.mailbox.sweep_run`'s
+    own module docstring)."""
+    repo = PostgresMailboxSweepRunRepository()
+    mailbox_id = _mailbox_id()
+    stale_run = repo.create_run(mailbox_id=mailbox_id, trigger=TRIGGER_MANUAL)
+    fresh_run = repo.create_run(mailbox_id=mailbox_id, trigger=TRIGGER_MANUAL)
+
+    fresh_repo = PostgresMailboxSweepRunRepository(engine=fresh_engine)
+    far_future = stale_run.started_at + timedelta(seconds=STALE_RUNNING_THRESHOLD_SECONDS * 2)
+    recovered = fresh_repo.recover_stale_runs(mailbox_id=mailbox_id, now=far_future)
+
+    assert {r.sweep_run_id for r in recovered} == {stale_run.sweep_run_id, fresh_run.sweep_run_id}
+    for r in recovered:
+        assert r.status == "FAILED"
+        assert r.error_code == SweepFailureReason.STALE_RECOVERY_TIMEOUT
+
+    # Durably persisted, not just returned in-memory.
+    reread = fresh_repo.get_run(stale_run.sweep_run_id)
+    assert reread.status == "FAILED"
+    assert reread.error_code == SweepFailureReason.STALE_RECOVERY_TIMEOUT
+    assert reread.completed_at is not None
+
+
+def test_recover_stale_runs_against_real_postgres_leaves_a_genuinely_fresh_run_alone(fresh_engine):
+    repo = PostgresMailboxSweepRunRepository()
+    mailbox_id = _mailbox_id()
+    run = repo.create_run(mailbox_id=mailbox_id, trigger=TRIGGER_MANUAL)
+
+    fresh_repo = PostgresMailboxSweepRunRepository(engine=fresh_engine)
+    recovered = fresh_repo.recover_stale_runs(mailbox_id=mailbox_id)
+    assert recovered == []
+    assert fresh_repo.get_run(run.sweep_run_id).status == "RUNNING"
 
 
 def test_sweep_run_persists_operational_addendum_aggregate_fields(fresh_engine):

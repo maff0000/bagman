@@ -133,6 +133,7 @@ from services.mailbox.domain_rule import (
     validate_and_normalize_sender_address,
     validate_and_normalize_subject_predicate,
 )
+from services.mailbox.lock import MailboxSweepLock
 from services.mailbox.mailbox import MailboxSource
 from services.mailbox.message import MailboxMessageRepository
 from services.mailbox.sweep import (
@@ -332,6 +333,7 @@ def resolve_domain_review(
     object_store: _ObjectStoreProtocol,
     scanner: EvidenceSafetyScanner,
     adapter: _AdapterProtocol,
+    sweep_lock: MailboxSweepLock,
     mailbox: MailboxSource,
     mailbox_id: str,
     mailbox_source_id: str,
@@ -994,6 +996,7 @@ def resolve_domain_review(
                 api=api,
                 object_store=object_store,
                 scanner=scanner,
+                sweep_lock=sweep_lock,
                 actor_type=actor_type,
                 actor_id=actor_id,
                 correlation_id=item.correlation_id,
@@ -1140,6 +1143,7 @@ def resolve_domain_review(
             api=api,
             object_store=object_store,
             scanner=scanner,
+            sweep_lock=sweep_lock,
             actor_type=actor_type,
             actor_id=actor_id,
             correlation_id=item.correlation_id,

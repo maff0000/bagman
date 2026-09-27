@@ -17,6 +17,7 @@ from core import identity
 from core.contract_validation import validate_against_contract
 from core.errors import ConflictError, NotFoundError, PersistenceError, ValidationError
 from core.timestamps import utc_now
+from persistence.postgres.db_errors import unique_violation_constraint
 from persistence.postgres.mailbox_domain_rule_models import MailboxDomainRuleRow
 from persistence.postgres.session import get_engine, session_scope
 from services.mailbox.domain_rule import (
@@ -225,6 +226,28 @@ class PostgresMailboxDomainRuleRepository(MailboxDomainRuleRepository):
         except (ValidationError, NotFoundError):
             raise
         except IntegrityError as exc:
+            # Slice 3/4/5 governance-reconciliation delta: a genuine
+            # concurrent-upsert race on one of the three partial unique
+            # indexes (scoped by `match_mode`) is a real, nameable
+            # conflict — not a generic persistence failure. Mirrors
+            # `persistence.postgres.mailbox_repository
+            # .PostgresMailboxSourceRepository.create_mailbox`'s own
+            # identical translation. Low real-world exposure (rule
+            # upserts are operator-driven, one at a time, in practice)
+            # but a genuine defect in the error TYPE surfaced under a
+            # true race, independently found during the Slice 3/4/5
+            # governance audit.
+            constraint = unique_violation_constraint(exc)
+            if constraint in (
+                "uq_mailbox_domain_rules_mailbox_domain_scope",
+                "uq_mailbox_domain_rules_mailbox_address",
+                "uq_mailbox_domain_rules_mailbox_subject",
+            ):
+                raise ConflictError(
+                    f"a MailboxDomainRule for mailbox_id={mailbox_id!r} sender_domain={sender_domain!r} "
+                    f"match_mode={match_mode!r} was upserted concurrently by another caller — this is a "
+                    "genuine race, not a persistence failure; retry to observe the now-existing rule"
+                ) from exc
             raise PersistenceError(f"could not upsert MailboxDomainRule: {exc}") from exc
         except SQLAlchemyError as exc:
             raise PersistenceError(f"could not upsert MailboxDomainRule: {exc}") from exc

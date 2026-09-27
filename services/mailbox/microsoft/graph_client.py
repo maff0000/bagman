@@ -534,14 +534,43 @@ def _retry_after_seconds(exc: urllib.error.HTTPError) -> Optional[float]:
         return None
 
 
+#: Hard maximum, in bytes, ever read from a 410 response body for
+#: structured (`json.loads`) `ResyncRequired` classification (Slice
+#: 3/4/5 governance-reconciliation delta) — mirrors
+#: `services.mailbox.gmail.gmail_client._MAX_ERROR_BODY_BYTES`'s own
+#: identical role/reasoning exactly: this is the one place in this
+#: client that ever parses an error body as structured JSON for a
+#: classification decision, and — a real, independently-found gap —
+#: it previously did so via a bare `exc.read()` with no bound at all,
+#: unlike Gmail's own equivalent 403-classification path (already
+#: hardened against exactly this after a real production incident, see
+#: that module's own `_read_body_bounded` docstring). A hostile or
+#: malformed 410 body could otherwise consume unbounded memory here.
+#: 64 KiB is deliberately generous: Graph's real `ResyncRequired` body
+#: is a small, fixed-shape JSON object, so this bound is never expected
+#: to be hit by a genuine Graph response.
+_MAX_RESYNC_BODY_BYTES = 64 * 1024
+
+
 def _is_resync_required(exc: urllib.error.HTTPError) -> bool:
     """Graph reports an expired/invalid delta token as a 410 Gone with
     `error.code == "ResyncRequired"` in the JSON body (Graph's own
-    documented delta-query contract)."""
+    documented delta-query contract).
+
+    Reads AT MOST `_MAX_RESYNC_BODY_BYTES + 1` bytes (never a bare,
+    unbounded `.read()` — see that constant's own docstring); if the
+    real body is longer than the bound, it is necessarily a truncated,
+    incomplete JSON document and is correctly treated as "not resync"
+    (the safe, conservative default) rather than risking a parse of a
+    cut-off structure.
+    """
     if exc.code != 410:
         return False
     try:
-        body = json.loads(exc.read().decode("utf-8", errors="replace"))
+        raw = exc.read(_MAX_RESYNC_BODY_BYTES + 1)
+        if len(raw) > _MAX_RESYNC_BODY_BYTES:
+            return False
+        body = json.loads(raw.decode("utf-8", errors="replace"))
         return body.get("error", {}).get("code") == "ResyncRequired"
     except Exception:  # noqa: BLE001 - malformed body is simply "not resync"
         return False

@@ -28,7 +28,14 @@ from persistence.postgres.session import get_engine, session_scope
 from services.mailbox.cursor import MailboxFolderCursor, MailboxFolderCursorRepository
 from services.mailbox.lock import DEFAULT_LEASE_DURATION_SECONDS, MailboxSweepLock, MailboxSweepLockError
 from services.mailbox.microsoft.oauth_state import MailboxOAuthState, MailboxOAuthStateRepository
-from services.mailbox.sweep_run import MailboxSweepRun, MailboxSweepRunRepository, transition as sweep_run_transition
+from services.mailbox.sweep_run import (
+    STALE_RUNNING_THRESHOLD_SECONDS,
+    MailboxSweepRun,
+    MailboxSweepRunRepository,
+    is_stale_running,
+    recover_stale_run,
+)
+from services.mailbox.sweep_run import transition as sweep_run_transition
 
 _SWEEP_RUN_SCHEMA = "mailbox/bagman.mailbox_sweep_run.v1.schema.json"
 
@@ -182,6 +189,42 @@ class PostgresMailboxSweepRunRepository(MailboxSweepRunRepository):
                 return [_sweep_run_row_to_domain(r) for r in query.all()]
         except SQLAlchemyError as exc:
             raise PersistenceError(f"could not list MailboxSweepRun rows: {exc}") from exc
+
+    def recover_stale_runs(
+        self,
+        *,
+        mailbox_id: str,
+        staleness_threshold_seconds: float = STALE_RUNNING_THRESHOLD_SECONDS,
+        now: Optional[datetime] = None,
+    ) -> list[MailboxSweepRun]:
+        now = now if now is not None else utc_now()
+        recovered: list[MailboxSweepRun] = []
+        try:
+            with session_scope(self._engine) as session:
+                rows = (
+                    session.query(MailboxSweepRunRow)
+                    .filter_by(mailbox_id=mailbox_id, status="RUNNING")
+                    .with_for_update()
+                    .all()
+                )
+                for row in rows:
+                    current = _sweep_run_row_to_domain(row)
+                    # Re-check UNDER THE LOCK — never trust a pre-lock
+                    # read alone (mirrors
+                    # PostgresBackgroundJobRepository.recover_stale_claims's
+                    # own discipline exactly).
+                    if not is_stale_running(current, now=now):
+                        continue
+                    updated = recover_stale_run(current)
+                    row.status = updated.status
+                    row.completed_at = updated.completed_at
+                    row.error_code = updated.error_code
+                    row.error_detail = updated.error_detail
+                    recovered.append(updated)
+                session.flush()
+        except SQLAlchemyError as exc:
+            raise PersistenceError(f"could not recover stale MailboxSweepRun rows: {exc}") from exc
+        return recovered
 
 
 # ---------------------------------------------------------------------

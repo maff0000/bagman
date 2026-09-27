@@ -5,11 +5,13 @@ disposable PostgreSQL container (mirrors
 """
 from __future__ import annotations
 
+import threading
 from datetime import datetime, timezone
 
 import pytest
 
 from core import identity
+from core.errors import ConflictError, PersistenceError
 from persistence.postgres.mailbox_message_models import MailboxMessageRow
 from persistence.postgres.mailbox_message_repository import PostgresMailboxMessageRepository
 from persistence.postgres.session import get_engine, session_scope
@@ -501,3 +503,55 @@ def test_subject_predicate_observed_scoped_to_exact_domain_and_mailbox():
         mailbox_id=mailbox_id, sender_domain="mail.vantage.example",
         predicate_type=SUBJECT_PREDICATE_EXACT, predicate_value="monthly statement",
     ) is False
+
+
+# ---------------------------------------------------------------------
+# Slice 3/4/5 governance-reconciliation delta — a genuine concurrent
+# race on the first observation of a (mailbox_id,
+# immutable_provider_message_id) identity previously surfaced as a raw
+# `PersistenceError` rather than a real, nameable `ConflictError` (see
+# `persistence.postgres.mailbox_message_repository`'s own comment at
+# the fix site). Real threads, real PostgreSQL, mirrors
+# `tests/persistence/test_ai_invocation_repository.py
+# ::test_genuinely_concurrent_threads_racing_the_same_subject_resolve_to_exactly_one_active_invocation`'s
+# own real-race-proof discipline.
+# ---------------------------------------------------------------------
+
+
+def test_concurrent_first_observation_of_the_same_message_never_raises_persistence_error():
+    mailbox_id = _mailbox_id()
+    n_workers = 8
+    barrier = threading.Barrier(n_workers)
+    results: list[dict] = [{} for _ in range(n_workers)]
+
+    def _worker(index: int) -> None:
+        repo = PostgresMailboxMessageRepository()
+        barrier.wait()
+        try:
+            message, created = _observe(repo, mailbox_id=mailbox_id, msg_id="race-msg-1")
+            results[index] = {"outcome": "ok", "created": created, "mailbox_message_id": message.mailbox_message_id}
+        except ConflictError:
+            results[index] = {"outcome": "conflict"}
+        except PersistenceError as exc:  # pragma: no cover - exactly the defect this test guards against
+            results[index] = {"outcome": "persistence_error", "detail": str(exc)}
+
+    threads = [threading.Thread(target=_worker, args=(i,)) for i in range(n_workers)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+
+    assert all(r for r in results), f"one or more worker threads did not complete: {results}"
+    assert all(r["outcome"] != "persistence_error" for r in results), (
+        f"a genuine race surfaced as PersistenceError instead of ConflictError: {results}"
+    )
+    # Every non-conflict outcome must agree on the SAME resolved row —
+    # resolve-or-create never produces two distinct rows for one
+    # identity even under a real race.
+    resolved_ids = {r["mailbox_message_id"] for r in results if r["outcome"] == "ok"}
+    assert len(resolved_ids) == 1
+
+    final_repo = PostgresMailboxMessageRepository()
+    all_rows = final_repo.list_messages(mailbox_id=mailbox_id)
+    matching = [m for m in all_rows if m.immutable_provider_message_id == "race-msg-1"]
+    assert len(matching) == 1
