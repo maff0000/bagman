@@ -305,6 +305,10 @@ def test_gmail_test_endpoint_succeeds_for_a_connected_mailbox(dev_client):
 
 
 def test_gmail_test_endpoint_reports_auth_error_without_mutating_connection_state_or_token(dev_client):
+    """A failed identity check on a STILL-FRESH access token never even
+    reaches the refresh path, so a rejected identity check is honestly
+    reported without refreshing anything or mutating `connection_state`.
+    The refresh-path scenarios are covered separately below."""
     mailbox_id = _create_gmail_mailbox(dev_client)
     _connect_and_complete(dev_client, mailbox_id, email="mgs241171@gmail.com")
     comp = get_composition()
@@ -317,6 +321,124 @@ def test_gmail_test_endpoint_reports_auth_error_without_mutating_connection_stat
     mailbox = dev_client.get(f"/internal/mailboxes/{mailbox_id}").json()
     assert mailbox["connection_state"] == "CONNECTED"
     assert comp.gmail_token_store.read(mailbox_id).access_token == stored_before.access_token
+
+
+# ---------------------------------------------------------------------
+# Test-action refresh-path fix — mirrors
+# test_mailbox_microsoft_endpoints.py's own equivalent suite exactly.
+# ---------------------------------------------------------------------
+
+
+def _store_expired_gmail_tokens(comp, mailbox_id: str) -> None:
+    expired = fake_token_bundle(access_token="stale-gmail-access-token", expires_in_seconds=-60.0)
+    comp.gmail_token_store.write(
+        mailbox_id, access_token=expired.access_token, refresh_token=expired.refresh_token, expires_at=expired.expires_at
+    )
+
+
+def test_gmail_test_endpoint_refreshes_an_expired_access_token_and_reports_ok(dev_client):
+    mailbox_id = _create_gmail_mailbox(dev_client)
+    _connect_and_complete(dev_client, mailbox_id, email="mgs241171@gmail.com")
+    comp = get_composition()
+    _store_expired_gmail_tokens(comp, mailbox_id)
+
+    comp.gmail_oauth_client.queue_refresh_result(
+        GmailTokenResult(status=GmailOutcomeStatus.OK, tokens=fake_token_bundle(access_token="fresh-gmail-access-token"))
+    )
+    comp.gmail_client.queue_profile_result(GmailIdentityResult(status=GmailOutcomeStatus.OK, identity=GmailIdentity(email="mgs241171@gmail.com")))
+
+    r = dev_client.post(f"/internal/mailboxes/{mailbox_id}/gmail/test", json={"actor_type": "USER", "actor_id": ACTOR_ID})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is True
+    assert "reconnect" not in body["detail"].lower()
+
+    stored_after = comp.gmail_token_store.read(mailbox_id)
+    assert stored_after.access_token == "fresh-gmail-access-token"
+
+    mailbox = dev_client.get(f"/internal/mailboxes/{mailbox_id}").json()
+    assert mailbox["connection_state"] == "CONNECTED"
+
+
+def test_gmail_test_endpoint_refresh_has_no_side_effects_on_sweep_needs_you_or_domain_rules(dev_client):
+    mailbox_id = _create_gmail_mailbox(dev_client)
+    _connect_and_complete(dev_client, mailbox_id, email="mgs241171@gmail.com")
+    comp = get_composition()
+    _store_expired_gmail_tokens(comp, mailbox_id)
+
+    runs_before = comp.mailbox_sweep_run_repository.list_runs(mailbox_id=mailbox_id)
+    rules_before = comp.mailbox_domain_rule_repository.list_rules(mailbox_id=mailbox_id)
+    needs_you_before = comp.needs_you_repository.list_needs_you_items(item_type="MAILBOX_DOMAIN_REVIEW")
+    messages_before = comp.mailbox_message_repository.list_messages(mailbox_id=mailbox_id)
+
+    comp.gmail_oauth_client.queue_refresh_result(
+        GmailTokenResult(status=GmailOutcomeStatus.OK, tokens=fake_token_bundle(access_token="fresh-gmail-access-token"))
+    )
+    comp.gmail_client.queue_profile_result(GmailIdentityResult(status=GmailOutcomeStatus.OK, identity=GmailIdentity(email="mgs241171@gmail.com")))
+    r = dev_client.post(f"/internal/mailboxes/{mailbox_id}/gmail/test", json={"actor_type": "USER", "actor_id": ACTOR_ID})
+    assert r.status_code == 200
+
+    assert comp.mailbox_sweep_run_repository.list_runs(mailbox_id=mailbox_id) == runs_before
+    assert comp.mailbox_domain_rule_repository.list_rules(mailbox_id=mailbox_id) == rules_before
+    assert comp.needs_you_repository.list_needs_you_items(item_type="MAILBOX_DOMAIN_REVIEW") == needs_you_before
+    assert comp.mailbox_message_repository.list_messages(mailbox_id=mailbox_id) == messages_before
+
+
+def test_gmail_test_endpoint_reports_reconnect_required_when_the_refresh_token_is_actually_revoked(dev_client):
+    mailbox_id = _create_gmail_mailbox(dev_client)
+    _connect_and_complete(dev_client, mailbox_id, email="mgs241171@gmail.com")
+    comp = get_composition()
+    _store_expired_gmail_tokens(comp, mailbox_id)
+
+    comp.gmail_oauth_client.queue_refresh_result(
+        GmailTokenResult(status=GmailOutcomeStatus.AUTH_ERROR, error_detail="invalid_grant: token has been expired or revoked")
+    )
+
+    r = dev_client.post(f"/internal/mailboxes/{mailbox_id}/gmail/test", json={"actor_type": "USER", "actor_id": ACTOR_ID})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is False
+    assert "reconnect" in body["detail"].lower() or "authentication" in body["detail"].lower()
+
+    mailbox = dev_client.get(f"/internal/mailboxes/{mailbox_id}").json()
+    assert mailbox["connection_state"] == "AUTH_REQUIRED"
+
+
+def test_gmail_test_endpoint_reports_a_non_auth_failure_after_a_successful_refresh_without_reconnect_wording(dev_client):
+    mailbox_id = _create_gmail_mailbox(dev_client)
+    _connect_and_complete(dev_client, mailbox_id, email="mgs241171@gmail.com")
+    comp = get_composition()
+    _store_expired_gmail_tokens(comp, mailbox_id)
+
+    comp.gmail_oauth_client.queue_refresh_result(
+        GmailTokenResult(status=GmailOutcomeStatus.OK, tokens=fake_token_bundle(access_token="fresh-gmail-access-token"))
+    )
+    comp.gmail_client.queue_profile_result(GmailIdentityResult(status=GmailOutcomeStatus.TRANSPORT_ERROR, error_detail="connection reset"))
+
+    r = dev_client.post(f"/internal/mailboxes/{mailbox_id}/gmail/test", json={"actor_type": "USER", "actor_id": ACTOR_ID})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is False
+    assert "reconnect" not in body["detail"].lower()
+    assert "transport_error" in body["detail"].lower()
+
+    mailbox = dev_client.get(f"/internal/mailboxes/{mailbox_id}").json()
+    assert mailbox["connection_state"] == "CONNECTED"
+
+
+def test_gmail_test_endpoint_never_returns_a_refreshed_token_or_refresh_token(dev_client):
+    mailbox_id = _create_gmail_mailbox(dev_client)
+    _connect_and_complete(dev_client, mailbox_id, email="mgs241171@gmail.com")
+    comp = get_composition()
+    _store_expired_gmail_tokens(comp, mailbox_id)
+
+    comp.gmail_oauth_client.queue_refresh_result(
+        GmailTokenResult(status=GmailOutcomeStatus.OK, tokens=fake_token_bundle(access_token="fresh-gmail-access-token"))
+    )
+    comp.gmail_client.queue_profile_result(GmailIdentityResult(status=GmailOutcomeStatus.OK, identity=GmailIdentity(email="mgs241171@gmail.com")))
+    r = dev_client.post(f"/internal/mailboxes/{mailbox_id}/gmail/test", json={"actor_type": "USER", "actor_id": ACTOR_ID})
+    assert "fresh-gmail-access-token" not in r.text
+    assert "fake-gmail-refresh-token" not in r.text
 
 
 def test_gmail_test_endpoint_has_no_side_effects_on_sweep_needs_you_or_domain_rules(dev_client):
