@@ -2330,3 +2330,74 @@ Matt merged PR #13 manually and issued a formal post-merge gate WO: confirm CI o
 ## 106.6 Verdict
 
 **CLOSED GREEN** for both mailboxes, confirmed twice — once at initial deployment (§106.4) and once under the architect's own formal post-merge re-verification gate against the exact canonical two-parent merge SHA (§106.5). Root cause for Microsoft and Gmail was identical and is recorded accurately here: the original Test implementation was intentionally non-mutating and therefore did not refresh expired OAuth access tokens, which caused healthy, idle OAuth mailboxes to appear disconnected. The production refresh credentials themselves were valid throughout — this is not, and must not be read as, an OAuth credential incident. The rule-engine condition expansion (§104.6/§105.1) remains untouched and unstarted.
+
+---
+
+# 107. Mailbox Rule-Engine Condition Expansion — Discovery-Only, Superseded by Architecture Ruling (2026-09-27)
+
+## 107.1 Scope
+
+Architect-authorised bounded delivery: extend the existing governed mailbox domain-rule engine (§104.6/§105.1's deferred item) so rules could additionally condition on classification, company/entity, and Xero-account suggestion. Per the WO's own explicit "discovery before implementation" gate, a complete, read-only mapping of the current rule engine was produced (branch `mailbox/rule-engine-condition-expansion`, starting SHA `f594a24`) **before any schema, model, or runtime code was written.**
+
+## 107.2 Discovery findings
+
+The existing rule engine (`services/mailbox/domain_rule.py`, `persistence/postgres/mailbox_domain_rule_models.py`, `contracts/mailbox/bagman.mailbox_domain_rule.v1.schema.json`) is confirmed sound, provider-neutral, and well-tested (3 parallel suites — in-memory/Postgres/contract). Its precedence, matching semantics, and audit trail all extend cleanly for a like-for-like new condition. But the mapping established, with concrete file:line evidence, that the rule engine's live evaluation point is structurally a **pre-intake gate**:
+
+- **Evaluation ordering, confirmed**: `services/mailbox/sweep.py:1264` calls `find_for_sender` against a bare `MailboxMessage` (no classification field exists on this dataclass — confirmed at `services/mailbox/message.py:115-197`) *before* any MIME fetch or `EvidenceItem` creation, except where an existing `MUST_READ` outcome deliberately continues processing.
+- **Classification unavailable at that point, structurally**: `services/evidence/classification.py`'s `EvidenceClassification` requires a real `evidence_id` (`app/api/routers/evidence_classification.py:260,318`), which does not exist until *after* a message has already passed the pre-intake gate and been MIME-fetched. A message resolved BLACKLIST/GRAYLIST/no-rule today never reaches evidence at all, so it can never acquire a classification. This is not intermittent absence — it is unconditionally true for every message at the point the existing gate runs, every time.
+- **Canonical company/entity unavailable as an independent pre-rule fact**: `EvidenceItem.entity_id` (`persistence/postgres/models.py:44-45,170-171`) — the one genuine, FK-backed, canonical entity attachment in this codebase — is populated *from* `MailboxDomainRule.destination_entity_id`, i.e. entity is today an **output** of the rule, not an input available before it runs. The only pre-rule candidate, `MailboxSource.default_entity_id` (`services/mailbox/mailbox.py:314-346`), is explicitly documented in this codebase's own doctrine as a non-authoritative hint — "`mailbox == company` must never be encoded anywhere as a canonical invariant."
+- **No Xero-account-suggestion producer exists at all**: `services/xero/ai_suggestion.py::resolve_ai_suggested_account` (`:60-100`) is a stateless *validator* of a caller-supplied candidate ID — its own docstring confirms no AI task producing a real suggestion has ever been wired. `services/needs_you/needs_you.py:152`'s `ITEM_TYPE_XERO_ACCOUNT_REQUIRED` is likewise declared "without a live producer wired." No table/column resembling a stored suggestion exists anywhere in the schema.
+
+## 107.3 Architecture ruling (Architect, 2026-09-27)
+
+Accepted in full, verbatim as issued: the existing mailbox domain-rule engine's responsibility is confirmed as **"a deterministic pre-intake/domain gate operating only on facts available before evidence enrichment"** — this responsibility is not changed by this delivery. §104.6/§105.1's original specification of the three condition dimensions was written against the wrong processing phase; the architecture is not to be forced to satisfy that premise. Specifically ruled:
+
+- **Classification**: a legitimate condition only in a *future* post-enrichment policy layer, once governed classification exists for the message in question — never added to the current pre-intake engine, and never given "sometimes unavailable" semantics merely to accommodate a live gate it structurally cannot satisfy. No condition that always evaluates absent is to be built.
+- **Company/entity**: a legitimate condition only once canonical entity resolution has genuinely occurred pre-rule. `MailboxSource.default_entity_id` must **not** be promoted into a security/isolation boundary — doing so would weaken this codebase's existing entity-isolation doctrine (the real FK-backed `entity_id` pattern used by every Xero table) for negligible discriminative value, since rules are already mailbox-scoped.
+- **Xero-account suggestion**: marked **`BLOCKED — NO GOVERNED PRODUCER EXISTS`**. Not to be built as a dead/always-absent condition field, and its prerequisite producer is explicitly not to be built under mailbox-rule-engine scope — it belongs to a separate, future accounting/enrichment work item.
+
+This is recorded as **a successful discovery outcome, not a failed implementation** — the architecture was correctly protected from an incorrect premise before any runtime change was made.
+
+## 107.4 PID reconciliation
+
+| Requested condition | Discovery result | Ruling |
+|---|---|---|
+| Classification | Fact does not exist at pre-intake evaluation phase (structural, not intermittent) | Moved to future post-enrichment policy scope |
+| Company/entity | Authoritative entity not available as an independent pre-rule fact; `default_entity_id` is hint-only by this codebase's own doctrine | Moved to future post-enrichment policy scope |
+| Xero-account suggestion | No producer currently exists anywhere in the codebase | Blocked pending a separately authorised producer capability |
+
+§104.6's original three-dimension rule-engine-expansion item is superseded by this ruling and must not be re-attempted in its original form.
+
+## 107.5 No implementation change
+
+**Confirmed: zero runtime/schema/rule-engine code was changed under this work order.** `git status` on the discovery branch (`mailbox/rule-engine-condition-expansion`, off `f594a24`) shows a clean working tree — no model, migration, contract-schema, API, or test file was modified. The existing rule model, schema, matching semantics, precedence, production rules, provider behaviour, and ingestion boundary are all preserved exactly as they were. No production deployment is required or was performed for this discovery ruling.
+
+## 107.6 Future processing model (recorded, not authorised for implementation)
+
+```text
+Mailbox/message discovery
+        ↓
+Existing pre-intake domain gate   (THIS delivery's scope — unchanged)
+        ↓
+MIME/content acquisition
+        ↓
+Evidence creation
+        ↓
+Classification
+        ↓
+Canonical entity/company resolution
+        ↓
+Xero-account suggestion (only once a real producer exists)
+        ↓
+Future post-enrichment policy evaluation   (NOT authorised by this ruling)
+```
+
+## 107.7 Proposed follow-up work items (proposed only — not begun)
+
+**A. Post-Enrichment Policy Foundation** — a bounded design/delivery for policy evaluation only after evidence exists, classification exists where applicable, and canonical entity/company is resolved. Must determine whether the existing rule abstractions (`domain_rule.py`'s model/precedence/matching) can be safely reused as shared primitives for this later stage, or whether a distinct policy-stage contract is required — that determination is not prejudged here, and no second engine is created by this ruling.
+
+**B. Xero Account Suggestion Producer** — a separate accounting/Xero work item establishing a real governed producer of account suggestions: inputs, provenance, confidence, company/Xero-connection isolation, human-review semantics, fail-closed behaviour. Only once this fact genuinely exists does a Xero-account-suggestion condition become eligible for the future post-enrichment policy layer.
+
+## 107.8 Verdict
+
+**§104.6 AS ORIGINALLY SPECIFIED — SUPERSEDED BY DISCOVERY, NO IMPLEMENTATION DEFECT.** The rule-engine expansion as originally scoped (classification + company + Xero-suggestion conditions on the existing live pre-intake gate) is not implementable honestly against real governed facts, and is not attempted. The existing rule engine is fully preserved, untouched, and remains CLOSED GREEN from §104/§105. Two future work items are proposed (§107.7) but not begun, pending separate architect authorisation.
