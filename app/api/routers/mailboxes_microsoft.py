@@ -159,7 +159,7 @@ from pydantic import BaseModel
 
 from app.api.composition import ensure_seed_entities, get_composition, get_mailbox_source_id
 from core.errors import BagmanError, ConflictError, NotFoundError, OAuthStateError, ValidationError
-from core.timestamps import utc_now
+from core.timestamps import to_contract_string, utc_now
 from services.mailbox.domain_rule import MATCH_MODE_EXACT
 from services.mailbox.lock import MailboxSweepLockError
 from services.mailbox.mailbox import (
@@ -167,8 +167,13 @@ from services.mailbox.mailbox import (
     PROVIDER_MICROSOFT_GRAPH,
 )
 from services.mailbox.domain_review_priority import aggregate_discovery_reasons, compute_review_priority
+from services.mailbox.microsoft.graph_client import GraphOutcomeStatus
 from services.mailbox.microsoft.oauth_state import consume_state
-from services.mailbox.review_resolution import resolve_domain_review, resolve_security_review
+from services.mailbox.review_resolution import (
+    list_mailbox_needs_you_items,
+    resolve_domain_review,
+    resolve_security_review,
+)
 from services.mailbox.sweep import run_sweep
 from services.mailbox.sweep_run import TRIGGER_MANUAL
 from services.needs_you.needs_you import (
@@ -431,6 +436,77 @@ async def disconnect_microsoft(mailbox_id: str, payload: DisconnectMicrosoftRequ
     return updated.to_dict()
 
 
+class TestMicrosoftMailboxRequest(BaseModel):
+    actor_type: str
+    actor_id: str
+
+
+@router.post("/{mailbox_id}/microsoft/test")
+async def test_microsoft_mailbox(mailbox_id: str, payload: TestMicrosoftMailboxRequest) -> dict[str, Any]:
+    """CD-6 mailbox-list GUI-completion WO — the "Test" mailbox-connection
+    action (§98.6's own required mailbox-list action, confirmed genuinely
+    absent by the Slice 3/4/5 governance reconciliation — see `PID.md`
+    §104.5's own "GUI/API surface" row).
+
+    A pure, read-only, non-destructive identity check — calls the SAME
+    real Microsoft Graph identity primitive already used at OAuth-
+    callback time (`MicrosoftOAuthClientProtocol.get_me`, see
+    `services/mailbox/microsoft/graph_client.py`), against the mailbox's
+    OWN already-stored access token (`composition.microsoft_token_store
+    .read(mailbox_id)`).
+
+    Deliberately reads the RAW stored token — never
+    `MicrosoftGraphMailboxAdapter._ensure_fresh_access_token`, which
+    would refresh an expiring token (a legitimate write) and, on a
+    refresh failure, call `mark_microsoft_auth_required` (a
+    `connection_state` mutation). This action must NEVER change
+    `connection_state`/`status`, so it never takes that path — an
+    expired-but-refreshable token is honestly reported as a failed check
+    here; the operator's remedy is the existing Connect/Reconnect
+    action, not this one. Never triggers a sweep, never fetches a
+    folder/message, never creates a Needs You item, never touches a
+    `MailboxDomainRule`, never advances a cursor — no such call exists
+    anywhere in this function.
+
+    Never returns the raw token (or any part of it) in the response or
+    the audit-event payload — only the mailbox's own already-public
+    email address (from the verified identity, when present) and a
+    closed-vocabulary outcome status.
+    """
+    composition = get_composition()
+    _require_microsoft_mailbox(composition, mailbox_id)
+    checked_at = utc_now()
+
+    tokens = composition.microsoft_token_store.read(mailbox_id)
+    if tokens is None:
+        ok = False
+        detail = "No stored Microsoft credentials for this mailbox — it has never completed the Connect flow."
+    else:
+        result = composition.microsoft_oauth_client.get_me(access_token=tokens.access_token)
+        if result.status == GraphOutcomeStatus.OK and result.identity is not None:
+            ok = True
+            identity_label = result.identity.mail or result.identity.user_principal_name or "(unknown address)"
+            detail = f"Microsoft Graph identity check succeeded for {identity_label}."
+        elif result.status == GraphOutcomeStatus.AUTH_ERROR:
+            ok = False
+            detail = "Microsoft Graph rejected the stored credential (authentication error) — reconnect this mailbox."
+        else:
+            ok = False
+            detail = f"Microsoft Graph identity check failed: {result.status.value}."
+
+    composition.api.record_audit_event(
+        event_type="MAILBOX_CONNECTION_TESTED",
+        actor_type=payload.actor_type,
+        actor_id=payload.actor_id,
+        subject_type="MailboxSource",
+        subject_id=mailbox_id,
+        correlation_id=mailbox_id,
+        causation_id=None,
+        payload={"mailbox_id": mailbox_id, "ok": ok},
+    )
+    return {"ok": ok, "checked_at": to_contract_string(checked_at), "detail": detail}
+
+
 @router.post("/{mailbox_id}/microsoft/sweep")
 async def sweep_microsoft(mailbox_id: str, payload: SweepMicrosoftRequest) -> dict[str, Any]:
     """"Sweep now". Always returns a terminal `MailboxSweepRun` on a
@@ -619,13 +695,12 @@ async def list_microsoft_domain_review_items(mailbox_id: str, status: str = "OPE
     """
     composition = get_composition()
     _require_microsoft_mailbox(composition, mailbox_id)
-    items = [
-        item
-        for item in composition.needs_you_repository.list_needs_you_items(
-            item_type=ITEM_TYPE_MAILBOX_DOMAIN_REVIEW, domain="MAILBOX", status=status
-        )
-        if item.metadata.get("mailbox_id") == mailbox_id
-    ]
+    items = list_mailbox_needs_you_items(
+        composition.needs_you_repository,
+        item_type=ITEM_TYPE_MAILBOX_DOMAIN_REVIEW,
+        mailbox_id=mailbox_id,
+        status=status,
+    )
 
     enriched_items = []
     for item in items:
@@ -1103,13 +1178,12 @@ async def list_microsoft_security_review_items(mailbox_id: str, status: str = "O
     proportionate rather than growing the full batch-triage treatment."""
     composition = get_composition()
     _require_microsoft_mailbox(composition, mailbox_id)
-    items = [
-        item
-        for item in composition.needs_you_repository.list_needs_you_items(
-            item_type=ITEM_TYPE_MAILBOX_AUTHENTICATION_ESCALATION, domain="MAILBOX", status=status
-        )
-        if item.metadata.get("mailbox_id") == mailbox_id
-    ]
+    items = list_mailbox_needs_you_items(
+        composition.needs_you_repository,
+        item_type=ITEM_TYPE_MAILBOX_AUTHENTICATION_ESCALATION,
+        mailbox_id=mailbox_id,
+        status=status,
+    )
     return {"mailbox_id": mailbox_id, "items": [i.to_dict() for i in items], "count": len(items)}
 
 

@@ -148,6 +148,57 @@ from services.needs_you.needs_you import (
 )
 
 
+def list_mailbox_needs_you_items(
+    needs_you_repository: NeedsYouRepository, *, item_type: str, mailbox_id: str, status: str = "OPEN"
+) -> list:
+    """CD-6 mailbox-list GUI-completion WO — the shared
+    ``item.metadata.get("mailbox_id") == mailbox_id`` scan every
+    provider router's domain-review/security-review listing endpoint
+    (``list_{microsoft,gmail,imap}_domain_review_items``/
+    ``list_{microsoft,gmail,imap}_security_review_items``) previously
+    implemented as six near-identical, independently-duplicated inline
+    list comprehensions — one implementation instead of many identical
+    copies. Mirrors ``services.mailbox.sweep._find_open_domain_review_item``'s
+    own identical filter (that function stays where it is — it
+    additionally matches on ``sender_domain`` and returns a single item,
+    a different enough shape that folding it into this one is not a
+    clean fit, and ``services/mailbox/sweep.py`` importing from this
+    module would invert this module's own existing dependency on
+    ``services.mailbox.sweep``)."""
+    return [
+        item
+        for item in needs_you_repository.list_needs_you_items(item_type=item_type, domain="MAILBOX", status=status)
+        if item.metadata.get("mailbox_id") == mailbox_id
+    ]
+
+
+def count_needs_review_items_for_mailbox(needs_you_repository: NeedsYouRepository, *, mailbox_id: str) -> int:
+    """CD-6 mailbox-list GUI-completion WO — the ``needs_review_count``
+    field on ``GET /internal/mailboxes``'s list response: the sum of
+    OPEN ``MAILBOX_DOMAIN_REVIEW`` + ``MAILBOX_AUTHENTICATION_ESCALATION``
+    Needs You items for ONE mailbox. Built on
+    :func:`list_mailbox_needs_you_items` so this is the SAME scan every
+    per-type provider endpoint already performs — no new counting logic,
+    no new item-type-scoping rule. Provider-neutral: works identically
+    for Microsoft/Gmail/IMAP mailboxes, since the underlying Needs You
+    items and this scan have no provider-specific shape at all — this is
+    true even for IMAP, which has no domain-review GUI PAGE wired yet (a
+    separate, out-of-scope gap; the COUNT itself is still accurate for
+    IMAP mailboxes because the underlying data/endpoint already exists)."""
+    return len(
+        list_mailbox_needs_you_items(
+            needs_you_repository, item_type=ITEM_TYPE_MAILBOX_DOMAIN_REVIEW, mailbox_id=mailbox_id, status="OPEN"
+        )
+    ) + len(
+        list_mailbox_needs_you_items(
+            needs_you_repository,
+            item_type=ITEM_TYPE_MAILBOX_AUTHENTICATION_ESCALATION,
+            mailbox_id=mailbox_id,
+            status="OPEN",
+        )
+    )
+
+
 class _AdapterProtocol(Protocol):
     """The narrow surface either function below needs from a
     provider adapter — mirrors

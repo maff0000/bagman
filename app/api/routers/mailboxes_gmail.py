@@ -104,11 +104,17 @@ from pydantic import BaseModel
 
 from app.api.composition import ensure_seed_entities, get_composition, get_mailbox_source_id
 from core.errors import BagmanError, ConflictError, NotFoundError, OAuthStateError, ValidationError
+from core.timestamps import to_contract_string, utc_now
 from services.mailbox.domain_rule import MATCH_MODE_EXACT
+from services.mailbox.gmail.gmail_client import GmailOutcomeStatus
 from services.mailbox.gmail.oauth_state import consume_state
 from services.mailbox.lock import MailboxSweepLockError
 from services.mailbox.mailbox import PROVIDER_GOOGLE_GMAIL
-from services.mailbox.review_resolution import resolve_domain_review, resolve_security_review
+from services.mailbox.review_resolution import (
+    list_mailbox_needs_you_items,
+    resolve_domain_review,
+    resolve_security_review,
+)
 from services.mailbox.sweep import run_sweep
 from services.mailbox.sweep_run import TRIGGER_MANUAL
 from services.needs_you.needs_you import ITEM_TYPE_MAILBOX_AUTHENTICATION_ESCALATION, ITEM_TYPE_MAILBOX_DOMAIN_REVIEW
@@ -326,6 +332,58 @@ async def disconnect_gmail(mailbox_id: str, payload: DisconnectGmailRequest) -> 
     return updated.to_dict()
 
 
+class TestGmailMailboxRequest(BaseModel):
+    actor_type: str
+    actor_id: str
+
+
+@router.post("/{mailbox_id}/gmail/test")
+async def test_gmail_mailbox(mailbox_id: str, payload: TestGmailMailboxRequest) -> dict[str, Any]:
+    """CD-6 mailbox-list GUI-completion WO — mirrors
+    `app/api/routers/mailboxes_microsoft.py::test_microsoft_mailbox`'s
+    own docstring exactly, substituting Gmail's own identity primitive
+    (`GmailClientProtocol.get_profile`) and stored-token source
+    (`composition.gmail_token_store`). Same hard guarantees: reads the
+    RAW stored token (never
+    `GmailMailboxAdapter._ensure_fresh_access_token`, which can refresh
+    the token and mark `AUTH_REQUIRED` on failure — both writes this
+    action must never perform); never sweeps/ingests/creates a Needs You
+    item/touches a domain rule/advances a cursor; never returns the raw
+    token."""
+    composition = get_composition()
+    _require_gmail_mailbox(composition, mailbox_id)
+    checked_at = utc_now()
+
+    tokens = composition.gmail_token_store.read(mailbox_id)
+    if tokens is None:
+        ok = False
+        detail = "No stored Gmail credentials for this mailbox — it has never completed the Connect flow."
+    else:
+        result = composition.gmail_client.get_profile(access_token=tokens.access_token)
+        if result.status == GmailOutcomeStatus.OK and result.identity is not None:
+            ok = True
+            identity_label = result.identity.email or "(unknown address)"
+            detail = f"Gmail identity check succeeded for {identity_label}."
+        elif result.status == GmailOutcomeStatus.AUTH_ERROR:
+            ok = False
+            detail = "Gmail rejected the stored credential (authentication error) — reconnect this mailbox."
+        else:
+            ok = False
+            detail = f"Gmail identity check failed: {result.status.value}."
+
+    composition.api.record_audit_event(
+        event_type="MAILBOX_CONNECTION_TESTED",
+        actor_type=payload.actor_type,
+        actor_id=payload.actor_id,
+        subject_type="MailboxSource",
+        subject_id=mailbox_id,
+        correlation_id=mailbox_id,
+        causation_id=None,
+        payload={"mailbox_id": mailbox_id, "ok": ok},
+    )
+    return {"ok": ok, "checked_at": to_contract_string(checked_at), "detail": detail}
+
+
 @router.post("/{mailbox_id}/gmail/sweep")
 async def sweep_gmail(mailbox_id: str, payload: SweepGmailRequest) -> dict[str, Any]:
     """"Sweep now". Always returns a terminal `MailboxSweepRun` on a
@@ -431,13 +489,12 @@ async def list_gmail_domain_rules(mailbox_id: str) -> dict[str, Any]:
 async def list_gmail_domain_review_items(mailbox_id: str, status: str = "OPEN") -> dict[str, Any]:
     composition = get_composition()
     _require_gmail_mailbox(composition, mailbox_id)
-    items = [
-        item
-        for item in composition.needs_you_repository.list_needs_you_items(
-            item_type=ITEM_TYPE_MAILBOX_DOMAIN_REVIEW, domain="MAILBOX", status=status
-        )
-        if item.metadata.get("mailbox_id") == mailbox_id
-    ]
+    items = list_mailbox_needs_you_items(
+        composition.needs_you_repository,
+        item_type=ITEM_TYPE_MAILBOX_DOMAIN_REVIEW,
+        mailbox_id=mailbox_id,
+        status=status,
+    )
     return {"mailbox_id": mailbox_id, "items": [i.to_dict() for i in items], "count": len(items)}
 
 
@@ -571,13 +628,12 @@ async def batch_resolve_gmail_domain_review(mailbox_id: str, payload: BatchResol
 async def list_gmail_security_review_items(mailbox_id: str, status: str = "OPEN") -> dict[str, Any]:
     composition = get_composition()
     _require_gmail_mailbox(composition, mailbox_id)
-    items = [
-        item
-        for item in composition.needs_you_repository.list_needs_you_items(
-            item_type=ITEM_TYPE_MAILBOX_AUTHENTICATION_ESCALATION, domain="MAILBOX", status=status
-        )
-        if item.metadata.get("mailbox_id") == mailbox_id
-    ]
+    items = list_mailbox_needs_you_items(
+        composition.needs_you_repository,
+        item_type=ITEM_TYPE_MAILBOX_AUTHENTICATION_ESCALATION,
+        mailbox_id=mailbox_id,
+        status=status,
+    )
     return {"mailbox_id": mailbox_id, "items": [i.to_dict() for i in items], "count": len(items)}
 
 

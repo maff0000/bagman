@@ -120,6 +120,92 @@ def test_failed_connect_auth_error_marks_auth_required_never_crashes(dev_client)
     assert body["connection_state"] == "AUTH_REQUIRED"
 
 
+# ---------------------------------------------------------------------
+# CD-6 mailbox-list GUI-completion WO — the "Test" connection action
+# (POST /{mailbox_id}/imap/test). Mirrors
+# test_mailbox_microsoft_endpoints.py's own equivalent suite, using
+# IMAP's own already-existing `attempt_login` primitive (a bare
+# connect+login probe that always logs out immediately — see
+# `services/mailbox/imap/imap_adapter.py::ImapMailboxAdapter.attempt_login`'s
+# own docstring).
+# ---------------------------------------------------------------------
+
+
+def test_imap_test_endpoint_reports_not_configured_when_no_credentials_exist(dev_client):
+    mailbox_id = _create_imap_mailbox(dev_client)
+    response = dev_client.post(f"/internal/mailboxes/{mailbox_id}/imap/test", json={"actor_type": "USER", "actor_id": ACTOR_ID})
+    assert response.status_code == 200
+    body = response.json()
+    assert body["ok"] is False
+    assert "checked_at" in body
+
+
+def test_imap_test_endpoint_succeeds_and_logs_out(dev_client):
+    mailbox_id = _create_imap_mailbox(dev_client)
+    composition = get_composition()
+    composition.imap_mailbox_adapter._credentials_provider = _fake_credentials_provider()
+    composition.imap_client.queue_connect_result(ImapConnectResult(status=ImapOutcomeStatus.OK))
+
+    response = dev_client.post(f"/internal/mailboxes/{mailbox_id}/imap/test", json={"actor_type": "USER", "actor_id": ACTOR_ID})
+    assert response.status_code == 200
+    body = response.json()
+    assert body["ok"] is True
+    assert composition.imap_client.logout_calls == 1  # never leaves a connection open
+
+
+def test_imap_test_endpoint_reports_auth_error_without_mutating_connection_state(dev_client):
+    mailbox_id = _create_imap_mailbox(dev_client)
+    composition = get_composition()
+    composition.imap_mailbox_adapter._credentials_provider = _fake_credentials_provider()
+    composition.imap_client.queue_connect_result(ImapConnectResult(status=ImapOutcomeStatus.OK))
+    dev_client.post(f"/internal/mailboxes/{mailbox_id}/imap/connect", json={"actor_type": "USER", "actor_id": ACTOR_ID})
+    assert dev_client.get(f"/internal/mailboxes/{mailbox_id}").json()["connection_state"] == "CONNECTED"
+
+    composition.imap_client.queue_connect_result(
+        ImapConnectResult(status=ImapOutcomeStatus.AUTH_ERROR, error_detail="bad credentials")
+    )
+    response = dev_client.post(f"/internal/mailboxes/{mailbox_id}/imap/test", json={"actor_type": "USER", "actor_id": ACTOR_ID})
+    assert response.json()["ok"] is False
+    # Never demoted to AUTH_REQUIRED by a /test call — only the real
+    # connect endpoint's own `_apply_login_outcome` mutates connection_state.
+    assert dev_client.get(f"/internal/mailboxes/{mailbox_id}").json()["connection_state"] == "CONNECTED"
+
+
+def test_imap_test_endpoint_has_no_side_effects_on_sweep_needs_you_or_domain_rules(dev_client):
+    mailbox_id = _create_imap_mailbox(dev_client)
+    composition = get_composition()
+    composition.imap_mailbox_adapter._credentials_provider = _fake_credentials_provider()
+    composition.imap_client.queue_connect_result(ImapConnectResult(status=ImapOutcomeStatus.OK))
+    dev_client.post(f"/internal/mailboxes/{mailbox_id}/imap/connect", json={"actor_type": "USER", "actor_id": ACTOR_ID})
+
+    runs_before = composition.mailbox_sweep_run_repository.list_runs(mailbox_id=mailbox_id)
+    rules_before = composition.mailbox_domain_rule_repository.list_rules(mailbox_id=mailbox_id)
+    needs_you_before = composition.needs_you_repository.list_needs_you_items(item_type="MAILBOX_DOMAIN_REVIEW")
+    messages_before = composition.mailbox_message_repository.list_messages(mailbox_id=mailbox_id)
+
+    composition.imap_client.queue_connect_result(ImapConnectResult(status=ImapOutcomeStatus.OK))
+    response = dev_client.post(f"/internal/mailboxes/{mailbox_id}/imap/test", json={"actor_type": "USER", "actor_id": ACTOR_ID})
+    assert response.status_code == 200
+
+    assert composition.mailbox_sweep_run_repository.list_runs(mailbox_id=mailbox_id) == runs_before
+    assert composition.mailbox_domain_rule_repository.list_rules(mailbox_id=mailbox_id) == rules_before
+    assert composition.needs_you_repository.list_needs_you_items(item_type="MAILBOX_DOMAIN_REVIEW") == needs_you_before
+    assert composition.mailbox_message_repository.list_messages(mailbox_id=mailbox_id) == messages_before
+
+
+def test_imap_test_endpoint_rejects_a_non_imap_mailbox(dev_client):
+    r = dev_client.post(
+        "/internal/mailboxes",
+        json={
+            "display_name": "Matt Infosecurs", "email_address": "matt-nonimap@infosecurs.com", "provider_kind": "MICROSOFT_GRAPH",
+            "actor_type": "USER", "actor_id": ACTOR_ID,
+        },
+    )
+    mailbox_id = r.json()["mailbox_id"]
+    response = dev_client.post(f"/internal/mailboxes/{mailbox_id}/imap/test", json={"actor_type": "USER", "actor_id": ACTOR_ID})
+    assert response.status_code == 422
+
+
 def test_sweep_before_connect_is_a_conflict(dev_client):
     mailbox_id = _create_imap_mailbox(dev_client)
     response = dev_client.post(f"/internal/mailboxes/{mailbox_id}/imap/sweep", json={"actor_type": "USER", "actor_id": ACTOR_ID})

@@ -1,12 +1,17 @@
-// features/mailbox/mailboxes.js — the Email tab (CD-6 Slice 3: Mailbox
-// Management). An operator-facing mailbox DEFINITION registry only —
-// see services/mailbox/mailbox.py's own module docstring for the full,
-// explicit out-of-scope list (no provider OAuth/IMAP login, no mail
-// fetch, no "Sweep now"/"Test Graph"/"Test IMAP" button anywhere in
-// this file, not even disabled). Mirrors features/xero/connections.js's
-// exact style/conventions (DOM helpers, chips, notify, the tab-shell
-// wiring pattern) — the closest existing precedent for "a per-row
-// card list with Add/Edit/lifecycle actions".
+// features/mailbox/mailboxes.js — the Email tab (originally CD-6 Slice 3:
+// Mailbox Management, an operator-facing mailbox DEFINITION registry
+// only — see services/mailbox/mailbox.py's own module docstring for
+// that slice's own explicit out-of-scope list). CD-6 Slice 4 onward
+// added real Connect/Sweep actions per provider (Microsoft/IMAP/Gmail);
+// the CD-6 mailbox-list GUI-completion WO (this delivery) added the
+// mailbox-list "Test"/"Email Activity"/"Messages" actions and the
+// last-error/relevant-message/needs-review/last-sweep-status fields
+// below — this stale comment previously (incorrectly) claimed no
+// Sweep/Test button existed anywhere in this file; both now do.
+// Mirrors features/xero/connections.js's exact style/conventions (DOM
+// helpers, chips, notify, the tab-shell wiring pattern) — the closest
+// existing precedent for "a per-row card list with Add/Edit/lifecycle
+// actions".
 import { el, clear, qs } from "../../shared/dom.js";
 import { fmtDateTime } from "../../shared/format.js";
 import { chip } from "../../shared/chips.js";
@@ -26,20 +31,31 @@ import {
   connectMicrosoftMailbox,
   disconnectMicrosoftMailbox,
   sweepMicrosoftMailboxNow,
+  testMicrosoftMailbox,
   listMicrosoftMessages,
+  listMicrosoftSweeps,
+  listMicrosoftDomainRules,
   listDomainReviewItems,
   connectImapMailbox,
   disconnectImapMailbox,
   sweepImapMailboxNow,
+  testImapMailbox,
   listImapMessages,
+  listImapSweeps,
+  listImapDomainRules,
   listImapDomainReviewItems,
   connectGmailMailbox,
   disconnectGmailMailbox,
   sweepGmailMailboxNow,
+  testGmailMailbox,
   listGmailMessages,
+  listGmailSweeps,
+  listGmailDomainRules,
   listGmailDomainReviewItems,
 } from "./mailbox-api.js";
 import { DomainReview } from "./domain-review.js";
+import { EmailActivity } from "./email-activity.js";
+import { MessageTriage } from "./message-triage.js";
 
 //: provider_kind (the governed, closed Python-level enum —
 //: services/mailbox/mailbox.py::PROVIDER_KINDS) -> human-readable
@@ -102,7 +118,13 @@ const _PROVIDER_ADAPTERS = {
     connect: connectMicrosoftMailbox,
     disconnect: disconnectMicrosoftMailbox,
     sweep: sweepMicrosoftMailboxNow,
+    //: CD-6 mailbox-list GUI-completion WO — the "Test" connection
+    //: action, plus the two read-only feeds the new Email Activity/
+    //: Messages views need (`listSweeps`/`listDomainRules`).
+    test: testMicrosoftMailbox,
     listMessages: listMicrosoftMessages,
+    listSweeps: listMicrosoftSweeps,
+    listDomainRules: listMicrosoftDomainRules,
     listDomainReviewItems: listDomainReviewItems,
     connectIsRedirect: true,
     //: The domain-review batch-triage page (features/mailbox/domain-review.js)
@@ -117,7 +139,10 @@ const _PROVIDER_ADAPTERS = {
     connect: connectImapMailbox,
     disconnect: disconnectImapMailbox,
     sweep: sweepImapMailboxNow,
+    test: testImapMailbox,
     listMessages: listImapMessages,
+    listSweeps: listImapSweeps,
+    listDomainRules: listImapDomainRules,
     listDomainReviewItems: listImapDomainReviewItems,
     connectIsRedirect: false,
     hasDomainReviewPage: false,
@@ -137,7 +162,10 @@ const _PROVIDER_ADAPTERS = {
     connect: connectGmailMailbox,
     disconnect: disconnectGmailMailbox,
     sweep: sweepGmailMailboxNow,
+    test: testGmailMailbox,
     listMessages: listGmailMessages,
+    listSweeps: listGmailSweeps,
+    listDomainRules: listGmailDomainRules,
     listDomainReviewItems: listGmailDomainReviewItems,
     connectIsRedirect: true,
     hasDomainReviewPage: false,
@@ -210,6 +238,16 @@ export const Mailboxes = {
       el("div", { class: "small muted", text: connectionStateLabel(mailbox.connection_state) })
     );
 
+    // CD-6 mailbox-list GUI-completion WO — `last_error_code`/
+    // `last_error_detail` are ALREADY real, always-present fields on
+    // `MailboxSource` (see services/mailbox/mailbox.py) — this card just
+    // never rendered them before. Shown only when genuinely non-null
+    // ("no dead controls, no fake availability" applies to information
+    // too — never an empty "Last error: —" line).
+    if (mailbox.last_error_code || mailbox.last_error_detail) {
+      body.appendChild(chip(`${mailbox.last_error_code || "ERROR"}: ${mailbox.last_error_detail || ""}`, "bad"));
+    }
+
     const entityName = await this._entityDisplayName(mailbox.default_entity_id);
     if (entityName) {
       body.appendChild(el("div", { class: "small muted", text: `Default company: ${entityName}` }));
@@ -222,6 +260,25 @@ export const Mailboxes = {
     if (mailbox.last_successful_sweep_at) {
       body.appendChild(
         el("div", { class: "small muted", text: `Last swept: ${fmtDateTime(mailbox.last_successful_sweep_at)}` })
+      );
+    }
+
+    // CD-6 mailbox-list GUI-completion WO — the three new GUI-list-only
+    // fields `GET /internal/mailboxes` now attaches to every row (see
+    // app/api/routers/mailboxes.py::list_mailboxes's own docstring).
+    body.appendChild(
+      el("div", {
+        class: "small muted",
+        text: `${mailbox.relevant_message_count || 0} relevant message(s) · ${mailbox.needs_review_count || 0} needing review`,
+      })
+    );
+    if (mailbox.last_sweep_status) {
+      const lastSweep = mailbox.last_sweep_status;
+      body.appendChild(
+        el("div", {
+          class: "small muted",
+          text: `Last sweep: ${lastSweep.status} (${lastSweep.messages_seen} message(s))`,
+        })
       );
     }
     card.appendChild(body);
@@ -272,6 +329,27 @@ export const Mailboxes = {
         domainReviewBtn.addEventListener("click", () => DomainReview.open(mailbox));
         actions.appendChild(domainReviewBtn);
       }
+    }
+
+    // CD-6 mailbox-list GUI-completion WO — "Test", "Email Activity",
+    // "Messages" are all pure, read-only/non-destructive views/actions:
+    // shown whenever a working adapter exists, regardless of
+    // enabled/connected state (unlike Sweep/Connect below, which
+    // require a live, ACTIVE connection) — mirrors "Domain Review
+    // (N)"'s own identical "these describe real history, not a live
+    // action" reasoning above.
+    if (providerAdapter) {
+      const testBtn = el("button", { class: "btn btn--ghost btn--sm", text: "Test", attrs: { type: "button" } });
+      testBtn.addEventListener("click", () => this._test(mailbox, providerAdapter));
+      actions.appendChild(testBtn);
+
+      const activityBtn = el("button", { class: "btn btn--ghost btn--sm", text: "Email Activity", attrs: { type: "button" } });
+      activityBtn.addEventListener("click", () => EmailActivity.open(mailbox, providerAdapter));
+      actions.appendChild(activityBtn);
+
+      const messagesBtn = el("button", { class: "btn btn--ghost btn--sm", text: "Messages", attrs: { type: "button" } });
+      messagesBtn.addEventListener("click", () => MessageTriage.open(mailbox, providerAdapter));
+      actions.appendChild(messagesBtn);
     }
 
     if (providerAdapter && mailbox.status === "ACTIVE") {
@@ -398,6 +476,25 @@ export const Mailboxes = {
       notify.error(`Sweep failed: ${body.error_code || body.status}`);
     }
     this.load();
+  },
+
+  /** CD-6 mailbox-list GUI-completion WO — "Test" mailbox-connection
+   * action. A pure, read-only identity check (see
+   * `app/api/routers/mailboxes_microsoft.py::test_microsoft_mailbox`'s
+   * own docstring for the full non-destructive guarantee) — never a
+   * sweep, never a `connection_state` mutation. Surfaced as a toast,
+   * exactly mirroring `_sweep()`'s own convention above. */
+  async _test(mailbox, providerAdapter) {
+    const { ok, status, body } = await providerAdapter.test(mailbox.mailbox_id, getActorId());
+    if (!ok || !body) {
+      notify.error(`Test request failed: ${errorMessage(status, body)}`);
+      return;
+    }
+    if (body.ok) {
+      notify.ok(body.detail || "Connection test succeeded.");
+    } else {
+      notify.error(body.detail || "Connection test failed.");
+    }
   },
 
   openAddDrawer() {

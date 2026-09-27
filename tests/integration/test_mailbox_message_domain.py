@@ -359,3 +359,40 @@ def test_sender_address_observed_false_for_an_unobserved_address(repo, mailbox_i
 def test_sender_address_observed_scoped_to_mailbox(repo, mailbox_id, other_mailbox_id):
     _observe(repo, mailbox_id=mailbox_id)
     assert repo.sender_address_observed(other_mailbox_id, "s@x.com") is False
+
+
+# ---------------------------------------------------------------------
+# CD-6 mailbox-list GUI-completion WO — `count_discovery_candidates`
+# (the `relevant_message_count` field on `GET /internal/mailboxes`).
+# ---------------------------------------------------------------------
+
+
+def test_count_discovery_candidates_counts_only_true_across_the_whole_mailbox(repo, mailbox_id):
+    """Deliberately broader than `list_candidate_messages_for_domain`
+    (no domain/ingestion_status filter) — every message with
+    `discovery_candidate is True` counts, regardless of which domain it
+    came from or what happened to it afterward."""
+    _observe_candidate(repo, mailbox_id=mailbox_id, msg_id="c1", sender_domain="vendor.com", discovery_candidate=True)
+    _observe_candidate(
+        repo, mailbox_id=mailbox_id, msg_id="c2", sender_domain="vendor.com",
+        discovery_candidate=True, status=INGESTION_STATUS_INGESTED,
+    )
+    _observe_candidate(repo, mailbox_id=mailbox_id, msg_id="c3", sender_domain="other.example", discovery_candidate=True)
+    # Not a candidate — heuristic ran and said no.
+    _observe_candidate(repo, mailbox_id=mailbox_id, msg_id="not-candidate", sender_domain="vendor.com", discovery_candidate=False)
+    # Heuristic never ran (e.g. a BLACKLIST-policy message).
+    _observe_candidate(repo, mailbox_id=mailbox_id, msg_id="never-checked", sender_domain="vendor.com", discovery_candidate=None)
+
+    assert repo.count_discovery_candidates(mailbox_id=mailbox_id) == 3
+
+
+def test_count_discovery_candidates_scoped_to_mailbox(repo, mailbox_id, other_mailbox_id):
+    _observe_candidate(repo, mailbox_id=mailbox_id, msg_id="mine", sender_domain="vendor.com", discovery_candidate=True)
+    _observe_candidate(repo, mailbox_id=other_mailbox_id, msg_id="theirs", sender_domain="vendor.com", discovery_candidate=True)
+
+    assert repo.count_discovery_candidates(mailbox_id=mailbox_id) == 1
+    assert repo.count_discovery_candidates(mailbox_id=other_mailbox_id) == 1
+
+
+def test_count_discovery_candidates_is_zero_for_a_mailbox_with_no_messages(repo, mailbox_id):
+    assert repo.count_discovery_candidates(mailbox_id=mailbox_id) == 0

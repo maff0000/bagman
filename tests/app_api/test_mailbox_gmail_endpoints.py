@@ -276,6 +276,82 @@ def test_disconnect_clears_connection_state_and_deletes_tokens(dev_client):
     assert comp.gmail_token_store.read(mailbox_id) is None
 
 
+# ---------------------------------------------------------------------
+# CD-6 mailbox-list GUI-completion WO — the "Test" connection action
+# (POST /{mailbox_id}/gmail/test). Mirrors
+# test_mailbox_microsoft_endpoints.py's own equivalent suite exactly.
+# ---------------------------------------------------------------------
+
+
+def test_gmail_test_endpoint_reports_not_connected_when_no_credentials_stored(dev_client):
+    mailbox_id = _create_gmail_mailbox(dev_client)
+    r = dev_client.post(f"/internal/mailboxes/{mailbox_id}/gmail/test", json={"actor_type": "USER", "actor_id": ACTOR_ID})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is False
+    assert "checked_at" in body
+
+
+def test_gmail_test_endpoint_succeeds_for_a_connected_mailbox(dev_client):
+    mailbox_id = _create_gmail_mailbox(dev_client)
+    _connect_and_complete(dev_client, mailbox_id, email="mgs241171@gmail.com")
+    comp = get_composition()
+    comp.gmail_client.queue_profile_result(GmailIdentityResult(status=GmailOutcomeStatus.OK, identity=GmailIdentity(email="mgs241171@gmail.com")))
+    r = dev_client.post(f"/internal/mailboxes/{mailbox_id}/gmail/test", json={"actor_type": "USER", "actor_id": ACTOR_ID})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is True
+    assert "mgs241171@gmail.com" in body["detail"]
+
+
+def test_gmail_test_endpoint_reports_auth_error_without_mutating_connection_state_or_token(dev_client):
+    mailbox_id = _create_gmail_mailbox(dev_client)
+    _connect_and_complete(dev_client, mailbox_id, email="mgs241171@gmail.com")
+    comp = get_composition()
+    stored_before = comp.gmail_token_store.read(mailbox_id)
+
+    comp.gmail_client.queue_profile_result(GmailIdentityResult(status=GmailOutcomeStatus.AUTH_ERROR, error_detail="token rejected"))
+    r = dev_client.post(f"/internal/mailboxes/{mailbox_id}/gmail/test", json={"actor_type": "USER", "actor_id": ACTOR_ID})
+    assert r.json()["ok"] is False
+
+    mailbox = dev_client.get(f"/internal/mailboxes/{mailbox_id}").json()
+    assert mailbox["connection_state"] == "CONNECTED"
+    assert comp.gmail_token_store.read(mailbox_id).access_token == stored_before.access_token
+
+
+def test_gmail_test_endpoint_has_no_side_effects_on_sweep_needs_you_or_domain_rules(dev_client):
+    mailbox_id = _create_gmail_mailbox(dev_client)
+    _connect_and_complete(dev_client, mailbox_id, email="mgs241171@gmail.com")
+    comp = get_composition()
+
+    runs_before = comp.mailbox_sweep_run_repository.list_runs(mailbox_id=mailbox_id)
+    rules_before = comp.mailbox_domain_rule_repository.list_rules(mailbox_id=mailbox_id)
+    needs_you_before = comp.needs_you_repository.list_needs_you_items(item_type="MAILBOX_DOMAIN_REVIEW")
+    messages_before = comp.mailbox_message_repository.list_messages(mailbox_id=mailbox_id)
+
+    comp.gmail_client.queue_profile_result(GmailIdentityResult(status=GmailOutcomeStatus.OK, identity=GmailIdentity(email="mgs241171@gmail.com")))
+    r = dev_client.post(f"/internal/mailboxes/{mailbox_id}/gmail/test", json={"actor_type": "USER", "actor_id": ACTOR_ID})
+    assert r.status_code == 200
+
+    assert comp.mailbox_sweep_run_repository.list_runs(mailbox_id=mailbox_id) == runs_before
+    assert comp.mailbox_domain_rule_repository.list_rules(mailbox_id=mailbox_id) == rules_before
+    assert comp.needs_you_repository.list_needs_you_items(item_type="MAILBOX_DOMAIN_REVIEW") == needs_you_before
+    assert comp.mailbox_message_repository.list_messages(mailbox_id=mailbox_id) == messages_before
+
+
+def test_gmail_test_endpoint_rejects_a_non_gmail_mailbox(dev_client):
+    r = dev_client.post(
+        "/internal/mailboxes",
+        json={
+            "display_name": "Matt Infosecurs", "email_address": "matt-nongmail@infosecurs.com", "provider_kind": "MICROSOFT_GRAPH",
+            "actor_type": "USER", "actor_id": ACTOR_ID,
+        },
+    )
+    mailbox_id = r.json()["mailbox_id"]
+    response = dev_client.post(f"/internal/mailboxes/{mailbox_id}/gmail/test", json={"actor_type": "USER", "actor_id": ACTOR_ID})
+    assert response.status_code == 422
+
+
 def test_sweep_before_connect_is_a_conflict(dev_client):
     mailbox_id = _create_gmail_mailbox(dev_client)
     r = dev_client.post(f"/internal/mailboxes/{mailbox_id}/gmail/sweep", json={"actor_type": "USER", "actor_id": ACTOR_ID})
