@@ -75,11 +75,16 @@ from pydantic import BaseModel
 
 from app.api.composition import ensure_seed_entities, get_composition, get_mailbox_source_id
 from core.errors import ConflictError, NotFoundError, ValidationError
+from core.timestamps import to_contract_string, utc_now
 from services.mailbox.domain_rule import MATCH_MODE_EXACT
 from services.mailbox.imap.imap_client import ImapOutcomeStatus
 from services.mailbox.lock import MailboxSweepLockError
 from services.mailbox.mailbox import PROVIDER_IMAP
-from services.mailbox.review_resolution import resolve_domain_review, resolve_security_review
+from services.mailbox.review_resolution import (
+    list_mailbox_needs_you_items,
+    resolve_domain_review,
+    resolve_security_review,
+)
 from services.mailbox.sweep import run_sweep
 from services.mailbox.sweep_run import TRIGGER_MANUAL
 from services.needs_you.needs_you import (
@@ -201,6 +206,60 @@ async def disconnect_imap(mailbox_id: str, payload: DisconnectImapRequest) -> di
     return updated.to_dict()
 
 
+class TestImapMailboxRequest(BaseModel):
+    actor_type: str
+    actor_id: str
+
+
+@router.post("/{mailbox_id}/imap/test")
+async def test_imap_mailbox(mailbox_id: str, payload: TestImapMailboxRequest) -> dict[str, Any]:
+    """CD-6 mailbox-list GUI-completion WO — mirrors
+    `app/api/routers/mailboxes_microsoft.py::test_microsoft_mailbox`'s
+    own docstring/guarantees, using IMAP's own already-existing
+    non-destructive primitive: `ImapMailboxAdapter.attempt_login` (a
+    bare connect+login probe — no folder `EXAMINE`/`FETCH` of any kind —
+    that ALWAYS logs out immediately afterwards; see that method's own
+    docstring). Deliberately calls `attempt_login` directly rather than
+    `connect_imap`'s own `_apply_login_outcome` helper — that helper is
+    what mutates `connection_state` on the real "connect" action; this
+    endpoint never calls it, so a test here can never change
+    `connection_state`/`status`, exactly like the Microsoft/Gmail
+    siblings never refresh-and-possibly-mark-`AUTH_REQUIRED`."""
+    composition = get_composition()
+    _require_imap_mailbox(composition, mailbox_id)
+    checked_at = utc_now()
+
+    if not composition.imap_mailbox_adapter.is_configured():
+        ok = False
+        detail = (
+            "matt@noust.ai IMAP is not configured yet — no username/password found at "
+            "/opt/bagman/secrets/mail/noustai/."
+        )
+    else:
+        outcome = composition.imap_mailbox_adapter.attempt_login(mailbox_id)
+        if outcome.status == ImapOutcomeStatus.OK:
+            ok = True
+            detail = "IMAP login check succeeded."
+        elif outcome.status == ImapOutcomeStatus.AUTH_ERROR:
+            ok = False
+            detail = "IMAP rejected the stored credential (authentication error) — reconnect this mailbox."
+        else:
+            ok = False
+            detail = f"IMAP login check failed: {outcome.status.value}."
+
+    composition.api.record_audit_event(
+        event_type="MAILBOX_CONNECTION_TESTED",
+        actor_type=payload.actor_type,
+        actor_id=payload.actor_id,
+        subject_type="MailboxSource",
+        subject_id=mailbox_id,
+        correlation_id=mailbox_id,
+        causation_id=None,
+        payload={"mailbox_id": mailbox_id, "ok": ok},
+    )
+    return {"ok": ok, "checked_at": to_contract_string(checked_at), "detail": detail}
+
+
 @router.post("/{mailbox_id}/imap/sweep")
 async def sweep_imap(mailbox_id: str, payload: SweepImapRequest) -> dict[str, Any]:
     """Mirrors `mailboxes_microsoft.py::sweep_microsoft`'s own doctrine
@@ -305,13 +364,12 @@ async def list_imap_domain_rules(mailbox_id: str) -> dict[str, Any]:
 async def list_imap_domain_review_items(mailbox_id: str, status: str = "OPEN") -> dict[str, Any]:
     composition = get_composition()
     _require_imap_mailbox(composition, mailbox_id)
-    items = [
-        item
-        for item in composition.needs_you_repository.list_needs_you_items(
-            item_type=ITEM_TYPE_MAILBOX_DOMAIN_REVIEW, domain="MAILBOX", status=status
-        )
-        if item.metadata.get("mailbox_id") == mailbox_id
-    ]
+    items = list_mailbox_needs_you_items(
+        composition.needs_you_repository,
+        item_type=ITEM_TYPE_MAILBOX_DOMAIN_REVIEW,
+        mailbox_id=mailbox_id,
+        status=status,
+    )
     return {"mailbox_id": mailbox_id, "items": [i.to_dict() for i in items], "count": len(items)}
 
 
@@ -439,13 +497,12 @@ async def batch_resolve_imap_domain_review(
 async def list_imap_security_review_items(mailbox_id: str, status: str = "OPEN") -> dict[str, Any]:
     composition = get_composition()
     _require_imap_mailbox(composition, mailbox_id)
-    items = [
-        item
-        for item in composition.needs_you_repository.list_needs_you_items(
-            item_type=ITEM_TYPE_MAILBOX_AUTHENTICATION_ESCALATION, domain="MAILBOX", status=status
-        )
-        if item.metadata.get("mailbox_id") == mailbox_id
-    ]
+    items = list_mailbox_needs_you_items(
+        composition.needs_you_repository,
+        item_type=ITEM_TYPE_MAILBOX_AUTHENTICATION_ESCALATION,
+        mailbox_id=mailbox_id,
+        status=status,
+    )
     return {"mailbox_id": mailbox_id, "items": [i.to_dict() for i in items], "count": len(items)}
 
 

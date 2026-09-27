@@ -555,3 +555,74 @@ def test_concurrent_first_observation_of_the_same_message_never_raises_persisten
     all_rows = final_repo.list_messages(mailbox_id=mailbox_id)
     matching = [m for m in all_rows if m.immutable_provider_message_id == "race-msg-1"]
     assert len(matching) == 1
+
+
+# ---------------------------------------------------------------------
+# CD-6 mailbox-list GUI-completion WO —
+# `count_discovery_candidates` (the `relevant_message_count` field on
+# `GET /internal/mailboxes`). Real PostgreSQL, a realistic multi-
+# hundred-row fixture, and a structural proof this is a real
+# `SELECT COUNT(*)` — never `len(list_messages(...))` — so a regression
+# back to a full-row fetch is structurally impossible to miss.
+# ---------------------------------------------------------------------
+
+
+def _observe_with_candidate_flag(repo, *, mailbox_id, msg_id, discovery_candidate):
+    return repo.record_observation(
+        mailbox_id=mailbox_id,
+        provider_kind="MICROSOFT_GRAPH",
+        immutable_provider_message_id=msg_id,
+        internet_message_id=f"<{msg_id}@b>",
+        observed_folder=FOLDER_INBOX,
+        subject="Invoice",
+        sender_address="billing@vendor.com",
+        sender_display_name="Vendor",
+        received_at=datetime.now(timezone.utc),
+        has_attachments=False,
+        ingestion_status=INGESTION_STATUS_INGESTED if discovery_candidate else "CHECKED_NOT_CANDIDATE",
+        sender_domain="vendor.com",
+        discovery_candidate=discovery_candidate,
+    )
+
+
+def test_count_discovery_candidates_is_a_real_count_against_a_multi_hundred_row_fixture():
+    """A realistic multi-hundred-row fixture (proportionate to a real
+    production mailbox carrying tens of thousands of rows) — 300
+    candidate rows, 250 non-candidate rows, and 50 rows belonging to a
+    DIFFERENT mailbox, all in the SAME table. The count must be exactly
+    right despite the volume and the mixed `discovery_candidate`
+    values/mailbox scoping."""
+    repo = PostgresMailboxMessageRepository()
+    mailbox_id = _mailbox_id()
+    other_mailbox_id = _mailbox_id()
+
+    for i in range(300):
+        _observe_with_candidate_flag(repo, mailbox_id=mailbox_id, msg_id=f"candidate-{i}", discovery_candidate=True)
+    for i in range(250):
+        _observe_with_candidate_flag(repo, mailbox_id=mailbox_id, msg_id=f"non-candidate-{i}", discovery_candidate=False)
+    for i in range(50):
+        _observe_with_candidate_flag(repo, mailbox_id=other_mailbox_id, msg_id=f"other-{i}", discovery_candidate=True)
+
+    assert repo.count_discovery_candidates(mailbox_id=mailbox_id) == 300
+    assert repo.count_discovery_candidates(mailbox_id=other_mailbox_id) == 50
+
+
+def test_count_discovery_candidates_never_calls_list_messages_or_list_candidate_messages_for_domain(monkeypatch):
+    """Structural proof, not just a behavioural one: a
+    `len(list_messages(...))`-style regression would be structurally
+    impossible to reintroduce without this test catching it — both
+    full-row-fetching methods are patched to raise, and the count is
+    still proven correct against a real (smaller, since this test's
+    only job is the structural proof) fixture."""
+    repo = PostgresMailboxMessageRepository()
+    mailbox_id = _mailbox_id()
+    for i in range(5):
+        _observe_with_candidate_flag(repo, mailbox_id=mailbox_id, msg_id=f"c-{i}", discovery_candidate=True)
+
+    def _boom(*args, **kwargs):
+        raise AssertionError("count_discovery_candidates must never fetch full rows to compute a count")
+
+    monkeypatch.setattr(PostgresMailboxMessageRepository, "list_messages", _boom)
+    monkeypatch.setattr(PostgresMailboxMessageRepository, "list_candidate_messages_for_domain", _boom)
+
+    assert repo.count_discovery_candidates(mailbox_id=mailbox_id) == 5

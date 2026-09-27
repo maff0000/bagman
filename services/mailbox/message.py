@@ -353,6 +353,33 @@ class MailboxMessageRepository(abc.ABC):
         raise NotImplementedError
 
     @abc.abstractmethod
+    def count_discovery_candidates(self, *, mailbox_id: str) -> int:
+        """CD-6 mailbox-list GUI-completion WO — a cheap, COUNT-only
+        query: how many ``MailboxMessage`` rows for ``mailbox_id`` have
+        ``discovery_candidate is True`` (the literal boolean ``True`` —
+        the SAME "was actually identified as a credible financial-
+        document candidate" gate :meth:`list_candidate_messages_for_domain`
+        already establishes, but WITHOUT that method's own domain/
+        eligibility/final-status filters — this is a whole-mailbox,
+        any-current-status "how many messages here were ever judged
+        relevant" figure for the GUI's mailbox-list
+        ``relevant_message_count`` column, not a reprocessing-eligibility
+        query).
+
+        Deliberately COUNT-only at the persistence layer — never
+        ``len(self.list_messages(...))``/
+        ``len(self.list_candidate_messages_for_domain(...))``. A real
+        mailbox can accumulate tens of thousands of message rows (25,000+
+        in production); fetching every full row just to discard them and
+        keep a count would be a genuine, avoidable performance
+        regression the GUI-list endpoint would otherwise pay on every
+        single call. See
+        :class:`persistence.postgres.mailbox_message_repository
+        .PostgresMailboxMessageRepository`'s own implementation for the
+        real ``SELECT COUNT(*)`` this requires."""
+        raise NotImplementedError
+
+    @abc.abstractmethod
     def list_candidate_messages_for_domain(
         self, *, mailbox_id: str, sender_domain: str, include_subdomains: bool = False
     ) -> list[MailboxMessage]:
@@ -600,6 +627,13 @@ class InMemoryMailboxMessageRepository(MailboxMessageRepository):
         if limit is None:
             return items[offset:]
         return items[offset : offset + limit]
+
+    def count_discovery_candidates(self, *, mailbox_id: str) -> int:
+        return sum(
+            1
+            for m in self._by_id.values()
+            if m.mailbox_id == mailbox_id and m.discovery_candidate is True
+        )
 
     def list_candidate_messages_for_domain(
         self, *, mailbox_id: str, sender_domain: str, include_subdomains: bool = False

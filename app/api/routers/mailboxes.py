@@ -91,6 +91,7 @@ from services.mailbox.domain_rule import (
     validate_and_normalize_sender_address,
     validate_and_normalize_subject_predicate,
 )
+from services.mailbox.review_resolution import count_needs_review_items_for_mailbox
 
 router = APIRouter(prefix="/internal/mailboxes")
 
@@ -168,11 +169,68 @@ async def create_mailbox(payload: CreateMailboxRequest) -> dict[str, Any]:
     return mailbox.to_dict()
 
 
+def _last_sweep_status(composition, mailbox_id: str) -> Optional[dict[str, Any]]:
+    """CD-6 mailbox-list GUI-completion WO — a lightweight "what happened
+    last time" projection of the single most recent
+    ``MailboxSweepRun`` for one mailbox (never the heavier, full
+    ``GET /{mailbox_id}/{provider}/sweeps`` list this list endpoint would
+    otherwise have to fetch and truncate itself). ``None`` when a
+    mailbox has never had a sweep run at all (the ordinary state for a
+    freshly-created or never-connected mailbox) — never fabricated."""
+    recent_runs = composition.mailbox_sweep_run_repository.list_runs(mailbox_id=mailbox_id, limit=1)
+    if not recent_runs:
+        return None
+    run = recent_runs[0]
+    run_dict = run.to_dict()
+    return {
+        "sweep_run_id": run.sweep_run_id,
+        "status": run.status,
+        "messages_seen": run.messages_seen,
+        "started_at": run_dict["started_at"],
+        "completed_at": run_dict["completed_at"],
+        "error_code": run.error_code,
+    }
+
+
 @router.get("")
 async def list_mailboxes() -> dict[str, Any]:
+    """List every mailbox definition — extended (CD-6 mailbox-list
+    GUI-completion WO) with three GUI-list-only, computed-fresh-on-every-
+    call fields that are NOT part of ``MailboxSource`` itself and are
+    NEVER persisted:
+
+    * ``relevant_message_count`` — a cheap COUNT-only query (see
+      ``services.mailbox.message.MailboxMessageRepository
+      .count_discovery_candidates``'s own docstring for why this must
+      never be a full-row fetch-then-``len()``).
+    * ``needs_review_count`` — the sum of this mailbox's own OPEN
+      ``MAILBOX_DOMAIN_REVIEW``/``MAILBOX_AUTHENTICATION_ESCALATION``
+      Needs You items (see
+      ``services.mailbox.review_resolution.count_needs_review_items_for_mailbox``),
+      accurate for all three providers including IMAP (which has no
+      domain-review GUI PAGE yet — a separate, disclosed gap; the count
+      itself is unaffected).
+    * ``last_sweep_status`` — see :func:`_last_sweep_status` above.
+
+    ``last_error_code``/``last_error_detail`` need no such treatment —
+    they are already real, always-present fields on ``MailboxSource``
+    itself (see ``services/mailbox/mailbox.py``), simply never rendered
+    by the GUI before this WO.
+    """
     composition = get_composition()
     items = composition.mailbox_source_repository.list_mailboxes()
-    return {"items": [m.to_dict() for m in items], "count": len(items)}
+    enriched_items = []
+    for mailbox in items:
+        item_dict = mailbox.to_dict()
+        item_dict["relevant_message_count"] = composition.mailbox_message_repository.count_discovery_candidates(
+            mailbox_id=mailbox.mailbox_id
+        )
+        item_dict["needs_review_count"] = count_needs_review_items_for_mailbox(
+            composition.needs_you_repository, mailbox_id=mailbox.mailbox_id
+        )
+        item_dict["last_sweep_status"] = _last_sweep_status(composition, mailbox.mailbox_id)
+        enriched_items.append(item_dict)
+    return {"items": enriched_items, "count": len(enriched_items)}
 
 
 @router.get("/{mailbox_id}")

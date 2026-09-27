@@ -280,6 +280,131 @@ def test_disconnect_returns_to_not_configured_and_deletes_tokens(dev_client):
 
 
 # ---------------------------------------------------------------------
+# CD-6 mailbox-list GUI-completion WO — the "Test" connection action
+# (POST /{mailbox_id}/microsoft/test). A pure, read-only, non-
+# destructive identity check — see
+# app/api/routers/mailboxes_microsoft.py::test_microsoft_mailbox's own
+# docstring for the full guarantee this suite proves.
+# ---------------------------------------------------------------------
+
+
+def test_test_endpoint_reports_not_connected_when_no_credentials_stored(dev_client):
+    mailbox_id = _create_mailbox(dev_client)
+    r = dev_client.post(f"/internal/mailboxes/{mailbox_id}/microsoft/test", json={"actor_type": "USER", "actor_id": ACTOR_ID})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is False
+    assert "never" in body["detail"].lower() or "no stored" in body["detail"].lower()
+    assert "checked_at" in body
+
+
+def test_test_endpoint_succeeds_for_a_connected_mailbox(dev_client):
+    mailbox_id = _create_mailbox(dev_client)
+    _connect_and_complete(dev_client, mailbox_id)
+    comp = get_composition()
+    comp.microsoft_oauth_client.queue_me_result(
+        MicrosoftIdentityResult(
+            status=GraphOutcomeStatus.OK,
+            identity=MicrosoftIdentity(mail="matt@infosecurs.com", user_principal_name="matt@infosecurs.com"),
+        )
+    )
+    r = dev_client.post(f"/internal/mailboxes/{mailbox_id}/microsoft/test", json={"actor_type": "USER", "actor_id": ACTOR_ID})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is True
+    assert "matt@infosecurs.com" in body["detail"]
+
+
+def test_test_endpoint_reports_auth_error_without_mutating_connection_state_or_token(dev_client):
+    """A failed test must be honestly reported, but must NEVER refresh
+    the stored token or mutate `connection_state` — see the endpoint's
+    own docstring for why this deliberately never calls
+    `MicrosoftGraphMailboxAdapter._ensure_fresh_access_token`."""
+    mailbox_id = _create_mailbox(dev_client)
+    _connect_and_complete(dev_client, mailbox_id)
+    comp = get_composition()
+    stored_before = comp.microsoft_token_store.read(mailbox_id)
+
+    comp.microsoft_oauth_client.queue_me_result(
+        MicrosoftIdentityResult(status=GraphOutcomeStatus.AUTH_ERROR, error_detail="token rejected")
+    )
+    r = dev_client.post(f"/internal/mailboxes/{mailbox_id}/microsoft/test", json={"actor_type": "USER", "actor_id": ACTOR_ID})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is False
+
+    mailbox = dev_client.get(f"/internal/mailboxes/{mailbox_id}").json()
+    assert mailbox["connection_state"] == "CONNECTED"  # unchanged — never demoted to AUTH_REQUIRED
+    stored_after = comp.microsoft_token_store.read(mailbox_id)
+    assert stored_after.access_token == stored_before.access_token  # never refreshed
+
+
+def test_test_endpoint_never_returns_the_raw_access_token(dev_client):
+    mailbox_id = _create_mailbox(dev_client)
+    _connect_and_complete(dev_client, mailbox_id)
+    comp = get_composition()
+    stored = comp.microsoft_token_store.read(mailbox_id)
+    comp.microsoft_oauth_client.queue_me_result(
+        MicrosoftIdentityResult(status=GraphOutcomeStatus.OK, identity=MicrosoftIdentity(mail="matt@infosecurs.com", user_principal_name="matt@infosecurs.com"))
+    )
+    r = dev_client.post(f"/internal/mailboxes/{mailbox_id}/microsoft/test", json={"actor_type": "USER", "actor_id": ACTOR_ID})
+    assert stored.access_token not in r.text
+
+
+def test_test_endpoint_has_no_side_effects_on_sweep_needs_you_or_domain_rules(dev_client):
+    """Structural proof: this action must never sweep, ingest, create a
+    Needs You item, or touch a MailboxDomainRule — every durable
+    collection this mailbox could affect is asserted byte-identical
+    before and after the call (beyond the audit event this endpoint
+    itself is documented to emit)."""
+    mailbox_id = _create_mailbox(dev_client)
+    _connect_and_complete(dev_client, mailbox_id)
+    comp = get_composition()
+
+    runs_before = comp.mailbox_sweep_run_repository.list_runs(mailbox_id=mailbox_id)
+    rules_before = comp.mailbox_domain_rule_repository.list_rules(mailbox_id=mailbox_id)
+    needs_you_before = comp.needs_you_repository.list_needs_you_items(item_type="MAILBOX_DOMAIN_REVIEW")
+    messages_before = comp.mailbox_message_repository.list_messages(mailbox_id=mailbox_id)
+
+    comp.microsoft_oauth_client.queue_me_result(
+        MicrosoftIdentityResult(status=GraphOutcomeStatus.OK, identity=MicrosoftIdentity(mail="matt@infosecurs.com", user_principal_name="matt@infosecurs.com"))
+    )
+    r = dev_client.post(f"/internal/mailboxes/{mailbox_id}/microsoft/test", json={"actor_type": "USER", "actor_id": ACTOR_ID})
+    assert r.status_code == 200
+
+    assert comp.mailbox_sweep_run_repository.list_runs(mailbox_id=mailbox_id) == runs_before
+    assert comp.mailbox_domain_rule_repository.list_rules(mailbox_id=mailbox_id) == rules_before
+    assert comp.needs_you_repository.list_needs_you_items(item_type="MAILBOX_DOMAIN_REVIEW") == needs_you_before
+    assert comp.mailbox_message_repository.list_messages(mailbox_id=mailbox_id) == messages_before
+
+
+def test_test_endpoint_rejects_a_non_microsoft_mailbox(dev_client):
+    mailbox_id = _create_mailbox(dev_client, provider_kind="IMAP", email="ops@noustai.com")
+    r = dev_client.post(f"/internal/mailboxes/{mailbox_id}/microsoft/test", json={"actor_type": "USER", "actor_id": ACTOR_ID})
+    assert r.status_code == 422
+
+
+def test_test_endpoint_emits_exactly_one_mailbox_connection_tested_audit_event(dev_client):
+    """Every mutation-adjacent action in this router emits a real audit
+    event (module docstring) — proven here the same way
+    `tests/app_api/test_mailbox_endpoints.py::test_every_mutation_is_audited`
+    already proves it for the plain lifecycle actions: exactly one
+    `MAILBOX_CONNECTION_TESTED` event, scoped to this mailbox, with no
+    secret-shaped content in its payload."""
+    mailbox_id = _create_mailbox(dev_client)
+    comp = get_composition()
+    r = dev_client.post(f"/internal/mailboxes/{mailbox_id}/microsoft/test", json={"actor_type": "USER", "actor_id": ACTOR_ID})
+    assert r.status_code == 200
+
+    events = comp.api.audit_repository.list_recent(limit=50, event_type_prefix="MAILBOX_CONNECTION_TESTED")
+    matching = [e for e in events if e.subject_id == mailbox_id]
+    assert len(matching) == 1
+    payload_text = str(matching[0].payload).lower()
+    for forbidden in ("password", "secret", "token", "credential", "api_key", "private_key"):
+        assert forbidden not in payload_text
+
+
+# ---------------------------------------------------------------------
 # sweep
 # ---------------------------------------------------------------------
 

@@ -19,6 +19,8 @@ export const MAILBOX_API = {
   microsoftDisconnect: (mailboxId) => `/internal/mailboxes/${encodeURIComponent(mailboxId)}/microsoft/disconnect`,
   microsoftSweep: (mailboxId) => `/internal/mailboxes/${encodeURIComponent(mailboxId)}/microsoft/sweep`,
   microsoftSweeps: (mailboxId) => `/internal/mailboxes/${encodeURIComponent(mailboxId)}/microsoft/sweeps`,
+  //: CD-6 mailbox-list GUI-completion WO — the "Test" connection action.
+  microsoftTest: (mailboxId) => `/internal/mailboxes/${encodeURIComponent(mailboxId)}/microsoft/test`,
   microsoftMessages: (mailboxId) => `/internal/mailboxes/${encodeURIComponent(mailboxId)}/microsoft/messages`,
   //: CD-6 GUI-operations-foundation WO — the domain-review batch-triage
   //: surface (services.xero.supplier_correlation-assisted review of the
@@ -66,6 +68,7 @@ export const MAILBOX_API = {
   imapDisconnect: (mailboxId) => `/internal/mailboxes/${encodeURIComponent(mailboxId)}/imap/disconnect`,
   imapSweep: (mailboxId) => `/internal/mailboxes/${encodeURIComponent(mailboxId)}/imap/sweep`,
   imapSweeps: (mailboxId) => `/internal/mailboxes/${encodeURIComponent(mailboxId)}/imap/sweeps`,
+  imapTest: (mailboxId) => `/internal/mailboxes/${encodeURIComponent(mailboxId)}/imap/test`,
   imapMessages: (mailboxId) => `/internal/mailboxes/${encodeURIComponent(mailboxId)}/imap/messages`,
   imapDomainRules: (mailboxId) => `/internal/mailboxes/${encodeURIComponent(mailboxId)}/imap/domain-rules`,
   imapDomainReview: (mailboxId) => `/internal/mailboxes/${encodeURIComponent(mailboxId)}/imap/domain-review`,
@@ -86,6 +89,7 @@ export const MAILBOX_API = {
   gmailDisconnect: (mailboxId) => `/internal/mailboxes/${encodeURIComponent(mailboxId)}/gmail/disconnect`,
   gmailSweep: (mailboxId) => `/internal/mailboxes/${encodeURIComponent(mailboxId)}/gmail/sweep`,
   gmailSweeps: (mailboxId) => `/internal/mailboxes/${encodeURIComponent(mailboxId)}/gmail/sweeps`,
+  gmailTest: (mailboxId) => `/internal/mailboxes/${encodeURIComponent(mailboxId)}/gmail/test`,
   gmailMessages: (mailboxId) => `/internal/mailboxes/${encodeURIComponent(mailboxId)}/gmail/messages`,
   gmailDomainRules: (mailboxId) => `/internal/mailboxes/${encodeURIComponent(mailboxId)}/gmail/domain-rules`,
   gmailDomainReview: (mailboxId) => `/internal/mailboxes/${encodeURIComponent(mailboxId)}/gmail/domain-review`,
@@ -163,6 +167,14 @@ export function listMicrosoftSweeps(mailboxId) {
   return apiGet(MAILBOX_API.microsoftSweeps(mailboxId));
 }
 
+/** CD-6 mailbox-list GUI-completion WO — the "Test" connection action.
+ * A pure, read-only identity check (see
+ * `app/api/routers/mailboxes_microsoft.py::test_microsoft_mailbox`'s
+ * own docstring) — never sweeps, never mutates `connection_state`. */
+export function testMicrosoftMailbox(mailboxId, actorId) {
+  return apiPost(MAILBOX_API.microsoftTest(mailboxId), { actor_type: "USER", actor_id: actorId });
+}
+
 export function listMicrosoftMessages(mailboxId) {
   return apiGet(MAILBOX_API.microsoftMessages(mailboxId));
 }
@@ -215,12 +227,18 @@ export function runXeroCorrelation(mailboxId, { entityId, actorId }) {
  * this rule to one specific, OBSERVED sender address rather than the
  * whole domain. The server independently re-validates it was actually
  * observed for this mailbox — this wrapper never second-guesses that. */
-export function resolveMailboxDomainReviewItem(
-  mailboxId,
-  itemId,
+/** The shared request-body shape every provider's domain-review
+ * single-item resolve endpoint accepts (identical across Microsoft/
+ * IMAP/Gmail — see `services/mailbox/review_resolution.py::resolve_domain_review`,
+ * the ONE provider-neutral implementation all three routers already
+ * delegate to). Factored out so `resolveMailboxDomainReviewItem`
+ * (Microsoft) and its IMAP/Gmail siblings below never triple this
+ * body-building logic. */
+function _resolveDomainReviewItem(
+  url,
   { decision, destinationEntityId, destinationMode, matchMode, processorHint, senderAddress, actorId }
 ) {
-  return apiPost(MAILBOX_API.microsoftDomainReviewResolveOne(mailboxId, itemId), {
+  return apiPost(url, {
     actor_type: "USER",
     actor_id: actorId,
     decision,
@@ -230,6 +248,23 @@ export function resolveMailboxDomainReviewItem(
     processor_hint: processorHint || null,
     sender_address: senderAddress || null,
   });
+}
+
+export function resolveMailboxDomainReviewItem(mailboxId, itemId, opts) {
+  return _resolveDomainReviewItem(MAILBOX_API.microsoftDomainReviewResolveOne(mailboxId, itemId), opts);
+}
+
+//: CD-6 mailbox-list GUI-completion WO (per-message triage view, capability
+//: 4) — the new triage view works across all three providers (the
+//: backend endpoint already existed for IMAP/Gmail too; only the
+//: Microsoft-scoped GUI wrapper existed here before this WO).
+
+export function resolveImapDomainReviewItem(mailboxId, itemId, opts) {
+  return _resolveDomainReviewItem(MAILBOX_API.imapDomainReviewResolveOne(mailboxId, itemId), opts);
+}
+
+export function resolveGmailDomainReviewItem(mailboxId, itemId, opts) {
+  return _resolveDomainReviewItem(MAILBOX_API.gmailDomainReviewResolveOne(mailboxId, itemId), opts);
 }
 
 /** Batched version of `resolveMailboxDomainReviewItem` — `items` is an
@@ -268,12 +303,35 @@ export function listSecurityReviewItems(mailboxId, status) {
 /** `decision` is exactly `"PROCESS_THIS_MESSAGE_ONCE"` or
  * `"DO_NOT_PROCESS_THIS_MESSAGE"` — see the endpoint's own docstring for
  * exactly what each does. Never touches the governing `MailboxDomainRule`. */
-export function resolveSecurityReviewItem(mailboxId, itemId, { decision, actorId }) {
-  return apiPost(MAILBOX_API.microsoftSecurityReviewResolveOne(mailboxId, itemId), {
-    actor_type: "USER",
-    actor_id: actorId,
-    decision,
-  });
+function _resolveSecurityReviewItem(url, { decision, actorId }) {
+  return apiPost(url, { actor_type: "USER", actor_id: actorId, decision });
+}
+
+export function resolveSecurityReviewItem(mailboxId, itemId, opts) {
+  return _resolveSecurityReviewItem(MAILBOX_API.microsoftSecurityReviewResolveOne(mailboxId, itemId), opts);
+}
+
+//: CD-6 mailbox-list GUI-completion WO (per-message triage view) — IMAP/
+//: Gmail security-review list+resolve wrappers; the backend endpoints
+//: already existed for both providers (mirrors Microsoft's own shape
+//: exactly), only the GUI-side wrapper was missing.
+
+export function listImapSecurityReviewItems(mailboxId, status) {
+  const suffix = status ? `?status=${encodeURIComponent(status)}` : "";
+  return apiGet(`${MAILBOX_API.imapSecurityReview(mailboxId)}${suffix}`);
+}
+
+export function resolveImapSecurityReviewItem(mailboxId, itemId, opts) {
+  return _resolveSecurityReviewItem(MAILBOX_API.imapSecurityReviewResolveOne(mailboxId, itemId), opts);
+}
+
+export function listGmailSecurityReviewItems(mailboxId, status) {
+  const suffix = status ? `?status=${encodeURIComponent(status)}` : "";
+  return apiGet(`${MAILBOX_API.gmailSecurityReview(mailboxId)}${suffix}`);
+}
+
+export function resolveGmailSecurityReviewItem(mailboxId, itemId, opts) {
+  return _resolveSecurityReviewItem(MAILBOX_API.gmailSecurityReviewResolveOne(mailboxId, itemId), opts);
 }
 
 //: CD-6 policy-rules-endpoint WO.
@@ -333,6 +391,14 @@ export function listImapMessages(mailboxId) {
   return apiGet(MAILBOX_API.imapMessages(mailboxId));
 }
 
+/** CD-6 mailbox-list GUI-completion WO — mirrors
+ * `testMicrosoftMailbox`'s own doctrine exactly, against IMAP's own
+ * `/imap/test` endpoint (a bare connect+login probe, always logging out
+ * immediately — see `app/api/routers/mailboxes_imap.py::test_imap_mailbox`). */
+export function testImapMailbox(mailboxId, actorId) {
+  return apiPost(MAILBOX_API.imapTest(mailboxId), { actor_type: "USER", actor_id: actorId });
+}
+
 export function listImapDomainReviewItems(mailboxId, status) {
   const suffix = status ? `?status=${encodeURIComponent(status)}` : "";
   return apiGet(`${MAILBOX_API.imapDomainReview(mailboxId)}${suffix}`);
@@ -365,6 +431,12 @@ export function listGmailSweeps(mailboxId) {
 
 export function listGmailMessages(mailboxId) {
   return apiGet(MAILBOX_API.gmailMessages(mailboxId));
+}
+
+/** CD-6 mailbox-list GUI-completion WO — mirrors `testMicrosoftMailbox`'s
+ * own doctrine exactly, against Gmail's own `/gmail/test` endpoint. */
+export function testGmailMailbox(mailboxId, actorId) {
+  return apiPost(MAILBOX_API.gmailTest(mailboxId), { actor_type: "USER", actor_id: actorId });
 }
 
 export function listGmailDomainReviewItems(mailboxId, status) {

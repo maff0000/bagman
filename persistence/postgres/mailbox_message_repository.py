@@ -293,6 +293,26 @@ class PostgresMailboxMessageRepository(MailboxMessageRepository):
         except SQLAlchemyError as exc:
             raise PersistenceError(f"could not list MailboxMessage rows: {exc}") from exc
 
+    def count_discovery_candidates(self, *, mailbox_id: str) -> int:
+        """A real ``SELECT COUNT(*) ... WHERE mailbox_id = ? AND
+        discovery_candidate = true`` — never a full-row fetch (see the
+        abstract method's own docstring for why this matters at real
+        production scale). Uses ``func.count()`` against the primary-key
+        column so the database itself performs the aggregation; no row
+        is ever materialised into a domain object here."""
+        try:
+            with session_scope(self._engine) as session:
+                return (
+                    session.query(func.count(MailboxMessageRow.mailbox_message_id))
+                    .filter(
+                        MailboxMessageRow.mailbox_id == mailbox_id,
+                        MailboxMessageRow.discovery_candidate.is_(True),
+                    )
+                    .scalar()
+                ) or 0
+        except SQLAlchemyError as exc:
+            raise PersistenceError(f"could not count discovery-candidate MailboxMessage rows: {exc}") from exc
+
     def list_candidate_messages_for_domain(
         self, *, mailbox_id: str, sender_domain: str, include_subdomains: bool = False
     ) -> list[MailboxMessage]:
