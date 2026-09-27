@@ -46,7 +46,7 @@ import abc
 import dataclasses
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Mapping, Optional, Sequence
+from typing import Any, Mapping, Optional, Sequence
 
 from core import identity
 from core.contract_validation import validate_against_contract
@@ -123,6 +123,39 @@ class SweepFailureReason:
 STALE_RUNNING_THRESHOLD_SECONDS: float = DEFAULT_LEASE_DURATION_SECONDS * 2
 
 
+def _folder_entry_to_dict(entry: Any) -> dict:
+    """Mailbox Operations GUI-completion WO — a real, pre-existing
+    production defect found and fixed while live-verifying the new
+    "Email Activity" view (PID §104.6's own scope; not a data/schema
+    defect this WO's own `folders_attempted` doctrine introduced):
+    `MailboxSweepRun.folders_attempted` was, before the CD-6 architect
+    amendment ("recursive folder discovery"), a plain list of bare
+    folder-name STRINGS (e.g. `["INBOX"]`) rather than today's
+    `{"folder_id": ..., "display_name": ...}` mapping shape. Two real
+    production `MailboxSweepRun` rows created before that amendment
+    still carry the OLD string shape — `to_dict()`'s previous
+    `dict(f)` call crashed on them (`ValueError: dictionary update
+    sequence element #0 has length 1; 2 is required` — Python's
+    `dict()` iterating a plain string character-by-character), a crash
+    only ever reachable by actually reading one of these two specific
+    historical rows through `.to_dict()`, which no live code path did
+    until this WO's new "Email Activity" view called the pre-existing
+    `GET .../sweeps` endpoint against them for the first time.
+
+    Fix: accept BOTH shapes. A genuine mapping is copied through
+    unchanged (`dict(entry)`, the original, still-correct behaviour for
+    every row created after the amendment). A bare string (the old
+    shape) is normalised into today's shape using the SAME value for
+    both `folder_id`/`display_name` — an honest, lossless
+    representation of what the old data actually recorded (a folder
+    name alone, with no separate canonical id ever captured), never a
+    fabricated value. This is a read-only serialisation fix — no
+    historical row is ever rewritten in the database."""
+    if isinstance(entry, str):
+        return {"folder_id": entry, "display_name": entry}
+    return dict(entry)
+
+
 @dataclass(frozen=True)
 class MailboxSweepRun:
     sweep_run_id: str
@@ -167,7 +200,7 @@ class MailboxSweepRun:
             "status": self.status,
             "started_at": to_contract_string(self.started_at),
             "completed_at": to_contract_string(self.completed_at) if self.completed_at is not None else None,
-            "folders_attempted": [dict(f) for f in self.folders_attempted],
+            "folders_attempted": [_folder_entry_to_dict(f) for f in self.folders_attempted],
             "messages_seen": self.messages_seen,
             "messages_new": self.messages_new,
             "evidence_created": self.evidence_created,
