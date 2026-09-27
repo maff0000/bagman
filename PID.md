@@ -2264,3 +2264,69 @@ Minimal, non-destructive smoke verification performed live, all confirmed GREEN:
 ## 105.5 Verdict
 
 **CLOSED GREEN.** Both the PL's own independent review and the fresh independent Auditor's `MAILBOX_GUI_COMPLETION_GREEN` verdict stand. One genuine, pre-existing production defect was found, fixed, tested, and deployed in-band as part of this same closure (§105.3) — reported transparently, not concealed. Two live, real operational findings (Microsoft and Gmail mailbox credentials both currently appear to need reconnection) are flagged for Matt's own attention as a separate matter. The §104.6 rule-engine condition expansion remains untouched and unstarted, reserved for a separate future work order.
+
+---
+
+# 106. OAuth Recovery Diagnostic + Test-Action False-Alarm Fix (2026-09-27)
+
+## 106.1 Scope
+
+Architect-authorised bounded operational-recovery task, opened directly off §105.4's two flagged findings (Microsoft/Gmail Test actions reporting `ok:false`/"reconnect required"). Objective: determine the true root cause — without assuming re-consent was needed — and restore working OAuth connectivity if the failure proved to be safely repairable within existing authorised configuration/code.
+
+## 106.2 Diagnosis
+
+Read-only checks first: all 3 OAuth-backed mailboxes' token files present, correctly permissioned (`0600`/`0700`), not missing. Non-secret `expires_at` metadata showed all 3 access tokens genuinely expired (short-lived by design, after several days of idle time) — proving nothing on its own about refresh-token validity.
+
+Key insight: the §105 "Test" action was deliberately built non-mutating — it reads the raw stored access token and never refreshes, specifically so the action itself could never trigger a write. That design choice means an ordinary, harmless, expected access-token expiry is structurally indistinguishable from a genuinely dead refresh token when judged by Test's own output alone.
+
+Architect authorised a narrowly-scoped diagnostic: invoke each provider adapter's own existing, already-governed `_ensure_fresh_access_token` (never a new refresh mechanism) directly, with all credential material redacted from every diagnostic output. Result, live against real production credentials:
+
+- **Microsoft** (Infosecurs): access token expired since 2026-09-19T09:40:47Z; refresh attempted → **succeeded**; new expiry 2026-09-27T16:03:56Z.
+- **Gmail** (matt.george.scott@gmail.com): expired since 2026-09-24T11:31:08Z; refresh → **succeeded**; new expiry 2026-09-27T15:41:43Z.
+- **Gmail** (mgs241171@gmail.com): expired since 2026-09-24T11:28:15Z; refresh → **succeeded**; new expiry 2026-09-27T15:41:43Z.
+
+All three refresh tokens are valid; no human re-consent was ever required for any of the three mailboxes. Re-invoking the real `/microsoft/test`/`/gmail/test` endpoints immediately after confirmed all three now report `ok:true`. Full before/after production reconciliation showed zero deltas (`MailboxSource=4`, `MailboxMessage=25056`, `MailboxSweepRun=9`, `MailboxDomainRule=32`, `NeedsYou 332/395`, `EvidenceItem=689`, `EvidenceClassification=18`); `connection_state` remained `CONNECTED` throughout (the Test action had never persisted its own read, confirming its non-mutating design held even for the false-alarm case).
+
+**This was never an OAuth credential incident.** No credential was ever revoked or invalid. §105.4's "reconnect required" finding was a false alarm produced entirely by the Test action's own design choice not to refresh before checking.
+
+## 106.3 Defect and fix
+
+The false alarm itself was ruled a real product defect, not acceptable for an operator-facing connection check: "can BAGMAN authenticate to and reach this mailbox using the credentials it normally uses in production" is the question Test should answer, and for OAuth-backed mailboxes that requires going through the same refresh path a real sweep already uses before concluding failure.
+
+**Fix** (branch `mailbox/test-action-refresh-fix`): added a one-line public pass-through `ensure_fresh_access_token(mailbox_id)` on both `MicrosoftGraphMailboxAdapter` and `GmailMailboxAdapter`, wrapping the existing private `_ensure_fresh_access_token` — no second refresh mechanism. Both `/microsoft/test` and `/gmail/test` routes now call this wrapper before the identity-check call, instead of reading the raw stored token directly.
+
+Behaviour, all confirmed by new regression tests:
+- Unexpired token → unchanged (no refresh call made; proven structurally — the fake OAuth clients raise `AssertionError` if `refresh()` is called with nothing queued).
+- Expired token + valid refresh → refresh runs through the existing governed path, new token persisted via the existing `token_store.write`, `ok:true`, no "reconnect" wording.
+- Expired token + refresh genuinely fails (revoked/invalid grant) → `ok:false`, reconnect/authentication wording, `connection_state → AUTH_REQUIRED` (the correct, already-governed transition — `mark_microsoft_auth_required` is only invoked on an *actual* refresh failure, never merely because the access token itself was expired; this was already true of the underlying adapter method and required no change).
+- Refresh succeeds but the subsequent identity check fails for an unrelated reason (e.g. transport error) → reported accurately, never collapsed into "reconnect required", no state mutation.
+- No sweep/message/domain-rule/Needs-You side effects in any path (proven by before/after repository-snapshot tests, mirroring §105's own discipline).
+- No access token, refresh token, or client secret ever appears in any response body or audit-event payload.
+- IMAP untouched (out of scope; no defect found there).
+
+10 new regression tests (5 per provider). Full suite: 2518 passed, 24 skipped, 0 failed (was 2508 before this delta); `gitleaks` clean. Independent Auditor (fresh context) confirmed all 8 architect-required behaviours against the actual code and re-ran the tests directly — verdict **GREEN**. PR #13 (`mailbox/test-action-refresh-fix`) merged to `main` manually by the architect at merge commit `670c11cbfff032d4c90fe7cc20bc59fcbd6d1d4b` — verified two-parent merge topology (parent 1: prior tip `9b2c837521e8e27c2c4653b6640d29f5f141b895`; parent 2: audited PR head `bc875b31c81fe3901fec813b6594928cfe10faf7`). Post-merge CI on the exact canonical merge SHA independently reconfirmed GREEN (`Security` workflow, `conclusion:success`) before any deployment proceeded.
+
+## 106.4 Canonical production deployment and verification (first pass, pre-manual-merge-confirmation)
+
+Canonical production image `bagman-api:main-670c11c` built and deployed — migration head unchanged, no new migration in this delta.
+
+Live verification (genuinely expired tokens, not synthetic — all 3 real access tokens had naturally expired again by the time of this check, ~30-40 minutes after the §106.2 diagnostic's own refresh):
+- Microsoft Test → `ok:true` ("Microsoft Graph identity check succeeded for matt@infosecurs.com").
+- Gmail Test (both mailboxes) → `ok:true`.
+- Token-store `expires_at` files confirmed advanced to new future timestamps for all three (proving a real refresh occurred, not a cached/stale result) — no token value inspected.
+- `docker logs` across the verification window: zero credential-shaped lines.
+
+**Full production reconciliation** (immediately before this deployment sequence → after): `MailboxSource=4`, `MailboxMessage=25056`, `MailboxSweepRun=9`, `MailboxDomainRule=32`, `NeedsYou 332/395`, `EvidenceItem=689`, `EvidenceClassification=18` — every value identical, zero unexplained drift. `connection_state` unchanged (`CONNECTED`) for all 4 mailboxes throughout. No historical sweep was run, no domain rule changed, no Needs You item created by any action in this whole sequence.
+
+## 106.5 Canonical post-merge re-verification (architect-witnessed manual merge)
+
+Matt merged PR #13 manually and issued a formal post-merge gate WO: confirm CI on the exact canonical merge SHA before any deploy, then re-verify.
+
+- **Post-merge CI gate**: `Security` workflow on `670c11cbfff032d4c90fe7cc20bc59fcbd6d1d4b` — `status:completed, conclusion:success` (confirmed via both the check-runs and workflow-runs APIs before proceeding).
+- **Canonical image provenance re-confirmed**: the Mac's `/opt/bagman/app/src` checkout was at `670c11cbfff032d4c90fe7cc20bc59fcbd6d1d4b` (matching `origin/main` exactly) at build time; the running `bagman-api` container's image tag (`bagman-api:main-670c11c`) traces to that exact checkout — no rebuild was needed since the §106.4 deployment was already from this identical commit.
+- **Live re-verification** (again against genuinely, naturally expired tokens — ~75 minutes after §106.4's own refresh): Microsoft Test → `ok:true`; both Gmail Tests → `ok:true`; all three `expires_at` files advanced to new future timestamps (Microsoft → `2026-09-27T18:42:24Z`, Gmail → `2026-09-27T18:29:05Z`/`18:29:05Z`), proving a genuine refresh on each call, not a cached result.
+- **Reconciliation** (before this re-verification pass → after, now also including `AIInvocation`/`BackgroundJob`): `MailboxSource=4`, `MailboxMessage=25056`, `MailboxSweepRun=9`, `MailboxDomainRule=32`, `NeedsYou 332/395`, `EvidenceItem=689`, `EvidenceClassification=18`, `AIInvocation=375`, `BackgroundJob=4` — every value identical, zero drift. `connection_state=CONNECTED` unchanged for all 4 mailboxes. No new sweep run, no new message, no new Needs You item, no domain-rule change. `docker logs` over the window: zero credential-shaped lines.
+
+## 106.6 Verdict
+
+**CLOSED GREEN** for both mailboxes, confirmed twice — once at initial deployment (§106.4) and once under the architect's own formal post-merge re-verification gate against the exact canonical two-parent merge SHA (§106.5). Root cause for Microsoft and Gmail was identical and is recorded accurately here: the original Test implementation was intentionally non-mutating and therefore did not refresh expired OAuth access tokens, which caused healthy, idle OAuth mailboxes to appear disconnected. The production refresh credentials themselves were valid throughout — this is not, and must not be read as, an OAuth credential incident. The rule-engine condition expansion (§104.6/§105.1) remains untouched and unstarted.
