@@ -448,48 +448,56 @@ async def test_microsoft_mailbox(mailbox_id: str, payload: TestMicrosoftMailboxR
     absent by the Slice 3/4/5 governance reconciliation — see `PID.md`
     §104.5's own "GUI/API surface" row).
 
-    A pure, read-only, non-destructive identity check — calls the SAME
-    real Microsoft Graph identity primitive already used at OAuth-
-    callback time (`MicrosoftOAuthClientProtocol.get_me`, see
-    `services/mailbox/microsoft/graph_client.py`), against the mailbox's
-    OWN already-stored access token (`composition.microsoft_token_store
-    .read(mailbox_id)`).
+    Answers "can BAGMAN authenticate to and reach this mailbox using the
+    credentials it normally uses in production" — the same question a
+    real sweep asks. That means it goes through
+    `MicrosoftGraphMailboxAdapter.ensure_fresh_access_token`, the SAME
+    governed pre-emptive-refresh path every sweep already uses, before
+    calling the real Microsoft Graph identity primitive
+    (`MicrosoftOAuthClientProtocol.get_me`).
 
-    Deliberately reads the RAW stored token — never
-    `MicrosoftGraphMailboxAdapter._ensure_fresh_access_token`, which
-    would refresh an expiring token (a legitimate write) and, on a
-    refresh failure, call `mark_microsoft_auth_required` (a
-    `connection_state` mutation). This action must NEVER change
-    `connection_state`/`status`, so it never takes that path — an
-    expired-but-refreshable token is honestly reported as a failed check
-    here; the operator's remedy is the existing Connect/Reconnect
-    action, not this one. Never triggers a sweep, never fetches a
-    folder/message, never creates a Needs You item, never touches a
-    `MailboxDomainRule`, never advances a cursor — no such call exists
-    anywhere in this function.
+    A healthy mailbox that has simply been idle has an EXPIRED access
+    token by design (access tokens are intentionally short-lived) — an
+    earlier version of this action read that raw, expired token without
+    ever refreshing it, so it reported `ok:false`/"reconnect" for a
+    perfectly healthy mailbox. Routing through the adapter's own refresh
+    path fixes that: a normal refresh succeeds silently and the check
+    proceeds; only a genuine refresh failure (revoked/invalid
+    refresh_token) is reported as requiring reconnection. A successful
+    refresh is not a mailbox mutation — it is ordinary credential
+    maintenance, the same write a real sweep attempt would already make
+    — and it never flips `connection_state`/`status`; only the adapter's
+    OWN existing, already-governed `mark_microsoft_auth_required` path
+    (invoked only on an actual refresh failure, never merely because a
+    token was expired) can do that.
+
+    Still never triggers a sweep, never fetches a folder/message beyond
+    this one identity call, never creates a Needs You item, never
+    touches a `MailboxDomainRule`, never advances a cursor.
 
     Never returns the raw token (or any part of it) in the response or
     the audit-event payload — only the mailbox's own already-public
-    email address (from the verified identity, when present) and a
-    closed-vocabulary outcome status.
+    email address (from the verified identity, when present), the
+    non-secret provider error detail on failure, and a closed-vocabulary
+    outcome status.
     """
     composition = get_composition()
     _require_microsoft_mailbox(composition, mailbox_id)
     checked_at = utc_now()
 
-    tokens = composition.microsoft_token_store.read(mailbox_id)
-    if tokens is None:
+    access_token, refresh_error_detail = composition.microsoft_mailbox_adapter.ensure_fresh_access_token(mailbox_id)
+    if access_token is None:
         ok = False
-        detail = "No stored Microsoft credentials for this mailbox — it has never completed the Connect flow."
+        detail = f"Microsoft authentication required — reconnect this mailbox: {refresh_error_detail}"
     else:
-        result = composition.microsoft_oauth_client.get_me(access_token=tokens.access_token)
+        result = composition.microsoft_oauth_client.get_me(access_token=access_token)
         if result.status == GraphOutcomeStatus.OK and result.identity is not None:
             ok = True
             identity_label = result.identity.mail or result.identity.user_principal_name or "(unknown address)"
             detail = f"Microsoft Graph identity check succeeded for {identity_label}."
         elif result.status == GraphOutcomeStatus.AUTH_ERROR:
             ok = False
-            detail = "Microsoft Graph rejected the stored credential (authentication error) — reconnect this mailbox."
+            detail = "Microsoft Graph rejected the refreshed credential (authentication error) — reconnect this mailbox."
         else:
             ok = False
             detail = f"Microsoft Graph identity check failed: {result.status.value}."

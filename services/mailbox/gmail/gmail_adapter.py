@@ -690,6 +690,15 @@ class GmailMailboxAdapter:
         self._persist_refreshed_tokens(mailbox_id, previous_refresh_token=tokens.refresh_token, refreshed_tokens=refreshed.tokens)
         return refreshed.tokens.access_token, None
 
+    def ensure_fresh_access_token(self, mailbox_id: str) -> tuple[Optional[str], Optional[str]]:
+        """Public entry point onto :meth:`_ensure_fresh_access_token` for
+        callers outside this adapter that need a genuinely usable
+        access token (e.g. the mailbox "Test" connection-check route) —
+        reuses the SAME pre-emptive-refresh/AUTH_REQUIRED-on-failure
+        path every sweep already goes through. No second refresh
+        mechanism; this is a pass-through, not a reimplementation."""
+        return self._ensure_fresh_access_token(mailbox_id)
+
     def _reactive_refresh(self, mailbox_id: str) -> tuple[Optional[str], Optional[str]]:
         """A request came back AUTH_ERROR despite what this adapter
         believed was a fresh token — refresh once (reactive path,

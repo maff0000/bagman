@@ -316,10 +316,13 @@ def test_test_endpoint_succeeds_for_a_connected_mailbox(dev_client):
 
 
 def test_test_endpoint_reports_auth_error_without_mutating_connection_state_or_token(dev_client):
-    """A failed test must be honestly reported, but must NEVER refresh
-    the stored token or mutate `connection_state` — see the endpoint's
-    own docstring for why this deliberately never calls
-    `MicrosoftGraphMailboxAdapter._ensure_fresh_access_token`."""
+    """A failed identity check on a STILL-FRESH access token (nowhere
+    near `_REFRESH_SKEW_SECONDS` of expiry) never even reaches the
+    refresh path — `ensure_fresh_access_token` returns the same stored
+    token unchanged, so a rejected identity check is honestly reported
+    without refreshing anything or mutating `connection_state`. The
+    refresh-path scenarios (expired token, successful/failed refresh)
+    are covered separately below."""
     mailbox_id = _create_mailbox(dev_client)
     _connect_and_complete(dev_client, mailbox_id)
     comp = get_composition()
@@ -337,6 +340,158 @@ def test_test_endpoint_reports_auth_error_without_mutating_connection_state_or_t
     assert mailbox["connection_state"] == "CONNECTED"  # unchanged — never demoted to AUTH_REQUIRED
     stored_after = comp.microsoft_token_store.read(mailbox_id)
     assert stored_after.access_token == stored_before.access_token  # never refreshed
+
+
+# ---------------------------------------------------------------------
+# Test-action refresh-path fix — a healthy mailbox that has simply been
+# idle has an EXPIRED access token by design (access tokens are
+# intentionally short-lived); the Test action must refresh through the
+# SAME governed path a real sweep uses before concluding "reconnect
+# required" (WO: "Test action refreshes through the existing governed
+# path instead of reporting a false reconnect-required alarm").
+# ---------------------------------------------------------------------
+
+
+def _store_expired_microsoft_tokens(comp, mailbox_id: str) -> None:
+    expired = fake_token_bundle(access_token="stale-ms-access-token", expires_in_seconds=-60.0)
+    comp.microsoft_token_store.write(
+        mailbox_id, access_token=expired.access_token, refresh_token=expired.refresh_token, expires_at=expired.expires_at
+    )
+
+
+def test_test_endpoint_refreshes_an_expired_access_token_and_reports_ok(dev_client):
+    mailbox_id = _create_mailbox(dev_client)
+    _connect_and_complete(dev_client, mailbox_id)
+    comp = get_composition()
+    _store_expired_microsoft_tokens(comp, mailbox_id)
+
+    comp.microsoft_oauth_client.queue_refresh_result(
+        MicrosoftTokenResult(status=GraphOutcomeStatus.OK, tokens=fake_token_bundle(access_token="fresh-ms-access-token"))
+    )
+    comp.microsoft_oauth_client.queue_me_result(
+        MicrosoftIdentityResult(
+            status=GraphOutcomeStatus.OK,
+            identity=MicrosoftIdentity(mail="matt@infosecurs.com", user_principal_name="matt@infosecurs.com"),
+        )
+    )
+
+    r = dev_client.post(f"/internal/mailboxes/{mailbox_id}/microsoft/test", json={"actor_type": "USER", "actor_id": ACTOR_ID})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is True
+    assert "reconnect" not in body["detail"].lower()
+
+    refresh_calls = [c for c in comp.microsoft_oauth_client.token_calls if c.kind == "refresh"]
+    assert len(refresh_calls) == 1
+
+    stored_after = comp.microsoft_token_store.read(mailbox_id)
+    assert stored_after.access_token == "fresh-ms-access-token"
+    assert stored_after.expires_at > datetime.now(timezone.utc)
+
+    mailbox = dev_client.get(f"/internal/mailboxes/{mailbox_id}").json()
+    assert mailbox["connection_state"] == "CONNECTED"
+
+
+def test_test_endpoint_refresh_has_no_side_effects_on_sweep_needs_you_or_domain_rules(dev_client):
+    mailbox_id = _create_mailbox(dev_client)
+    _connect_and_complete(dev_client, mailbox_id)
+    comp = get_composition()
+    _store_expired_microsoft_tokens(comp, mailbox_id)
+
+    runs_before = comp.mailbox_sweep_run_repository.list_runs(mailbox_id=mailbox_id)
+    rules_before = comp.mailbox_domain_rule_repository.list_rules(mailbox_id=mailbox_id)
+    needs_you_before = comp.needs_you_repository.list_needs_you_items(item_type="MAILBOX_DOMAIN_REVIEW")
+    messages_before = comp.mailbox_message_repository.list_messages(mailbox_id=mailbox_id)
+
+    comp.microsoft_oauth_client.queue_refresh_result(
+        MicrosoftTokenResult(status=GraphOutcomeStatus.OK, tokens=fake_token_bundle(access_token="fresh-ms-access-token"))
+    )
+    comp.microsoft_oauth_client.queue_me_result(
+        MicrosoftIdentityResult(
+            status=GraphOutcomeStatus.OK,
+            identity=MicrosoftIdentity(mail="matt@infosecurs.com", user_principal_name="matt@infosecurs.com"),
+        )
+    )
+    r = dev_client.post(f"/internal/mailboxes/{mailbox_id}/microsoft/test", json={"actor_type": "USER", "actor_id": ACTOR_ID})
+    assert r.status_code == 200
+
+    assert comp.mailbox_sweep_run_repository.list_runs(mailbox_id=mailbox_id) == runs_before
+    assert comp.mailbox_domain_rule_repository.list_rules(mailbox_id=mailbox_id) == rules_before
+    assert comp.needs_you_repository.list_needs_you_items(item_type="MAILBOX_DOMAIN_REVIEW") == needs_you_before
+    assert comp.mailbox_message_repository.list_messages(mailbox_id=mailbox_id) == messages_before
+
+
+def test_test_endpoint_reports_reconnect_required_when_the_refresh_token_is_actually_revoked(dev_client):
+    """An expired access token whose REFRESH also fails is the one
+    genuine case this action must report as reconnect-required — and
+    the one case where `connection_state -> AUTH_REQUIRED` is the
+    correct, already-governed transition (never merely because the
+    access token itself was expired)."""
+    mailbox_id = _create_mailbox(dev_client)
+    _connect_and_complete(dev_client, mailbox_id)
+    comp = get_composition()
+    _store_expired_microsoft_tokens(comp, mailbox_id)
+
+    comp.microsoft_oauth_client.queue_refresh_result(
+        MicrosoftTokenResult(status=GraphOutcomeStatus.AUTH_ERROR, error_detail="invalid_grant: token has been revoked")
+    )
+
+    r = dev_client.post(f"/internal/mailboxes/{mailbox_id}/microsoft/test", json={"actor_type": "USER", "actor_id": ACTOR_ID})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is False
+    assert "reconnect" in body["detail"].lower() or "authentication" in body["detail"].lower()
+
+    mailbox = dev_client.get(f"/internal/mailboxes/{mailbox_id}").json()
+    assert mailbox["connection_state"] == "AUTH_REQUIRED"
+
+
+def test_test_endpoint_reports_a_non_auth_failure_after_a_successful_refresh_without_reconnect_wording(dev_client):
+    """A refresh that SUCCEEDS, followed by a genuine non-auth provider
+    failure on the identity check itself (e.g. a transient transport
+    error), must be reported accurately — never collapsed into
+    "reconnect required"."""
+    mailbox_id = _create_mailbox(dev_client)
+    _connect_and_complete(dev_client, mailbox_id)
+    comp = get_composition()
+    _store_expired_microsoft_tokens(comp, mailbox_id)
+
+    comp.microsoft_oauth_client.queue_refresh_result(
+        MicrosoftTokenResult(status=GraphOutcomeStatus.OK, tokens=fake_token_bundle(access_token="fresh-ms-access-token"))
+    )
+    comp.microsoft_oauth_client.queue_me_result(
+        MicrosoftIdentityResult(status=GraphOutcomeStatus.TRANSPORT_ERROR, error_detail="connection reset")
+    )
+
+    r = dev_client.post(f"/internal/mailboxes/{mailbox_id}/microsoft/test", json={"actor_type": "USER", "actor_id": ACTOR_ID})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is False
+    assert "reconnect" not in body["detail"].lower()
+    assert "transport_error" in body["detail"].lower()
+
+    mailbox = dev_client.get(f"/internal/mailboxes/{mailbox_id}").json()
+    assert mailbox["connection_state"] == "CONNECTED"  # unchanged — this was never an auth failure
+
+
+def test_test_endpoint_never_returns_a_refreshed_token_or_refresh_token(dev_client):
+    mailbox_id = _create_mailbox(dev_client)
+    _connect_and_complete(dev_client, mailbox_id)
+    comp = get_composition()
+    _store_expired_microsoft_tokens(comp, mailbox_id)
+
+    comp.microsoft_oauth_client.queue_refresh_result(
+        MicrosoftTokenResult(status=GraphOutcomeStatus.OK, tokens=fake_token_bundle(access_token="fresh-ms-access-token"))
+    )
+    comp.microsoft_oauth_client.queue_me_result(
+        MicrosoftIdentityResult(
+            status=GraphOutcomeStatus.OK,
+            identity=MicrosoftIdentity(mail="matt@infosecurs.com", user_principal_name="matt@infosecurs.com"),
+        )
+    )
+    r = dev_client.post(f"/internal/mailboxes/{mailbox_id}/microsoft/test", json={"actor_type": "USER", "actor_id": ACTOR_ID})
+    assert "fresh-ms-access-token" not in r.text
+    assert "fake-ms-refresh-token" not in r.text
 
 
 def test_test_endpoint_never_returns_the_raw_access_token(dev_client):

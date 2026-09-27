@@ -342,31 +342,32 @@ async def test_gmail_mailbox(mailbox_id: str, payload: TestGmailMailboxRequest) 
     """CD-6 mailbox-list GUI-completion WO — mirrors
     `app/api/routers/mailboxes_microsoft.py::test_microsoft_mailbox`'s
     own docstring exactly, substituting Gmail's own identity primitive
-    (`GmailClientProtocol.get_profile`) and stored-token source
-    (`composition.gmail_token_store`). Same hard guarantees: reads the
-    RAW stored token (never
-    `GmailMailboxAdapter._ensure_fresh_access_token`, which can refresh
-    the token and mark `AUTH_REQUIRED` on failure — both writes this
-    action must never perform); never sweeps/ingests/creates a Needs You
-    item/touches a domain rule/advances a cursor; never returns the raw
-    token."""
+    (`GmailClientProtocol.get_profile`) and refresh path
+    (`GmailMailboxAdapter.ensure_fresh_access_token`). Same hard
+    guarantees: a successful refresh is ordinary credential maintenance,
+    not a mailbox mutation, and never flips `connection_state`/`status`
+    itself — only the adapter's own existing `mark_microsoft_auth_required`
+    path (invoked only on an actual refresh failure, never merely
+    because a token was expired) can do that; never
+    sweeps/ingests/creates a Needs You item/touches a domain rule/
+    advances a cursor; never returns the raw token."""
     composition = get_composition()
     _require_gmail_mailbox(composition, mailbox_id)
     checked_at = utc_now()
 
-    tokens = composition.gmail_token_store.read(mailbox_id)
-    if tokens is None:
+    access_token, refresh_error_detail = composition.gmail_mailbox_adapter.ensure_fresh_access_token(mailbox_id)
+    if access_token is None:
         ok = False
-        detail = "No stored Gmail credentials for this mailbox — it has never completed the Connect flow."
+        detail = f"Gmail authentication required — reconnect this mailbox: {refresh_error_detail}"
     else:
-        result = composition.gmail_client.get_profile(access_token=tokens.access_token)
+        result = composition.gmail_client.get_profile(access_token=access_token)
         if result.status == GmailOutcomeStatus.OK and result.identity is not None:
             ok = True
             identity_label = result.identity.email or "(unknown address)"
             detail = f"Gmail identity check succeeded for {identity_label}."
         elif result.status == GmailOutcomeStatus.AUTH_ERROR:
             ok = False
-            detail = "Gmail rejected the stored credential (authentication error) — reconnect this mailbox."
+            detail = "Gmail rejected the refreshed credential (authentication error) — reconnect this mailbox."
         else:
             ok = False
             detail = f"Gmail identity check failed: {result.status.value}."
