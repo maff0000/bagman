@@ -54,6 +54,32 @@ def test_sweep_run_persists_and_completes(fresh_engine):
     assert list(fetched.folders_attempted) == folders_attempted
 
 
+def test_to_dict_handles_a_real_legacy_string_shaped_folders_attempted_row_from_postgres(fresh_engine):
+    """Mailbox Operations GUI-completion WO — a real, pre-existing
+    production defect (see `services.mailbox.sweep_run._folder_entry_to_dict`'s
+    own docstring): two real production `MailboxSweepRun` rows, created
+    before the "recursive folder discovery" amendment, still store
+    `folders_attempted` as a bare list of folder-name STRINGS (e.g.
+    `["INBOX"]`) rather than today's `{folder_id, display_name}` mapping
+    shape. Proves the fix against a REAL round trip through Postgres
+    JSONB (not just the in-memory domain-level proof) -- the historical
+    shape genuinely survives a real INSERT/SELECT unchanged, and
+    `to_dict()` must still not crash reading it back."""
+    repo = PostgresMailboxSweepRunRepository()
+    mailbox_id = _mailbox_id()
+    run = repo.create_run(mailbox_id=mailbox_id, trigger=TRIGGER_MANUAL)
+
+    fresh_repo = PostgresMailboxSweepRunRepository(engine=fresh_engine)
+    completed = fresh_repo.complete_run(
+        run.sweep_run_id, new_status="SUCCEEDED", folders_attempted=["INBOX"],
+        messages_seen=1, messages_new=1, evidence_created=1, duplicates=0, quarantined=0, failures=0,
+    )
+    assert completed.to_dict()["folders_attempted"] == [{"folder_id": "INBOX", "display_name": "INBOX"}]
+
+    refetched = PostgresMailboxSweepRunRepository(engine=fresh_engine).get_run(run.sweep_run_id)
+    assert refetched.to_dict()["folders_attempted"] == [{"folder_id": "INBOX", "display_name": "INBOX"}]
+
+
 def test_recover_stale_runs_against_real_postgres_recovers_only_the_stale_row(fresh_engine):
     """Slice 3/4/5 governance-reconciliation delta: real, DB-backed
     proof that a `MailboxSweepRun` abandoned by a killed process (never

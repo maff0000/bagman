@@ -8,6 +8,7 @@ delta closes: a `MailboxSweepRun` abandoned by a killed process
 previously had no path back to a terminal state at all."""
 from __future__ import annotations
 
+import dataclasses
 from datetime import timedelta
 
 import pytest
@@ -175,3 +176,69 @@ def test_recovered_run_can_never_transition_again(repo, mailbox_id):
             recovered.sweep_run_id, new_status="SUCCEEDED", folders_attempted=[], messages_seen=0,
             messages_new=0, evidence_created=0, duplicates=0, quarantined=0, failures=0,
         )
+
+
+# ---------------------------------------------------------------------
+# Mailbox Operations GUI-completion WO — `to_dict()` must never crash on
+# a historical `folders_attempted` entry stored in the OLD, pre-
+# "recursive folder discovery"-amendment shape (a bare folder-name
+# string, e.g. "INBOX", rather than today's
+# {"folder_id": ..., "display_name": ...} mapping). A real, pre-existing
+# production defect independently found and fixed while live-verifying
+# this WO's own new "Email Activity" view.
+# ---------------------------------------------------------------------
+
+
+def test_to_dict_normalizes_a_legacy_bare_string_folder_entry(repo, mailbox_id):
+    """`folders_attempted` entries in the OLD, pre-"recursive folder
+    discovery"-amendment shape (a bare string, never a mapping) only
+    ever reach a real `MailboxSweepRun` object via a historical row
+    loaded straight from storage (`_sweep_run_row_to_domain`/
+    `_row_to_domain`, never through `transition()`'s own contract
+    validation, which the CURRENT shape always satisfies) -- so this
+    test constructs the domain object directly via `dataclasses.replace`,
+    mirroring that real load path exactly, rather than going through
+    `complete_run` (which only ever receives the modern shape from any
+    current caller)."""
+    run = repo.create_run(mailbox_id=mailbox_id, trigger=TRIGGER_MANUAL)
+    legacy_run = dataclasses.replace(run, status="SUCCEEDED", folders_attempted=("INBOX",))
+    rendered = legacy_run.to_dict()["folders_attempted"]
+    assert rendered == [{"folder_id": "INBOX", "display_name": "INBOX"}]
+
+
+def test_to_dict_handles_a_mix_of_legacy_string_and_modern_mapping_entries(repo, mailbox_id):
+    run = repo.create_run(mailbox_id=mailbox_id, trigger=TRIGGER_MANUAL)
+    legacy_run = dataclasses.replace(
+        run, status="SUCCEEDED",
+        folders_attempted=("INBOX", {"folder_id": "real-id-1", "display_name": "Inbox"}),
+    )
+    rendered = legacy_run.to_dict()["folders_attempted"]
+    assert rendered == [
+        {"folder_id": "INBOX", "display_name": "INBOX"},
+        {"folder_id": "real-id-1", "display_name": "Inbox"},
+    ]
+
+
+def test_to_dict_still_copies_a_modern_mapping_entry_through_unchanged(repo, mailbox_id):
+    """Regression guard: the fix must not alter the pre-existing,
+    correct behaviour for the modern shape."""
+    run = repo.create_run(mailbox_id=mailbox_id, trigger=TRIGGER_MANUAL)
+    completed = repo.complete_run(
+        run.sweep_run_id, new_status="SUCCEEDED",
+        folders_attempted=[
+            {
+                "folder_id": "real-id",
+                "display_name": "Inbox",
+                "completed": True,
+                "messages_seen": 5,
+                "new_discovery_records": 2,
+                "deep_processing_count": 1,
+                "cursor_established": True,
+            }
+        ],
+        messages_seen=5, messages_new=2, evidence_created=2, duplicates=0, quarantined=0, failures=0,
+    )
+    rendered = completed.to_dict()["folders_attempted"]
+    assert rendered[0]["folder_id"] == "real-id"
+    assert rendered[0]["completed"] is True
+    assert rendered[0]["messages_seen"] == 5
