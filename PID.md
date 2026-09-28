@@ -2401,3 +2401,120 @@ Future post-enrichment policy evaluation   (NOT authorised by this ruling)
 ## 107.8 Verdict
 
 **§104.6 AS ORIGINALLY SPECIFIED — SUPERSEDED BY DISCOVERY, NO IMPLEMENTATION DEFECT.** The rule-engine expansion as originally scoped (classification + company + Xero-suggestion conditions on the existing live pre-intake gate) is not implementable honestly against real governed facts, and is not attempted. The existing rule engine is fully preserved, untouched, and remains CLOSED GREEN from §104/§105. Two future work items are proposed (§107.7) but not begun, pending separate architect authorisation.
+
+---
+
+# 108. Post-Enrichment Policy Foundation — Discovery & Design (2026-09-27)
+
+## 108.1 Scope
+
+Architect-authorised bounded discovery/design WO, following directly from §107's finding that classification, company/entity, and Xero-account-suggestion cannot be honestly evaluated at the existing pre-intake gate. Objective: establish the real post-enrichment lifecycle, the governed facts that genuinely exist at each stage, and whether a new "post-enrichment policy" abstraction is actually warranted — grounded in the real codebase, not desired future architecture. **Discovery/design only — no runtime, schema, API, GUI, or policy-evaluation code was written; no migration created; no historical processing, AI invocation, or Xero-suggestion producer built.**
+
+Three independent read-only discovery passes were run in parallel against branch `mailbox/post-enrichment-policy-foundation-discovery` (off canonical `main` at `b5119c7`): (A) the exact post-intake→classification runtime lifecycle and the Evidence/Classification/Entity fact matrix; (B) BAGMAN's AI-invocation architecture and the full Needs You mechanism; (C) the real Xero/accounting fact inventory and an existing-rule-abstraction reuse analysis. `git status` on the discovery branch is clean throughout — confirmed zero code changes.
+
+## 108.2 A — Actual current lifecycle (post-intake gate → classification)
+
+Verified against real code, file:line, not docstrings:
+
+1. **Message discovery** — `services/mailbox/sweep.py`, per-folder delta/next_link paging.
+2. **Domain-rule evaluation** — `sweep.py:1264`, `find_for_sender`. `BLACKLIST` short-circuits (`:1274-1296`, message row recorded, no MIME fetch, ever). No-rule/`GRAYLIST` fall to the bounded discovery heuristic (`:1298-1328`, never a MIME fetch). Only `POLICY_MUST_READ` continues.
+3. **Per-message auth check** (`MUST_READ` only) — `:1344-1358`; a FAIL escalates to `SECURITY_REVIEW` + a Needs You item and stops (no MIME fetch on failure).
+4. **MIME/content acquisition** — `:1360-1387`. Only a real `OK` result proceeds.
+5. **Evidence creation** — `ingest_email_evidence` (`services/mailbox/microsoft/evidence_ingest.py:129`) → `EvidenceRepository.register_evidence` (`services/evidence/evidence.py:134/265`).
+6. **Entity assignment — same call, not a later step, when the rule's destination is FIXED**: `sweep.py:1412-1414` computes `entity_id_for_evidence = rule.destination_entity_id if FIXED else None`, threaded directly into `register_evidence`. `assign_entity`/`assign_evidence_entity` is **never** called at intake time — it exists solely as the separate, later, human-triggered `COMPANY_REQUIRED` resolution path.
+7. **Needs You (`COMPANY_REQUIRED`)** — only when the rule's destination is `REVIEW_REQUIRED`: `sweep.py:1499-1502`, evidence already created with `entity_id=None`.
+8. **Classification — not part of this pipeline, at all.** Zero classification calls exist anywhere in `services/mailbox/*.py` or `evidence_ingest.py`. Classification is reachable only via three separate, explicitly-triggered HTTP endpoints (`app/api/routers/evidence_classification.py`): `.../classifications/deterministic` (rule-based, zero AI, can yield `CLASSIFIED` directly), `.../classifications/ai-preview` (dry-run, not persisted as a classification), `.../classifications/orchestrated` (persists an `AI_PROPOSAL` row — **always** `REVIEW_REQUIRED`/`UNCLASSIFIABLE`, never `CLASSIFIED` directly on first pass). The orchestrated endpoint's own docstring states it has **never been invoked against real production evidence**. No scheduler/sweep/cron path calls any of these three today.
+9. **AI invocation record** — `AIInvocation` is created only inside the orchestrated-classification call path, never during mailbox sweep itself.
+10. **Needs You (`CLASSIFICATION_REVIEW`)** — raised only when an `AI_PROPOSAL` is `REVIEW_REQUIRED`/`UNCLASSIFIABLE`; resolved via `resolve_classification_review` (`services/evidence/classification_review.py:398`), which creates a new, superseding `OPERATOR_ASSIGNED` classification (append-only chain, never an overwrite) and can "teach" a new deterministic `EvidenceClassificationRule` for future automatic matching.
+11. **Document-type-specific downstream processing** — none exists anywhere outside the classification module family itself.
+12. **Automatic Xero-related processing from evidence** — none exists. Zero files under `services/xero/*.py` reference `evidence_id` at all.
+
+**The central finding**: classification is not an intermittently-available fact — it is, for the overwhelming majority of real evidence today, a fact that **nothing in the system ever computes at all**, because nothing triggers it automatically. Entity resolution is the opposite case: a genuinely common, expected, actively-managed workflow state (`entity_id=None` pending `COMPANY_REQUIRED` resolution), not an edge case.
+
+## 108.3 B — Fact availability matrix
+
+`Fact → producer → persisted? → first available stage → authoritative? → mutable? → isolation boundary → provenance`
+
+| Fact | Producer | Persisted? | First available | Authoritative? | Mutable? | Isolation | Provenance |
+|---|---|---|---|---|---|---|---|
+| `EvidenceItem.evidence_id` | `register_evidence` | Yes (PK) | Evidence creation | Yes | Immutable | n/a | `created_at`, `source_id` |
+| `EvidenceItem.entity_id` | `register_evidence` (FIXED rule) **or** later `assign_evidence_entity` via `COMPANY_REQUIRED` resolution | Yes | Creation, or resolution time | Yes once set | **Write-once from `None`→a value only** — a different value on an already-resolved item raises `ConflictError`; reassignment is an explicit, not-yet-built governed correction workflow | Real FK to `governed_entities.entity_id` | `EVIDENCE_ENTITY_ASSIGNED` audit event |
+| `MailboxSource.default_entity_id` | Operator, mailbox setup | Yes | Before any message exists | **No — explicitly non-authoritative hint** | Mutable, mailbox-level | None (not an isolation mechanism) | n/a |
+| `EvidenceClassification` (any) | Only via one of 3 explicit HTTP endpoints — never automatic | Yes, separate append-only table | Whenever (if ever) explicitly triggered — **not guaranteed for any message** | The *current* classification is a query (`get_current_classification`), not a stored flag | Individual rows immutable; "current" answer changes via a new superseding row | Scoped to one `evidence_id` | Exactly one of `rule_id` / `ai_invocation_id` / `operator_action_id` per row, `reason_codes`, nullable `confidence` |
+| `EvidenceClassification.status`/`document_type` | Same | Yes | Same | `DETERMINISTIC_RULE`→can be `CLASSIFIED` directly; `AI_PROPOSAL`→never `CLASSIFIED` on first pass; `OPERATOR_ASSIGNED`→the only source that produces durable `CLASSIFIED` truth | Superseded, not mutated | Same | Same |
+| `AIInvocation` | Only inside orchestrated-classification | Yes | Only if/when called | Yes | Terminal state machine | n/a | Own status; referenced by `ai_invocation_id` |
+| `XeroConnection`/`XeroAccount` | Xero OAuth connect / sync | Yes, `entity_id`-scoped, real unique constraints | Independent of any evidence | Yes | `XeroAccount` is a synced mirror, not itself a suggestion | Real `entity_id` FK/unique-per-entity | Standard audit events (`record_audit_event`, same shape as mailbox's) |
+| Xero supplier correlation | `services/xero/supplier_correlation.py` | **No** — transient, written only into an existing OPEN `MAILBOX_DOMAIN_REVIEW` item's own metadata; explicitly documented "no new persisted canonical domain model" | Pre-intake-adjacent (enriches a domain-review item, not evidence) | No — never auto-approves, never resolves anything | n/a (not a durable fact) | Domain-scoped only; never touches account codes | n/a |
+| Xero-account suggestion | **No producer exists** | No | Never | n/a | n/a | n/a | n/a |
+
+**Absence semantics** (item 9 of the WO): `entity_id=None` means "not yet resolved" — an expected, actively-managed state. Classification-absent means "nothing has ever asked for this to be classified" — the default state for effectively all evidence today, not a transient gap. Xero-suggestion-absent means "the producer does not exist" — a capability gap, not a data-availability gap. These three absences are NOT the same kind of thing and must never be collapsed into one "unknown" semantic.
+
+## 108.4 AI outputs and Needs You mechanism (supporting C, F, H, I)
+
+- **AI-invocation architecture** (`ai_invocations` table, `persistence/postgres/ai_invocation_models.py:131-183`): a partial unique index enforces at most one non-terminal invocation per `(task_id, task_version, primary_input_reference)`; terminal rows accumulate as a real audit trail. Classification is the only AI task touching evidence today, and its output is a **SUGGESTION by construction** — `AI_PROPOSAL` classifications are structurally barred from `status=CLASSIFIED`.
+- **A second deterministic rule engine already exists**, separate from the mailbox domain-rule engine: `services/evidence/classification_rule.py` (`EvidenceClassificationRule`), consumed by `.../classifications/deterministic` and "taught" new rules via `resolve_classification_review`'s correction path. This matters directly for §108.7's reuse decision below — a classification-condition "policy" already has its own home, at the evidence layer, and does not need the mailbox engine (or a new one) to serve it.
+- **Needs You** (`services/needs_you/needs_you.py:127-217`): status vocabulary `{OPEN, RESOLVED, DISMISSED}`, both terminal states having **zero** onward transitions — the uniform, explicit doctrine is "never reopen; a producer that still has a live question raises a fresh item instead." Dedup is a generic `(item_type, source_object_reference)` idempotency guard (one documented metadata-scan exception for `MAILBOX_DOMAIN_REVIEW`, which has no single canonical reference).
+- **`COMPANY_REQUIRED` resolution already IS the entity-assignment decision mechanism** (`app/api/routers/needs_you.py:130-270`): assigns the entity via `assign_evidence_entity` **before** persisting the item RESOLVED (so a failed assignment can never falsely appear answered); idempotent; validates the target entity is real. Shared by both the manual-upload flow and the mailbox flow — one producer contract, two triggers.
+- **`CLASSIFICATION_REVIEW` resolution already IS the classification-confirmation/correction decision mechanism** (`services/evidence/classification_review.py`): confirm-or-correct, always a new superseding row (even a plain confirmation is a new row — explicit named doctrine), optional rule-teaching. `DISMISSED` is explicitly disallowed for this item type (would leave a permanently ambiguous proposal with no path forward).
+- **`XERO_ACCOUNT_REQUIRED`/`XERO_REFERENCE_DATA_STALE`**: declared, zero live producer for either, confirmed by repo-wide grep.
+
+## 108.5 Xero/accounting facts and rule-abstraction reuse (supporting C, F, G, J)
+
+Real persisted, authoritative Xero facts (`XeroConnection`, `XeroAccount`) are entity-scoped with genuine unique constraints — a sound isolation pattern to mirror. `resolve_ai_suggested_account` is confirmed **entirely dead in production** — called only by its own tests, no real caller anywhere. Supplier correlation is real but transient, metadata-only, domain-scoped (never account-scoped), and structurally pre-evidence — not itself a post-enrichment fact. No automatic mailbox→Xero pipeline exists anywhere.
+
+**Reuse analysis of `services/mailbox/domain_rule.py`'s abstractions**, against a hypothetical future policy needing independent, simultaneously-checkable, heterogeneous-typed conditions (classification, entity, account):
+- Condition representation: **not reusable** — `match_mode` is a closed 4-member enum of mutually-exclusive identity-space *shapes*, each with its own dedicated DB index, not a composable AND-able condition set.
+- Matching primitives (`core/text_matching.py`): **not reusable** — string-domain normalisation/prefix matching has no bearing on exact-value/FK/enum equality checks.
+- Precedence model (four-tier most-specific-wins): **not reusable** — tied to domain/address/subject specificity; no natural "more specific" ordering exists between orthogonal facts like classification and entity.
+- Action/result representation (`MUST_READ`/`GRAYLIST`/`BLACKLIST`): **not reusable** — meaningless once evidence already exists.
+- Audit structure: **fully reusable, already generic** — `record_audit_event(...)` is called with the identical shape from Xero's own routers as from mailbox's; this is already BAGMAN's one common house-style audit primitive, not something to extract, just something to reuse verbatim.
+
+## 108.6 Earliest safe post-enrichment decision point (E)
+
+Given §108.2/§108.3, there is **no fixed synchronous pipeline stage** at which "evidence exists AND entity is resolved AND classification is persisted" reliably converges — the example sequence in the WO's own §5 template does not hold as a guaranteed linear flow. Entity resolution and classification are each **independently event-driven**, arriving at unpredictable, uncorrelated times (immediately, much later, or never) via two already-separate, already-working mechanisms (§108.4). A "policy point" premised on a synchronous convergence of all three facts would, for classification specifically, almost never fire against real production data today, since nothing yet triggers classification automatically for the bulk of evidence.
+
+## 108.7 One-stage vs multi-stage ruling (F)
+
+**Option B is what the evidence supports — not Option A.** The system already expresses multiple, explicit, per-fact lifecycle-stage decision points (`COMPANY_REQUIRED` for entity; `CLASSIFICATION_REVIEW` for classification), each correct and working at the stage its own fact naturally becomes available, rather than one common convergence point. Forcing Option A would require either fabricating a synchronisation barrier that doesn't exist, or leaving evidence indefinitely unprocessed waiting for a fact (classification) that may never arrive.
+
+## 108.8 Reuse decision (D/G)
+
+**Option 4 — no new policy abstraction is justified at this time**, refined from Fork C's Option-3 fallback once combined with the full fact/mechanism picture: every fact this WO was asked to condition on already has a correct, working, fact-specific decision mechanism at the layer where that fact naturally lives — entity via `COMPANY_REQUIRED` + `assign_evidence_entity`; classification via `CLASSIFICATION_REVIEW` + `resolve_classification_review` + its own existing deterministic rule engine (`EvidenceClassificationRule`, itself a rule-teaching mechanism, already in production). The only literal reusable primitive across all of this is the generic audit-event call, which needs no extraction — it is already shared. There is no evidence-grounded gap that a new general-purpose "post-enrichment policy engine" would close.
+
+## 108.9 Proposed policy input/outcome contracts, re-evaluation, security, audit, historical semantics (E/H/I/J — answered against the DO-NOT-BUILD verdict)
+
+Per item 19's own explicit allowance, most of §§8–16 of the WO become **not applicable as a new engine's design**, because no new engine is recommended. Answered honestly against what actually exists instead of manufacturing a fictional contract:
+
+- **Input/outcome contract**: already exists, twice, narrowly — `COMPANY_REQUIRED`'s resolution contract (`resolution.entity_id` + a real evidence anchor → `assign_evidence_entity`) and `CLASSIFICATION_REVIEW`'s (`CONFIRMED`/`CORRECTED` decision → new superseding classification row, optional rule-teaching). No third, general contract is proposed.
+- **Missing/unknown semantics**: already correctly fail-closed in both existing mechanisms — a failed entity assignment never falsely marks `COMPANY_REQUIRED` resolved; `DISMISSED` is structurally disallowed for `CLASSIFICATION_REVIEW` to prevent a permanently-ambiguous dead end.
+- **Re-evaluation/idempotency**: already a clean, uniform, codebase-wide doctrine — Needs You items are never reopened; a still-live question raises a fresh item instead. This applies without modification to any future fact-specific decision (including a future Xero-account-suggestion review).
+- **Security/isolation**: already sound at every real fact source found — `EvidenceItem.entity_id` is a genuine FK, `XeroConnection`/`XeroAccount` are entity-scoped with real unique constraints, supplier correlation never crosses into account codes. Nothing found here needs new isolation design.
+- **Audit/provenance**: already a single, generic, already-reused house-style primitive (`record_audit_event`) — any future fact-specific decision (including a future Xero-suggestion review) should call it exactly as `COMPANY_REQUIRED`/classification-review/mailbox-rule mutations already do.
+- **Historical/backfill semantics**: not applicable to a policy engine that is not being built. The existing "never reopen, raise a fresh item" Needs You doctrine already gives a consistent, non-special-cased answer for re-running any fact-specific decision historically, should that ever be needed.
+
+## 108.10 Xero Account Suggestion Producer prerequisite contract (I)
+
+The one genuine, evidence-grounded gap found across all three forks is **not** a missing policy engine — it is a missing **producer** for the Xero-account-suggestion fact itself. Candidate output fields for that future, separately-authorised WO, classified per the WO's own instruction (include only what the evidence genuinely requires):
+
+| Field | Classification | Basis |
+|---|---|---|
+| `entity_id` | REQUIRED NOW | Every real Xero fact found (`XeroConnection`, `XeroAccount`) is entity-scoped; a suggestion not scoped identically would break the isolation pattern used everywhere else. |
+| `xero_connection_id`/`tenant_id` | REQUIRED NOW | Mirrors `XeroAccount`'s own real unique-constraint scoping. |
+| `suggested_account_id` | REQUIRED NOW | The fact itself. |
+| `confidence` | REQUIRED NOW | Mirrors `EvidenceClassification.confidence` (already nullable, already an established pattern for AI-produced facts in this codebase). |
+| `rationale`/`reason_code` | OPTIONAL NOW | Mirrors `EvidenceClassification.reason_codes`. |
+| `ai_invocation_id` (provenance) | REQUIRED NOW | Mirrors classification's own provenance discipline exactly — every AI-produced fact in this codebase carries this back-reference. |
+| `candidate_set` | OPTIONAL NOW | Only if the producer considers multiple accounts; `resolve_ai_suggested_account`'s existing eligible-set validation shape is the natural fit if reused. |
+| `review status` | REQUIRED NOW | Must follow the SAME "never `CLASSIFIED`/confirmed on first pass from AI alone" doctrine already proven for classification — an AI-produced suggestion must default to requiring human confirmation, mirroring `AI_PROPOSAL`'s own structural bar against direct authoritative status. |
+| `timestamp`/`version` | REQUIRED NOW | Universal in every other governed record found (`created_at` on every table inspected). |
+| Automatic account-selection/posting | REJECT | No evidence anywhere in this codebase of automatic Xero posting from a suggestion — would contradict the existing "AI output is a suggestion, human confirms" doctrine found everywhere else. |
+
+Its human-review/resolution step should reuse `ITEM_TYPE_XERO_ACCOUNT_REQUIRED` (already declared) via a resolution handler mirroring `COMPANY_REQUIRED`'s exact pattern (assign-then-persist, idempotent, fail-closed) — not a new policy engine, not a new Needs You mechanism.
+
+## 108.11 Proposed implementation slices (J)
+
+Given the §108.8 verdict, no Post-Enrichment Policy Foundation implementation is proposed. The one concrete, bounded, evidence-grounded next slice is the previously-proposed **Xero Account Suggestion Producer** (§107.7.B), now with a real candidate contract (§108.10) to design against instead of speculation — still not begun, pending separate architect authorisation.
+
+## 108.12 Verdict
+
+**DO NOT BUILD** a new general-purpose Post-Enrichment Policy engine. The existing, separate, working, fact-specific decision mechanisms (`COMPANY_REQUIRED` + `assign_evidence_entity` for entity; `CLASSIFICATION_REVIEW` + `resolve_classification_review` + `EvidenceClassificationRule` for classification) are already the correct abstraction for every fact this WO investigated, at the lifecycle stage each fact actually becomes available — which is event-driven per fact, not a synchronous convergence point. The only genuine gap found is a missing Xero-account-suggestion **producer** (a data problem), not a policy-engine gap; its prerequisite contract is recorded at §108.10 for a future, separate, bounded WO. Zero runtime/schema/API/GUI/policy-evaluation code was written under this WO.
