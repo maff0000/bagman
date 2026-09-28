@@ -733,9 +733,25 @@ _XERO_ACCOUNT_SUGGESTION_INPUT_SCHEMA: Mapping[str, Any] = {
             "type": "string",
             "minLength": 1,
             "description": "Canonical evidence_id this suggestion reasons about (PID §29).",
-        }
+        },
+        "context_fingerprint": {
+            "type": "string",
+            "minLength": 1,
+            "description": (
+                "A deterministic hash of every governed fact this invocation's context was actually "
+                "built from (classification, entity, eligible-account-set, prompt/context contract "
+                "versions — see services.xero.account_suggestion.compute_account_suggestion_fingerprint). "
+                "Post-merge concurrency-finding correction: the caller (produce_account_suggestion) "
+                "MUST filter any prior-SUCCEEDED-invocation reuse search by this field matching exactly "
+                "— reusing an invocation computed under a DIFFERENT context_fingerprint would mean "
+                "trusting a suggestion reasoned against stale classification/eligible-account state, "
+                "even though the account-id VALIDITY check downstream is always freshly re-run. Mirrors "
+                "DOCUMENT_TYPE_PROPOSAL v2's own `classifier_fingerprint` field/reuse-guard pattern "
+                "exactly (`_DOCUMENT_TYPE_PROPOSAL_V2_INPUT_SCHEMA`)."
+            ),
+        },
     },
-    "required": ["evidence_id"],
+    "required": ["evidence_id", "context_fingerprint"],
     "additionalProperties": False,
 }
 

@@ -46,9 +46,13 @@ from services.xero.account_suggestion import (
     OUTCOME_SUGGESTION_PRODUCED,
     OUTCOME_XERO_NOT_CONNECTED,
     InMemoryXeroAccountSuggestionRepository,
+    compute_account_suggestion_fingerprint,
     produce_account_suggestion,
 )
+from services.xero.account_suggestion_context import build_account_suggestion_context
 from services.xero.connection import InMemoryXeroConnectionRepository
+from services.xero.eligibility import list_eligible_accounts
+from ai.prompts.loader import resolve_prompt_contract_version
 
 ACTOR_ID = "xero-account-suggestion-tests"
 
@@ -196,6 +200,50 @@ def _produce(evidence_id, entity_id, *, entity_repository, evidence_repository, 
         litellm_client=litellm_client, object_store=object_store, audit_repository=audit_repository,
         record_audit_event=audit_repository.record_audit_event, needs_you_repository=needs_you_repository,
         actor_type=actor.SYSTEM, actor_id=ACTOR_ID, correlation_id=correlation_id,
+    )
+
+
+def _expected_fingerprint(*, evidence_id, entity_id, evidence_repository, entity_repository,
+                           classification_repository, xero_account_repository, object_store):
+    """Independently replicates the EXACT fingerprint
+    `produce_account_suggestion` will itself compute right now for this
+    evidence_id, under whatever the CURRENT governed context is at call
+    time — used to pre-seed a `SUCCEEDED` `AIInvocation` a test wants
+    the orchestrator to genuinely reuse (or, with a stale value,
+    genuinely refuse to reuse)."""
+    evidence = evidence_repository.get_evidence(evidence_id)
+    entity = entity_repository.get_entity(entity_id)
+    current = classification_repository.get_current_classification(evidence_id, CLASSIFICATION_TYPE_DOCUMENT_TYPE)
+    eligible_accounts = list_eligible_accounts(xero_account_repository.list_accounts(entity_id=entity_id))
+    raw_content = object_store.get(evidence.storage_reference)
+    context = build_account_suggestion_context(
+        evidence=evidence, raw_content=raw_content, classification=current,
+        eligible_accounts=eligible_accounts, entity_name=entity.display_name,
+    ).context
+    content_hash = evidence.content_hash
+    evidence_content_hash = content_hash.get("value") if isinstance(content_hash, dict) else str(content_hash)
+    return compute_account_suggestion_fingerprint(
+        task_id="XERO_ACCOUNT_SUGGESTION", task_version=1,
+        prompt_contract_version=resolve_prompt_contract_version("XERO_ACCOUNT_SUGGESTION", 1),
+        evidence_id=evidence_id, evidence_content_hash=evidence_content_hash,
+        context_contract_version=context.context_contract_version, context_sha256=context.context_sha256,
+        eligible_account_ids=[a.account_id for a in eligible_accounts],
+    )
+
+
+def _seed_succeeded_invocation(ai_invocation_repository, *, evidence_id, context_fingerprint,
+                                account_id="ACC-1", confidence=0.9):
+    created = ai_invocation_repository.create_invocation(
+        task_id="XERO_ACCOUNT_SUGGESTION", task_version=1, role="BACKGROUND", provider="LITELLM",
+        capability_alias="bagman-fast",
+        input_references={"evidence_id": evidence_id, "context_fingerprint": context_fingerprint},
+        actor_type=actor.SYSTEM, actor_id=ACTOR_ID,
+    )
+    ai_invocation_repository.transition_status(created.ai_invocation_id, "RUNNING")
+    return ai_invocation_repository.transition_status(
+        created.ai_invocation_id, "SUCCEEDED",
+        output={"suggested_account_id": account_id, "confidence": confidence, "signals": [], "warnings": []},
+        confidence=confidence, provider_model="fake-model", prompt_contract_version="v1",
     )
 
 
@@ -665,3 +713,95 @@ def test_eligible_accounts_never_leak_across_entities(
     assert "ACC-B1" not in sent_context
     assert "Entity B Only Account" not in sent_context
     assert "ACC-A1" in sent_context
+
+
+# ---------------------------------------------------------------------
+# 21. Stale prior-SUCCEEDED-invocation reuse (post-merge architect
+#     finding) — reuse must be bound to a MATCHING context_fingerprint,
+#     never merely to the (task, version, evidence_id) subject.
+# ---------------------------------------------------------------------
+
+
+def test_crash_recovery_reuses_a_prior_succeeded_invocation_when_context_is_unchanged(
+    entity_repository, evidence_repository, classification_repository, xero_connection_repository,
+    xero_account_repository, suggestion_repository, assignment_repository, ai_invocation_repository,
+    litellm_client, object_store, audit_repository, needs_you_repository,
+):
+    """The legitimate crash-recovery case must still work: a prior
+    invocation that SUCCEEDED under the EXACT current context (nothing
+    about classification/eligible-accounts has changed since) is reused
+    — proven here by never queuing a new litellm response at all; if
+    the orchestrator tried to call the model again, the FakeLiteLLMClient
+    would raise on the unscripted call."""
+    entity_id, evidence_id, connection = _full_setup(
+        entity_repository, evidence_repository, classification_repository, xero_connection_repository,
+        xero_account_repository, object_store=object_store, account_id="ACC-1",
+    )
+    fingerprint = _expected_fingerprint(
+        evidence_id=evidence_id, entity_id=entity_id, evidence_repository=evidence_repository,
+        entity_repository=entity_repository, classification_repository=classification_repository,
+        xero_account_repository=xero_account_repository, object_store=object_store,
+    )
+    _seed_succeeded_invocation(
+        ai_invocation_repository, evidence_id=evidence_id, context_fingerprint=fingerprint, account_id="ACC-1",
+    )
+
+    result = _produce(
+        evidence_id, entity_id, entity_repository=entity_repository, evidence_repository=evidence_repository,
+        classification_repository=classification_repository, xero_connection_repository=xero_connection_repository,
+        xero_account_repository=xero_account_repository, suggestion_repository=suggestion_repository,
+        assignment_repository=assignment_repository, ai_invocation_repository=ai_invocation_repository,
+        litellm_client=litellm_client, object_store=object_store, audit_repository=audit_repository,
+        needs_you_repository=needs_you_repository,
+    )
+
+    assert result.outcome == OUTCOME_SUGGESTION_PRODUCED
+    assert result.suggestion.suggested_account_id == "ACC-1"
+    assert litellm_client.calls == []  # reused, never called the model
+
+
+def test_stale_prior_succeeded_invocation_is_not_reused_after_eligible_accounts_change(
+    entity_repository, evidence_repository, classification_repository, xero_connection_repository,
+    xero_account_repository, suggestion_repository, assignment_repository, ai_invocation_repository,
+    litellm_client, object_store, audit_repository, needs_you_repository,
+):
+    """A prior SUCCEEDED invocation computed BEFORE the eligible-account
+    set changed (a new account added) must NOT be reused — its own
+    `context_fingerprint` no longer matches. The orchestrator must fall
+    through to a genuinely fresh model call reflecting the current
+    account universe, never silently trust the stale one."""
+    entity_id, evidence_id, connection = _full_setup(
+        entity_repository, evidence_repository, classification_repository, xero_connection_repository,
+        xero_account_repository, object_store=object_store, account_id="ACC-1",
+    )
+    stale_fingerprint = _expected_fingerprint(
+        evidence_id=evidence_id, entity_id=entity_id, evidence_repository=evidence_repository,
+        entity_repository=entity_repository, classification_repository=classification_repository,
+        xero_account_repository=xero_account_repository, object_store=object_store,
+    )
+    _seed_succeeded_invocation(
+        ai_invocation_repository, evidence_id=evidence_id, context_fingerprint=stale_fingerprint,
+        account_id="ACC-1",
+    )
+
+    # The governed context changes: a new eligible account is synced.
+    _add_account(xero_account_repository, entity_id=entity_id, tenant_id=connection.tenant_id, account_id="ACC-2", name="New Account")
+
+    # No response is queued for the STALE fingerprint's own account
+    # (ACC-1) — the fresh call must reflect the NEW context and propose
+    # the newly-added account instead, proving a genuinely new
+    # invocation ran rather than the stale one being trusted.
+    _queue_suggestion(litellm_client, account_id="ACC-2")
+
+    result = _produce(
+        evidence_id, entity_id, entity_repository=entity_repository, evidence_repository=evidence_repository,
+        classification_repository=classification_repository, xero_connection_repository=xero_connection_repository,
+        xero_account_repository=xero_account_repository, suggestion_repository=suggestion_repository,
+        assignment_repository=assignment_repository, ai_invocation_repository=ai_invocation_repository,
+        litellm_client=litellm_client, object_store=object_store, audit_repository=audit_repository,
+        needs_you_repository=needs_you_repository,
+    )
+
+    assert result.outcome == OUTCOME_SUGGESTION_PRODUCED
+    assert result.suggestion.suggested_account_id == "ACC-2"
+    assert len(litellm_client.calls) == 1  # a genuinely new call was made, the stale invocation was not reused

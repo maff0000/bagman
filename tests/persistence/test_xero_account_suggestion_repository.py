@@ -149,25 +149,46 @@ def test_suggestion_evidence_id_foreign_key_is_enforced_at_the_database_level():
             )
 
 
-def test_no_uniqueness_constraint_on_suggestion_evidence_id_beyond_the_primary_key():
-    """Documented judgment call (`services.xero.account_suggestion`'s
-    own module docstring): idempotency for suggestions is enforced by
-    the ORCHESTRATOR, not a DB constraint beyond the real PK — proven
-    here by successfully inserting TWO suggestion rows for the same
-    evidence_id directly at the repository level."""
+def test_suggestion_evidence_id_uniqueness_is_enforced_at_the_database_level_not_only_in_application_code():
+    """CORRECTED (post-merge concurrency finding, migration
+    `f1a2b3c4d5e6`): this table was ORIGINALLY PK-only, permitting two
+    rows per `evidence_id` — a real, disposable-PostgreSQL concurrency
+    test (`tests/persistence/test_xero_account_suggestion_concurrency.py`)
+    proved that gap reachable under genuine concurrency, not merely
+    theoretical. A real unique constraint now backs "at most one
+    suggestion per evidence_id", mirroring
+    `test_assignment_evidence_id_uniqueness_is_enforced_at_the_database_level_not_only_in_application_code`'s
+    own proof shape exactly: the application-level pre-check is
+    bypassed by writing the SECOND row directly via a raw session, so
+    only the real database constraint — never `create_suggestion`'s own
+    pre-check — is what is actually proven here."""
     entity_id, evidence_id, ai_invocation_id = _setup()
     repo = PostgresXeroAccountSuggestionRepository()
     first = repo.create_suggestion(
         evidence_id=evidence_id, entity_id=entity_id, tenant_id="tenant-a",
         suggested_account_id="ACC-1", confidence=0.5, signals=[], ai_invocation_id=ai_invocation_id,
     )
+
+    with pytest.raises(IntegrityError):
+        with session_scope(get_engine()) as session:
+            session.add(
+                XeroAccountSuggestionRow(
+                    suggestion_id=identity.generate_id(), evidence_id=evidence_id, entity_id=entity_id,
+                    tenant_id="tenant-a", suggested_account_id="ACC-2", confidence=0.6, signals=[],
+                    ai_invocation_id=ai_invocation_id, status="REVIEW_REQUIRED", created_at=_utc_now(),
+                )
+            )
+
+    # The real, application-level contract: a second create_suggestion
+    # call for the same evidence_id is idempotent-under-race, returning
+    # the FIRST (winning) row unchanged — never raising, never creating
+    # a second row.
     second = repo.create_suggestion(
         evidence_id=evidence_id, entity_id=entity_id, tenant_id="tenant-a",
         suggested_account_id="ACC-2", confidence=0.6, signals=[], ai_invocation_id=ai_invocation_id,
     )
-    assert first.suggestion_id != second.suggestion_id
-    # get_by_evidence returns the most recently created row.
-    assert repo.get_by_evidence(evidence_id).suggestion_id == second.suggestion_id
+    assert second.suggestion_id == first.suggestion_id
+    assert second.suggested_account_id == "ACC-1"
 
 
 # ---------------------------------------------------------------------

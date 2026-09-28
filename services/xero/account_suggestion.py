@@ -23,22 +23,8 @@ Xero-account classifier, every suggestion here is AI-produced — the
 idempotency/failure-handling discipline is what is mirrored, not the
 deterministic-first control flow).
 
-Judgment call — why this orchestrator does NOT reproduce
-``classify_evidence``'s fingerprint-scoped invocation search verbatim
+Idempotency/reuse — THREE real mechanisms, layered
 ------------------------------------------------------------------------
-``DOCUMENT_TYPE_PROPOSAL`` v2 can search prior ``AIInvocation`` rows BY
-FINGERPRINT because its own `input_schema` carries a
-`classifier_fingerprint` field inside `input_references` (see
-`ai/tasks.py`'s own `_DOCUMENT_TYPE_PROPOSAL_V2_INPUT_SCHEMA`).
-`XERO_ACCOUNT_SUGGESTION`'s `input_schema` was deliberately built to
-mirror `ai/tasks.py::_DOCUMENT_INPUT_SCHEMA` instead (per this WO's own
-spec: a closed schema carrying only `evidence_id`) — so there is no
-field to persist a fingerprint into for a later search to filter on.
-
-Given that constraint, this orchestrator's idempotency story is built
-from TWO real, available mechanisms instead of one fingerprint-scoped
-search:
-
 1. **Business-level idempotency, checked FIRST, before any AI
    involvement at all** — :meth:`XeroAccountSuggestionRepository
    .get_by_evidence`: once a suggestion exists for an `evidence_id`, no
@@ -46,17 +32,49 @@ search:
    :data:`OUTCOME_SUGGESTION_ALREADY_EXISTS`) and no AI call is ever
    attempted. This is the guard that actually matters for "duplicate
    producer invocation is idempotent" (see this WO's own test 9) — it
-   fires before invocation-level concerns are even reached.
-2. **Subject-scoped `AIInvocation` concurrency/crash-recovery**, via
-   `ai.invocation.AIInvocationRepository.find_active_invocation`/
-   `list_invocations` keyed on `(task_id, task_version,
-   primary_input_reference=evidence_id)` — exactly the same guard
-   `ai/gateway/background.py`'s own PID §73 concurrency mechanism
+   fires before invocation-level concerns are even reached. **CORRECTED
+   (post-merge concurrency finding)**: this was NOT, as originally
+   shipped, backed by a real database constraint under genuine
+   concurrency — a real, disposable-PostgreSQL concurrency test
+   (`tests/persistence/test_xero_account_suggestion_concurrency.py`)
+   proved two genuinely concurrent callers could both pass this check
+   before either had committed. Fixed at the persistence layer
+   (`XeroAccountSuggestionRepository`'s own updated class docstring;
+   real constraint `uq_xero_account_suggestions_evidence_id`, migration
+   `f1a2b3c4d5e6`) — this orchestrator's own control flow required no
+   further change here, since it always relied on `create_suggestion`
+   to be the single source of truth, which is now actually true under
+   concurrency, not merely under sequential calls.
+2. **Subject-scoped `AIInvocation` concurrency**, via
+   `ai.invocation.AIInvocationRepository.find_active_invocation` keyed
+   on `(task_id, task_version, primary_input_reference=evidence_id)` —
+   the same guard `ai/gateway/background.py`'s own PID §73 mechanism
    already provides for every task. A non-terminal prior invocation for
    this evidence_id -> :data:`OUTCOME_AI_IN_PROGRESS` (no second call).
-   A prior SUCCEEDED invocation with no suggestion yet -> reused
-   directly (the crash-recovery case: the model call itself completed
-   but the process died before the suggestion row was persisted).
+3. **FINGERPRINT-scoped crash-recovery reuse** (post-merge stale-reuse
+   finding, CORRECTED from the original design) — a prior SUCCEEDED
+   invocation for this `evidence_id` is reused ONLY when its own stored
+   `input_references["context_fingerprint"]` matches the CURRENT
+   `compute_account_suggestion_fingerprint(...)` output exactly, mirrors
+   `classify_evidence`'s own `classifier_fingerprint`-filtered search.
+   `XERO_ACCOUNT_SUGGESTION`'s `input_schema`
+   (`_XERO_ACCOUNT_SUGGESTION_INPUT_SCHEMA`, `ai/tasks.py`) now carries
+   `context_fingerprint` as a required field for exactly this purpose —
+   originally it did not, matching `_DOCUMENT_INPUT_SCHEMA`'s narrower
+   shape, and the reuse search was (incorrectly) scoped by subject
+   alone. **Why this matters**: the account-id VALIDITY check (step 10,
+   `resolve_ai_suggested_account`) was ALWAYS freshly re-run against the
+   CURRENT eligible-account set on every call regardless of reuse — a
+   hallucinated/wrong-tenant/no-longer-eligible account could never slip
+   through via reuse, even before this fix. What COULD have gone stale
+   is the SUGGESTION's own content (which account, confidence, signals)
+   — reasoned by the model against whatever classification/eligible-
+   account snapshot existed when the reused invocation originally ran.
+   If that context has since changed (classification corrected, an
+   account renamed/removed, a prompt/context contract version bumped),
+   the fingerprint changes too, and this call falls through to a
+   genuinely fresh model invocation reflecting the CURRENT context
+   instead of trusting stale reasoning.
 
 Deliberately NOT implemented: a hard "refuse to retry a FAILED
 invocation" guard. `classify_evidence`'s own fingerprint-scoped guard
@@ -222,10 +240,25 @@ class XeroAccountSuggestion:
 
 class XeroAccountSuggestionRepository(abc.ABC):
     """Repository abstraction for XeroAccountSuggestion. No supersession
-    chain (unlike `EvidenceClassificationRepository`) — see module
-    docstring's "one non-superseded suggestion attempt per fingerprint,
-    enforced via the idempotency check in the orchestrator, not a DB
-    constraint beyond a real PK"."""
+    chain (unlike `EvidenceClassificationRepository`) — at most ONE
+    suggestion row may ever exist per `evidence_id`, period.
+
+    CORRECTED (post-merge concurrency finding, `xero/account-suggestion-
+    producer` WO follow-up): this was ORIGINALLY documented as "enforced
+    via the idempotency check in the orchestrator, not a DB constraint
+    beyond a real PK" — a real, disposable-PostgreSQL concurrency test
+    (`tests/persistence/test_xero_account_suggestion_concurrency.py`)
+    proved that claim false: two genuinely concurrent
+    `produce_account_suggestion` callers for the same `evidence_id` both
+    passed the orchestrator's own `get_by_evidence`-before-any-AI-call
+    check and both committed a row. A real database-level unique
+    constraint (`uq_xero_account_suggestions_evidence_id`, migration
+    `f1a2b3c4d5e6`) now backs this invariant, mirroring
+    `services.xero.account_assignment`'s own already-correct
+    "pre-check to avoid an unnecessary failed insert in the common case;
+    the constraint-violation path is what actually proves correctness
+    under a genuine race" discipline. See :meth:`create_suggestion`'s
+    own updated contract."""
 
     @abc.abstractmethod
     def create_suggestion(
@@ -239,6 +272,14 @@ class XeroAccountSuggestionRepository(abc.ABC):
         signals: Sequence[str],
         ai_invocation_id: str,
     ) -> XeroAccountSuggestion:
+        """Create the suggestion row for `evidence_id` — or, if a
+        genuinely concurrent caller already committed one first, return
+        THAT existing row unchanged (idempotent-under-race, never a
+        raised `ConflictError` — unlike an assignment, a suggestion
+        carries no "conflicting decision" a losing caller must be
+        warned about; it simply learns about the row the winning caller
+        already created, exactly as if it had called
+        :meth:`get_by_evidence` a moment later itself)."""
         raise NotImplementedError
 
     @abc.abstractmethod
@@ -248,20 +289,21 @@ class XeroAccountSuggestionRepository(abc.ABC):
     @abc.abstractmethod
     def get_by_evidence(self, evidence_id: str) -> Optional[XeroAccountSuggestion]:
         """Read-only lookup, never `NotFoundError` — an evidence item
-        with no suggestion yet is an ordinary, expected state. When more
-        than one row exists for `evidence_id` (not expected in ordinary
-        operation — see class docstring), the most recently created row
-        wins."""
+        with no suggestion yet is an ordinary, expected state. At most
+        one row can ever exist for `evidence_id` (see class docstring)."""
         raise NotImplementedError
 
 
 class InMemoryXeroAccountSuggestionRepository(XeroAccountSuggestionRepository):
-    """Narrow in-memory reference implementation (PID §21 Option A)."""
+    """Narrow in-memory reference implementation (PID §21 Option A).
+    Enforces the SAME "at most one row per evidence_id, idempotent
+    under a repeat call" invariant `PostgresXeroAccountSuggestionRepository`
+    enforces via a real database constraint — see class docstring."""
 
     def __init__(self) -> None:
         self._by_id: dict[str, XeroAccountSuggestion] = {}
-        #: evidence_id -> ordered list of suggestion_ids, oldest first.
-        self._by_evidence: dict[str, list[str]] = {}
+        #: evidence_id -> the one suggestion_id for it, if any.
+        self._by_evidence: dict[str, str] = {}
 
     def create_suggestion(
         self,
@@ -274,6 +316,12 @@ class InMemoryXeroAccountSuggestionRepository(XeroAccountSuggestionRepository):
         signals: Sequence[str],
         ai_invocation_id: str,
     ) -> XeroAccountSuggestion:
+        existing_id = self._by_evidence.get(evidence_id)
+        if existing_id is not None:
+            # Idempotent-under-race — see class docstring's
+            # :meth:`create_suggestion` contract.
+            return self._by_id[existing_id]
+
         try:
             candidate = XeroAccountSuggestion(
                 suggestion_id=identity.generate_id(),
@@ -293,7 +341,7 @@ class InMemoryXeroAccountSuggestionRepository(XeroAccountSuggestionRepository):
             raise ValidationError(f"could not create XeroAccountSuggestion: {exc}") from exc
 
         self._by_id[candidate.suggestion_id] = candidate
-        self._by_evidence.setdefault(evidence_id, []).append(candidate.suggestion_id)
+        self._by_evidence[evidence_id] = candidate.suggestion_id
         return candidate
 
     def get_suggestion(self, suggestion_id: str) -> XeroAccountSuggestion:
@@ -303,8 +351,8 @@ class InMemoryXeroAccountSuggestionRepository(XeroAccountSuggestionRepository):
             raise NotFoundError(f"no XeroAccountSuggestion with suggestion_id '{suggestion_id}'") from None
 
     def get_by_evidence(self, evidence_id: str) -> Optional[XeroAccountSuggestion]:
-        ids = self._by_evidence.get(evidence_id) or []
-        return self._by_id[ids[-1]] if ids else None
+        existing_id = self._by_evidence.get(evidence_id)
+        return self._by_id[existing_id] if existing_id is not None else None
 
 
 # ---------------------------------------------------------------------
@@ -548,26 +596,39 @@ def produce_account_suggestion(
             outcome=OUTCOME_AI_IN_PROGRESS, ai_invocation_id=active.ai_invocation_id, fingerprint=fingerprint,
         )
 
+    # Post-merge concurrency-finding correction: reuse is now
+    # FINGERPRINT-scoped, not merely subject-scoped — mirrors
+    # `classify_evidence`'s own `classifier_fingerprint`-filtered search
+    # exactly (see module docstring). A prior SUCCEEDED invocation
+    # computed under a DIFFERENT `context_fingerprint` (classification
+    # changed, the eligible-account set changed, a prompt/context
+    # version bumped) is never reused — this call falls through to a
+    # genuinely fresh model invocation reflecting the CURRENT context
+    # instead. The account-id VALIDITY check at step 10 was always
+    # freshly re-run regardless (see PID reconciliation note there), but
+    # the SUGGESTION's own content (which account, confidence, signals)
+    # must never be trusted from a context that has since changed.
     prior_succeeded = next(
         (
             inv
             for inv in ai_invocation_repository.list_invocations(
                 task_id=AI_TASK_ID, task_version=AI_TASK_VERSION, primary_input_reference=evidence_id,
             )
-            if inv.status == "SUCCEEDED"
+            if inv.status == "SUCCEEDED" and inv.input_references.get("context_fingerprint") == fingerprint
         ),
         None,
     )
     if prior_succeeded is not None:
-        # Crash-recovery: the model call itself already completed but
-        # the suggestion row was never persisted (process died in
-        # between) — reuse it rather than calling the model again.
+        # Crash-recovery: the model call itself already completed,
+        # under this EXACT current context, but the suggestion row was
+        # never persisted (process died in between) — reuse it rather
+        # than calling the model again.
         invocation = prior_succeeded
     else:
         invocation = run_background_task(
             task_id=AI_TASK_ID,
             task_version=AI_TASK_VERSION,
-            input_references={"evidence_id": evidence_id},
+            input_references={"evidence_id": evidence_id, "context_fingerprint": fingerprint},
             evidence_content=context.rendered_context,
             actor_type=actor_type,
             actor_id=actor_id,

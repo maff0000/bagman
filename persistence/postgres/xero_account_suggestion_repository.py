@@ -39,6 +39,14 @@ _SUGGESTION_SCHEMA = "xero/bagman.xero_account_suggestion.v1.schema.json"
 _ASSIGNMENT_SCHEMA = "xero/bagman.xero_account_assignment.v1.schema.json"
 
 _ASSIGNMENT_DEDUPE_CONSTRAINT = "uq_xero_account_assignments_evidence_id"
+#: Post-merge concurrency-finding fix (`xero/account-suggestion-producer`
+#: WO follow-up, migration `f1a2b3c4d5e6`) — see
+#: `services.xero.account_suggestion.XeroAccountSuggestionRepository`'s
+#: own updated class docstring for the full story: a real,
+#: disposable-PostgreSQL concurrency test proved two genuinely
+#: concurrent callers could both commit a row for the same
+#: `evidence_id` before this constraint existed.
+_SUGGESTION_DEDUPE_CONSTRAINT = "uq_xero_account_suggestions_evidence_id"
 
 
 # ---------------------------------------------------------------------
@@ -78,6 +86,16 @@ class PostgresXeroAccountSuggestionRepository(XeroAccountSuggestionRepository):
         signals: Sequence[str],
         ai_invocation_id: str,
     ) -> XeroAccountSuggestion:
+        # Pre-check purely to avoid an unnecessary failed insert attempt
+        # in the common, non-racing case — mirrors
+        # PostgresXeroAccountAssignmentRepository.create_assignment's own
+        # discipline exactly. The constraint-violation path below is
+        # what actually proves correctness under a genuine race (see
+        # tests/persistence/test_xero_account_suggestion_concurrency.py).
+        existing = self.get_by_evidence(evidence_id)
+        if existing is not None:
+            return existing
+
         try:
             candidate = XeroAccountSuggestion(
                 suggestion_id=identity.generate_id(),
@@ -112,6 +130,22 @@ class PostgresXeroAccountSuggestionRepository(XeroAccountSuggestionRepository):
             with session_scope(self._engine) as session:
                 session.add(row)
         except IntegrityError as exc:
+            if unique_violation_constraint(exc) == _SUGGESTION_DEDUPE_CONSTRAINT:
+                # A genuinely concurrent caller won the race and
+                # committed first — idempotent-under-race (see
+                # XeroAccountSuggestionRepository.create_suggestion's
+                # own contract docstring): return THAT row, never raise.
+                winner = self.get_by_evidence(evidence_id)
+                if winner is not None:
+                    return winner
+                # Vanishingly unlikely (the winner's own transaction
+                # committed but is somehow not yet visible) — surface
+                # honestly rather than silently return the losing
+                # candidate as if it were persisted.
+                raise PersistenceError(
+                    f"XeroAccountSuggestion unique-constraint conflict for evidence_id '{evidence_id}' "
+                    "but no existing row could be re-read"
+                ) from exc
             raise PersistenceError(f"could not create XeroAccountSuggestion: {exc}") from exc
         except SQLAlchemyError as exc:
             raise PersistenceError(f"could not create XeroAccountSuggestion: {exc}") from exc
