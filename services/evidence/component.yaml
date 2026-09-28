@@ -3,7 +3,7 @@
 # contracts/manifest/bagman.component_manifest.v1.schema.json.
 
 id: BAGMAN.SERVICES.EVIDENCE
-version: 3
+version: 4
 
 responsibility: >
   Own canonical EvidenceItem identity and its immutability and
@@ -20,10 +20,33 @@ responsibility: >
   classification-service layer on top of that same data model — no new
   canonical type, purely additive compute/orchestration logic.
 
+  As of this version, also owns EvidenceClassificationJob
+  (`evidence/automatic-classification-activation` WO) — the durable,
+  asynchronous trigger for the existing, UNMODIFIED
+  `classification_orchestrator.classify_evidence`. Before this
+  version, classification only ever ran when a human/process explicitly
+  called one of the three HTTP endpoints in
+  `app/api/routers/evidence_classification.py`; this delivery adds the
+  missing automatic trigger — a durable job is enqueued immediately
+  after either real evidence-creation call site
+  (`services/mailbox/microsoft/evidence_ingest.py`,
+  `app/api/routers/intake.py`) successfully registers a new
+  `EvidenceItem`, and a separate, bounded, operator/cron-invoked worker
+  script (`scripts/process_evidence_classification_jobs.py`) later
+  claims and processes it, running `classify_evidence` unmodified — no
+  new classifier, no new AI task, no new human-review mechanism. See
+  `services/evidence/classification_job.py`'s own module docstring for
+  the full idempotency (evidence_id-keyed, not a caller-supplied
+  idempotency key — a deliberate, documented divergence from
+  `ai.jobs.BackgroundJob`'s own idempotency-key doctrine)/lifecycle/
+  stale-claim-recovery/disclosed-limitation doctrine this record type
+  implements.
+
 owns:
   - EvidenceItem
   - EvidenceClassification
   - EvidenceClassificationRule
+  - EvidenceClassificationJob
 
 # What services/evidence/ actually imports from core/: identity (id
 # generation), timestamps (UTC handling), errors
@@ -61,6 +84,14 @@ produces:
   - EVIDENCE_CLASSIFICATION_RULE_CREATED
   - EVIDENCE_CLASSIFICATION_RULE_RETIRED
   - EVIDENCE_CLASSIFIED
+  # evidence/automatic-classification-activation WO — the one new
+  # audit event type `services/evidence/classification_job.py`'s two
+  # concrete repositories emit themselves, for the one transition no
+  # external caller is ever positioned to observe (a lazy stale-claim
+  # recovery pass silently discovering and recovering an abandoned
+  # row) — mirrors ai.jobs.BACKGROUND_JOB_STALE_RECOVERY_AUDIT_EVENT_TYPE's
+  # own identical role and emission discipline.
+  - EVIDENCE_CLASSIFICATION_JOB_STALE_RECOVERED
 
 dependencies:
   - jsonschema

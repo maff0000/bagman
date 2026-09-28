@@ -67,6 +67,7 @@ from core import actor
 from core.api import BagmanCanonicalAPI
 from persistence.objects.store import EvidenceObjectStore
 from services.evidence.classification import EvidenceClassificationRepository
+from services.evidence.classification_job import EvidenceClassificationJobRepository
 from services.evidence.classification_rule import EvidenceClassificationRuleRepository
 from services.evidence.intake.intake import IntakeRepository
 from services.evidence.intake.scanner import EvidenceSafetyScanner, ScanResult, ScanVerdict
@@ -468,6 +469,21 @@ class RuntimeComposition:
     #: own docstring).
     classification_rule_repository: EvidenceClassificationRuleRepository
     classification_repository: EvidenceClassificationRepository
+    #: `evidence/automatic-classification-activation` WO — the durable
+    #: queue backing the missing automatic classification trigger (see
+    #: `services.evidence.classification_job`'s own module docstring).
+    #: In-memory in development/test, a real
+    #: `PostgresEvidenceClassificationJobRepository` (sharing `engine`/
+    #: `api.audit_repository`, exactly like `background_job_repository`
+    #: above) in production — same never-mixed-across-modes discipline
+    #: as every repository above. Consumed by both real evidence-
+    #: creation call sites (`services/mailbox/microsoft/evidence_ingest.py`,
+    #: `app/api/routers/intake.py`) and by the standalone worker script
+    #: `scripts/process_evidence_classification_jobs.py` — no HTTP
+    #: router reads it directly (mirrors `background_job_repository`'s
+    #: own "bounded operator/maintenance-mode procedure, not a
+    #: background service" precedent).
+    classification_job_repository: EvidenceClassificationJobRepository
 
 
 def _build_development_or_test(runtime_environment: str) -> RuntimeComposition:
@@ -598,6 +614,15 @@ def _build_development_or_test(runtime_environment: str) -> RuntimeComposition:
         ai_invocation_repository=ai_invocation_repository,
     )
 
+    # `evidence/automatic-classification-activation` WO — sharing
+    # `api.audit_repository` exactly like `background_job_repository`
+    # above (same stale-claim-recovery audit-emission discipline).
+    from services.evidence.classification_job import InMemoryEvidenceClassificationJobRepository
+
+    classification_job_repository = InMemoryEvidenceClassificationJobRepository(
+        audit_repository=api.audit_repository
+    )
+
     # `default_response` closes the WI-4 dev-mode gap documented on
     # `_dev_mode_litellm_default_response` above — without it, a real
     # click on the GUI's "Run analysis" button in a live dev server
@@ -653,6 +678,7 @@ def _build_development_or_test(runtime_environment: str) -> RuntimeComposition:
         mailbox_domain_rule_repository=mailbox_domain_rule_repository,
         classification_rule_repository=classification_rule_repository,
         classification_repository=classification_repository,
+        classification_job_repository=classification_job_repository,
     )
 
 
@@ -679,6 +705,9 @@ def _build_production() -> RuntimeComposition:
         PostgresMailboxMicrosoftOAuthStateRepository,
         PostgresMailboxSweepLock,
         PostgresMailboxSweepRunRepository,
+    )
+    from persistence.postgres.evidence_classification_job_repository import (
+        PostgresEvidenceClassificationJobRepository,
     )
     from persistence.postgres.evidence_classification_repository import PostgresEvidenceClassificationRepository
     from persistence.postgres.evidence_classification_rule_repository import (
@@ -805,6 +834,13 @@ def _build_production() -> RuntimeComposition:
         rule_repository=classification_rule_repository,
         ai_invocation_repository=ai_invocation_repository,
         engine=engine,
+    )
+
+    # `evidence/automatic-classification-activation` WO — durable job
+    # queue, sharing `engine`/`api.audit_repository` exactly like
+    # `background_job_repository` above.
+    classification_job_repository = PostgresEvidenceClassificationJobRepository(
+        engine, audit_repository=api.audit_repository
     )
 
     litellm_client = LiteLLMClient(
@@ -968,6 +1004,7 @@ def _build_production() -> RuntimeComposition:
         mailbox_domain_rule_repository=mailbox_domain_rule_repository,
         classification_rule_repository=classification_rule_repository,
         classification_repository=classification_repository,
+        classification_job_repository=classification_job_repository,
     )
 
 

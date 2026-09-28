@@ -332,3 +332,95 @@ def test_direct_upload_bypass_is_closed(client):
     # And, positively: no EvidenceItem was created by this attempt —
     # confirmed by the response itself never being a 2xx creation.
     assert response.status_code not in (200, 201)
+
+
+# ---------------------------------------------------------------------
+# evidence/automatic-classification-activation WO — the manual-upload
+# call site's own automatic-classification-trigger wiring. See
+# services/evidence/classification_job.py's own module docstring and
+# tests/integration/test_mailbox_evidence_ingest.py for the mailbox
+# call site's equivalent proof.
+# ---------------------------------------------------------------------
+
+
+def test_successful_upload_enqueues_exactly_one_classification_job(client):
+    """`app/api/routers/intake.py::_register_accepted_evidence` calls
+    `enqueue_classification_job_for_evidence` immediately after its own
+    `composition.api.register_evidence(...)` succeeds — this proves it
+    against the REAL, disposable-PostgreSQL production composition
+    `client` builds (never in-memory), a genuine round trip through
+    `PostgresEvidenceClassificationJobRepository`."""
+    from app.api.composition import get_composition
+
+    response = _post_intake(
+        client,
+        content=SYNTHETIC_PDF,
+        filename="auto-classification.pdf",
+        actor_id="matt",
+    )
+    assert response.status_code == 201
+    evidence_id = response.json()["evidence"]["evidence_id"]
+
+    job = get_composition().classification_job_repository.get_by_evidence(evidence_id)
+    assert job is not None
+    assert job.evidence_id == evidence_id
+    assert job.status == "PENDING"
+    assert job.actor_type == "SYSTEM"
+
+
+def test_a_second_upload_replaying_the_same_idempotency_key_never_creates_a_second_job(client):
+    """A replayed intake (same `Idempotency-Key`) resolves to the SAME
+    `EvidenceItem` (CD-4's own idempotent-observation doctrine) —
+    `enqueue_classification_job_for_evidence`'s own evidence_id-keyed
+    idempotency must therefore never create a second job either."""
+    from app.api.composition import get_composition
+
+    key = "auto-classification-replay-key"  # gitleaks:allow
+    first = _post_intake(client, content=SYNTHETIC_PDF, filename="replay.pdf", actor_id="matt", idempotency_key=key)
+    assert first.status_code == 201
+    evidence_id = first.json()["evidence"]["evidence_id"]
+
+    # Same key AND same file (mirrors
+    # test_idempotent_replay_same_key_same_file_returns_same_result_no_duplicates
+    # exactly) -> an honest replay, 200, same evidence_id — a
+    # DIFFERENT file under the same key is a 409 IDEMPOTENCY_CONFLICT
+    # (see test_idempotency_conflict_same_key_different_file_returns_409),
+    # not the case this test is proving.
+    second = _post_intake(client, content=SYNTHETIC_PDF, filename="replay.pdf", actor_id="matt", idempotency_key=key)
+    assert second.status_code == 200
+    assert second.json()["evidence"]["evidence_id"] == evidence_id
+
+    composition = get_composition()
+    job = composition.classification_job_repository.get_by_evidence(evidence_id)
+    assert job is not None
+
+    from persistence.postgres.evidence_classification_job_models import EvidenceClassificationJobRow
+    from persistence.postgres.session import get_engine, session_scope
+
+    with session_scope(get_engine()) as session:
+        row_count = (
+            session.query(EvidenceClassificationJobRow).filter_by(evidence_id=evidence_id).count()
+        )
+    assert row_count == 1
+
+
+def test_quarantined_upload_never_creates_a_classification_job(client):
+    """A rejected/quarantined upload never reaches
+    `register_evidence` at all (`services/evidence/intake/policy.py`'s
+    own gate) — so there is no `evidence_id` to enqueue against, and no
+    `EvidenceClassificationJob` row may exist for it."""
+    from persistence.postgres.evidence_classification_job_models import EvidenceClassificationJobRow
+    from persistence.postgres.session import get_engine, session_scope
+
+    with session_scope(get_engine()) as session:
+        before_count = session.query(EvidenceClassificationJobRow).count()
+
+    response = _post_intake(client, content=EICAR_TEST_STRING, filename="eicar.txt", content_type="text/plain")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["intake"]["status"] == "QUARANTINED"
+    assert body["evidence"] is None
+
+    with session_scope(get_engine()) as session:
+        after_count = session.query(EvidenceClassificationJobRow).count()
+    assert after_count == before_count

@@ -141,3 +141,111 @@ def test_never_stores_raw_mime_in_the_evidence_metadata(api, object_store, sourc
     outcome = _ingest(api, object_store, scanner, source_id=source_id, message_id="msg-nolog")
     # metadata carries only non-body context — never the raw bytes/body text.
     assert "Body" not in str(outcome.evidence.metadata)
+
+
+# ---------------------------------------------------------------------
+# evidence/automatic-classification-activation WO — the mailbox call
+# site's own automatic-classification-trigger wiring. See
+# services/evidence/classification_job.py's own module docstring and
+# tests/app_api/test_intake_endpoint.py for the manual-upload call
+# site's equivalent proof.
+# ---------------------------------------------------------------------
+
+
+def test_clean_ingest_enqueues_exactly_one_classification_job(api, object_store, source_id):
+    from services.evidence.classification_job import InMemoryEvidenceClassificationJobRepository
+
+    classification_job_repository = InMemoryEvidenceClassificationJobRepository()
+    scanner = ScriptedScanner(ScanVerdict.CLEAN)
+    outcome = ingest_email_evidence(
+        raw_mime_bytes=b"From: a@b.com\r\nSubject: Hi\r\n\r\nBody",
+        mailbox_id=identity.generate_id(),
+        mailbox_source_id=source_id,
+        immutable_provider_message_id="msg-auto-classify",
+        observed_at=datetime.now(timezone.utc),
+        received_at=datetime.now(timezone.utc),
+        sender_address="a@b.com",
+        subject="Hi",
+        api=api,
+        object_store=object_store,
+        scanner=scanner,
+        actor_type="SYSTEM",
+        actor_id="test",
+        classification_job_repository=classification_job_repository,
+    )
+    assert outcome.status == INGEST_STATUS_INGESTED
+
+    job = classification_job_repository.get_by_evidence(outcome.evidence.evidence_id)
+    assert job is not None
+    assert job.status == "PENDING"
+
+
+def test_ingest_with_no_classification_job_repository_supplied_never_enqueues_and_never_raises(api, object_store, source_id):
+    """`classification_job_repository` defaults to `None` (a documented
+    judgment call — see `ingest_email_evidence`'s own inline comment) —
+    proving the many pre-existing tests/callers in this module that
+    never pass it still ingest cleanly, with no automatic job (an
+    accepted, disclosed gap, never a crash)."""
+    scanner = ScriptedScanner(ScanVerdict.CLEAN)
+    outcome = _ingest(api, object_store, scanner, source_id=source_id, message_id="msg-no-job-repo")
+    assert outcome.status == INGEST_STATUS_INGESTED
+
+
+def test_quarantined_ingest_never_enqueues_a_classification_job(api, object_store, source_id):
+    from services.evidence.classification_job import InMemoryEvidenceClassificationJobRepository
+
+    classification_job_repository = InMemoryEvidenceClassificationJobRepository()
+    scanner = ScriptedScanner(ScanVerdict.MALICIOUS)
+    outcome = ingest_email_evidence(
+        raw_mime_bytes=b"From: a@b.com\r\nSubject: Hi\r\n\r\nBody",
+        mailbox_id=identity.generate_id(),
+        mailbox_source_id=source_id,
+        immutable_provider_message_id="msg-quarantine-no-job",
+        observed_at=datetime.now(timezone.utc),
+        received_at=datetime.now(timezone.utc),
+        sender_address="a@b.com",
+        subject="Hi",
+        api=api,
+        object_store=object_store,
+        scanner=scanner,
+        actor_type="SYSTEM",
+        actor_id="test",
+        classification_job_repository=classification_job_repository,
+    )
+    assert outcome.status == INGEST_STATUS_QUARANTINED
+    assert outcome.evidence is None
+    # No evidence_id exists to enqueue against at all — structurally
+    # zero jobs, proven by an empty repository.
+    assert classification_job_repository._by_id == {}  # noqa: SLF001 - direct internal-state proof, test-only
+
+
+def test_enqueue_never_raises_even_when_the_job_repository_itself_fails(api, object_store, source_id):
+    """The invariant `enqueue_classification_job_for_evidence`'s own
+    docstring states: 'no ENQUEUE failure may corrupt evidence
+    ingestion either' — proven here with a repository whose
+    `submit_job` always raises."""
+
+    class _AlwaysRaisingJobRepository:
+        def submit_job(self, **kwargs):
+            raise RuntimeError("simulated repository failure")
+
+    scanner = ScriptedScanner(ScanVerdict.CLEAN)
+    outcome = ingest_email_evidence(
+        raw_mime_bytes=b"From: a@b.com\r\nSubject: Hi\r\n\r\nBody",
+        mailbox_id=identity.generate_id(),
+        mailbox_source_id=source_id,
+        immutable_provider_message_id="msg-job-repo-fails",
+        observed_at=datetime.now(timezone.utc),
+        received_at=datetime.now(timezone.utc),
+        sender_address="a@b.com",
+        subject="Hi",
+        api=api,
+        object_store=object_store,
+        scanner=scanner,
+        actor_type="SYSTEM",
+        actor_id="test",
+        classification_job_repository=_AlwaysRaisingJobRepository(),
+    )
+    # The ingest itself completed successfully regardless.
+    assert outcome.status == INGEST_STATUS_INGESTED
+    assert outcome.evidence is not None

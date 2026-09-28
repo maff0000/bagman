@@ -159,13 +159,14 @@ CD-6 Slice 1 (PID §98, "GUI Operations Foundation") additionally owns: a real p
 - **External access:** `false`
 - **Prohibited:** `direct_email_access`, `direct_bank_access`, `direct_xero_access`, `direct_chargebee_access`
 
-### `BAGMAN.SERVICES.EVIDENCE` (v3)
+### `BAGMAN.SERVICES.EVIDENCE` (v4)
 
 Own canonical EvidenceItem identity and its immutability and idempotent-observation semantics (an EvidenceItem, once recorded, is never mutated, and a replayed observation of the same external reference resolves to the existing record rather than creating a duplicate); also owns EvidenceClassification (an append-only, supersession-chained document_type classification of an EvidenceItem) and EvidenceClassificationRule (the separate, deterministic rule-based classification authority behind CD-6 Slice 5 WI-1) — two distinct canonical types this component defines alongside EvidenceItem itself, never folded into it. CD-6 Slice 5 WI-2 adds the deterministic matcher/observed-evidence-guard/preview/governed-rule-lifecycle/ classification-service layer on top of that same data model — no new canonical type, purely additive compute/orchestration logic.
+As of this version, also owns EvidenceClassificationJob (`evidence/automatic-classification-activation` WO) — the durable, asynchronous trigger for the existing, UNMODIFIED `classification_orchestrator.classify_evidence`. Before this version, classification only ever ran when a human/process explicitly called one of the three HTTP endpoints in `app/api/routers/evidence_classification.py`; this delivery adds the missing automatic trigger — a durable job is enqueued immediately after either real evidence-creation call site (`services/mailbox/microsoft/evidence_ingest.py`, `app/api/routers/intake.py`) successfully registers a new `EvidenceItem`, and a separate, bounded, operator/cron-invoked worker script (`scripts/process_evidence_classification_jobs.py`) later claims and processes it, running `classify_evidence` unmodified — no new classifier, no new AI task, no new human-review mechanism. See `services/evidence/classification_job.py`'s own module docstring for the full idempotency (evidence_id-keyed, not a caller-supplied idempotency key — a deliberate, documented divergence from `ai.jobs.BackgroundJob`'s own idempotency-key doctrine)/lifecycle/ stale-claim-recovery/disclosed-limitation doctrine this record type implements.
 
-- **Owns:** `EvidenceItem`, `EvidenceClassification`, `EvidenceClassificationRule`
+- **Owns:** `EvidenceItem`, `EvidenceClassification`, `EvidenceClassificationRule`, `EvidenceClassificationJob`
 - **Consumes:** `BAGMAN.CORE`
-- **Produces:** `EVIDENCE_CLASSIFICATION_RULE_CREATED`, `EVIDENCE_CLASSIFICATION_RULE_RETIRED`, `EVIDENCE_CLASSIFIED`
+- **Produces:** `EVIDENCE_CLASSIFICATION_RULE_CREATED`, `EVIDENCE_CLASSIFICATION_RULE_RETIRED`, `EVIDENCE_CLASSIFIED`, `EVIDENCE_CLASSIFICATION_JOB_STALE_RECOVERED`
 - **Dependencies:** `jsonschema`, `rfc3339-validator`
 - **External access:** `false`
 - **Prohibited:** `direct_email_access`, `direct_bank_access`, `direct_xero_access`, `direct_chargebee_access`

@@ -147,6 +147,7 @@ CANONICAL_TABLES = (
     "evidence_classifications",  # CD-6 Slice 5 WI-1
     "evidence_classification_rules",  # CD-6 Slice 5 WI-1
     "background_jobs",  # CD-6 §103 Inference Architecture Ruling
+    "evidence_classification_jobs",  # evidence/automatic-classification-activation WO
 )
 
 

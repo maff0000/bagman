@@ -871,6 +871,16 @@ class _ObjectStoreProtocol(Protocol):
     def put_prefixed(self, prefix, object_id, content_hash, data): ...
 
 
+class _ClassificationJobRepositoryProtocol(Protocol):
+    """The exact facade surface this module needs from
+    `services.evidence.classification_job.EvidenceClassificationJobRepository`
+    — mirrors `_EvidenceAPIProtocol`/`_ObjectStoreProtocol` above
+    exactly (this module stays composition-root-agnostic, never
+    importing `app.api.composition` itself)."""
+
+    def submit_job(self, **kwargs): ...
+
+
 class _SweepStopped(Exception):
     """Internal-only signal: a whole-sweep-stopping condition (a
     reconnect-required auth failure, or BAGMAN's own configuration
@@ -900,6 +910,7 @@ def run_sweep(
     api: _EvidenceAPIProtocol,
     object_store: _ObjectStoreProtocol,
     scanner: EvidenceSafetyScanner,
+    classification_job_repository: Optional[_ClassificationJobRepositoryProtocol] = None,
     actor_type: str,
     actor_id: str,
     now: Optional[datetime] = None,
@@ -1424,6 +1435,7 @@ def run_sweep(
                             api=api,
                             object_store=object_store,
                             scanner=scanner,
+                            classification_job_repository=classification_job_repository,
                             actor_type=actor_type,
                             actor_id=actor_id,
                             correlation_id=run.sweep_run_id,
@@ -1724,6 +1736,7 @@ def _reprocess_one_message(
     api: _EvidenceAPIProtocol,
     object_store: _ObjectStoreProtocol,
     scanner: EvidenceSafetyScanner,
+    classification_job_repository: Optional[_ClassificationJobRepositoryProtocol] = None,
     actor_type: str,
     actor_id: str,
     correlation_id: Optional[str] = None,
@@ -1956,6 +1969,7 @@ def _reprocess_one_message(
         api=api,
         object_store=object_store,
         scanner=scanner,
+        classification_job_repository=classification_job_repository,
         actor_type=actor_type,
         actor_id=actor_id,
         correlation_id=correlation_id,
@@ -2079,6 +2093,7 @@ def reprocess_all_historical_candidates_for_domain(
     api: _EvidenceAPIProtocol,
     object_store: _ObjectStoreProtocol,
     scanner: EvidenceSafetyScanner,
+    classification_job_repository: Optional[_ClassificationJobRepositoryProtocol] = None,
     sweep_lock: MailboxSweepLock,
     actor_type: str,
     actor_id: str,
@@ -2245,6 +2260,7 @@ def reprocess_all_historical_candidates_for_domain(
                     api=api,
                     object_store=object_store,
                     scanner=scanner,
+                    classification_job_repository=classification_job_repository,
                     actor_type=actor_type,
                     actor_id=actor_id,
                     correlation_id=correlation_id,
@@ -2267,6 +2283,7 @@ def process_security_reviewed_message_once(
     api: _EvidenceAPIProtocol,
     object_store: _ObjectStoreProtocol,
     scanner: EvidenceSafetyScanner,
+    classification_job_repository: Optional[_ClassificationJobRepositoryProtocol] = None,
     actor_type: str,
     actor_id: str,
     correlation_id: Optional[str] = None,
@@ -2344,6 +2361,7 @@ def process_security_reviewed_message_once(
         api=api,
         object_store=object_store,
         scanner=scanner,
+        classification_job_repository=classification_job_repository,
         actor_type=actor_type,
         actor_id=actor_id,
         correlation_id=correlation_id,
