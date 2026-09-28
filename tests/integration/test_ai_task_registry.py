@@ -52,7 +52,11 @@ def test_task_registry_has_exactly_the_four_pid_section_21_tasks_plus_wi3s_ask_b
     # boundary correction") additively registers a 7th entry,
     # DOCUMENT_TYPE_PROPOSAL v3 (a targeted BROKER_ACTIVITY_NOTICE/
     # NON_ACCOUNTING_DOCUMENT prompt-wording fix) — v1/v2 stay
-    # registered and untouched, same additive pattern.
+    # registered and untouched, same additive pattern. The BAGMAN
+    # accounting platform's `xero/account-suggestion-producer` WO
+    # additively registers an 8th entry, XERO_ACCOUNT_SUGGESTION v1 (the
+    # Xero Account Suggestion Producer's own AI task) — same additive
+    # pattern again.
     assert set(TASK_REGISTRY.keys()) == {
         ("DOCUMENT_SUMMARY", 1),
         ("DOCUMENT_TYPE_PROPOSAL", 1),
@@ -61,6 +65,7 @@ def test_task_registry_has_exactly_the_four_pid_section_21_tasks_plus_wi3s_ask_b
         ("ENTITY_PROPOSAL", 1),
         ("OPERATOR_DOCUMENT_REVIEW", 1),
         ("ASK_BAGMAN", 1),
+        ("XERO_ACCOUNT_SUGGESTION", 1),
     }
 
 

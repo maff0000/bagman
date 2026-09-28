@@ -93,6 +93,7 @@ from core.errors import (
     TenantSelectionError,
     ValidationError,
 )
+from services.xero.account_suggestion import produce_account_suggestion
 from services.xero.ai_suggestion import UNRESOLVED, resolve_ai_suggested_account
 from services.xero.client import XeroConnectionInfo, XeroOutcomeStatus
 from services.xero.connection import XeroConnection
@@ -158,6 +159,14 @@ class ResolveSuggestionRequest(BaseModel):
     spec §6) — see :func:`resolve_suggested_account`'s own docstring."""
 
     suggested_account_id: Optional[str] = None
+
+
+class SuggestAccountRequest(BaseModel):
+    """Body for `POST /{entity_id}/evidence/{evidence_id}/suggest-account`
+    — minimal, mirrors `SyncRequest`'s own shape (just the actor)."""
+
+    actor_type: str
+    actor_id: str
 
 
 def _require_entity(composition, entity_id: str) -> None:
@@ -941,4 +950,81 @@ async def resolve_suggested_account(entity_id: str, payload: ResolveSuggestionRe
         "resolved": resolution.resolved,
         "account_id": resolution.account_id if resolution.resolved else UNRESOLVED,
         "reason": resolution.reason,
+    }
+
+
+@router.post("/{entity_id}/evidence/{evidence_id}/suggest-account")
+async def suggest_account(entity_id: str, evidence_id: str, payload: SuggestAccountRequest) -> dict[str, Any]:
+    """Trigger the Xero Account Suggestion Producer
+    (`services.xero.account_suggestion.produce_account_suggestion`) for
+    one evidence item, entity-scoped in the URL (structural isolation,
+    matching this router's existing doctrine — see module docstring).
+
+    Never auto-posts, never mutates Xero, never returns raw AI
+    invocation internals or any secret — only the outcome and the
+    (possibly newly created, possibly already-existing) suggestion.
+    """
+    composition = get_composition()
+    _require_entity(composition, entity_id)
+
+    result = produce_account_suggestion(
+        evidence_id=evidence_id,
+        entity_id=entity_id,
+        evidence_repository=composition.api.evidence_repository,
+        classification_repository=composition.classification_repository,
+        entity_repository=composition.api.entity_repository,
+        xero_connection_repository=composition.xero_connection_repository,
+        xero_account_repository=composition.xero_account_repository,
+        suggestion_repository=composition.xero_account_suggestion_repository,
+        assignment_repository=composition.xero_account_assignment_repository,
+        ai_invocation_repository=composition.ai_invocation_repository,
+        litellm_client=composition.litellm_client,
+        object_store=composition.object_store,
+        audit_repository=composition.api.audit_repository,
+        record_audit_event=composition.api.record_audit_event,
+        needs_you_repository=composition.needs_you_repository,
+        actor_type=payload.actor_type,
+        actor_id=payload.actor_id,
+    )
+    return {
+        "outcome": result.outcome,
+        "entity_id": entity_id,
+        "evidence_id": evidence_id,
+        "suggestion": result.suggestion.to_dict() if result.suggestion else None,
+        "assignment": result.assignment.to_dict() if result.assignment else None,
+        "needs_you_item_id": result.needs_you_item_id,
+        "unsupported_reason": result.unsupported_reason,
+        "rejection_reason": result.rejection_reason,
+    }
+
+
+@router.get("/{entity_id}/evidence/{evidence_id}/suggestion")
+async def get_account_suggestion(entity_id: str, evidence_id: str) -> dict[str, Any]:
+    """Read-only lookup: the current suggestion and/or authoritative
+    assignment for one evidence item, if any — used by the Needs You
+    review drawer's `XERO_ACCOUNT_REQUIRED` branch.
+
+    Cross-entity isolation: a suggestion/assignment row that exists but
+    belongs to a DIFFERENT entity than the URL's own `entity_id` is
+    treated identically to "does not exist" — never returned. This
+    mirrors `produce_account_suggestion`'s own entity-match gate
+    (`services/xero/account_suggestion.py`); `get_by_evidence` on both
+    repositories filters only by `evidence_id`, so this ownership check
+    must happen here, at the read boundary, not be assumed from the
+    repository call alone (independent-audit finding, fixed before
+    merge)."""
+    composition = get_composition()
+    _require_entity(composition, entity_id)
+
+    suggestion = composition.xero_account_suggestion_repository.get_by_evidence(evidence_id)
+    if suggestion is not None and suggestion.entity_id != entity_id:
+        suggestion = None
+    assignment = composition.xero_account_assignment_repository.get_by_evidence(evidence_id)
+    if assignment is not None and assignment.entity_id != entity_id:
+        assignment = None
+    return {
+        "entity_id": entity_id,
+        "evidence_id": evidence_id,
+        "suggestion": suggestion.to_dict() if suggestion else None,
+        "assignment": assignment.to_dict() if assignment else None,
     }

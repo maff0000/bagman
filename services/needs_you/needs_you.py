@@ -152,6 +152,19 @@ ITEM_TYPE_GENERIC_QUESTION = "GENERIC_QUESTION"
 ITEM_TYPE_XERO_ACCOUNT_REQUIRED = "XERO_ACCOUNT_REQUIRED"
 ITEM_TYPE_XERO_REFERENCE_DATA_STALE = "XERO_REFERENCE_DATA_STALE"
 
+#: `xero/account-suggestion-producer` WO — the first real producer for
+#: `ITEM_TYPE_XERO_ACCOUNT_REQUIRED` (declared above, previously
+#: unwired — see that constant's own docstring). Mirrors
+#: `ALLOWED_ACTION_CLASSIFICATION_REVIEW`'s own "one item type, one
+#: allowed_action_type" shape.
+#: `services.xero.account_suggestion.produce_account_suggestion` is the
+#: producer; the resolution handler lives in
+#: `services.xero.account_suggestion_resolution` (imported into
+#: `app/api/routers/needs_you.py`, mirroring exactly where
+#: `resolve_classification_review` is imported for
+#: `CLASSIFICATION_REVIEW`).
+ALLOWED_ACTION_XERO_ACCOUNT_REQUIRED = "XERO_ACCOUNT_REQUIRED"
+
 #: CD-6 Slice 4 addition (first real Microsoft Graph adapter + sweep
 #: engine) — the one real Needs You producer this slice adds: an
 #: ACTIVE Microsoft mailbox that needs a (re)connect action (see

@@ -713,6 +713,97 @@ ASK_BAGMAN_V1 = TaskContract(
 )
 
 
+#: Xero Account Suggestion Producer (BAGMAN accounting platform,
+#: `xero/account-suggestion-producer` WO) — proposes which Xero
+#: chart-of-accounts entry one eligible piece of evidence (an
+#: already-classified SUPPLIER_INVOICE/RECEIPT) should be coded to.
+#: Unlike `DOCUMENT_TYPE_PROPOSAL`, there is no deterministic-first
+#: classifier for this question — every suggestion this task produces
+#: is AI-originated, but it is NEVER trusted at face value: the caller
+#: (`services.xero.account_suggestion.produce_account_suggestion`)
+#: validates `suggested_account_id` against the real governed eligible-
+#: account set via `services.xero.ai_suggestion.resolve_ai_suggested_account`
+#: before ever persisting a suggestion row, and the suggestion itself is
+#: always non-authoritative (`status=REVIEW_REQUIRED`) until a human
+#: resolves the resulting Needs You item.
+_XERO_ACCOUNT_SUGGESTION_INPUT_SCHEMA: Mapping[str, Any] = {
+    "type": "object",
+    "properties": {
+        "evidence_id": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Canonical evidence_id this suggestion reasons about (PID §29).",
+        },
+        "context_fingerprint": {
+            "type": "string",
+            "minLength": 1,
+            "description": (
+                "A deterministic hash of every governed fact this invocation's context was actually "
+                "built from (classification, entity, eligible-account-set, prompt/context contract "
+                "versions — see services.xero.account_suggestion.compute_account_suggestion_fingerprint). "
+                "Post-merge concurrency-finding correction: the caller (produce_account_suggestion) "
+                "MUST filter any prior-SUCCEEDED-invocation reuse search by this field matching exactly "
+                "— reusing an invocation computed under a DIFFERENT context_fingerprint would mean "
+                "trusting a suggestion reasoned against stale classification/eligible-account state, "
+                "even though the account-id VALIDITY check downstream is always freshly re-run. Mirrors "
+                "DOCUMENT_TYPE_PROPOSAL v2's own `classifier_fingerprint` field/reuse-guard pattern "
+                "exactly (`_DOCUMENT_TYPE_PROPOSAL_V2_INPUT_SCHEMA`)."
+            ),
+        },
+    },
+    "required": ["evidence_id", "context_fingerprint"],
+    "additionalProperties": False,
+}
+
+_XERO_ACCOUNT_SUGGESTION_OUTPUT_SCHEMA: Mapping[str, Any] = {
+    "type": "object",
+    "properties": {
+        "suggested_account_id": {
+            "type": "string",
+            "minLength": 1,
+            "description": (
+                "The model's proposed Xero `AccountID`, chosen from the closed list of eligible "
+                "accounts explicitly supplied in this invocation's evidence_content — the model must "
+                "never invent an id outside that list. Deliberately NOT a JSON Schema `enum` (unlike "
+                "`DOCUMENT_TYPE_PROPOSAL` v2/v3's closed `proposed_type` vocabulary): the eligible-"
+                "account set is dynamic per entity/Xero-connection and cannot be statically expressed "
+                "in a task contract that is shared across every BAGMAN company. Membership is instead "
+                "enforced DOWNSTREAM, post-response, by "
+                "`services.xero.ai_suggestion.resolve_ai_suggested_account` — a response naming an "
+                "AccountID outside the supplied candidate set is rejected there and no suggestion is "
+                "ever persisted for it. This is a deliberate, documented deviation from the sibling "
+                "task's own enum-constrained pattern, not an oversight."
+            ),
+        },
+        **_common_confidence_signals_warnings_properties(),
+    },
+    "required": ["suggested_account_id", "confidence", "signals", "warnings"],
+    "additionalProperties": False,
+}
+
+XERO_ACCOUNT_SUGGESTION_V1 = TaskContract(
+    task_id="XERO_ACCOUNT_SUGGESTION",
+    task_version=1,
+    role="BACKGROUND",
+    preferred_capability="bagman-fast",
+    input_schema=_XERO_ACCOUNT_SUGGESTION_INPUT_SCHEMA,
+    output_schema=_XERO_ACCOUNT_SUGGESTION_OUTPUT_SCHEMA,
+    timeout_seconds=25,
+    confidence_policy={
+        "meaning": (
+            "The model's self-reported confidence that suggested_account_id is the correct Xero "
+            "account for this evidence, given the supplied eligible-account context."
+        ),
+        "notes": (
+            "No fixed pass/fail threshold is enforced by this task contract — every suggestion "
+            "requires human confirmation regardless of confidence value (see this task's own "
+            "review-status doctrine: an AI-produced suggestion is never authoritative on its own)."
+        ),
+    },
+    data_policy="LOCAL_OK",
+)
+
+
 #: The single source of truth for every registered task (PID §21),
 #: keyed by exact `(task_id, task_version)` — callers request the
 #: task, never the model (PID §22).
@@ -726,6 +817,7 @@ TASK_REGISTRY: Mapping[tuple[str, int], TaskContract] = {
         ENTITY_PROPOSAL_V1,
         OPERATOR_DOCUMENT_REVIEW_V1,
         ASK_BAGMAN_V1,
+        XERO_ACCOUNT_SUGGESTION_V1,
     )
 }
 

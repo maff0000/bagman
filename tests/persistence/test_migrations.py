@@ -44,6 +44,8 @@ EXPECTED_TABLES = {
     "evidence_classification_rules",  # CD-6 Slice 5 WI-1
     "evidence_classifications",  # CD-6 Slice 5 WI-1
     "background_jobs",  # CD-6 §103 Inference Architecture Ruling
+    "xero_account_suggestions",  # xero/account-suggestion-producer WO
+    "xero_account_assignments",  # xero/account-suggestion-producer WO
 }
 
 
@@ -108,6 +110,8 @@ def test_xero_migration_downgrade_genuinely_undoes_the_upgrade(postgres_containe
         "evidence_classification_rules",  # CD-6 Slice 5 WI-1, chained downstream of a1c4e8f2d6b7
         "evidence_classifications",  # CD-6 Slice 5 WI-1, chained downstream of a1c4e8f2d6b7
         "background_jobs",  # CD-6 §103 Inference Architecture Ruling, chained downstream of b4d8f1a92c65
+        "xero_account_suggestions",  # xero/account-suggestion-producer WO, chained downstream of c7a3f9e1b542
+        "xero_account_assignments",  # xero/account-suggestion-producer WO, chained downstream of c7a3f9e1b542
     }
     try:
         command.downgrade(cfg, "712c5a2aab92")
@@ -149,6 +153,8 @@ def test_mailbox_migration_downgrade_genuinely_undoes_the_upgrade(postgres_conta
         "evidence_classification_rules",  # CD-6 Slice 5 WI-1, chained downstream of a1c4e8f2d6b7
         "evidence_classifications",  # CD-6 Slice 5 WI-1, chained downstream of a1c4e8f2d6b7
         "background_jobs",  # CD-6 §103 Inference Architecture Ruling, chained downstream of b4d8f1a92c65
+        "xero_account_suggestions",  # xero/account-suggestion-producer WO, chained downstream of c7a3f9e1b542
+        "xero_account_assignments",  # xero/account-suggestion-producer WO, chained downstream of c7a3f9e1b542
     }
     try:
         command.downgrade(cfg, "5e8c1f42b9a7")
@@ -179,6 +185,8 @@ def test_mailbox_microsoft_sweep_migration_downgrade_genuinely_undoes_the_upgrad
         "evidence_classification_rules",  # CD-6 Slice 5 WI-1, chained downstream of a1c4e8f2d6b7
         "evidence_classifications",  # CD-6 Slice 5 WI-1, chained downstream of a1c4e8f2d6b7
         "background_jobs",  # CD-6 §103 Inference Architecture Ruling, chained downstream of b4d8f1a92c65
+        "xero_account_suggestions",  # xero/account-suggestion-producer WO, chained downstream of c7a3f9e1b542
+        "xero_account_assignments",  # xero/account-suggestion-producer WO, chained downstream of c7a3f9e1b542
     }
     try:
         command.downgrade(cfg, "a3d7c1f9e246")

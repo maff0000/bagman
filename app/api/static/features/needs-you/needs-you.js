@@ -30,6 +30,10 @@ import { DomainReview } from "../mailbox/domain-review.js";
 // See features/needs-you/classification-review.js's own module
 // docstring for why it imports `NeedsYou` back from this file.
 import { ClassificationReview } from "./classification-review.js";
+// `xero/account-suggestion-producer` WO — the XERO_ACCOUNT_REQUIRED
+// branch of this SAME universal review drawer, mirroring
+// ClassificationReview's own placement exactly.
+import { XeroAccountSuggestionReview } from "./xero-account-suggestion-review.js";
 
 //: services.needs_you.needs_you.ALLOWED_ACTION_MAILBOX_DOMAIN_REVIEW's
 //: own real string value (services/needs_you/needs_you.py) — kept here
@@ -56,6 +60,10 @@ const TYPE_PHRASE = {
   CLASSIFICATION_REVIEW: (n) => `${n} email${n === 1 ? "" : "s"} need${n === 1 ? "s" : ""} classification`,
   RULE_APPROVAL: (n) => `${n} rule proposal${n === 1 ? "" : "s"} need${n === 1 ? "s" : ""} approval`,
   GENERIC_QUESTION: (n) => `${n} question${n === 1 ? "" : "s"} need${n === 1 ? "s" : ""} an answer`,
+  // `xero/account-suggestion-producer` WO — the first real producer for
+  // XERO_ACCOUNT_REQUIRED (see services/needs_you/needs_you.py's own
+  // docstring for this constant).
+  XERO_ACCOUNT_REQUIRED: (n) => `${n} document${n === 1 ? "" : "s"} need${n === 1 ? "s" : ""} an account`,
 };
 
 export const NeedsYou = {
@@ -138,6 +146,20 @@ export const NeedsYou = {
         el("div", { class: "needs-you-card__meta small", text: `${m.subject || "(no subject)"}${pct}` })
       );
     }
+    // `xero/account-suggestion-producer` WO — a bounded card summary
+    // straight from the item's own metadata (never a per-card
+    // suggestion/account fetch), mirroring CLASSIFICATION_REVIEW's own
+    // pattern immediately above.
+    if (item.allowed_action_type === "XERO_ACCOUNT_REQUIRED") {
+      const m = item.metadata || {};
+      const pct = m.confidence != null ? ` · ${Math.round(m.confidence * 100)}%` : "";
+      card.appendChild(
+        el("div", {
+          class: "needs-you-card__meta small",
+          text: `Suggested account: ${m.suggested_account_id || "—"}${pct}`,
+        })
+      );
+    }
     if (item.status === "OPEN") {
       const reviewBtn = el("button", {
         class: "btn btn--primary",
@@ -203,6 +225,14 @@ export const NeedsYou = {
       // Dismiss button (the backend already rejects DISMISSED for this
       // item type, see app/api/routers/needs_you.py).
       await ClassificationReview.render(body, item);
+      return;
+    }
+
+    if (item.allowed_action_type === "XERO_ACCOUNT_REQUIRED") {
+      // `xero/account-suggestion-producer` WO — the full account-
+      // suggestion review drawer body, branched exactly like
+      // CLASSIFICATION_REVIEW/MAILBOX_DOMAIN_REVIEW below.
+      await XeroAccountSuggestionReview.render(body, item);
       return;
     }
 

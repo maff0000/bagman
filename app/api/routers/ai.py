@@ -60,7 +60,19 @@ _MAX_PAGE_SIZE = 200
 #: `(task_id, task_version)` pair is refused; see
 #: `tests/integration/test_architecture_boundaries.py`'s
 #: request-level proof of this rejection.
-_GENERIC_PATH_FORBIDDEN_TASKS: frozenset[tuple[str, int]] = frozenset({("DOCUMENT_TYPE_PROPOSAL", 2)})
+#: `xero/account-suggestion-producer` WO — `XERO_ACCOUNT_SUGGESTION` v1
+#: needs the same governed treatment as `DOCUMENT_TYPE_PROPOSAL` v2: its
+#: `evidence_content` is built by `services.xero.account_suggestion_context
+#: .build_account_suggestion_context` (eligible-account list, entity
+#: name, classification — never this router's own best-effort raw-byte
+#: UTF-8 decode), and its own orchestrator
+#: (`services.xero.account_suggestion.produce_account_suggestion`)
+#: additionally gates on eligibility/staleness/idempotency this generic
+#: surface cannot reproduce. See
+#: `app/api/routers/xero.py::suggest_account` for the dedicated endpoint.
+_GENERIC_PATH_FORBIDDEN_TASKS: frozenset[tuple[str, int]] = frozenset(
+    {("DOCUMENT_TYPE_PROPOSAL", 2), ("XERO_ACCOUNT_SUGGESTION", 1)}
+)
 
 #: CD-6 §103 Inference Architecture Ruling, PID §103.4 item 4's own
 #: "GUI/status-display" instruction: `/internal/ai/health` only ever

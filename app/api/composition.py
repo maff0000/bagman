@@ -88,6 +88,8 @@ from services.mailbox.microsoft.secrets import MicrosoftTokenStoreProtocol
 from services.mailbox.sweep_run import MailboxSweepRunRepository
 from services.needs_you.needs_you import NeedsYouRepository
 from services.xero.account import XeroAccountRepository
+from services.xero.account_assignment import XeroAccountAssignmentRepository
+from services.xero.account_suggestion import XeroAccountSuggestionRepository
 from services.xero.client import XeroAccountingClientProtocol, XeroOAuthClientProtocol
 from services.xero.connection import XeroConnectionRepository
 from services.xero.oauth_state import OAuthStateRepository
@@ -353,6 +355,13 @@ class RuntimeComposition:
     xero_connection_repository: XeroConnectionRepository
     xero_account_repository: XeroAccountRepository
     xero_sync_run_repository: XeroSyncRunRepository
+    #: `xero/account-suggestion-producer` WO — the AI-proposal ledger
+    #: (never authoritative on its own) and the separate, write-once
+    #: authoritative coding-decision record a human resolution creates.
+    #: Same never-mixed-across-modes discipline as every repository
+    #: above.
+    xero_account_suggestion_repository: XeroAccountSuggestionRepository
+    xero_account_assignment_repository: XeroAccountAssignmentRepository
     oauth_state_repository: OAuthStateRepository
     xero_oauth_client: XeroOAuthClientProtocol
     xero_accounting_client: XeroAccountingClientProtocol
@@ -485,6 +494,8 @@ def _build_development_or_test(runtime_environment: str) -> RuntimeComposition:
     from services.mailbox.sweep_run import InMemoryMailboxSweepRunRepository
     from services.needs_you.needs_you import InMemoryNeedsYouRepository
     from services.xero.account import InMemoryXeroAccountRepository
+    from services.xero.account_assignment import InMemoryXeroAccountAssignmentRepository
+    from services.xero.account_suggestion import InMemoryXeroAccountSuggestionRepository
     from services.xero.connection import InMemoryXeroConnectionRepository
     from services.xero.fake_client import FakeXeroAccountingClient, FakeXeroOAuthClient
     from services.xero.oauth_state import InMemoryOAuthStateRepository
@@ -500,6 +511,8 @@ def _build_development_or_test(runtime_environment: str) -> RuntimeComposition:
     xero_connection_repository = InMemoryXeroConnectionRepository()
     xero_account_repository = InMemoryXeroAccountRepository()
     xero_sync_run_repository = InMemoryXeroSyncRunRepository()
+    xero_account_suggestion_repository = InMemoryXeroAccountSuggestionRepository()
+    xero_account_assignment_repository = InMemoryXeroAccountAssignmentRepository()
     oauth_state_repository = InMemoryOAuthStateRepository()
     # CD-6 Slice 2: no real Xero Developer App exists yet (PID §102.1's
     # own stated constraint) — development/test composition ALWAYS uses
@@ -613,6 +626,8 @@ def _build_development_or_test(runtime_environment: str) -> RuntimeComposition:
         xero_connection_repository=xero_connection_repository,
         xero_account_repository=xero_account_repository,
         xero_sync_run_repository=xero_sync_run_repository,
+        xero_account_suggestion_repository=xero_account_suggestion_repository,
+        xero_account_assignment_repository=xero_account_assignment_repository,
         oauth_state_repository=oauth_state_repository,
         xero_oauth_client=xero_oauth_client,
         xero_accounting_client=xero_accounting_client,
@@ -674,6 +689,10 @@ def _build_production() -> RuntimeComposition:
     from persistence.postgres.provenance_repository import PostgresProvenanceRepository
     from persistence.postgres.session import get_engine
     from persistence.postgres.source_repository import PostgresSourceRepository
+    from persistence.postgres.xero_account_suggestion_repository import (
+        PostgresXeroAccountAssignmentRepository,
+        PostgresXeroAccountSuggestionRepository,
+    )
     from persistence.postgres.xero_repository import (
         PostgresOAuthStateRepository,
         PostgresXeroAccountRepository,
@@ -817,6 +836,8 @@ def _build_production() -> RuntimeComposition:
     xero_connection_repository = PostgresXeroConnectionRepository(engine)
     xero_account_repository = PostgresXeroAccountRepository(engine)
     xero_sync_run_repository = PostgresXeroSyncRunRepository(engine)
+    xero_account_suggestion_repository = PostgresXeroAccountSuggestionRepository(engine)
+    xero_account_assignment_repository = PostgresXeroAccountAssignmentRepository(engine)
     oauth_state_repository = PostgresOAuthStateRepository(engine)
     xero_oauth_client = XeroOAuthClient()
     xero_accounting_client = XeroAccountingClient()
@@ -920,6 +941,8 @@ def _build_production() -> RuntimeComposition:
         xero_connection_repository=xero_connection_repository,
         xero_account_repository=xero_account_repository,
         xero_sync_run_repository=xero_sync_run_repository,
+        xero_account_suggestion_repository=xero_account_suggestion_repository,
+        xero_account_assignment_repository=xero_account_assignment_repository,
         oauth_state_repository=oauth_state_repository,
         xero_oauth_client=xero_oauth_client,
         xero_accounting_client=xero_accounting_client,

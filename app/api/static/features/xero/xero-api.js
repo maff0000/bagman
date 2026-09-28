@@ -13,6 +13,10 @@ export const XERO_API = {
   syncs: (entityId) => `/internal/xero/${encodeURIComponent(entityId)}/syncs`,
   syncNow: (entityId) => `/internal/xero/${encodeURIComponent(entityId)}/sync`,
   disconnect: (entityId) => `/internal/xero/${encodeURIComponent(entityId)}/disconnect`,
+  suggestAccount: (entityId, evidenceId) =>
+    `/internal/xero/${encodeURIComponent(entityId)}/evidence/${encodeURIComponent(evidenceId)}/suggest-account`,
+  getSuggestion: (entityId, evidenceId) =>
+    `/internal/xero/${encodeURIComponent(entityId)}/evidence/${encodeURIComponent(evidenceId)}/suggestion`,
 };
 
 export function getXeroStatus(entityId) {
@@ -41,4 +45,21 @@ export function syncXeroNow(entityId, actorId) {
 
 export function disconnectXero(entityId, actorId) {
   return apiPost(XERO_API.disconnect(entityId), { actor_type: "USER", actor_id: actorId });
+}
+
+/** Trigger the Xero Account Suggestion Producer for one evidence item
+ * (`xero/account-suggestion-producer` WO). Not called by the ordinary
+ * review drawer flow today (the producer is invoked server-side by
+ * whatever pipeline first raises the XERO_ACCOUNT_REQUIRED item) —
+ * exposed here for any future manual "suggest again" trigger. */
+export function suggestXeroAccount(entityId, evidenceId, actorId) {
+  return apiPost(XERO_API.suggestAccount(entityId, evidenceId), {
+    actor_type: "USER",
+    actor_id: actorId,
+  });
+}
+
+/** The current suggestion/assignment for one evidence item, if any. */
+export function getXeroAccountSuggestion(entityId, evidenceId) {
+  return apiGet(XERO_API.getSuggestion(entityId, evidenceId));
 }
