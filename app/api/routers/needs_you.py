@@ -42,7 +42,12 @@ from pydantic import BaseModel
 from core.errors import ConflictError, ValidationError
 from app.api.composition import get_composition
 from services.evidence.classification_review import resolve_classification_review
-from services.needs_you.needs_you import ITEM_TYPE_CLASSIFICATION_REVIEW, ITEM_TYPE_COMPANY_REQUIRED
+from services.needs_you.needs_you import (
+    ITEM_TYPE_CLASSIFICATION_REVIEW,
+    ITEM_TYPE_COMPANY_REQUIRED,
+    ITEM_TYPE_XERO_ACCOUNT_REQUIRED,
+)
+from services.xero.account_suggestion_resolution import resolve_account_suggestion
 
 router = APIRouter(prefix="/internal/needs-you")
 
@@ -291,6 +296,29 @@ async def resolve_needs_you_item(item_id: str, payload: ResolveNeedsYouItemReque
             classification_repository=composition.classification_repository,
             rule_repository=composition.classification_rule_repository,
             audit_repository=composition.api.audit_repository,
+            record_audit_event=composition.api.record_audit_event,
+        )
+
+    if current.item_type == ITEM_TYPE_XERO_ACCOUNT_REQUIRED and payload.new_status == "RESOLVED":
+        # `xero/account-suggestion-producer` WO — the real business-logic
+        # mutation for an XERO_ACCOUNT_REQUIRED item, in the exact same
+        # slot the COMPANY_REQUIRED/CLASSIFICATION_REVIEW branches above
+        # occupy: real work (the governed, write-once XeroAccountAssignment
+        # write) BEFORE the generic `resolve_needs_you_item` call below.
+        # Any exception here (ValidationError/NotFoundError/ConflictError)
+        # propagates before the item is ever marked RESOLVED — the item
+        # stays OPEN, and a failed assignment attempt can never leave
+        # this question falsely marked answered.
+        resolve_account_suggestion(
+            needs_you_item=current,
+            resolution=payload.resolution,
+            actor_type=payload.actor_type,
+            actor_id=payload.actor_id,
+            evidence_repository=composition.api.evidence_repository,
+            xero_connection_repository=composition.xero_connection_repository,
+            xero_account_repository=composition.xero_account_repository,
+            suggestion_repository=composition.xero_account_suggestion_repository,
+            assignment_repository=composition.xero_account_assignment_repository,
             record_audit_event=composition.api.record_audit_event,
         )
 

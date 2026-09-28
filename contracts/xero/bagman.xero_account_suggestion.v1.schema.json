@@ -1,0 +1,75 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://bagman.internal/contracts/xero/bagman.xero_account_suggestion.v1.schema.json",
+  "title": "BAGMAN XeroAccountSuggestion",
+  "description": "One AI-produced, non-authoritative proposal of which Xero chart-of-accounts entry a piece of eligible evidence should be coded to (`xero/account-suggestion-producer` WO). Append-only ledger row — never mutated, never itself an authoritative coding decision. `status` is always `REVIEW_REQUIRED` at creation: an AI-produced suggestion is NEVER created with any other status (mirrors `EvidenceClassification`'s own AI_PROPOSAL discipline). The real, write-once authoritative decision is a SEPARATE record, `XeroAccountAssignment` (`bagman.xero_account_assignment.v1`), created only by a human operator's resolution of the Needs You item this suggestion raises.",
+  "type": "object",
+  "properties": {
+    "suggestion_id": {
+      "$ref": "https://bagman.internal/contracts/common/bagman.identifier.v1.schema.json",
+      "description": "Canonical BAGMAN identifier for this suggestion row."
+    },
+    "evidence_id": {
+      "$ref": "https://bagman.internal/contracts/common/bagman.identifier.v1.schema.json",
+      "description": "The `EvidenceItem` this suggestion was produced for."
+    },
+    "entity_id": {
+      "$ref": "https://bagman.internal/contracts/common/bagman.identifier.v1.schema.json",
+      "description": "The BAGMAN `GovernedEntity` this suggestion was produced for — copied verbatim from the evidence's own already-resolved `entity_id` at creation time, never re-derived later (mirrors how `EvidenceItem.entity_id` itself is set once and trusted)."
+    },
+    "tenant_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The Xero organisation/tenant (`XeroConnection.tenant_id` / `XeroAccount.tenant_id`'s own identifier) this suggestion's candidate account set was drawn from — the same field name/shape `XeroAccount` already uses for this identity, deliberately reused rather than inventing a second name for the same concept."
+    },
+    "suggested_account_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The Xero `AccountID` the AI proposed — already validated, before this row is ever created, against the real eligible-account set supplied to the model (`services.xero.ai_suggestion.resolve_ai_suggested_account`)."
+    },
+    "confidence": {
+      "oneOf": [
+        { "type": "number", "minimum": 0.0, "maximum": 1.0 },
+        { "type": "null" }
+      ],
+      "description": "The model's self-reported confidence (mirrors `EvidenceClassification.confidence`'s own AI_PROPOSAL shape) — never a manufactured value."
+    },
+    "signals": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Short, evidence-based justifications the model gave for this suggestion (from the AIInvocation output's own `signals` field) — bounded short strings, never raw document content."
+    },
+    "ai_invocation_id": {
+      "$ref": "https://bagman.internal/contracts/common/bagman.identifier.v1.schema.json",
+      "description": "The `AIInvocation` that produced this suggestion — full provenance back to exactly which governed AI run this came from."
+    },
+    "status": {
+      "type": "string",
+      "const": "REVIEW_REQUIRED",
+      "description": "Always `REVIEW_REQUIRED` — an AI-produced suggestion is never created with any other status (see this schema's own top-level description). No transition/status-change exists on this row at all; a human decision is recorded on the separate `XeroAccountAssignment` record instead."
+    },
+    "created_at": {
+      "$ref": "https://bagman.internal/contracts/common/bagman.utc_timestamp.v1.schema.json"
+    },
+    "schema_version": {
+      "allOf": [
+        { "$ref": "https://bagman.internal/contracts/common/bagman.schema_version.v1.schema.json" }
+      ],
+      "const": "bagman.xero_account_suggestion.v1"
+    }
+  },
+  "required": [
+    "suggestion_id",
+    "evidence_id",
+    "entity_id",
+    "tenant_id",
+    "suggested_account_id",
+    "confidence",
+    "signals",
+    "ai_invocation_id",
+    "status",
+    "created_at",
+    "schema_version"
+  ],
+  "additionalProperties": false
+}

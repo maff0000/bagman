@@ -43,10 +43,33 @@ responsibility: >
   "why this lives in services/xero/" docstring section), never
   auto-approving anything.
 
+  As of this version, also owns the governed Xero Account Suggestion
+  Producer (`xero/account-suggestion-producer` WO): given one piece of
+  eligible governed evidence (already classified SUPPLIER_INVOICE/
+  RECEIPT with a resolved entity_id), produces an AI-generated
+  suggestion of which synced Xero account it should be coded to
+  (`services/xero/account_suggestion.py::produce_account_suggestion`,
+  task `XERO_ACCOUNT_SUGGESTION` v1, `BAGMAN.AI`), persists it as a
+  non-authoritative, append-only proposal (`XeroAccountSuggestion` —
+  the AI's output is validated against this component's own
+  pre-existing eligible-account-set validator before it is ever
+  persisted, never trusted on its own claim), and routes it through
+  `BAGMAN.NEEDS_YOU`'s existing `XERO_ACCOUNT_REQUIRED` item type for
+  human confirmation or correction
+  (`services/xero/account_suggestion_resolution.py::resolve_account_suggestion`),
+  which alone creates the separate, write-once authoritative
+  `XeroAccountAssignment` record — mirroring
+  `EvidenceItem.entity_id`/`assign_entity`'s own write-once/
+  `ConflictError`-on-reassignment discipline. Still never posts,
+  journals, reconciles, or otherwise mutates real Xero state — every
+  write this capability makes is to BAGMAN's own database only.
+
 owns:
   - XeroConnection
   - XeroAccount
   - XeroSyncRun
+  - XeroAccountSuggestion
+  - XeroAccountAssignment
 
 # services/xero/*.py depends on core/ exactly like every other CD-2/
 # CD-4/CD-5/CD-6 domain module: identity (id generation), timestamps
@@ -63,21 +86,45 @@ owns:
 # services/mailbox/sweep.py's own existing BAGMAN.NEEDS_YOU dependency
 # (see supplier_correlation.py's own module docstring for why this
 # capability lives here rather than in either of those two components).
+# As of this version, services/xero/account_suggestion.py additionally
+# depends on ai.gateway.background/ai.tasks/ai.prompts.loader
+# (BAGMAN.AI — the same governed AI-invocation gateway
+# services.evidence.classification_orchestrator already consumes, never
+# a second/direct model call) and on
+# services.evidence.classification.get_current_classification/the
+# DOCUMENT_TYPES vocabulary (BAGMAN.SERVICES.EVIDENCE) to read the
+# already-governed classification/entity facts this producer's
+# eligibility gate requires — a read-only consumption of already-
+# computed facts, never a second classification/entity-resolution
+# mechanism.
 consumes:
   - BAGMAN.CORE
   - BAGMAN.MAILBOX
   - BAGMAN.NEEDS_YOU
+  - BAGMAN.AI
+  - BAGMAN.SERVICES.EVIDENCE
 
-# This component does not itself emit AuditEvents — every
-# XERO_CONNECTION_*/XERO_SYNC_* audit event is minted by the HTTP
-# orchestration layer that calls this component's repositories/
-# run_sync (app/api/routers/xero.py) via
-# core.api.BagmanCanonicalAPI.record_audit_event(), exactly like
-# services/needs_you/ and services/evidence/intake/ never emitting
-# their own audit events (see those components' own manifests, and
-# architect spec §22's explicit "use the existing core.audit
-# infrastructure, do not invent a second audit mechanism" instruction).
-produces: []
+# Every XERO_CONNECTION_*/XERO_SYNC_* audit event is still minted by
+# the HTTP orchestration layer that calls this component's
+# repositories/run_sync (app/api/routers/xero.py) via
+# core.api.BagmanCanonicalAPI.record_audit_event() — unchanged.
+#
+# As of this version, XERO_ACCOUNT_SUGGESTION_PRODUCED/
+# XERO_ACCOUNT_SUGGESTION_REJECTED/XERO_ACCOUNT_ASSIGNED are the first
+# audit events this component emits from its OWN service layer
+# (services/xero/account_suggestion.py,
+# services/xero/account_suggestion_resolution.py), each via a
+# dependency-injected `record_audit_event` callable (never a second
+# audit mechanism) — mirroring the identical pattern
+# ai/gateway/background.py (BAGMAN.AI) and
+# services/evidence/classification_orchestrator.py
+# (BAGMAN.SERVICES.EVIDENCE) already use for their own
+# AI_INVOCATION_*/service-layer events, not a new precedent this
+# component invented.
+produces:
+  - XERO_ACCOUNT_SUGGESTION_PRODUCED
+  - XERO_ACCOUNT_SUGGESTION_REJECTED
+  - XERO_ACCOUNT_ASSIGNED
 
 # No new third-party dependency: services/xero/client.py speaks HTTP
 # via stdlib urllib.request only (mirrors ai/providers/litellm/client.py

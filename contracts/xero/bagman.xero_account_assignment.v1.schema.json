@@ -1,0 +1,76 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://bagman.internal/contracts/xero/bagman.xero_account_assignment.v1.schema.json",
+  "title": "BAGMAN XeroAccountAssignment",
+  "description": "The authoritative, write-once record of which Xero chart-of-accounts entry a piece of evidence was actually coded to (`xero/account-suggestion-producer` WO). Created ONLY by a human operator's resolution of an `XERO_ACCOUNT_REQUIRED` Needs You item — never by the suggestion producer itself (see `bagman.xero_account_suggestion.v1`, a separate, non-authoritative AI proposal record). Exactly one row per `evidence_id` (real database-level unique constraint) — a genuine reassignment attempt (a second call with a DIFFERENT `account_id`) raises a conflict, mirroring `EvidenceItem.assign_entity`'s own write-once discipline exactly; this is a deliberate, not-yet-built correction workflow, same as entity reassignment. This record never itself mutates Xero — it is BAGMAN's own internal record of the human decision, nothing more.",
+  "type": "object",
+  "properties": {
+    "assignment_id": {
+      "$ref": "https://bagman.internal/contracts/common/bagman.identifier.v1.schema.json",
+      "description": "Canonical BAGMAN identifier for this assignment row."
+    },
+    "evidence_id": {
+      "$ref": "https://bagman.internal/contracts/common/bagman.identifier.v1.schema.json",
+      "description": "The `EvidenceItem` this assignment resolves — exactly one assignment row may ever exist per `evidence_id`."
+    },
+    "entity_id": {
+      "$ref": "https://bagman.internal/contracts/common/bagman.identifier.v1.schema.json",
+      "description": "The BAGMAN `GovernedEntity` this assignment belongs to — must match the referenced evidence's own authoritative `entity_id` at resolution time (validated by the resolution handler, never trusted from a stale suggestion-time snapshot alone)."
+    },
+    "tenant_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The Xero organisation/tenant `account_id` below resolves within — same field name/shape as `XeroAccount.tenant_id`/`XeroAccountSuggestion.tenant_id`."
+    },
+    "account_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The Xero `AccountID` this evidence was actually coded to — validated, at resolution time, against a FRESH re-fetch of the eligible-account set (never the suggestion-time snapshot, which may be stale)."
+    },
+    "source": {
+      "type": "string",
+      "enum": ["AI_ACCEPTED", "OPERATOR_SELECTED"],
+      "description": "`AI_ACCEPTED` — the operator accepted BAGMAN's own suggested `account_id` unchanged. `OPERATOR_SELECTED` — the operator chose a different, valid eligible account instead."
+    },
+    "suggestion_id": {
+      "oneOf": [
+        { "$ref": "https://bagman.internal/contracts/common/bagman.identifier.v1.schema.json" },
+        { "type": "null" }
+      ],
+      "description": "The `XeroAccountSuggestion` that prompted this assignment, when one exists — null is legal (an assignment could in principle be recorded against an `XERO_ACCOUNT_REQUIRED` item with no live suggestion, e.g. a defensive future path), but every resolution this WO builds always supplies one."
+    },
+    "assigned_by_actor_type": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Mirrors `NeedsYouItem.resolved_by_actor_type` — who/what made this coding decision."
+    },
+    "assigned_by_actor_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Mirrors `NeedsYouItem.resolved_by_actor_id`."
+    },
+    "assigned_at": {
+      "$ref": "https://bagman.internal/contracts/common/bagman.utc_timestamp.v1.schema.json"
+    },
+    "schema_version": {
+      "allOf": [
+        { "$ref": "https://bagman.internal/contracts/common/bagman.schema_version.v1.schema.json" }
+      ],
+      "const": "bagman.xero_account_assignment.v1"
+    }
+  },
+  "required": [
+    "assignment_id",
+    "evidence_id",
+    "entity_id",
+    "tenant_id",
+    "account_id",
+    "source",
+    "suggestion_id",
+    "assigned_by_actor_type",
+    "assigned_by_actor_id",
+    "assigned_at",
+    "schema_version"
+  ],
+  "additionalProperties": false
+}
