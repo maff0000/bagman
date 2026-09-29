@@ -316,6 +316,22 @@ def _resolve_activation_boundary(raw: Optional[str]) -> tuple[Optional[datetime]
             f"{_ACTIVATION_BOUNDARY_ENV_VAR}={raw!r} could not be parsed as ISO-8601 ({exc}) — "
             "reconciliation skipped for this run (fail closed)"
         )
+    # Independent-audit finding (third re-audit round): `fromisoformat`
+    # happily accepts a value with no timezone/offset at all (e.g.
+    # "2026-10-15T00:00:00", no trailing "Z") and silently returns a
+    # NAIVE datetime — comparing that against `received_at`'s own real,
+    # timezone-AWARE column would not raise, but would be resolved
+    # ambiguously (session/server-local time), a genuine silent-
+    # correctness risk directly inside the one guarantee this function
+    # exists to provide ("fail loudly on malformed input, never guess").
+    # A naive value is therefore treated as malformed too — fail closed,
+    # exactly like any other parse failure, never silently accepted.
+    if parsed.tzinfo is None:
+        return None, (
+            f"{_ACTIVATION_BOUNDARY_ENV_VAR}={raw!r} has no timezone/offset (e.g. no trailing 'Z') — "
+            "an activation boundary must be explicit and unambiguous; reconciliation skipped for this "
+            "run (fail closed)"
+        )
     return parsed, None
 
 #: See module docstring's "Per-job outcome doctrine" section for the

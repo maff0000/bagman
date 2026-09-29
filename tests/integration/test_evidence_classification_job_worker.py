@@ -775,6 +775,20 @@ def test_resolve_activation_boundary_malformed_skips_never_raises():
     assert "not-a-real-timestamp" in skip_reason
 
 
+def test_resolve_activation_boundary_naive_value_with_no_timezone_fails_closed():
+    """Independent-audit finding (third re-audit round):
+    `datetime.fromisoformat` happily accepts a value with no
+    timezone/offset at all and silently returns a NAIVE datetime — a
+    genuine silent-correctness risk against `received_at`'s own real,
+    timezone-aware column. A naive value must be treated as malformed,
+    never silently accepted, per this function's own "fail loudly,
+    never guess" contract."""
+    boundary, skip_reason = worker._resolve_activation_boundary("2026-10-15T00:00:00")
+    assert boundary is None
+    assert skip_reason is not None
+    assert "timezone" in skip_reason.lower()
+
+
 def test_resolve_activation_boundary_valid_value_parses_correctly():
     boundary, skip_reason = worker._resolve_activation_boundary("2026-10-15T00:00:00Z")
     assert skip_reason is None
