@@ -702,12 +702,33 @@ def reconcile_missing_classification_jobs(
 
     Deliberately bounded (`limit`, default 200) and deliberately
     recency-biased (relies on `list_evidence`'s own `received_at DESC`
-    ordering) — NOT an attempt to exhaustively reconcile the entire
-    evidence corpus in one call. This is intentional: a genuinely
-    orphaned item (rare — only reachable via a process crash in the
-    narrow window between evidence-commit and enqueue) will keep
-    surfacing in each successive reconciliation pass until it is
-    caught, since only items still missing a job are found each time.
+    ordering, with NO offset/cursor between calls — see
+    `tests/persistence/test_evidence_classification_job_reconciliation.py`'s
+    own "same-limit repeat call" and "widen the limit" tests for the
+    exact, proven behaviour below) — NOT an attempt to exhaustively
+    reconcile the entire evidence corpus in one call.
+
+    CORRECTED, honest characterisation of what this actually guarantees
+    (an earlier draft of this docstring overclaimed "will keep
+    surfacing... until caught" unconditionally — the tests below prove
+    that is only true while the orphan count stays within `limit`):
+    for the realistic case this gap-repair path exists for — a small
+    number of rare, crash-induced orphans, never a backlog approaching
+    `limit` — routine periodic runs at the default `limit` resolve them
+    without operator intervention, since each still-unjobbed item keeps
+    appearing in the "most recent `limit`" window until it is caught. If
+    the number of orphans awaiting a job at once ever EXCEEDS `limit`,
+    an identical repeat call at the same `limit` makes ZERO further
+    progress on the OLDER excess (it keeps re-resolving whatever is
+    currently most-recent, which — once resolved — is naturally pushed
+    out of a later call's own "most recent `limit`" window by ordinary
+    new evidence arriving in the meantime); reaching that older excess
+    requires an operator to re-run with a larger `--limit` (a real,
+    simple, always-effective, DB-safe recovery lever — never a
+    permanent loss the way the pre-reconciliation gap was — just not an
+    unconditionally-automatic one once a backlog exceeds the default
+    window).
+
     Historical evidence (received before the activation boundary) can
     NEVER be found by this scan, at any limit, no matter how many times
     it runs — the `received_at_from` filter is unconditional and
