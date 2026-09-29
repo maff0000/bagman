@@ -58,6 +58,7 @@ from services.evidence.classification_job import (
     recover_stale_claim,
     transition_job,
 )
+from services.evidence.classification_orchestrator import CLASSIFY_EVIDENCE_OUTCOMES
 
 _EVIDENCE_ID_CONSTRAINT = "uq_evidence_classification_jobs_evidence_id"
 
@@ -86,6 +87,7 @@ def _row_to_job(row: EvidenceClassificationJobRow) -> EvidenceClassificationJob:
         claimed_by=row.claimed_by,
         claimed_at=row.claimed_at,
         last_error=row.last_error,
+        classification_outcome=row.classification_outcome,
     )
 
 
@@ -104,6 +106,7 @@ def _row_from_job(job: EvidenceClassificationJob) -> EvidenceClassificationJobRo
         claimed_by=job.claimed_by,
         claimed_at=job.claimed_at,
         last_error=job.last_error,
+        classification_outcome=job.classification_outcome,
     )
 
 
@@ -119,6 +122,7 @@ def _apply_job_to_row(row: EvidenceClassificationJobRow, job: EvidenceClassifica
     row.claimed_by = job.claimed_by
     row.claimed_at = job.claimed_at
     row.last_error = job.last_error
+    row.classification_outcome = job.classification_outcome
 
 
 class PostgresEvidenceClassificationJobRepository(EvidenceClassificationJobRepository):
@@ -286,10 +290,22 @@ class PostgresEvidenceClassificationJobRepository(EvidenceClassificationJobRepos
     def mark_in_progress(self, job_id: str) -> EvidenceClassificationJob:
         return self._transition_locked(job_id, "IN_PROGRESS", attempt_count_delta=1)
 
-    def mark_succeeded(self, job_id: str) -> EvidenceClassificationJob:
-        return self._transition_locked(job_id, "SUCCEEDED")
+    def mark_succeeded(self, job_id: str, *, classification_outcome: str) -> EvidenceClassificationJob:
+        if classification_outcome not in CLASSIFY_EVIDENCE_OUTCOMES:
+            raise ValidationError(
+                f"classification_outcome '{classification_outcome}' is not one of "
+                f"{sorted(CLASSIFY_EVIDENCE_OUTCOMES)}"
+            )
+        return self._transition_locked(job_id, "SUCCEEDED", classification_outcome=classification_outcome)
 
-    def mark_failed(self, job_id: str, *, error: str, retryable: bool) -> EvidenceClassificationJob:
+    def mark_failed(
+        self, job_id: str, *, error: str, retryable: bool, classification_outcome: Optional[str] = None
+    ) -> EvidenceClassificationJob:
+        if classification_outcome is not None and classification_outcome not in CLASSIFY_EVIDENCE_OUTCOMES:
+            raise ValidationError(
+                f"classification_outcome '{classification_outcome}' is not one of "
+                f"{sorted(CLASSIFY_EVIDENCE_OUTCOMES)}"
+            )
         try:
             with session_scope(self._engine) as session:
                 row = self._get_row_for_update(session, job_id)
@@ -297,7 +313,9 @@ class PostgresEvidenceClassificationJobRepository(EvidenceClassificationJobRepos
                 target_status = (
                     "FAILED_RETRYABLE" if (retryable and current.attempt_count < current.max_attempts) else "FAILED_TERMINAL"
                 )
-                updated = transition_job(current, target_status, last_error=error)
+                updated = transition_job(
+                    current, target_status, last_error=error, classification_outcome=classification_outcome
+                )
                 _apply_job_to_row(row, updated)
                 session.flush()
         except (NotFoundError, InvalidStateTransitionError, ValidationError, PersistenceError):

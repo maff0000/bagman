@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 import pytest
 
 from ai.invocation import InMemoryAIInvocationRepository
+from ai.providers.litellm.client import LiteLLMOutcomeStatus
 from ai.providers.litellm.fake import FakeLiteLLMClient
 from core import actor, identity
 from core.audit import InMemoryAuditRepository
@@ -35,6 +36,16 @@ from services.evidence.classification import (
 from services.evidence.classification_job import (
     InMemoryEvidenceClassificationJobRepository,
     enqueue_classification_job_for_evidence,
+)
+from services.evidence.classification_orchestrator import (
+    OUTCOME_AI_IN_PROGRESS,
+    OUTCOME_AI_INVOCATION_FAILED,
+    OUTCOME_AI_PRIOR_FAILURE,
+    OUTCOME_AI_PROPOSAL_REVIEW_REQUIRED,
+    OUTCOME_CONTEXT_UNSUPPORTED,
+    OUTCOME_CURRENT_CLASSIFICATION_EXISTS,
+    OUTCOME_DETERMINISTIC_CLASSIFIED,
+    classify_evidence,
 )
 from services.evidence.classification_rule import InMemoryEvidenceClassificationRuleRepository
 from services.evidence.evidence import InMemoryEvidenceRepository
@@ -231,9 +242,11 @@ def test_worker_processes_pending_job_ai_succeeds_creates_one_review_item(
     assert record["outcome"] == "SUCCEEDED"
     assert record["job_status"] == "SUCCEEDED"
     assert record["classify_evidence_outcome"] == "AI_PROPOSAL_REVIEW_REQUIRED"
+    assert record["classification_outcome"] == OUTCOME_AI_PROPOSAL_REVIEW_REQUIRED
 
     job = classification_job_repository.get_by_evidence(evidence_id)
     assert job.status == "SUCCEEDED"
+    assert job.classification_outcome == OUTCOME_AI_PROPOSAL_REVIEW_REQUIRED
 
     # `ensure_classification_review_item`'s own `source_object_reference`
     # is the `EvidenceClassification.classification_id` (its dedupe
@@ -284,7 +297,11 @@ def test_worker_processes_job_deterministic_rule_match_zero_ai_calls(
     [record] = result["records"]
     assert record["outcome"] == "SUCCEEDED"
     assert record["classify_evidence_outcome"] == "DETERMINISTIC_CLASSIFIED"
+    assert record["classification_outcome"] == OUTCOME_DETERMINISTIC_CLASSIFIED
     assert litellm_client.calls == []  # zero AI calls made
+
+    job = classification_job_repository.get_by_evidence(evidence_id)
+    assert job.classification_outcome == OUTCOME_DETERMINISTIC_CLASSIFIED
 
 
 # ---------------------------------------------------------------------
@@ -321,6 +338,7 @@ def test_worker_processes_job_for_already_classified_evidence_succeeds_no_duplic
     [record] = result["records"]
     assert record["outcome"] == "SUCCEEDED"
     assert record["classify_evidence_outcome"] == "CURRENT_CLASSIFICATION_EXISTS"
+    assert record["classification_outcome"] == OUTCOME_CURRENT_CLASSIFICATION_EXISTS
 
     after_history = classification_repository.list_classification_history(evidence_id, CLASSIFICATION_TYPE_DOCUMENT_TYPE)
     assert len(after_history) == len(before_history) == 1  # no duplicate classification row
@@ -438,3 +456,243 @@ def test_no_new_code_imports_the_xero_account_suggestion_producer():
             f"{relative_path} must never import services.xero.* (no automatic Xero Account Suggestion "
             f"triggering is part of this delivery) — found: {sorted(m for m in imported_modules if m.startswith('services.xero'))}"
         )
+
+
+# ---------------------------------------------------------------------
+# Architect delta (2026-09-29 review, WO item 3) — the corrected
+# outcome-to-job-status mapping. One test per outcome category from
+# `scripts.process_evidence_classification_jobs`'s own
+# `_COMPLETE_OUTCOMES`/`_COMPLETE_BUT_UNRESOLVED_OUTCOMES`/
+# `_AI_FAILURE_OUTCOMES`/`_RETRY_DEFER_OUTCOMES` sets.
+# ---------------------------------------------------------------------
+
+
+def _register_document_evidence_no_storage_reference(evidence_repository) -> str:
+    """CONTEXT_UNSUPPORTED's own real trigger — an EvidenceItem with NO
+    stored content at all (see `classify_evidence`'s own `if not
+    evidence.storage_reference:` guard, step 8 of its docstring's
+    numbered sequence)."""
+    now = datetime.now(timezone.utc)
+    item = evidence_repository.register_evidence(
+        entity_id=None, evidence_type="DOCUMENT", source_id=identity.generate_id(),
+        observed_at=now, received_at=now,
+        content_hash={"algorithm": "SHA-256", "value": hashlib.sha256(b"no content stored").hexdigest()},
+        mime_type="application/octet-stream", size_bytes=0, storage_reference=None,
+    )
+    return item.evidence_id
+
+
+def test_outcome_context_unsupported_maps_to_succeeded_no_real_classification(
+    evidence_repository, rule_repository, classification_repository, ai_invocation_repository, litellm_client,
+    audit_repository, needs_you_repository, classification_job_repository,
+):
+    evidence_id = _register_document_evidence_no_storage_reference(evidence_repository)
+    enqueue_classification_job_for_evidence(
+        evidence_id, classification_job_repository=classification_job_repository, actor_type=actor.SYSTEM, actor_id=ACTOR_ID,
+    )
+    # Deliberately no object_store passed through — CONTEXT_UNSUPPORTED
+    # is reached before object_store.get is ever called (no
+    # storage_reference at all), so an InMemoryObjectStore with nothing
+    # in it is fine here.
+    result = _run_process(
+        limit=5, classification_job_repository=classification_job_repository, evidence_repository=evidence_repository,
+        rule_repository=rule_repository, classification_repository=classification_repository,
+        ai_invocation_repository=ai_invocation_repository, litellm_client=litellm_client,
+        object_store=InMemoryObjectStore(), audit_repository=audit_repository, needs_you_repository=needs_you_repository,
+    )
+    [record] = result["records"]
+    assert record["outcome"] == "SUCCEEDED"
+    assert record["classify_evidence_outcome"] == OUTCOME_CONTEXT_UNSUPPORTED
+    assert record["classification_outcome"] == OUTCOME_CONTEXT_UNSUPPORTED
+
+    job = classification_job_repository.get_by_evidence(evidence_id)
+    assert job.status == "SUCCEEDED"
+    assert job.classification_outcome == OUTCOME_CONTEXT_UNSUPPORTED
+    # Not confusable with a genuine classification — no row was ever created.
+    assert classification_repository.get_current_classification(evidence_id, CLASSIFICATION_TYPE_DOCUMENT_TYPE) is None
+    assert litellm_client.calls == []
+
+
+def test_outcome_ai_invocation_failed_maps_to_failed_terminal(
+    evidence_repository, rule_repository, classification_repository, ai_invocation_repository, litellm_client,
+    object_store, audit_repository, needs_you_repository, classification_job_repository,
+):
+    evidence_id = _register_email_evidence(
+        evidence_repository, object_store,
+        content=_rfc822_email(sender="a@b.com", subject="Will fail", body="body"),
+    )
+    enqueue_classification_job_for_evidence(
+        evidence_id, classification_job_repository=classification_job_repository, actor_type=actor.SYSTEM, actor_id=ACTOR_ID,
+    )
+    litellm_client.queue_failure(capability_alias="bagman-core", status=LiteLLMOutcomeStatus.TIMEOUT, error_detail="boom")
+
+    result = _run_process(
+        limit=5, classification_job_repository=classification_job_repository, evidence_repository=evidence_repository,
+        rule_repository=rule_repository, classification_repository=classification_repository,
+        ai_invocation_repository=ai_invocation_repository, litellm_client=litellm_client, object_store=object_store,
+        audit_repository=audit_repository, needs_you_repository=needs_you_repository,
+    )
+    [record] = result["records"]
+    assert record["outcome"] == "TERMINAL_FAILURE"
+    assert record["job_status"] == "FAILED_TERMINAL"
+    assert record["classify_evidence_outcome"] == OUTCOME_AI_INVOCATION_FAILED
+    assert record["classification_outcome"] == OUTCOME_AI_INVOCATION_FAILED
+
+    job = classification_job_repository.get_by_evidence(evidence_id)
+    assert job.status == "FAILED_TERMINAL"
+    assert job.classification_outcome == OUTCOME_AI_INVOCATION_FAILED
+    assert job.attempt_count < job.max_attempts, (
+        "FAILED_TERMINAL here comes from retryable=False (the prior-failure-guard reasoning), never from "
+        "attempt_count exhaustion"
+    )
+
+
+def test_outcome_ai_prior_failure_maps_to_failed_terminal(
+    evidence_repository, rule_repository, classification_repository, ai_invocation_repository, litellm_client,
+    object_store, audit_repository, needs_you_repository, classification_job_repository,
+):
+    """Mirrors `tests/integration/test_classification_orchestrator.py
+    ::test_prior_failed_invocation_is_not_silently_retried`'s own exact
+    fixture shape for reaching AI_PRIOR_FAILURE: a first, DIRECT
+    `classify_evidence(persist=True)` call (simulating an earlier,
+    already-completed dispatch attempt — not going through this WO's
+    own job/worker machinery at all) establishes a real FAILED
+    `AIInvocation` for this evidence's exact classifier fingerprint;
+    THEN a job is enqueued and processed by the worker, which must
+    reach AI_PRIOR_FAILURE (not attempt a second model call — the
+    FakeLiteLLMClient's queue is empty by then, so a retry would raise
+    an AssertionError instead of silently succeeding)."""
+    evidence_id = _register_email_evidence(
+        evidence_repository, object_store,
+        content=_rfc822_email(sender="a@b.com", subject="Prior failure", body="body"),
+    )
+    litellm_client.queue_failure(capability_alias="bagman-core", status=LiteLLMOutcomeStatus.TIMEOUT)
+    first = classify_evidence(
+        evidence_id=evidence_id, persist=True, evidence_repository=evidence_repository,
+        rule_repository=rule_repository, classification_repository=classification_repository,
+        ai_invocation_repository=ai_invocation_repository, litellm_client=litellm_client, object_store=object_store,
+        audit_repository=audit_repository, record_audit_event=audit_repository.record_audit_event,
+        needs_you_repository=needs_you_repository, actor_type=actor.SYSTEM, actor_id="pre-existing-dispatch",
+    )
+    assert first.outcome == OUTCOME_AI_INVOCATION_FAILED
+    assert len(litellm_client.calls) == 1
+
+    enqueue_classification_job_for_evidence(
+        evidence_id, classification_job_repository=classification_job_repository, actor_type=actor.SYSTEM, actor_id=ACTOR_ID,
+    )
+    result = _run_process(
+        limit=5, classification_job_repository=classification_job_repository, evidence_repository=evidence_repository,
+        rule_repository=rule_repository, classification_repository=classification_repository,
+        ai_invocation_repository=ai_invocation_repository, litellm_client=litellm_client, object_store=object_store,
+        audit_repository=audit_repository, needs_you_repository=needs_you_repository,
+    )
+    [record] = result["records"]
+    assert record["outcome"] == "TERMINAL_FAILURE"
+    assert record["job_status"] == "FAILED_TERMINAL"
+    assert record["classify_evidence_outcome"] == OUTCOME_AI_PRIOR_FAILURE
+    assert record["classification_outcome"] == OUTCOME_AI_PRIOR_FAILURE
+    assert len(litellm_client.calls) == 1  # no second model call was made by the worker's own attempt
+
+    job = classification_job_repository.get_by_evidence(evidence_id)
+    assert job.status == "FAILED_TERMINAL"
+    assert job.classification_outcome == OUTCOME_AI_PRIOR_FAILURE
+
+
+def test_outcome_ai_in_progress_maps_to_failed_retryable_and_is_reclaimable(
+    evidence_repository, rule_repository, classification_repository, ai_invocation_repository, litellm_client,
+    object_store, audit_repository, needs_you_repository, classification_job_repository,
+):
+    """Mirrors `tests/integration/test_classification_orchestrator.py
+    ::test_active_invocation_guard_returns_ai_in_progress_never_launches_duplicate`'s
+    own exact fixture shape: a genuinely non-terminal (freshly-created,
+    still `REQUESTED`) `AIInvocation` for the same
+    `(task_id, task_version, evidence_id)` subject already exists before
+    the worker ever runs, simulating a concurrent in-flight call
+    (another worker/reconciliation race, or a manual HTTP request)."""
+    evidence_id = _register_email_evidence(
+        evidence_repository, object_store,
+        content=_rfc822_email(sender="a@b.com", subject="In progress", body="body"),
+    )
+    in_flight = ai_invocation_repository.create_invocation(
+        task_id="DOCUMENT_TYPE_PROPOSAL", task_version=2, role="BACKGROUND", provider="LITELLM",
+        capability_alias="bagman-core", input_references={"evidence_id": evidence_id},
+        actor_type=actor.SYSTEM, actor_id="a-concurrent-caller",
+    )
+    enqueue_classification_job_for_evidence(
+        evidence_id, classification_job_repository=classification_job_repository, actor_type=actor.SYSTEM, actor_id=ACTOR_ID,
+    )
+    result = _run_process(
+        limit=5, classification_job_repository=classification_job_repository, evidence_repository=evidence_repository,
+        rule_repository=rule_repository, classification_repository=classification_repository,
+        ai_invocation_repository=ai_invocation_repository, litellm_client=litellm_client, object_store=object_store,
+        audit_repository=audit_repository, needs_you_repository=needs_you_repository,
+    )
+    [record] = result["records"]
+    assert record["outcome"] == "DEFERRED_RETRYABLE"
+    assert record["job_status"] == "FAILED_RETRYABLE"
+    assert record["classify_evidence_outcome"] == OUTCOME_AI_IN_PROGRESS
+    assert record["classification_outcome"] == OUTCOME_AI_IN_PROGRESS
+    assert litellm_client.calls == []  # never a duplicate model call
+
+    job = classification_job_repository.get_by_evidence(evidence_id)
+    assert job.status == "FAILED_RETRYABLE"
+    assert job.classification_outcome == OUTCOME_AI_IN_PROGRESS
+
+    # IS reclaimable — not stuck.
+    reclaimed = classification_job_repository.claim_next_pending(limit=5, claimed_by="later-worker")
+    assert [j.job_id for j in reclaimed] == [job.job_id]
+
+
+def test_no_ai_failure_outcome_is_ever_reported_as_a_job_succeeded(
+    evidence_repository, rule_repository, classification_repository, ai_invocation_repository, litellm_client,
+    object_store, audit_repository, needs_you_repository, classification_job_repository,
+):
+    """Structural proof (test plan item 7): for every real job produced
+    by an outcome in `worker._AI_FAILURE_OUTCOMES`
+    (`AI_INVOCATION_FAILED`/`AI_PRIOR_FAILURE`), the job's own `status`
+    is NEVER `SUCCEEDED` — never a coincidence of the two scenario
+    tests above, a genuine parametrized scan over both."""
+    # Scenario A: AI_INVOCATION_FAILED.
+    evidence_id_a = _register_email_evidence(
+        evidence_repository, object_store,
+        content=_rfc822_email(sender="a@b.com", subject="Fails A", body="body"),
+    )
+    litellm_client.queue_failure(capability_alias="bagman-core", status=LiteLLMOutcomeStatus.TIMEOUT)
+    enqueue_classification_job_for_evidence(
+        evidence_id_a, classification_job_repository=classification_job_repository, actor_type=actor.SYSTEM, actor_id=ACTOR_ID,
+    )
+
+    # Scenario B: AI_PRIOR_FAILURE (a distinct evidence item, its own
+    # pre-established FAILED AIInvocation).
+    evidence_id_b = _register_email_evidence(
+        evidence_repository, object_store,
+        content=_rfc822_email(sender="a@b.com", subject="Fails B", body="body"),
+    )
+    litellm_client.queue_failure(capability_alias="bagman-core", status=LiteLLMOutcomeStatus.TIMEOUT)
+    classify_evidence(
+        evidence_id=evidence_id_b, persist=True, evidence_repository=evidence_repository,
+        rule_repository=rule_repository, classification_repository=classification_repository,
+        ai_invocation_repository=ai_invocation_repository, litellm_client=litellm_client, object_store=object_store,
+        audit_repository=audit_repository, record_audit_event=audit_repository.record_audit_event,
+        needs_you_repository=needs_you_repository, actor_type=actor.SYSTEM, actor_id="pre-existing-dispatch",
+    )
+    enqueue_classification_job_for_evidence(
+        evidence_id_b, classification_job_repository=classification_job_repository, actor_type=actor.SYSTEM, actor_id=ACTOR_ID,
+    )
+
+    result = _run_process(
+        limit=5, classification_job_repository=classification_job_repository, evidence_repository=evidence_repository,
+        rule_repository=rule_repository, classification_repository=classification_repository,
+        ai_invocation_repository=ai_invocation_repository, litellm_client=litellm_client, object_store=object_store,
+        audit_repository=audit_repository, needs_you_repository=needs_you_repository,
+    )
+    assert result["claimed_count"] == 2
+    scanned = 0
+    for record in result["records"]:
+        if record["classification_outcome"] in worker._AI_FAILURE_OUTCOMES:
+            scanned += 1
+            assert record["job_status"] != "SUCCEEDED", (
+                f"an AI-failure classification_outcome ({record['classification_outcome']!r}) was recorded "
+                f"on a SUCCEEDED job — this must never happen: {record}"
+            )
+    assert scanned == 2, "both scripted AI-failure scenarios must actually have been scanned"

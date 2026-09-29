@@ -31,7 +31,8 @@ submitted automatically, by `enqueue_classification_job_for_evidence`,
 never manually via this script; `--process --limit N` is this script's
 only mode.
 
-Per-job outcome doctrine — a documented judgment call
+Per-job outcome doctrine — corrected 2026-09-29 (architect review, WO
+item 3)
 ------------------------------------------------------------------------
 A claimed job's SOLE responsibility is "run `classify_evidence` once
 for this `evidence_id`", never "guarantee a definitive classification
@@ -39,13 +40,24 @@ resulted" — `classify_evidence` already has its own complete internal
 failure semantics (WI-3's own governed outcome vocabulary,
 `CLASSIFY_EVIDENCE_OUTCOMES`) and NEVER raises for an ordinary
 AI/context/deterministic-conflict/current-classification-exists
-condition. Therefore: **any `ClassifyEvidenceResult` `classify_evidence`
-returns WITHOUT RAISING — including `OUTCOME_CURRENT_CLASSIFICATION_EXISTS`,
-`OUTCOME_AI_INVOCATION_FAILED`, `OUTCOME_CONTEXT_UNSUPPORTED`,
-`OUTCOME_DETERMINISTIC_CONFLICT`, etc. — is a job `SUCCEEDED`.** This
-worker never re-interprets or duplicates `classify_evidence`'s own
-outcome semantics; it only threads everything through correctly and
-reports the outcome it saw.
+condition. An earlier version of this worker treated **any**
+`ClassifyEvidenceResult` `classify_evidence` returned WITHOUT RAISING —
+including `AI_IN_PROGRESS`/`AI_INVOCATION_FAILED`/`AI_PRIOR_FAILURE` —
+as an undifferentiated job `SUCCEEDED`, with no durable record of which
+outcome actually happened. The architect's review of this WO REQUIRED
+that be replaced with an HONEST, EXPLICIT mapping from each of the 10
+real `CLASSIFY_EVIDENCE_OUTCOMES` values to job status +
+`EvidenceClassificationJob.classification_outcome` (see
+`services.evidence.classification_job`'s own module docstring) — see
+`_COMPLETE_OUTCOMES`/`_COMPLETE_BUT_UNRESOLVED_OUTCOMES`/
+`_AI_FAILURE_OUTCOMES`/`_RETRY_DEFER_OUTCOMES` below and `_process_one`'s
+own outcome-dispatch for the full, exhaustive mapping — never a coarse
+"it didn't raise" bucket again. `classification_outcome` is durably
+recorded on the job row for EVERY one of these four categories, so an
+operator can always distinguish a genuinely-classified success from a
+governed-but-unresolved or AI-failed one, even though the job's own
+`status` is `SUCCEEDED` for two of the four categories (see those
+constants' own docstrings for why).
 
 Only a genuinely RAISED exception is a job failure — an actual
 infrastructure fault (object store down, database down, an unexpected
@@ -91,6 +103,39 @@ docstring section and identical reasoning):
   explicitly, mirroring `process_background_job_overflow.py`'s own
   named, itemised exceptions — not invent a second implicit default.
 
+Reconciliation is wired in BEFORE claiming (architect requirement, WO
+item 1)
+------------------------------------------------------------------------
+`main()` (never `run_process()` — see that decision's own note at the
+call site below) calls
+`services.evidence.classification_job.reconcile_missing_classification_jobs`
+exactly once, BEFORE `classification_job_repository.claim_next_pending`,
+matching the architect's required flow: normal evidence creation ->
+best-effort immediate enqueue -> worker invocation -> bounded
+prospective reconciliation -> claim/process jobs. Reconciliation runs
+with its own distinct `actor_id`
+(`bagman-evidence-classification-reconciliation`, vs. this worker's own
+`bagman-evidence-classification-worker`) so a job's `actor_id` alone
+tells an operator whether it was submitted by the immediate-enqueue
+path or recovered by reconciliation — `EvidenceClassificationJob
+.actor_id` is a plain persisted column, queryable like any other, so
+this distinction costs nothing and is worth keeping (a documented,
+non-blocking judgment call — no dedicated reporting surface for it
+exists yet). The reconciled count is folded into this script's own
+summary report as `reconciled_count`, alongside `claimed_count`.
+`run_process()` itself is deliberately NOT changed to call
+reconciliation internally — it is exercised directly, without
+reconciliation, by `tests/integration/test_evidence_classification_job_worker.py
+::test_run_process_never_creates_jobs_itself` (a pre-existing, still-
+authoritative proof that `--process` alone never conjures a job into
+existence for un-enqueued evidence); wiring reconciliation into
+`run_process()` itself would make that specific, deliberate guarantee
+false. `main()` is the correct seam: it is the one, real, operator-
+invoked entrypoint that always wants both steps, and it is what
+production imports/runs. (Nothing prevents a future revision from
+splitting this into two explicit CLI flags — not attempted here, the
+WO's own spec asks for exactly one wired-in call.)
+
 Usage
 -----
     python3 scripts/process_evidence_classification_jobs.py \\
@@ -122,18 +167,96 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from core import identity  # noqa: E402
 from core.errors import NotFoundError, PersistenceError  # noqa: E402
 from core.timestamps import to_contract_string, utc_now  # noqa: E402
-from services.evidence.classification_job import EvidenceClassificationJob  # noqa: E402
-from services.evidence.classification_orchestrator import classify_evidence  # noqa: E402
+from services.evidence.classification_job import (  # noqa: E402
+    EvidenceClassificationJob,
+    reconcile_missing_classification_jobs,
+)
+from services.evidence.classification_orchestrator import (  # noqa: E402
+    OUTCOME_AI_IN_PROGRESS,
+    OUTCOME_AI_INVOCATION_FAILED,
+    OUTCOME_AI_PRIOR_FAILURE,
+    OUTCOME_AI_PROPOSAL_REVIEW_REQUIRED,
+    OUTCOME_AI_PROPOSAL_UNCLASSIFIABLE,
+    OUTCOME_CONTEXT_UNSUPPORTED,
+    OUTCOME_CURRENT_CLASSIFICATION_EXISTS,
+    OUTCOME_DETERMINISTIC_CLASSIFIED,
+    OUTCOME_DETERMINISTIC_CONFLICT,
+    OUTCOME_DETERMINISTIC_EXISTING,
+    classify_evidence,
+)
 
 #: Bounded ceiling for `--limit` (never "unlimited") — mirrors
 #: `process_background_job_overflow.py`'s own identical bound.
 _MAX_PROCESS_LIMIT = 200
 
 _ACTOR_TYPE = "SYSTEM"
+_WORKER_ACTOR_ID = "bagman-evidence-classification-worker"
+#: Distinct from `_WORKER_ACTOR_ID` (see module docstring's
+#: "Reconciliation is wired in BEFORE claiming" section) — lets a job's
+#: own `actor_id` tell an operator whether it was submitted by the
+#: immediate-enqueue path or recovered by the reconciliation pass.
+_RECONCILIATION_ACTOR_ID = "bagman-evidence-classification-reconciliation"
 
 #: See module docstring's "Per-job outcome doctrine" section for the
 #: full reasoning behind this classification.
 _RETRYABLE_EXCEPTION_TYPES = (PersistenceError, TimeoutError, ConnectionError, OSError)
+
+#: A genuinely, completely classified/governed-terminal outcome — the
+#: evidence item is DONE, no further automatic action is useful. Job
+#: status `SUCCEEDED`, `classification_outcome` records exactly which
+#: of these it was.
+_COMPLETE_OUTCOMES = frozenset({
+    OUTCOME_CURRENT_CLASSIFICATION_EXISTS,
+    OUTCOME_DETERMINISTIC_CLASSIFIED,
+    OUTCOME_DETERMINISTIC_EXISTING,
+    OUTCOME_AI_PROPOSAL_REVIEW_REQUIRED,
+    OUTCOME_AI_PROPOSAL_UNCLASSIFIABLE,
+})
+#: A governed, non-retryable terminal condition was reached — genuinely
+#: classified? NO. But no automatic retry is useful either (a
+#: deterministic-rule conflict needs a human to fix the conflicting
+#: rules; unsupported context needs different evidence content — never
+#: something a retry produces). Job status is still SUCCEEDED (its
+#: narrow responsibility — "ran classify_evidence once" — is complete),
+#: but `classification_outcome` durably records that no real
+#: classification resulted, so operators can distinguish this from
+#: genuine success (architect requirement, WO item 3).
+_COMPLETE_BUT_UNRESOLVED_OUTCOMES = frozenset({
+    OUTCOME_DETERMINISTIC_CONFLICT,
+    OUTCOME_CONTEXT_UNSUPPORTED,
+})
+#: classify_evidence's own same-fingerprint prior-failure guard means a
+#: job-level retry of either of these would NEVER make real progress —
+#: a second `classify_evidence` call for the identical evidence+context
+#: either finds the same FAILED AIInvocation again (AI_PRIOR_FAILURE,
+#: no new model call attempted at all) or, for a fresh
+#: AI_INVOCATION_FAILED, immediately becomes exactly that
+#: AI_PRIOR_FAILURE state on any subsequent call. Retrying at the job
+#: level would therefore only ever loop into AI_PRIOR_FAILURE, never
+#: recover — architect's own explicit "do not paper over that"
+#: instruction. Both go straight to FAILED_TERMINAL, durably recording
+#: which one via `classification_outcome`, so this evidence item is
+#: visible in the existing operational review/recovery model (an
+#: operator can already re-trigger classification by hand via the
+#: existing HTTP endpoints once/if the underlying condition is
+#: addressed — that manual path is untouched by this delivery).
+_AI_FAILURE_OUTCOMES = frozenset({
+    OUTCOME_AI_INVOCATION_FAILED,
+    OUTCOME_AI_PRIOR_FAILURE,
+})
+#: Another invocation for this evidence_id is genuinely still running
+#: (a concurrent manual HTTP call, or another worker/reconciliation
+#: race) — nothing failed, nothing completed. Must NOT disappear into
+#: terminal SUCCEEDED. Treated as FAILED_RETRYABLE (reclaimable) so a
+#: LATER worker run naturally re-checks once the other invocation
+#: finishes — documented judgment call: this does consume one
+#: attempt_count slot (attempt_count increments unconditionally at
+#: mark_in_progress, before the outcome is known — an unavoidable
+#: consequence of the existing, unmodified attempt-counting design),
+#: which is an accepted, narrow imprecision (AI_IN_PROGRESS should be
+#: rare and short-lived; max_attempts=3 gives ample headroom for it to
+#: resolve across a few worker runs).
+_RETRY_DEFER_OUTCOMES = frozenset({OUTCOME_AI_IN_PROGRESS})
 
 
 def _process_one(
@@ -177,37 +300,80 @@ def _process_one(
             record_audit_event=record_audit_event,
             needs_you_repository=needs_you_repository,
             actor_type=_ACTOR_TYPE,
-            actor_id="bagman-evidence-classification-worker",
+            actor_id=_WORKER_ACTOR_ID,
             correlation_id=job.correlation_id,
         )
     except NotFoundError as exc:
         # Structurally near-impossible given the real evidence_id FK on
         # evidence_classification_jobs (see module docstring) — handled
-        # defensively, never assumed impossible.
+        # defensively, never assumed impossible. A raised exception
+        # never reaches classify_evidence's own outcome vocabulary at
+        # all, so no `classification_outcome` is recorded (see
+        # `mark_failed`'s own docstring).
         updated = classification_job_repository.mark_failed(
             job.job_id, error=f"NotFoundError: {exc}", retryable=False
         )
-        return {"job_id": job.job_id, "evidence_id": job.evidence_id, "outcome": "EVIDENCE_NOT_FOUND", "job_status": updated.status}
+        return {"job_id": job.job_id, "evidence_id": job.evidence_id, "outcome": "EVIDENCE_NOT_FOUND", "job_status": updated.status, "classification_outcome": updated.classification_outcome}
     except _RETRYABLE_EXCEPTION_TYPES as exc:
         updated = classification_job_repository.mark_failed(
             job.job_id, error=f"{type(exc).__name__}: {exc}", retryable=True
         )
-        return {"job_id": job.job_id, "evidence_id": job.evidence_id, "outcome": "RETRYABLE_FAILURE", "job_status": updated.status, "error": str(exc)}
+        return {"job_id": job.job_id, "evidence_id": job.evidence_id, "outcome": "RETRYABLE_FAILURE", "job_status": updated.status, "classification_outcome": updated.classification_outcome, "error": str(exc)}
     except Exception as exc:  # noqa: BLE001 - see module docstring's "Per-job outcome doctrine" (unrecognised -> retryable)
         updated = classification_job_repository.mark_failed(
             job.job_id, error=f"{type(exc).__name__}: {exc}", retryable=True
         )
-        return {"job_id": job.job_id, "evidence_id": job.evidence_id, "outcome": "RETRYABLE_FAILURE", "job_status": updated.status, "error": str(exc)}
+        return {"job_id": job.job_id, "evidence_id": job.evidence_id, "outcome": "RETRYABLE_FAILURE", "job_status": updated.status, "classification_outcome": updated.classification_outcome, "error": str(exc)}
 
-    # Any outcome classify_evidence RETURNED without raising is a job
-    # SUCCESS (see module docstring) — never re-interpreted here.
-    updated = classification_job_repository.mark_succeeded(job.job_id)
+    # classify_evidence RETURNED without raising — map its own outcome
+    # honestly onto job status + classification_outcome (see module
+    # docstring's "Per-job outcome doctrine", corrected 2026-09-29;
+    # architect requirement WO item 3). Never a coarse "it didn't raise
+    # -> SUCCEEDED" bucket again.
+    if result.outcome in _COMPLETE_OUTCOMES or result.outcome in _COMPLETE_BUT_UNRESOLVED_OUTCOMES:
+        updated = classification_job_repository.mark_succeeded(job.job_id, classification_outcome=result.outcome)
+        report_outcome = "SUCCEEDED"
+    elif result.outcome in _AI_FAILURE_OUTCOMES:
+        # Always FAILED_TERMINAL regardless of attempt_count — the
+        # same-fingerprint prior-failure guard means a job-level retry
+        # can never make progress (see _AI_FAILURE_OUTCOMES's own
+        # docstring); `retryable=False` already forces this outcome
+        # via `mark_failed`'s own budget logic.
+        updated = classification_job_repository.mark_failed(
+            job.job_id,
+            error=f"classify_evidence returned {result.outcome} (error_code={result.error_code})",
+            retryable=False,
+            classification_outcome=result.outcome,
+        )
+        report_outcome = "TERMINAL_FAILURE"
+    elif result.outcome in _RETRY_DEFER_OUTCOMES:
+        updated = classification_job_repository.mark_failed(
+            job.job_id,
+            error=f"classify_evidence returned {result.outcome} — another invocation is active; will be reclaimed",
+            retryable=True,
+            classification_outcome=result.outcome,
+        )
+        report_outcome = "DEFERRED_RETRYABLE"
+    else:
+        # Structurally impossible given CLASSIFY_EVIDENCE_OUTCOMES is a
+        # closed, exhaustive set fully partitioned across the four sets
+        # above — raise loudly rather than silently defaulting, so a
+        # future new outcome value added to classify_evidence can never
+        # silently fall through unclassified (see module docstring).
+        raise AssertionError(
+            f"classify_evidence returned outcome '{result.outcome}', which is not covered by any of "
+            "_COMPLETE_OUTCOMES/_COMPLETE_BUT_UNRESOLVED_OUTCOMES/_AI_FAILURE_OUTCOMES/_RETRY_DEFER_OUTCOMES "
+            "— this worker's outcome mapping must be extended to cover it before it can ever be marked "
+            "succeeded or failed"
+        )
+
     return {
         "job_id": job.job_id,
         "evidence_id": job.evidence_id,
-        "outcome": "SUCCEEDED",
+        "outcome": report_outcome,
         "job_status": updated.status,
         "classify_evidence_outcome": result.outcome,
+        "classification_outcome": updated.classification_outcome,
         "deterministic_outcome": result.deterministic_outcome,
         "ai_invocation_id": result.ai_invocation_id,
     }
@@ -307,6 +473,21 @@ def main(argv: Optional[list[str]] = None) -> int:
     started_at = utc_now()
     worker_id = args.worker_id or f"evidence-classification-worker-{uuid.uuid4()}"
 
+    # Bounded, prospective reconciliation FIRST — see module docstring's
+    # "Reconciliation is wired in BEFORE claiming" section. Deliberately
+    # called here in main(), never inside run_process() itself (that
+    # would falsify test_run_process_never_creates_jobs_itself's own,
+    # still-authoritative "--process alone never conjures a job into
+    # existence" guarantee — see that section for the full reasoning).
+    reconciled_count = reconcile_missing_classification_jobs(
+        evidence_repository=composition.api.evidence_repository,
+        classification_job_repository=composition.classification_job_repository,
+        classification_repository=composition.classification_repository,
+        actor_type=_ACTOR_TYPE,
+        actor_id=_RECONCILIATION_ACTOR_ID,
+        limit=args.limit,
+    )
+
     result = run_process(
         limit=args.limit,
         claimed_by=worker_id,
@@ -322,11 +503,13 @@ def main(argv: Optional[list[str]] = None) -> int:
         needs_you_repository=composition.needs_you_repository,
     )
     has_retryable_or_terminal_failure = any(
-        r["outcome"] in ("RETRYABLE_FAILURE", "EVIDENCE_NOT_FOUND") for r in result["records"]
+        r["outcome"] in ("RETRYABLE_FAILURE", "EVIDENCE_NOT_FOUND", "TERMINAL_FAILURE", "DEFERRED_RETRYABLE")
+        for r in result["records"]
     )
 
     report = {
         "run_id": run_id,
+        "reconciled_count": reconciled_count,
         **result,
         "started_at": to_contract_string(started_at),
         "completed_at": to_contract_string(utc_now()),

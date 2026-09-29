@@ -3,7 +3,7 @@
 # contracts/manifest/bagman.component_manifest.v1.schema.json.
 
 id: BAGMAN.SERVICES.EVIDENCE
-version: 4
+version: 5
 
 responsibility: >
   Own canonical EvidenceItem identity and its immutability and
@@ -20,13 +20,13 @@ responsibility: >
   classification-service layer on top of that same data model — no new
   canonical type, purely additive compute/orchestration logic.
 
-  As of this version, also owns EvidenceClassificationJob
+  As of version 4, also owns EvidenceClassificationJob
   (`evidence/automatic-classification-activation` WO) — the durable,
   asynchronous trigger for the existing, UNMODIFIED
-  `classification_orchestrator.classify_evidence`. Before this
-  version, classification only ever ran when a human/process explicitly
-  called one of the three HTTP endpoints in
-  `app/api/routers/evidence_classification.py`; this delivery adds the
+  `classification_orchestrator.classify_evidence`. Before that version,
+  classification only ever ran when a human/process explicitly called
+  one of the three HTTP endpoints in
+  `app/api/routers/evidence_classification.py`; that delivery added the
   missing automatic trigger — a durable job is enqueued immediately
   after either real evidence-creation call site
   (`services/mailbox/microsoft/evidence_ingest.py`,
@@ -39,8 +39,28 @@ responsibility: >
   the full idempotency (evidence_id-keyed, not a caller-supplied
   idempotency key — a deliberate, documented divergence from
   `ai.jobs.BackgroundJob`'s own idempotency-key doctrine)/lifecycle/
-  stale-claim-recovery/disclosed-limitation doctrine this record type
-  implements.
+  stale-claim-recovery doctrine this record type implements.
+
+  As of this version (architect review, 2026-09-29), the WO's own
+  disclosed enqueue-loss gap is CLOSED by two additions, never a
+  historical bulk backfill (that non-goal is unchanged): (1)
+  `reconcile_missing_classification_jobs` — a bounded, recency-biased,
+  activation-boundary-scoped scan (reusing
+  `EvidenceRepository.list_evidence`'s own existing
+  `received_at_from`/`limit` filtering — no new query surface) that
+  submits a job for any evidence with `received_at` on/after the new
+  `AUTOMATIC_CLASSIFICATION_ACTIVATION_BOUNDARY` constant that has
+  neither a job nor a current classification yet; wired into
+  `scripts/process_evidence_classification_jobs.py`'s `main()`, once,
+  before `claim_next_pending`; and (2) `EvidenceClassificationJob` now
+  carries a durable `classification_outcome` field (nullable string,
+  one of `classification_orchestrator.CLASSIFY_EVIDENCE_OUTCOMES`) —
+  `mark_succeeded` now REQUIRES it, `mark_failed` accepts it optionally
+  — so the worker's own outcome-to-job-status mapping can honestly
+  distinguish a genuine classification success from a governed-but-
+  unresolved outcome or an AI failure, never collapsing all of them
+  into an undifferentiated SUCCEEDED. Migration `ae936a444eae` (chained
+  off `a7f34c9e2d18`) adds the column.
 
 owns:
   - EvidenceItem

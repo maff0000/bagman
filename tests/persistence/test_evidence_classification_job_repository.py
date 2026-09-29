@@ -34,6 +34,7 @@ from persistence.postgres.external_reference_repository import PostgresExternalR
 from persistence.postgres.session import get_engine
 from persistence.postgres.source_repository import PostgresSourceRepository
 from services.evidence.classification_job import EVIDENCE_CLASSIFICATION_JOB_STALE_RECOVERY_AUDIT_EVENT_TYPE
+from services.evidence.classification_orchestrator import OUTCOME_DETERMINISTIC_CLASSIFIED
 
 
 def _real_evidence_id() -> str:
@@ -253,11 +254,13 @@ def test_full_lifecycle_happy_path():
     assert in_progress.status == "IN_PROGRESS"
     assert in_progress.attempt_count == 1
 
-    succeeded = repo.mark_succeeded(job.job_id)
+    succeeded = repo.mark_succeeded(job.job_id, classification_outcome=OUTCOME_DETERMINISTIC_CLASSIFIED)
     assert succeeded.status == "SUCCEEDED"
+    assert succeeded.classification_outcome == OUTCOME_DETERMINISTIC_CLASSIFIED
 
     fetched = repo.get_job(job.job_id)
     assert fetched.status == "SUCCEEDED"
+    assert fetched.classification_outcome == OUTCOME_DETERMINISTIC_CLASSIFIED
 
 
 def test_retryable_failure_then_reclaim_then_succeeds():
@@ -271,7 +274,7 @@ def test_retryable_failure_then_reclaim_then_succeeds():
     [reclaimed] = repo.claim_next_pending(limit=1, claimed_by="worker-2")
     assert reclaimed.attempt_count == 1
     repo.mark_in_progress(reclaimed.job_id)
-    succeeded = repo.mark_succeeded(job.job_id)
+    succeeded = repo.mark_succeeded(job.job_id, classification_outcome=OUTCOME_DETERMINISTIC_CLASSIFIED)
     assert succeeded.status == "SUCCEEDED"
 
 
@@ -385,7 +388,7 @@ def test_a_stale_in_progress_job_is_reclaimed_then_can_succeed():
     [reclaimed] = repo.claim_next_pending(limit=1, claimed_by="worker-recovers")
     assert reclaimed.status == "CLAIMED"
     repo.mark_in_progress(reclaimed.job_id)
-    succeeded = repo.mark_succeeded(job.job_id)
+    succeeded = repo.mark_succeeded(job.job_id, classification_outcome=OUTCOME_DETERMINISTIC_CLASSIFIED)
     assert succeeded.status == "SUCCEEDED"
 
 
@@ -400,6 +403,7 @@ def test_job_row_carries_no_credential_shaped_fields():
     assert fields == {
         "job_id", "evidence_id", "status", "actor_type", "actor_id", "correlation_id", "created_at",
         "updated_at", "attempt_count", "max_attempts", "claimed_by", "claimed_at", "last_error",
+        "classification_outcome",
     }
     for forbidden in ("password", "secret", "token", "api_key", "credential"):
         assert forbidden not in " ".join(fields).lower()

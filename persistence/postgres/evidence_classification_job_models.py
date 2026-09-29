@@ -65,3 +65,13 @@ class EvidenceClassificationJobRow(Base):
     claimed_by: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     claimed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     last_error: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    #: The exact `classify_evidence` outcome this job's one dispatch
+    #: attempt produced — one of `services.evidence
+    #: .classification_orchestrator.CLASSIFY_EVIDENCE_OUTCOMES`, never a
+    #: retyped string (architect requirement, WO item 3; migration
+    #: chained off `a7f34c9e2d18`). Nullable: `None` for every job that
+    #: has never left `PENDING`/`CLAIMED`, and for a
+    #: `FAILED_RETRYABLE`/`FAILED_TERMINAL` row produced by a genuinely
+    #: RAISED infrastructure exception (which never reaches
+    #: `classify_evidence`'s own outcome vocabulary at all).
+    classification_outcome: Mapped[Optional[str]] = mapped_column(String, nullable=True)

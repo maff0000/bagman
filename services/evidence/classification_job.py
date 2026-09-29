@@ -70,27 +70,42 @@ actually happened — this job row exists only to answer "was this
 evidence handed to the classifier at least once, and did that attempt
 complete without an infrastructure-level exception", nothing more.
 
-The known, accepted, NOT-closed-here gap: enqueue can be skipped
+The enqueue-loss gap, and how it is closed (architect requirement,
+2026-09-29 review of this WO)
 ------------------------------------------------------------------------
-There is no outbox/LISTEN-NOTIFY/DB-trigger/backfill-reconciliation
-mechanism ANYWHERE in this codebase (verified: neither
-``ai.jobs``/``BackgroundJob`` nor any other durable-job mechanism in
-this repository has one either) — so if the process enqueuing a job
-crashes between ``core.api.BagmanCanonicalAPI.register_evidence``'s own
-transaction committing and :func:`enqueue_classification_job_for_evidence`
-actually being called (or if that call itself fails and its own
-exception is swallowed — see that function's own docstring), that one
-``EvidenceItem`` never gets an automatic job, ever, unless something
-else later independently triggers classification for it (e.g. an
-operator hitting one of the existing HTTP endpoints by hand). This is a
-disclosed, accepted, narrow limitation of THIS delivery — building a
-backfill/reconciliation sweep to close it is explicitly OUT OF SCOPE
-(the WO's own "no historical bulk classification" non-goal) and is not
-attempted here. The registration transaction itself
-(``persistence/postgres/evidence_repository.py``'s own
-``session_scope`` covering the ``EvidenceItem`` + external-reference
-rows) is unaffected either way — this gap is scoped ENTIRELY to "does a
-job get enqueued", never to evidence durability itself.
+There is no outbox/LISTEN-NOTIFY/DB-trigger mechanism ANYWHERE in this
+codebase (verified: neither ``ai.jobs``/``BackgroundJob`` nor any other
+durable-job mechanism in this repository has one either) — so if the
+process enqueuing a job crashes between
+``core.api.BagmanCanonicalAPI.register_evidence``'s own transaction
+committing and :func:`enqueue_classification_job_for_evidence` actually
+being called (or if that call itself fails and its own exception is
+swallowed — see that function's own docstring), that one
+``EvidenceItem`` would never get an automatic job on its own. An
+earlier version of this delivery disclosed this as an accepted, narrow,
+NOT-closed-here limitation and left it there. The architect's review of
+this WO REQUIRED that gap be closed — narrowly, prospectively, never as
+a historical bulk backfill (the WO's own "no historical bulk
+classification" non-goal is unchanged and remains absolute).
+:func:`reconcile_missing_classification_jobs`, below, is that closure:
+a bounded, recency-biased, activation-boundary-scoped scan (reusing
+:meth:`services.evidence.evidence.EvidenceRepository.list_evidence`'s
+own existing ``received_at_from``/``limit`` filtering — no new query
+surface anywhere) that finds evidence with `received_at` on or after
+:data:`AUTOMATIC_CLASSIFICATION_ACTIVATION_BOUNDARY` that has neither a
+job nor a current classification yet, and submits the missing job for
+it — see that function's own docstring for the full doctrine, and
+``scripts/process_evidence_classification_jobs.py``'s module docstring
+for how it is wired into the worker's own run sequence. Evidence
+received BEFORE the activation boundary remains permanently untouched
+by anything in this module, at any scan size, on any call — that is
+the explicit, durable boundary between "this WO's own narrow,
+prospective repair" and "a historical bulk backfill", which stays out
+of scope. The registration transaction itself
+(``persistence/postgres/evidence_repository.py``'s own ``session_scope``
+covering the ``EvidenceItem`` + external-reference rows) is unaffected
+either way — this gap was always scoped ENTIRELY to "does a job get
+enqueued", never to evidence durability itself.
 
 Attempt-counting / stale-claim-recovery / status machine
 ------------------------------------------------------------------------
@@ -115,7 +130,7 @@ import dataclasses
 import logging
 import threading
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 from ai.invocation import STALE_RUNNING_THRESHOLD_SECONDS
@@ -123,8 +138,35 @@ from core import actor, identity
 from core.audit import AuditRepository, InMemoryAuditRepository
 from core.errors import InvalidStateTransitionError, NotFoundError, ValidationError
 from core.timestamps import utc_now
+from services.evidence.classification import CLASSIFICATION_TYPE_DOCUMENT_TYPE
+from services.evidence.classification_orchestrator import CLASSIFY_EVIDENCE_OUTCOMES
 
 logger = logging.getLogger(__name__)
+
+#: The automatic-classification activation boundary (architect
+#: requirement, 2026-09-29 review — a deterministic, durable,
+#: independently-inspectable value, NEVER an undocumented "current
+#: time" computation). Evidence with `received_at` strictly BEFORE this
+#: boundary is historical and must NEVER be reconciled/enqueued by
+#: anything in this module (see
+#: :func:`reconcile_missing_classification_jobs`), no matter how the
+#: reconciliation scan is invoked. Survives restart/deployment
+#: trivially — it is source code, shipped with this exact commit;
+#: anyone can `grep` it.
+#:
+#: Confirmed against `services.evidence.evidence.EvidenceRepository
+#: .list_evidence`'s own `received_at_from` filter (the exact field
+#: this constant is compared against — see that method's docstring and
+#: `persistence/postgres/evidence_repository.py`'s real, DB-level
+#: `EvidenceItemRow.received_at >= received_at_from` filter, not a
+#: Python-side post-filter).
+#:
+#: Value: today's real UTC date (`date -u`) at implementation time —
+#: 2026-09-29T00:00:00Z — a deliberate, one-time PL decision, not
+#: something to tune. Every real evidence item observed by this system
+#: from this delivery's activation onward has `received_at` at or after
+#: this moment; nothing genuinely historical can ever cross it.
+AUTOMATIC_CLASSIFICATION_ACTIVATION_BOUNDARY = datetime(2026, 9, 29, 0, 0, 0, tzinfo=timezone.utc)
 
 #: The closed set of `EvidenceClassificationJob` lifecycle states —
 #: identical vocabulary to `ai.jobs.BACKGROUND_JOB_STATUSES` (see
@@ -176,6 +218,18 @@ class EvidenceClassificationJob:
     claimed_by: Optional[str] = None
     claimed_at: Optional[datetime] = None
     last_error: Optional[str] = None
+    #: The exact `classify_evidence` outcome this job's one dispatch
+    #: attempt produced (one of `services.evidence
+    #: .classification_orchestrator.CLASSIFY_EVIDENCE_OUTCOMES` — never
+    #: a re-typed/invented string; see module docstring's "Correct
+    #: durable job outcome semantics" doctrine, architect requirement
+    #: WO item 3). `None` until a genuine, non-raising `classify_evidence`
+    #: call has completed for this job — i.e. for every job that has
+    #: never left `PENDING`/`CLAIMED`, and for a `FAILED_RETRYABLE`/
+    #: `FAILED_TERMINAL` row produced by a genuinely RAISED infrastructure
+    #: exception (which never reaches `classify_evidence`'s own outcome
+    #: vocabulary at all — see `mark_failed`'s own docstring).
+    classification_outcome: Optional[str] = None
 
     def to_dict(self) -> dict:
         """Plain-dict rendering for logging/reporting (e.g.
@@ -197,6 +251,7 @@ class EvidenceClassificationJob:
             "claimed_by": self.claimed_by,
             "claimed_at": self.claimed_at,
             "last_error": self.last_error,
+            "classification_outcome": self.classification_outcome,
         }
 
 
@@ -341,17 +396,48 @@ class EvidenceClassificationJobRepository(abc.ABC):
         raise NotImplementedError
 
     @abc.abstractmethod
-    def mark_succeeded(self, job_id: str) -> EvidenceClassificationJob:
+    def mark_succeeded(self, job_id: str, *, classification_outcome: str) -> EvidenceClassificationJob:
         """`IN_PROGRESS -> SUCCEEDED`. No `ai_invocation_id` parameter
         (see module docstring — a deterministic-only success is a
-        complete, valid outcome with no AI invocation at all)."""
+        complete, valid outcome with no AI invocation at all).
+
+        `classification_outcome` is REQUIRED — the exact
+        `classify_evidence` outcome this dispatch attempt produced
+        (architect requirement, WO item 3: a job may only ever be
+        marked SUCCEEDED once the caller can name, honestly, which of
+        `services.evidence.classification_orchestrator
+        .CLASSIFY_EVIDENCE_OUTCOMES` it actually got — never an
+        undifferentiated "it didn't raise").
+
+        Raises:
+            core.errors.ValidationError: `classification_outcome` is
+                not one of `CLASSIFY_EVIDENCE_OUTCOMES`.
+        """
         raise NotImplementedError
 
     @abc.abstractmethod
-    def mark_failed(self, job_id: str, *, error: str, retryable: bool) -> EvidenceClassificationJob:
+    def mark_failed(
+        self, job_id: str, *, error: str, retryable: bool, classification_outcome: Optional[str] = None
+    ) -> EvidenceClassificationJob:
         """`IN_PROGRESS -> FAILED_RETRYABLE` (if `retryable` and
         `attempt_count < max_attempts`) or `IN_PROGRESS ->
-        FAILED_TERMINAL` (otherwise). Always stamps `last_error`."""
+        FAILED_TERMINAL` (otherwise). Always stamps `last_error`.
+
+        `classification_outcome` is OPTIONAL here, unlike
+        `mark_succeeded` — a genuine RAISED infrastructure exception
+        (object store down, database down, ...) never reaches
+        `classify_evidence`'s own outcome vocabulary at all, so there
+        is nothing honest to record; leave it `None` for that case.
+        An outcome-driven terminal failure (`AI_INVOCATION_FAILED`/
+        `AI_PRIOR_FAILURE` — see
+        `scripts/process_evidence_classification_jobs.py`'s own
+        outcome-mapping doctrine) DOES have a real outcome to record —
+        pass it.
+
+        Raises:
+            core.errors.ValidationError: `classification_outcome` is
+                supplied but is not one of `CLASSIFY_EVIDENCE_OUTCOMES`.
+        """
         raise NotImplementedError
 
     @abc.abstractmethod
@@ -488,18 +574,30 @@ class InMemoryEvidenceClassificationJobRepository(EvidenceClassificationJobRepos
             self._by_id[job_id] = updated
             return updated
 
-    def mark_succeeded(self, job_id: str) -> EvidenceClassificationJob:
+    def mark_succeeded(self, job_id: str, *, classification_outcome: str) -> EvidenceClassificationJob:
+        if classification_outcome not in CLASSIFY_EVIDENCE_OUTCOMES:
+            raise ValidationError(
+                f"classification_outcome '{classification_outcome}' is not one of "
+                f"{sorted(CLASSIFY_EVIDENCE_OUTCOMES)}"
+            )
         with self._lock:
             job = self.get_job(job_id)
-            updated = transition_job(job, "SUCCEEDED")
+            updated = transition_job(job, "SUCCEEDED", classification_outcome=classification_outcome)
             self._by_id[job_id] = updated
             return updated
 
-    def mark_failed(self, job_id: str, *, error: str, retryable: bool) -> EvidenceClassificationJob:
+    def mark_failed(
+        self, job_id: str, *, error: str, retryable: bool, classification_outcome: Optional[str] = None
+    ) -> EvidenceClassificationJob:
+        if classification_outcome is not None and classification_outcome not in CLASSIFY_EVIDENCE_OUTCOMES:
+            raise ValidationError(
+                f"classification_outcome '{classification_outcome}' is not one of "
+                f"{sorted(CLASSIFY_EVIDENCE_OUTCOMES)}"
+            )
         with self._lock:
             job = self.get_job(job_id)
             target_status = "FAILED_RETRYABLE" if (retryable and job.attempt_count < job.max_attempts) else "FAILED_TERMINAL"
-            updated = transition_job(job, target_status, last_error=error)
+            updated = transition_job(job, target_status, last_error=error, classification_outcome=classification_outcome)
             self._by_id[job_id] = updated
             return updated
 
@@ -537,14 +635,16 @@ def enqueue_classification_job_for_evidence(
     itself — it never raises for an ordinary AI/context failure)
     extends here to "no ENQUEUE failure may corrupt evidence ingestion
     either": `EvidenceItem` registration is the primary, already-durably
-    -committed operation (see module docstring's "known, accepted,
-    NOT-closed-here gap" section — the transaction that commits the
+    -committed operation (see module docstring's "The enqueue-loss gap,
+    and how it is closed" section — the transaction that commits the
     `EvidenceItem` has ALREADY completed by the time either call site
     reaches this function); losing the automatic classification trigger
-    for one evidence item is a real but bounded degradation (an
-    operator can always re-trigger classification for it by hand via
-    the existing HTTP endpoints), never a reason to fail an otherwise-
-    successful evidence observation. There is no established
+    for one evidence item is a real but bounded degradation — closed,
+    prospectively, by :func:`reconcile_missing_classification_jobs`
+    (below), and an operator can always re-trigger classification for
+    it by hand via the existing HTTP endpoints too — never a reason to
+    fail an otherwise-successful evidence observation. There is no
+    established
     "log a non-fatal side-effect failure" helper elsewhere in this
     codebase to reuse (checked: neither `services/` nor `core/` defines
     one — only `app/api/` configures the stdlib `logging` module, which
@@ -563,8 +663,86 @@ def enqueue_classification_job_for_evidence(
     except Exception:  # noqa: BLE001 - must never propagate; see docstring
         logger.error(
             "failed to enqueue EvidenceClassificationJob for evidence_id=%s — evidence registration "
-            "itself is unaffected; this evidence item will not be automatically classified unless an "
-            "operator re-triggers classification for it by hand (see module docstring's known gap)",
+            "itself is unaffected; this evidence item will be picked up by the next bounded "
+            "reconciliation pass (reconcile_missing_classification_jobs, if received_at is on/after "
+            "AUTOMATIC_CLASSIFICATION_ACTIVATION_BOUNDARY) or can be re-triggered by hand via the "
+            "existing HTTP endpoints",
             evidence_id,
             exc_info=True,
         )
+
+
+def reconcile_missing_classification_jobs(
+    *,
+    evidence_repository,
+    classification_job_repository: EvidenceClassificationJobRepository,
+    classification_repository,
+    actor_type: str,
+    actor_id: str,
+    limit: int = 200,
+    now: Optional[datetime] = None,
+) -> int:
+    """The bounded, prospective repair path for the disclosed
+    "post-commit enqueue can be skipped" gap (see
+    :func:`enqueue_classification_job_for_evidence`'s own docstring —
+    this function is what actually closes that gap, superseding the
+    earlier "accepted, not-closed-here" framing).
+
+    Scans the `limit` MOST RECENTLY RECEIVED eligible evidence items
+    with `received_at >= AUTOMATIC_CLASSIFICATION_ACTIVATION_BOUNDARY`
+    (via the existing `EvidenceRepository.list_evidence(received_at_from=...)`
+    — no new query surface), and for each one that has NEITHER an
+    existing `EvidenceClassificationJob` NOR a current classification
+    already, submits the missing job — idempotently, relying on the
+    real `evidence_id` unique constraint exactly like the normal
+    enqueue path (a genuine race between this function and a normal
+    `enqueue_classification_job_for_evidence` call for the same
+    evidence resolves to exactly one row, never two — same DB-level
+    guarantee, not a new one).
+
+    Deliberately bounded (`limit`, default 200) and deliberately
+    recency-biased (relies on `list_evidence`'s own `received_at DESC`
+    ordering) — NOT an attempt to exhaustively reconcile the entire
+    evidence corpus in one call. This is intentional: a genuinely
+    orphaned item (rare — only reachable via a process crash in the
+    narrow window between evidence-commit and enqueue) will keep
+    surfacing in each successive reconciliation pass until it is
+    caught, since only items still missing a job are found each time.
+    Historical evidence (received before the activation boundary) can
+    NEVER be found by this scan, at any limit, no matter how many times
+    it runs — the `received_at_from` filter is unconditional and
+    applies to every call.
+
+    `now` is accepted purely for test-determinism symmetry with the
+    rest of this module's functions (mirroring
+    `EvidenceClassificationJobRepository.claim_next_pending`'s own
+    `now` parameter) — this function does not itself compare `now`
+    against anything; the activation boundary is a fixed constant, not
+    derived from `now`.
+
+    Returns the number of jobs actually submitted (0 in the common
+    case — most evidence already has a job via the immediate-enqueue
+    path; this function exists for the rare gap, not as the normal
+    path).
+    """
+    candidates = evidence_repository.list_evidence(
+        received_at_from=AUTOMATIC_CLASSIFICATION_ACTIVATION_BOUNDARY, limit=limit,
+    )
+
+    submitted_count = 0
+    for item in candidates:
+        if classification_job_repository.get_by_evidence(item.evidence_id) is not None:
+            continue
+        if classification_repository.get_current_classification(
+            item.evidence_id, CLASSIFICATION_TYPE_DOCUMENT_TYPE
+        ) is not None:
+            continue
+        # submit_job's own idempotency (the real evidence_id unique
+        # constraint) is the real safety net if a race occurs mid-scan
+        # — no second guard is added here (see docstring).
+        classification_job_repository.submit_job(
+            evidence_id=item.evidence_id, actor_type=actor_type, actor_id=actor_id,
+        )
+        submitted_count += 1
+
+    return submitted_count
