@@ -34,7 +34,7 @@ from persistence.postgres.external_reference_repository import PostgresExternalR
 from persistence.postgres.session import get_engine
 from persistence.postgres.source_repository import PostgresSourceRepository
 from services.evidence.classification_job import EVIDENCE_CLASSIFICATION_JOB_STALE_RECOVERY_AUDIT_EVENT_TYPE
-from services.evidence.classification_orchestrator import OUTCOME_DETERMINISTIC_CLASSIFIED
+from services.evidence.classification_orchestrator import OUTCOME_AI_IN_PROGRESS, OUTCOME_DETERMINISTIC_CLASSIFIED
 
 
 def _real_evidence_id() -> str:
@@ -290,6 +290,51 @@ def test_retries_exhausted_then_terminal():
     assert repo.get_job(job.job_id).status == "FAILED_TERMINAL"
     # A FAILED_TERMINAL job is never reclaimable.
     assert repo.claim_next_pending(limit=5, claimed_by="worker-late") == []
+
+
+def test_mark_deferred_round_trip():
+    """Real, disposable-PostgreSQL proof (test plan item 9) that
+    `mark_deferred` is a genuine, working repository method: status
+    transitions to `DEFERRED`, `classification_outcome` is stamped,
+    `attempt_count` is decremented by exactly 1 (undoing
+    `mark_in_progress`'s own increment for this claim), and
+    `claimed_by`/`claimed_at` are cleared."""
+    job = _submit()
+    repo = PostgresEvidenceClassificationJobRepository()
+    [claimed] = repo.claim_next_pending(limit=1, claimed_by="worker-1")
+    assert claimed.claimed_by == "worker-1"
+    assert claimed.claimed_at is not None
+
+    in_progress = repo.mark_in_progress(claimed.job_id)
+    assert in_progress.attempt_count == 1
+
+    deferred = repo.mark_deferred(job.job_id, classification_outcome=OUTCOME_AI_IN_PROGRESS)
+    assert deferred.status == "DEFERRED"
+    assert deferred.classification_outcome == OUTCOME_AI_IN_PROGRESS
+    assert deferred.attempt_count == 0, "the compensating decrement must undo mark_in_progress's own +1"
+    assert deferred.claimed_by is None
+    assert deferred.claimed_at is None
+
+    fetched = repo.get_job(job.job_id)
+    assert fetched.status == "DEFERRED"
+    assert fetched.classification_outcome == OUTCOME_AI_IN_PROGRESS
+    assert fetched.attempt_count == 0
+
+    # And it is genuinely reclaimable — a real second claim_next_pending
+    # call, not merely a status label.
+    [reclaimed] = repo.claim_next_pending(limit=5, claimed_by="worker-2")
+    assert reclaimed.job_id == job.job_id
+    assert reclaimed.status == "CLAIMED"
+    assert reclaimed.claimed_by == "worker-2"
+
+
+def test_mark_deferred_rejects_an_unknown_classification_outcome():
+    job = _submit()
+    repo = PostgresEvidenceClassificationJobRepository()
+    [claimed] = repo.claim_next_pending(limit=1, claimed_by="worker-1")
+    repo.mark_in_progress(claimed.job_id)
+    with pytest.raises(ValidationError):
+        repo.mark_deferred(job.job_id, classification_outcome="NOT_A_REAL_OUTCOME")
 
 
 def test_invalid_transition_raises():

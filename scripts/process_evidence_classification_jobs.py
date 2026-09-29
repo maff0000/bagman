@@ -136,11 +136,73 @@ production imports/runs. (Nothing prevents a future revision from
 splitting this into two explicit CLI flags — not attempted here, the
 WO's own spec asks for exactly one wired-in call.)
 
+The activation boundary is operator-set Layer-2 configuration, and
+reconciliation fails CLOSED, never silently, when it is unavailable
+(corrected 2026-09-29, architect review, WO item 1)
+------------------------------------------------------------------------
+`reconcile_missing_classification_jobs` now takes `activation_boundary`
+as a required parameter (see
+`services.evidence.classification_job`'s own module docstring — an
+earlier version of that module hardcoded a hidden
+`AUTOMATIC_CLASSIFICATION_ACTIVATION_BOUNDARY` constant instead, which
+was wrong given this feature had not yet been deployed to production).
+THIS script is the one real caller that supplies it, reading the
+`BAGMAN_EVIDENCE_CLASSIFICATION_ACTIVATION_BOUNDARY` environment
+variable — BAGMAN's own documented Layer 2 "runtime environment
+configuration" (`config/README.md`, which lists "feature flags" as a
+canonical Layer 2 example) — as an ISO-8601 UTC string (e.g.
+`2026-10-15T00:00:00Z`), parsed with the exact same
+`datetime.fromisoformat(value.replace("Z", "+00:00"))` pattern already
+established at `services/xero/client.py`'s own `_parse_xero_wire_datetime`,
+wrapped so a malformed value fails loudly and specifically (see
+`_resolve_activation_boundary` below) rather than with a bare
+traceback.
+
+Deliberately env-var-only, NEVER a CLI flag: per the architect's own
+explicit "set during the later production-activation WO" instruction,
+this value is an OPERATOR-set deployment/environment concern, never a
+per-invocation argument that could accidentally be passed differently
+on different runs.
+
+If the variable is unset, or set to something that does not parse,
+reconciliation is SKIPPED ENTIRELY for that run — fail closed, never a
+silent default to "now" or to any other value. This is reported
+explicitly in the run's own summary JSON as
+`reconciliation_skipped_reason` (a human-readable string; `None` when
+reconciliation actually ran). Critically, a skipped reconciliation NEVER
+blocks the worker's OTHER responsibility — claiming and processing
+already-existing `PENDING`/`FAILED_RETRYABLE`/`DEFERRED`/reclaimed jobs
+proceeds completely normally regardless of whether reconciliation ran.
+`main()` delegates this whole "resolve boundary, maybe reconcile, then
+always process" sequence to `_run_worker` (below) — a small,
+dependency-injected extraction (`composition` passed in explicitly,
+rather than fetched via `get_composition()` internally) added
+specifically so this dispatch logic is directly unit-testable without
+real env vars or a real database (this codebase has no pre-existing
+"inject a fake composition into main()" test pattern for any script in
+this directory, so this is a documented, narrow, test-motivated
+addition — `main()` itself remains the one, thin, real entrypoint that
+calls `get_composition()` and does file/stdout I/O).
+
+Reconciliation's own bound is a separate CLI concern from the worker's
+claim count
+------------------------------------------------------------------------
+`--limit` continues to govern only `claim_next_pending`'s own claim
+count (unrelated to reconciliation). A new, distinct
+`--reconciliation-repair-limit` flag (default 200, matching
+`reconcile_missing_classification_jobs`'s own default `repair_limit`)
+governs how many missing jobs a single reconciliation pass may create —
+deliberately NOT conflated with `--limit`, since the two bound
+genuinely different things (jobs claimed-and-processed vs. jobs
+newly-created-by-repair) that an operator may reasonably want to tune
+independently.
+
 Usage
 -----
     python3 scripts/process_evidence_classification_jobs.py \\
         --runtime-dir /opt/bagman/runtime/evidence-classification-jobs \\
-        --process --limit 10 --worker-id operator-manual-run-1
+        --process --limit 10 --reconciliation-repair-limit 200 \\
+        --worker-id operator-manual-run-1
 
 `--runtime-dir` may also be supplied via
 `BAGMAN_EVIDENCE_CLASSIFICATION_JOB_RUNTIME_DIR`. This process expects
@@ -151,6 +213,14 @@ scripts/process_evidence_classification_jobs.py ...`), via
 operator script in this directory. Never installed as a live periodic
 job (cron/systemd timer) by this delivery — that is a separate, future
 production-activation decision (WO non-goal).
+
+Reconciliation only actually runs once
+`BAGMAN_EVIDENCE_CLASSIFICATION_ACTIVATION_BOUNDARY` is set to a real
+value (see "The activation boundary is operator-set Layer-2
+configuration" section above) — deliberately NOT set by this delivery;
+that is a separate, later, production-activation decision. Until then,
+every run's own summary JSON reports `reconciliation_skipped_reason`
+explaining why, and ordinary claim/process work is entirely unaffected.
 """
 from __future__ import annotations
 
@@ -159,6 +229,7 @@ import json
 import os
 import sys
 import uuid
+from datetime import datetime
 from pathlib import Path
 from typing import Iterable, Optional
 
@@ -196,6 +267,56 @@ _WORKER_ACTOR_ID = "bagman-evidence-classification-worker"
 #: own `actor_id` tell an operator whether it was submitted by the
 #: immediate-enqueue path or recovered by the reconciliation pass.
 _RECONCILIATION_ACTOR_ID = "bagman-evidence-classification-reconciliation"
+
+#: Layer-2 runtime environment configuration (see module docstring's
+#: "The activation boundary is operator-set Layer-2 configuration"
+#: section) — an ISO-8601 UTC string, e.g. `2026-10-15T00:00:00Z`.
+#: Deliberately env-var-only, never a CLI flag (see that section).
+_ACTIVATION_BOUNDARY_ENV_VAR = "BAGMAN_EVIDENCE_CLASSIFICATION_ACTIVATION_BOUNDARY"
+
+#: Default `--reconciliation-repair-limit`, matching
+#: `services.evidence.classification_job.reconcile_missing_classification_jobs`'s
+#: own default `repair_limit`.
+_DEFAULT_RECONCILIATION_REPAIR_LIMIT = 200
+
+
+def _resolve_activation_boundary(raw: Optional[str]) -> tuple[Optional[datetime], Optional[str]]:
+    """Parse `_ACTIVATION_BOUNDARY_ENV_VAR`'s raw value (or `None`, if
+    unset) into `(activation_boundary, skip_reason)` — exactly one of
+    the pair is ever non-`None`. A pure function, deliberately taking
+    the raw string rather than reading `os.environ` itself, so it is
+    directly unit-testable with no environment mutation required (see
+    module docstring's "The activation boundary is operator-set Layer-2
+    configuration" section).
+
+    Mirrors `services/xero/client.py`'s own `_parse_xero_wire_datetime`
+    parsing pattern exactly (`datetime.fromisoformat(value.replace("Z",
+    "+00:00"))`), but — unlike that helper, which silently returns
+    `None` for an unparseable value because a single cosmetic Xero
+    field is not worth failing a whole sync over — a malformed
+    activation boundary here fails LOUDLY and SPECIFICALLY: the
+    returned `skip_reason` names the exact env var, the exact raw value
+    received, and the exact parse error, so an operator reading a run's
+    own summary JSON never has to guess why reconciliation did not run.
+
+    Never raises. Fails CLOSED: `raw` missing/empty, or present but not
+    valid ISO-8601, both return `(None, <reason>)` — never a silent
+    default to "now" or to any other value.
+    """
+    if not raw:
+        return None, (
+            f"{_ACTIVATION_BOUNDARY_ENV_VAR} is not set — reconciliation skipped for this run "
+            "(fail closed; set it to a real ISO-8601 UTC value, e.g. 2026-10-15T00:00:00Z, at the "
+            "production-activation WO)"
+        )
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError as exc:
+        return None, (
+            f"{_ACTIVATION_BOUNDARY_ENV_VAR}={raw!r} could not be parsed as ISO-8601 ({exc}) — "
+            "reconciliation skipped for this run (fail closed)"
+        )
+    return parsed, None
 
 #: See module docstring's "Per-job outcome doctrine" section for the
 #: full reasoning behind this classification.
@@ -236,10 +357,35 @@ _COMPLETE_BUT_UNRESOLVED_OUTCOMES = frozenset({
 #: recover — architect's own explicit "do not paper over that"
 #: instruction. Both go straight to FAILED_TERMINAL, durably recording
 #: which one via `classification_outcome`, so this evidence item is
-#: visible in the existing operational review/recovery model (an
-#: operator can already re-trigger classification by hand via the
-#: existing HTTP endpoints once/if the underlying condition is
-#: addressed — that manual path is untouched by this delivery).
+#: visible in the existing operational review/recovery model.
+#:
+#: CORRECTED 2026-09-29 (architect review, WO item 4 — Option A): an
+#: earlier version of this comment claimed an operator could recover
+#: one of these "by hand via the existing HTTP endpoints once/if the
+#: underlying condition is addressed" — that is FALSE and is retracted
+#: here. `compute_classifier_fingerprint`
+#: (`services.evidence.classification_ai_fingerprint`) is a pure
+#: function of evidence content + classification-context + task/prompt
+#: version — never of time or caller identity — so a manual HTTP call
+#: to any of the three existing classification endpoints, for the SAME
+#: evidence_id with an UNCHANGED classification context, computes the
+#: IDENTICAL fingerprint and, per classify_evidence's own §27
+#: same-fingerprint guard (the `matching_fingerprint`/`prior_failed`
+#: branch in `services.evidence.classification_orchestrator`),
+#: immediately returns AI_PRIOR_FAILURE again WITHOUT ever attempting a
+#: new model call — normal retry, automatic OR manual, genuinely cannot
+#: recover this state. Real recovery requires either the classification
+#: context itself changing (e.g. a prompt/task version bump, which
+#: changes the fingerprint for every future call) or a
+#: separately-authorised future reset/retry mechanism that does not
+#: exist yet and is explicitly OUT OF SCOPE for this delivery — this is
+#: a documentation-only correction, no reset mechanism is built here
+#: (architect's own explicit "Option A... this is acceptable for this
+#: WO if operational visibility is sufficient" ruling: the job's own
+#: durable `classification_outcome` + `FAILED_TERMINAL` status IS that
+#: operational visibility — an operator reviewing failed jobs can SEE
+#: this state precisely; they just cannot currently self-serve a fix
+#: for it through this delivery's own tooling).
 _AI_FAILURE_OUTCOMES = frozenset({
     OUTCOME_AI_INVOCATION_FAILED,
     OUTCOME_AI_PRIOR_FAILURE,
@@ -247,15 +393,22 @@ _AI_FAILURE_OUTCOMES = frozenset({
 #: Another invocation for this evidence_id is genuinely still running
 #: (a concurrent manual HTTP call, or another worker/reconciliation
 #: race) — nothing failed, nothing completed. Must NOT disappear into
-#: terminal SUCCEEDED. Treated as FAILED_RETRYABLE (reclaimable) so a
-#: LATER worker run naturally re-checks once the other invocation
-#: finishes — documented judgment call: this does consume one
-#: attempt_count slot (attempt_count increments unconditionally at
-#: mark_in_progress, before the outcome is known — an unavoidable
-#: consequence of the existing, unmodified attempt-counting design),
-#: which is an accepted, narrow imprecision (AI_IN_PROGRESS should be
-#: rare and short-lived; max_attempts=3 gives ample headroom for it to
-#: resolve across a few worker runs).
+#: terminal SUCCEEDED, and must NEVER consume real attempt/failure
+#: budget either (corrected 2026-09-29, architect review, WO item 3 —
+#: an earlier version of this worker mapped this outcome to
+#: FAILED_RETRYABLE, which DOES consume an attempt_count slot at
+#: mark_in_progress time even though nothing about this outcome is a
+#: genuine failed attempt; repeated polling of a slow-but-healthy AI
+#: invocation could therefore exhaust max_attempts and wrongly
+#: terminate the job). Mapped instead to the new `DEFERRED` status
+#: (`services.evidence.classification_job`'s own module docstring,
+#: "DEFERRED" section) via `mark_deferred`, which decrements
+#: attempt_count by exactly 1 — undoing mark_in_progress's own
+#: increment for this specific claim — so the net effect of a deferred
+#: check is a wash: the job is reclaimable exactly like
+#: PENDING/FAILED_RETRYABLE, and a LATER worker run naturally re-checks
+#: once the other invocation finishes, with attempt_count never
+#: net-increasing beyond what a single genuine attempt would show.
 _RETRY_DEFER_OUTCOMES = frozenset({OUTCOME_AI_IN_PROGRESS})
 
 
@@ -347,13 +500,15 @@ def _process_one(
         )
         report_outcome = "TERMINAL_FAILURE"
     elif result.outcome in _RETRY_DEFER_OUTCOMES:
-        updated = classification_job_repository.mark_failed(
-            job.job_id,
-            error=f"classify_evidence returned {result.outcome} — another invocation is active; will be reclaimed",
-            retryable=True,
-            classification_outcome=result.outcome,
+        # mark_deferred, never mark_failed — see _RETRY_DEFER_OUTCOMES's
+        # own docstring (architect requirement, WO item 3): this is not
+        # a failed attempt, and must not consume attempt/failure
+        # budget. mark_deferred itself performs the compensating
+        # attempt_count decrement.
+        updated = classification_job_repository.mark_deferred(
+            job.job_id, classification_outcome=result.outcome,
         )
-        report_outcome = "DEFERRED_RETRYABLE"
+        report_outcome = "DEFERRED"
     else:
         # Structurally impossible given CLASSIFY_EVIDENCE_OUTCOMES is a
         # closed, exhaustive set fully partitioned across the four sets
@@ -442,12 +597,26 @@ def _parse_args(argv: Optional[Iterable[str]]) -> argparse.Namespace:
     )
     parser.add_argument("--process", action="store_true", required=True, help="claim and execute pending/retryable jobs right now (the only mode)")
     parser.add_argument("--limit", type=int, required=True, help=f"bounded claim count (1-{_MAX_PROCESS_LIMIT})")
+    parser.add_argument(
+        "--reconciliation-repair-limit",
+        type=int,
+        default=_DEFAULT_RECONCILIATION_REPAIR_LIMIT,
+        help=(
+            "bounded max number of missing jobs a single reconciliation pass may create this run "
+            f"(default {_DEFAULT_RECONCILIATION_REPAIR_LIMIT}) — a separate concern from --limit, "
+            "which governs claim_next_pending's own claim count; has no effect at all if "
+            f"{_ACTIVATION_BOUNDARY_ENV_VAR} is unset/malformed (reconciliation is skipped entirely — "
+            "see module docstring)"
+        ),
+    )
     parser.add_argument("--worker-id", default=None, help="worker identity stamped on claimed jobs; defaults to a generated id")
 
     args = parser.parse_args(list(argv) if argv is not None else None)
 
     if not (1 <= args.limit <= _MAX_PROCESS_LIMIT):
         parser.error(f"--limit must be between 1 and {_MAX_PROCESS_LIMIT} (got {args.limit})")
+    if args.reconciliation_repair_limit < 1:
+        parser.error(f"--reconciliation-repair-limit must be >= 1 (got {args.reconciliation_repair_limit})")
 
     runtime_dir = args.runtime_dir or os.environ.get("BAGMAN_EVIDENCE_CLASSIFICATION_JOB_RUNTIME_DIR")
     if not runtime_dir:
@@ -460,33 +629,60 @@ def _parse_args(argv: Optional[Iterable[str]]) -> argparse.Namespace:
     return args
 
 
-def main(argv: Optional[list[str]] = None) -> int:
-    args = _parse_args(argv)
-    runtime_dir = Path(args.runtime_dir)
-    runtime_dir.mkdir(parents=True, exist_ok=True)
+def _run_worker(
+    *,
+    args: argparse.Namespace,
+    composition,
+    run_id: str,
+    started_at,
+    worker_id: str,
+    env: Optional[dict] = None,
+) -> dict:
+    """Everything `main()` does once it has a `composition` and parsed
+    `args`: resolve the activation boundary, reconcile-or-skip, always
+    process, and assemble the run's own summary report. Extracted as a
+    small, dependency-injected function (`composition` passed in
+    explicitly, `env` defaulting to `os.environ`) specifically so this
+    dispatch logic — most importantly, "an unset/malformed activation
+    boundary skips reconciliation but never blocks ordinary claim/
+    process work" — is directly unit-testable with a fake/in-memory
+    `composition` and no real env vars or database (see module
+    docstring's "The activation boundary is operator-set Layer-2
+    configuration" section for why this extraction exists; this
+    codebase has no pre-existing "inject a fake composition into
+    main()" pattern for any script in this directory, so this is a
+    documented, narrow, test-motivated addition). `main()` itself stays
+    the one, thin, real entrypoint that calls `get_composition()` and
+    performs file/stdout I/O.
 
-    from app.api.composition import get_composition  # local import: keeps this module importable/testable with zero env vars set
-
-    composition = get_composition()
-
-    run_id = identity.generate_id()
-    started_at = utc_now()
-    worker_id = args.worker_id or f"evidence-classification-worker-{uuid.uuid4()}"
+    Returns `{"report": <dict>, "exit_code": <int>}`.
+    """
+    env = env if env is not None else os.environ
+    activation_boundary, skip_reason = _resolve_activation_boundary(env.get(_ACTIVATION_BOUNDARY_ENV_VAR))
 
     # Bounded, prospective reconciliation FIRST — see module docstring's
     # "Reconciliation is wired in BEFORE claiming" section. Deliberately
-    # called here in main(), never inside run_process() itself (that
-    # would falsify test_run_process_never_creates_jobs_itself's own,
-    # still-authoritative "--process alone never conjures a job into
+    # called here, never inside run_process() itself (that would
+    # falsify test_run_process_never_creates_jobs_itself's own, still-
+    # authoritative "--process alone never conjures a job into
     # existence" guarantee — see that section for the full reasoning).
-    reconciled_count = reconcile_missing_classification_jobs(
-        evidence_repository=composition.api.evidence_repository,
-        classification_job_repository=composition.classification_job_repository,
-        classification_repository=composition.classification_repository,
-        actor_type=_ACTOR_TYPE,
-        actor_id=_RECONCILIATION_ACTOR_ID,
-        limit=args.limit,
-    )
+    # A skipped reconciliation (activation_boundary is None) NEVER
+    # blocks the ordinary claim/process work below — see module
+    # docstring's own "fails CLOSED, never silently" section.
+    if activation_boundary is not None:
+        reconciled_count = reconcile_missing_classification_jobs(
+            evidence_repository=composition.api.evidence_repository,
+            classification_job_repository=composition.classification_job_repository,
+            classification_repository=composition.classification_repository,
+            actor_type=_ACTOR_TYPE,
+            actor_id=_RECONCILIATION_ACTOR_ID,
+            activation_boundary=activation_boundary,
+            repair_limit=args.reconciliation_repair_limit,
+        )
+        reconciliation_skipped_reason = None
+    else:
+        reconciled_count = 0
+        reconciliation_skipped_reason = skip_reason
 
     result = run_process(
         limit=args.limit,
@@ -503,24 +699,46 @@ def main(argv: Optional[list[str]] = None) -> int:
         needs_you_repository=composition.needs_you_repository,
     )
     has_retryable_or_terminal_failure = any(
-        r["outcome"] in ("RETRYABLE_FAILURE", "EVIDENCE_NOT_FOUND", "TERMINAL_FAILURE", "DEFERRED_RETRYABLE")
+        r["outcome"] in ("RETRYABLE_FAILURE", "EVIDENCE_NOT_FOUND", "TERMINAL_FAILURE", "DEFERRED")
         for r in result["records"]
     )
 
     report = {
         "run_id": run_id,
         "reconciled_count": reconciled_count,
+        "reconciliation_skipped_reason": reconciliation_skipped_reason,
         **result,
         "started_at": to_contract_string(started_at),
         "completed_at": to_contract_string(utc_now()),
     }
+
+    return {"report": report, "exit_code": 1 if has_retryable_or_terminal_failure else 0}
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    args = _parse_args(argv)
+    runtime_dir = Path(args.runtime_dir)
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+
+    from app.api.composition import get_composition  # local import: keeps this module importable/testable with zero env vars set
+
+    composition = get_composition()
+
+    run_id = identity.generate_id()
+    started_at = utc_now()
+    worker_id = args.worker_id or f"evidence-classification-worker-{uuid.uuid4()}"
+
+    outcome = _run_worker(
+        args=args, composition=composition, run_id=run_id, started_at=started_at, worker_id=worker_id,
+    )
+    report = outcome["report"]
 
     report_path = runtime_dir / f"evidence-classification-jobs-process-{run_id}-report.json"
     report_path.write_text(json.dumps(report, indent=2, sort_keys=True, default=str), encoding="utf-8")
     print(json.dumps(report, indent=2, sort_keys=True, default=str))
     print(f"[process_evidence_classification_jobs] report written to {report_path}", file=sys.stderr)
 
-    return 1 if has_retryable_or_terminal_failure else 0
+    return outcome["exit_code"]
 
 
 if __name__ == "__main__":

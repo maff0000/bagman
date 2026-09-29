@@ -62,11 +62,16 @@ from services.evidence.classification_orchestrator import CLASSIFY_EVIDENCE_OUTC
 
 _EVIDENCE_ID_CONSTRAINT = "uq_evidence_classification_jobs_evidence_id"
 
-#: The two statuses `claim_next_pending` may claim from — mirrors
+#: The statuses `claim_next_pending` may claim from — `PENDING`/
+#: `FAILED_RETRYABLE` mirror
 #: `persistence.postgres.background_job_repository._CLAIMABLE_STATUSES`
 #: exactly (a plain tuple, not a set, since it is only ever used inside
-#: a SQLAlchemy `.in_(...)` filter).
-_CLAIMABLE_STATUSES = ("PENDING", "FAILED_RETRYABLE")
+#: a SQLAlchemy `.in_(...)` filter); `DEFERRED` is this module's own
+#: addition (architect requirement, 2026-09-29 review, WO item 3, see
+#: `services.evidence.classification_job`'s own module docstring's
+#: "DEFERRED" section) — a `DEFERRED` job is claimable again exactly
+#: like `PENDING`/`FAILED_RETRYABLE`.
+_CLAIMABLE_STATUSES = ("PENDING", "FAILED_RETRYABLE", "DEFERRED")
 
 #: The two statuses `recover_stale_claims` scans.
 _STALE_CANDIDATE_STATUSES = ("CLAIMED", "IN_PROGRESS")
@@ -297,6 +302,29 @@ class PostgresEvidenceClassificationJobRepository(EvidenceClassificationJobRepos
                 f"{sorted(CLASSIFY_EVIDENCE_OUTCOMES)}"
             )
         return self._transition_locked(job_id, "SUCCEEDED", classification_outcome=classification_outcome)
+
+    def mark_deferred(self, job_id: str, *, classification_outcome: str) -> EvidenceClassificationJob:
+        if classification_outcome not in CLASSIFY_EVIDENCE_OUTCOMES:
+            raise ValidationError(
+                f"classification_outcome '{classification_outcome}' is not one of "
+                f"{sorted(CLASSIFY_EVIDENCE_OUTCOMES)}"
+            )
+        # attempt_count_delta=-1: the deliberate compensating decrement
+        # documented on the ABC's own mark_deferred docstring, mirroring
+        # mark_in_progress's own attempt_count_delta=+1 pattern exactly
+        # (both go through the same `_transition_locked` helper, which
+        # computes `current.attempt_count + attempt_count_delta` under
+        # the same row lock — never a separate read/write race). Also
+        # clears claimed_by/claimed_at — a DEFERRED row holds no claim
+        # lock (see module docstring's own _CLAIMABLE_STATUSES note).
+        return self._transition_locked(
+            job_id,
+            "DEFERRED",
+            classification_outcome=classification_outcome,
+            claimed_by=None,
+            claimed_at=None,
+            attempt_count_delta=-1,
+        )
 
     def mark_failed(
         self, job_id: str, *, error: str, retryable: bool, classification_outcome: Optional[str] = None

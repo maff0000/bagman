@@ -4,7 +4,9 @@
 WO — architect delta, 2026-09-29 review, WO item 1: closes the
 disclosed "enqueue can be skipped" gap with a bounded, prospective,
 activation-boundary-scoped reconciliation, NEVER a historical bulk
-backfill).
+backfill; WO item 2, this round: genuine paging via `repair_limit`/
+`page_size`/`offset`, replacing the earlier single-fixed-window
+implementation).
 
 Mirrors `tests/persistence/test_evidence_classification_job_concurrency.py`'s
 own discipline for the genuine-race proof (real `threading.Thread`s +
@@ -13,6 +15,22 @@ a `threading.Barrier`, never sequential calls) and
 own `_real_evidence_id()`-style fixture construction for everything
 else — this module needs its own variant that accepts an explicit
 `received_at`, which neither of those modules' helpers exposes.
+
+`activation_boundary` is no longer a module-level constant (see
+`services.evidence.classification_job`'s own module docstring — it is
+now a required, caller-supplied parameter, sourced for real only from
+`scripts/process_evidence_classification_jobs.py`'s own env-var
+resolution, proven separately in
+`tests/integration/test_evidence_classification_job_worker.py`). Every
+test below therefore establishes its OWN `activation_boundary` —
+`utc_now()` at the moment the test starts — rather than sharing one
+fixed value: since tests in this module run against a real, persistent,
+shared-across-tests Postgres database, a fresh per-test boundary
+naturally excludes every OTHER test's own evidence rows (created
+earlier, hence with an earlier `received_at`) without requiring any
+DB cleanup between tests — the same self-isolation property a fixed
+historical constant would have needed the old module-level constant
+for, achieved here without needing one.
 """
 from __future__ import annotations
 
@@ -38,7 +56,6 @@ from services.evidence.classification import (
     STATUS_CLASSIFIED,
 )
 from services.evidence.classification_job import (
-    AUTOMATIC_CLASSIFICATION_ACTIVATION_BOUNDARY,
     enqueue_classification_job_for_evidence,
     reconcile_missing_classification_jobs,
 )
@@ -83,14 +100,20 @@ def _real_evidence_id(*, received_at: datetime.datetime) -> str:
     return evidence.evidence_id
 
 
-def _reconcile(*, limit: int = 200, repo=None) -> int:
+def _reconcile(
+    *, activation_boundary: datetime.datetime, repair_limit: int = 200, page_size: int = 200,
+    max_rows_scanned: int = 5000, repo=None,
+) -> int:
     return reconcile_missing_classification_jobs(
         evidence_repository=_evidence_repository(),
         classification_job_repository=repo or PostgresEvidenceClassificationJobRepository(),
         classification_repository=_classification_repository(),
         actor_type="SYSTEM",
         actor_id=ACTOR_ID,
-        limit=limit,
+        activation_boundary=activation_boundary,
+        repair_limit=repair_limit,
+        page_size=page_size,
+        max_rows_scanned=max_rows_scanned,
     )
 
 
@@ -119,7 +142,8 @@ class _EnqueueFailsOnceRepository(PostgresEvidenceClassificationJobRepository):
 
 
 def test_forced_enqueue_failure_is_recovered_by_reconciliation_and_then_processable():
-    evidence_id = _real_evidence_id(received_at=utc_now())
+    boundary = utc_now()
+    evidence_id = _real_evidence_id(received_at=boundary)
     failing_repo = _EnqueueFailsOnceRepository()
 
     # Ingestion's own call site — never raises by contract (see
@@ -132,7 +156,7 @@ def test_forced_enqueue_failure_is_recovered_by_reconciliation_and_then_processa
     real_repo = PostgresEvidenceClassificationJobRepository()
     assert real_repo.get_by_evidence(evidence_id) is None, "zero job rows immediately after the forced failure"
 
-    reconciled = _reconcile(repo=real_repo)
+    reconciled = _reconcile(activation_boundary=boundary, repo=real_repo)
     assert reconciled == 1
 
     job = real_repo.get_by_evidence(evidence_id)
@@ -151,23 +175,23 @@ def test_forced_enqueue_failure_is_recovered_by_reconciliation_and_then_processa
 
 
 def test_historical_evidence_before_activation_boundary_is_never_reconciled():
-    historical_received_at = AUTOMATIC_CLASSIFICATION_ACTIVATION_BOUNDARY - datetime.timedelta(days=1)
+    boundary = utc_now()
+    historical_received_at = boundary - datetime.timedelta(days=1)
     evidence_id = _real_evidence_id(received_at=historical_received_at)
     assert PostgresEvidenceClassificationJobRepository().get_by_evidence(evidence_id) is None
 
-    for limit in (1, 50, 200):
-        reconciled = _reconcile(limit=limit)
+    for repair_limit in (1, 50, 200):
+        reconciled = _reconcile(activation_boundary=boundary, repair_limit=repair_limit)
         assert reconciled == 0
         assert PostgresEvidenceClassificationJobRepository().get_by_evidence(evidence_id) is None
 
 
 def test_evidence_exactly_at_the_boundary_is_eligible_evidence_strictly_before_is_not():
-    at_boundary_id = _real_evidence_id(received_at=AUTOMATIC_CLASSIFICATION_ACTIVATION_BOUNDARY)
-    before_boundary_id = _real_evidence_id(
-        received_at=AUTOMATIC_CLASSIFICATION_ACTIVATION_BOUNDARY - datetime.timedelta(microseconds=1)
-    )
+    boundary = utc_now()
+    at_boundary_id = _real_evidence_id(received_at=boundary)
+    before_boundary_id = _real_evidence_id(received_at=boundary - datetime.timedelta(microseconds=1))
 
-    reconciled = _reconcile()
+    reconciled = _reconcile(activation_boundary=boundary)
     assert reconciled == 1
 
     repo = PostgresEvidenceClassificationJobRepository()
@@ -192,7 +216,8 @@ class _BarrierGatedJobRepository(PostgresEvidenceClassificationJobRepository):
 
 
 def test_enqueue_races_reconciliation_for_the_same_evidence_exactly_one_row_results():
-    evidence_id = _real_evidence_id(received_at=utc_now())
+    boundary = utc_now()
+    evidence_id = _real_evidence_id(received_at=boundary)
     barrier = threading.Barrier(2)
     gated_repo = _BarrierGatedJobRepository(barrier)
 
@@ -214,7 +239,8 @@ def test_enqueue_races_reconciliation_for_the_same_evidence_exactly_one_row_resu
                 classification_repository=_classification_repository(),
                 actor_type="SYSTEM",
                 actor_id="a-different-reconciliation-actor",
-                limit=200,
+                activation_boundary=boundary,
+                repair_limit=200,
             )
         except Exception as exc:  # noqa: BLE001 - captured for the assertions below
             errors.append(exc)
@@ -244,7 +270,8 @@ def test_enqueue_races_reconciliation_for_the_same_evidence_exactly_one_row_resu
 
 
 def test_reconciliation_skips_evidence_with_a_current_classification_already():
-    evidence_id = _real_evidence_id(received_at=utc_now())
+    boundary = utc_now()
+    evidence_id = _real_evidence_id(received_at=boundary)
     classification_repo = _classification_repository()
     classification_repo.create_classification(
         evidence_id=evidence_id,
@@ -262,102 +289,190 @@ def test_reconciliation_skips_evidence_with_a_current_classification_already():
         classification_repository=classification_repo,
         actor_type="SYSTEM",
         actor_id=ACTOR_ID,
-        limit=200,
+        activation_boundary=boundary,
+        repair_limit=200,
     )
     assert reconciled == 0
     assert PostgresEvidenceClassificationJobRepository().get_by_evidence(evidence_id) is None
 
 
 # ---------------------------------------------------------------------
-# Test plan item 5 — reconciliation is bounded: exactly `limit` jobs
-# created in one call, never all of them; the scan genuinely progresses
-# (never silently unbounded, never silently stuck) when given the scope
-# to cover the remainder.
+# Test plan item 2/5 — reconciliation is bounded: exactly `repair_limit`
+# jobs created in one call, never all of them at once; but — CORRECTED
+# 2026-09-29 (architect review, WO item 2) — the scan now genuinely
+# PAGES, so a fixed `repair_limit` eventually repairs a backlog LARGER
+# than itself across repeated calls, with no operator lever needed.
 # ---------------------------------------------------------------------
 #
-# A documented finding worth recording for an independent reviewer:
-# `list_evidence(received_at_from=..., limit=limit)` takes NO `offset`
-# (the WO's own spec is explicit that this function must reuse
-# `list_evidence` exactly as it stands, adding no new query method) —
-# so the SAME "top `limit` most-recently-received" rows are returned on
-# every call against an unchanged evidence set, regardless of which of
-# them already got a job on an earlier call (job existence is checked
-# in Python, after the query, never as a SQL-level filter). A repeat
-# call with the IDENTICAL `limit` therefore returns the SAME window
-# every time, resolves 0 new jobs the second time once that window is
-# fully jobbed, and can NEVER walk further back into an evidence
-# backlog older than the current top-`limit` window on its own. This is
-# consistent with, and does not violate, this function's own documented
-# "deliberately bounded, recency-biased, NOT an attempt to exhaustively
-# reconcile the entire corpus" doctrine — a genuinely orphaned item
-# surfaces reliably as long as it stays within a `limit`-sized window of
-# the most-recently-received evidence (the realistic shape of the gap
-# this function exists to close — a rare, recent crash, not a large
-# historical backlog), but clearing a backlog LARGER than `limit`
-# requires calling with a larger `limit` (an operator lever, `--limit`
-# on the worker CLI), never repeated calls at the same bound. Proven
-# below.
+# A documented finding worth recording for an independent reviewer,
+# CORRECTED from the previous round: the earlier implementation called
+# `list_evidence(received_at_from=..., limit=limit)` exactly ONCE, with
+# no `offset` — so the SAME "top `limit` most-recently-received" rows
+# were returned on every call, and an identical repeat call at the same
+# `limit` made ZERO further progress on an older excess (widening
+# `--limit` was the only lever). This implementation instead PAGES
+# through `list_evidence`'s own `limit`+`offset` parameters,
+# `page_size` rows at a time, until `repair_limit` jobs have been
+# submitted or the evidence set is exhausted (see
+# `reconcile_missing_classification_jobs`'s own docstring for the full
+# doctrine) — `repair_limit` now means "max jobs to CREATE this run",
+# not "how many rows to inspect". No cross-call cursor is persisted:
+# each call starts scanning from `offset=0` again, but already-resolved
+# evidence is cheaply skipped, so a repeated call with the SAME
+# `repair_limit` naturally reaches further into the backlog each time,
+# proven below.
 
 
-def test_reconciliation_creates_at_most_limit_jobs_in_one_call():
-    now = utc_now()
+def test_reconciliation_creates_at_most_repair_limit_jobs_in_one_call():
+    boundary = utc_now()
     total_orphans = 5
-    limit = 2
+    repair_limit = 2
     evidence_ids = [
-        _real_evidence_id(received_at=now + datetime.timedelta(seconds=i)) for i in range(total_orphans)
+        _real_evidence_id(received_at=boundary + datetime.timedelta(seconds=i)) for i in range(total_orphans)
     ]
 
-    reconciled = _reconcile(limit=limit)
-    assert reconciled == limit, "exactly `limit` jobs created in one call, never all of them"
+    reconciled = _reconcile(activation_boundary=boundary, repair_limit=repair_limit)
+    assert reconciled == repair_limit, "exactly `repair_limit` jobs created in one call, never all of them"
 
     repo = PostgresEvidenceClassificationJobRepository()
     jobbed = [eid for eid in evidence_ids if repo.get_by_evidence(eid) is not None]
-    assert len(jobbed) == limit
+    assert len(jobbed) == repair_limit
     # The two jobbed items are the MOST RECENTLY RECEIVED of the five
-    # (list_evidence's own `received_at DESC` ordering) — the last two
-    # created (highest `received_at`).
-    assert set(jobbed) == set(evidence_ids[-limit:])
+    # (list_evidence's own `received_at DESC` ordering, offset=0's own
+    # first page) — the last two created (highest `received_at`).
+    assert set(jobbed) == set(evidence_ids[-repair_limit:])
 
 
-def test_a_second_call_with_the_same_limit_makes_no_further_progress_on_the_same_static_backlog():
-    """The documented finding above, proven directly: once the top-
-    `limit` window is fully jobbed, an identical repeat call resolves
-    to zero — it is NOT silently unbounded (it never creates more than
-    `limit`), but it is also not a magic incremental-progress cursor;
-    the remaining backlog needs a larger `limit`, proven in the next
-    test."""
-    now = utc_now()
-    evidence_ids = [_real_evidence_id(received_at=now + datetime.timedelta(seconds=i)) for i in range(5)]
-    limit = 2
+def test_a_second_call_with_the_same_repair_limit_continues_into_older_candidates():
+    """CORRECTED, renamed from
+    `test_a_second_call_with_the_same_limit_makes_no_further_progress_on_the_same_static_backlog`
+    (architect review, WO item 2): that test's own claim — an identical
+    repeat call makes ZERO further progress — was true for the PREVIOUS,
+    non-paging implementation and is proven WRONG here for the new one.
+    A second call with the SAME `repair_limit` genuinely reaches further
+    into the backlog: the first two already-jobbed (most recent) rows
+    are cheaply skipped, and the scan continues into the next-oldest
+    still-orphaned rows."""
+    boundary = utc_now()
+    evidence_ids = [
+        _real_evidence_id(received_at=boundary + datetime.timedelta(seconds=i)) for i in range(5)
+    ]
+    repair_limit = 2
 
-    first_pass = _reconcile(limit=limit)
-    assert first_pass == limit
+    first_pass = _reconcile(activation_boundary=boundary, repair_limit=repair_limit)
+    assert first_pass == repair_limit
 
-    second_pass = _reconcile(limit=limit)
-    assert second_pass == 0
+    second_pass = _reconcile(activation_boundary=boundary, repair_limit=repair_limit)
+    assert second_pass == repair_limit, "unlike the old implementation, a second identical call makes real progress"
 
     repo = PostgresEvidenceClassificationJobRepository()
     jobbed = [eid for eid in evidence_ids if repo.get_by_evidence(eid) is not None]
-    assert len(jobbed) == limit, "still only the original `limit` jobs — the identical repeat call added none"
+    assert len(jobbed) == 2 * repair_limit, "the second pass reached NEW, previously-unjobbed evidence"
+    # The four jobbed items are the four MOST RECENT of the five —
+    # exactly one (the single oldest) remains unresolved after two
+    # passes of repair_limit=2 each.
+    assert set(jobbed) == set(evidence_ids[-2 * repair_limit :])
+    oldest = evidence_ids[0]
+    assert repo.get_by_evidence(oldest) is None, "the single oldest orphan is not yet reached after two passes"
 
 
-def test_widening_the_limit_reaches_the_remainder_of_a_backlog_larger_than_the_original_limit():
-    now = utc_now()
-    total_orphans = 5
-    small_limit = 2
+def test_repeated_calls_with_a_fixed_repair_limit_eventually_repair_a_backlog_larger_than_itself():
+    """Test plan item 2, the full proof: a backlog LARGER than
+    `repair_limit` exists; repeated calls with the SAME, never-widened
+    `repair_limit` eventually repair the ENTIRE backlog — no operator
+    lever (a larger `--limit`) is needed any more, unlike the previous
+    implementation."""
+    boundary = utc_now()
+    total_orphans = 7
+    repair_limit = 2
     evidence_ids = [
-        _real_evidence_id(received_at=now + datetime.timedelta(seconds=i)) for i in range(total_orphans)
+        _real_evidence_id(received_at=boundary + datetime.timedelta(seconds=i)) for i in range(total_orphans)
     ]
 
-    first_pass = _reconcile(limit=small_limit)
-    assert first_pass == small_limit
+    repo = PostgresEvidenceClassificationJobRepository()
+    total_reconciled = 0
+    # Bounded loop (never an infinite `while True`) — ceil(7/2) = 4
+    # passes suffice; a couple of spare iterations confirm it then
+    # stays at 0, never over-submits.
+    for _ in range(6):
+        reconciled_this_pass = _reconcile(activation_boundary=boundary, repair_limit=repair_limit)
+        total_reconciled += reconciled_this_pass
+        if reconciled_this_pass == 0:
+            break
 
-    # A wide-enough limit on a later call reaches every remaining
-    # orphan — proving the mechanism is genuinely bounded by `limit`
-    # (never hardcoded), not permanently stuck once the first call's
-    # window is resolved.
-    second_pass = _reconcile(limit=200)
-    assert second_pass == total_orphans - small_limit
+    assert total_reconciled == total_orphans, "every orphan is eventually repaired by the fixed repair_limit"
+    assert all(repo.get_by_evidence(eid) is not None for eid in evidence_ids)
+
+    # One more call now makes genuinely zero further progress — the
+    # backlog really is fully resolved, not merely "still making slow
+    # progress".
+    assert _reconcile(activation_boundary=boundary, repair_limit=repair_limit) == 0
+
+
+def test_pre_activation_evidence_remains_untouched_across_repeated_reconciliation_calls():
+    """Test plan item 3: evidence received BEFORE `activation_boundary`
+    is never reconciled — proven not just once (already covered above)
+    but across MULTIPLE reconciliation calls, including while a
+    same-boundary backlog-repair loop (mirroring the test above) runs
+    several times, to rule out the historical-exclusion filter being
+    accidentally bypassed by the new paging/offset logic."""
+    boundary = utc_now()
+    historical_ids = [
+        _real_evidence_id(received_at=boundary - datetime.timedelta(days=1, seconds=i)) for i in range(3)
+    ]
+    prospective_ids = [
+        _real_evidence_id(received_at=boundary + datetime.timedelta(seconds=i)) for i in range(5)
+    ]
+    repo = PostgresEvidenceClassificationJobRepository()
+
+    for _ in range(4):
+        _reconcile(activation_boundary=boundary, repair_limit=2)
+        for historical_id in historical_ids:
+            assert repo.get_by_evidence(historical_id) is None, "historical evidence must never be reconciled"
+
+    # Meanwhile the prospective backlog genuinely did get repaired by
+    # those same repeated calls.
+    assert all(repo.get_by_evidence(eid) is not None for eid in prospective_ids)
+
+
+def test_widening_the_repair_limit_still_reaches_the_remainder_faster():
+    """The old "operator lever" is still available and still works —
+    paging did not remove it, it just made it optional. A wide-enough
+    `repair_limit` on a later call reaches every remaining orphan in
+    one pass."""
+    boundary = utc_now()
+    total_orphans = 5
+    small_repair_limit = 2
+    evidence_ids = [
+        _real_evidence_id(received_at=boundary + datetime.timedelta(seconds=i)) for i in range(total_orphans)
+    ]
+
+    first_pass = _reconcile(activation_boundary=boundary, repair_limit=small_repair_limit)
+    assert first_pass == small_repair_limit
+
+    second_pass = _reconcile(activation_boundary=boundary, repair_limit=200)
+    assert second_pass == total_orphans - small_repair_limit
+
+    repo = PostgresEvidenceClassificationJobRepository()
+    assert all(repo.get_by_evidence(eid) is not None for eid in evidence_ids)
+
+
+def test_max_rows_scanned_bounds_a_single_call_without_interfering_with_a_normal_repair():
+    """The new, explicitly-documented `max_rows_scanned` safety bound
+    (a PL judgment call, not part of the architect's own pseudocode —
+    see `reconcile_missing_classification_jobs`'s own docstring): set
+    generously here anyway, it must never prevent a normal, realistic
+    repair from completing in one call."""
+    boundary = utc_now()
+    total_orphans = 10
+    evidence_ids = [
+        _real_evidence_id(received_at=boundary + datetime.timedelta(seconds=i)) for i in range(total_orphans)
+    ]
+
+    reconciled = _reconcile(
+        activation_boundary=boundary, repair_limit=200, page_size=3, max_rows_scanned=5000,
+    )
+    assert reconciled == total_orphans
 
     repo = PostgresEvidenceClassificationJobRepository()
     assert all(repo.get_by_evidence(eid) is not None for eid in evidence_ids)
@@ -370,7 +485,8 @@ def test_reconciliation_never_raises_and_still_resolves_to_one_row_across_thread
     submit_job's own unique constraint must still resolve to one row,
     never raise, exactly like `enqueue_classification_job_for_evidence`
     already proves in isolation."""
-    evidence_id = _real_evidence_id(received_at=utc_now())
+    boundary = utc_now()
+    evidence_id = _real_evidence_id(received_at=boundary)
     barrier = threading.Barrier(3)
     errors: list = []
 
@@ -383,7 +499,8 @@ def test_reconciliation_never_raises_and_still_resolves_to_one_row_across_thread
                 classification_repository=_classification_repository(),
                 actor_type="SYSTEM",
                 actor_id=ACTOR_ID,
-                limit=200,
+                activation_boundary=boundary,
+                repair_limit=200,
             )
         except Exception as exc:  # noqa: BLE001 - captured, never swallowed
             errors.append(exc)

@@ -88,24 +88,60 @@ this WO REQUIRED that gap be closed — narrowly, prospectively, never as
 a historical bulk backfill (the WO's own "no historical bulk
 classification" non-goal is unchanged and remains absolute).
 :func:`reconcile_missing_classification_jobs`, below, is that closure:
-a bounded, recency-biased, activation-boundary-scoped scan (reusing
+a bounded, activation-boundary-scoped, genuinely-paging scan (reusing
 :meth:`services.evidence.evidence.EvidenceRepository.list_evidence`'s
-own existing ``received_at_from``/``limit`` filtering — no new query
-surface anywhere) that finds evidence with `received_at` on or after
-:data:`AUTOMATIC_CLASSIFICATION_ACTIVATION_BOUNDARY` that has neither a
-job nor a current classification yet, and submits the missing job for
-it — see that function's own docstring for the full doctrine, and
-``scripts/process_evidence_classification_jobs.py``'s module docstring
-for how it is wired into the worker's own run sequence. Evidence
-received BEFORE the activation boundary remains permanently untouched
-by anything in this module, at any scan size, on any call — that is
-the explicit, durable boundary between "this WO's own narrow,
+own existing ``received_at_from``/``limit``/``offset`` filtering — no
+new query surface anywhere) that finds evidence with `received_at` on
+or after an explicit, caller-supplied ``activation_boundary`` that has
+neither a job nor a current classification yet, and submits the
+missing job for it — see that function's own docstring for the full
+paging doctrine, and ``scripts/process_evidence_classification_jobs.py``'s
+module docstring for how it is wired into the worker's own run
+sequence and where ``activation_boundary`` actually comes from.
+Evidence received BEFORE the activation boundary remains permanently
+untouched by anything in this module, at any scan size, on any call —
+that is the explicit, durable boundary between "this WO's own narrow,
 prospective repair" and "a historical bulk backfill", which stays out
 of scope. The registration transaction itself
 (``persistence/postgres/evidence_repository.py``'s own ``session_scope``
 covering the ``EvidenceItem`` + external-reference rows) is unaffected
 either way — this gap was always scoped ENTIRELY to "does a job get
 enqueued", never to evidence durability itself.
+
+The activation boundary is Layer-2 runtime configuration, NEVER a
+hardcoded constant (corrected 2026-09-29, architect review, WO item 1)
+------------------------------------------------------------------------
+An earlier version of this module defined
+``AUTOMATIC_CLASSIFICATION_ACTIVATION_BOUNDARY`` as a hardcoded
+``datetime`` constant, set to "today" at implementation time. That was
+wrong: this feature had not yet been deployed to production at
+implementation time, so the real production-activation moment is
+necessarily LATER than any date fixed in source code at implementation
+time — evidence received between the hardcoded date and the eventual
+real activation moment would have been wrongly treated as prospective
+(reconcilable) when it is actually historical (pre-activation),
+violating the "no historical backfill" boundary above. This module no
+longer defines any such constant. :func:`reconcile_missing_classification_jobs`
+below takes ``activation_boundary`` as an explicit, REQUIRED keyword
+parameter instead — this keeps the function itself pure and directly
+testable, with no environment-variable coupling of its own (consistent
+with every other explicit parameter it already takes: ``actor_type``,
+``actor_id``, and so on).
+
+The REAL value is supplied by the one caller that matters —
+``scripts/process_evidence_classification_jobs.py``'s ``main()`` —
+which reads it from the ``BAGMAN_EVIDENCE_CLASSIFICATION_ACTIVATION_BOUNDARY``
+environment variable (BAGMAN's own documented Layer 2 "runtime
+environment configuration" — see ``config/README.md``, which
+explicitly lists "feature flags" as a canonical Layer 2 example; an
+activation boundary is the same shape of thing: environment-specific,
+not secret, supplied externally, never committed as a real value). If
+that variable is unset or malformed, reconciliation is SKIPPED for
+that run — fail closed, never silently defaulted to "now" or to any
+other value — see that script's own module docstring for the full
+doctrine. This value will be set for real only at the later,
+separately-authorised production-activation WO; until then, no real
+value exists anywhere, including in any example config file.
 
 Attempt-counting / stale-claim-recovery / status machine
 ------------------------------------------------------------------------
@@ -122,6 +158,71 @@ independently-tuned one" reasoning that constant's own docstring
 gives; a documented judgment call, not a WO-mandated value (there is
 nothing evidence-classification-specific that would justify a
 different number).
+
+``DEFERRED`` — an ``AI_IN_PROGRESS`` check must never consume
+attempt/failure budget (architect requirement, 2026-09-29 review, WO
+item 3)
+------------------------------------------------------------------------
+Because ``attempt_count`` increments unconditionally at
+:meth:`mark_in_progress` (see above), a job that is claimed and
+dispatched while ANOTHER invocation for the same evidence is genuinely
+still running (``classify_evidence`` returns
+``OUTCOME_AI_IN_PROGRESS`` — nothing failed, nothing completed) would,
+under the plain "increment then find out the outcome" sequence, have
+already spent one attempt before the worker even learns nothing was
+wrong. Repeated polling of a slow-but-healthy AI invocation could
+therefore exhaust ``max_attempts`` and wrongly terminate the job, even
+though no real attempt ever failed. ``DEFERRED`` is the fix: a new,
+non-terminal status reached only from ``IN_PROGRESS``
+(:meth:`EvidenceClassificationJobRepository.mark_deferred`), which
+clears ``claimed_by``/``claimed_at`` exactly like the stale-claim
+recovery transitions already do, and — the actual correctness fix —
+DECREMENTS ``attempt_count`` by exactly 1, undoing the increment
+:meth:`mark_in_progress` applied for that one specific claim, since a
+deferred check discovers nothing about whether classification itself
+can succeed and is therefore not a genuine classification attempt at
+all. A ``DEFERRED`` job is claimable again exactly like ``PENDING``/
+``FAILED_RETRYABLE`` (see ``_CLAIMABLE_STATUSES`` in both concrete
+repositories), and does NOT participate in stale-claim recovery — it
+holds no claim lock to be stale (see :func:`is_stale_claim`, which
+already excludes it by construction: that function only ever returns
+`True` for `CLAIMED`/`IN_PROGRESS`).
+
+Terminal AI-failure outcomes are genuinely NOT recoverable via normal
+retry — Option A doctrine (corrected 2026-09-29, architect review, WO
+item 4)
+------------------------------------------------------------------------
+An earlier round of this delivery's own documentation claimed an
+operator could recover a ``FAILED_TERMINAL`` job whose
+``classification_outcome`` is ``AI_INVOCATION_FAILED``/
+``AI_PRIOR_FAILURE`` "by hand via the existing HTTP endpoints". That
+claim is FALSE and is retracted here (see
+``scripts/process_evidence_classification_jobs.py``'s own
+``_AI_FAILURE_OUTCOMES`` for the full, corrected reasoning): a manual
+HTTP call to any of the three existing classification endpoints, for
+the SAME ``evidence_id`` with an UNCHANGED classification context
+(same content, same classification-rule state, same prompt/task
+version), computes the IDENTICAL
+``compute_classifier_fingerprint`` result
+(``services.evidence.classification_ai_fingerprint`` — a pure function
+of evidence content + classification context + task/prompt version,
+never of time or caller identity) and, per ``classify_evidence``'s own
+§27 same-fingerprint guard
+(``services.evidence.classification_orchestrator``, the
+``matching_fingerprint``/``prior_failed`` branch), immediately returns
+``AI_PRIOR_FAILURE`` again WITHOUT ever attempting a new model call.
+Neither automatic nor manual retry can recover this state. Real
+recovery requires either the classification context genuinely
+changing (e.g. a prompt/task version bump, which changes the
+fingerprint for every future call) or a separately-authorised future
+reset/retry mechanism that does not exist yet — this delivery
+deliberately does NOT build one (architect's own explicit "Option
+A... this is acceptable for this WO if operational visibility is
+sufficient" ruling): the job's own durable ``classification_outcome``
++ ``FAILED_TERMINAL`` status IS that operational visibility — an
+operator reviewing failed jobs can see this state precisely; they just
+cannot currently self-serve a fix for it through this delivery's own
+tooling.
 """
 from __future__ import annotations
 
@@ -130,7 +231,7 @@ import dataclasses
 import logging
 import threading
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Optional
 
 from ai.invocation import STALE_RUNNING_THRESHOLD_SECONDS
@@ -143,49 +244,32 @@ from services.evidence.classification_orchestrator import CLASSIFY_EVIDENCE_OUTC
 
 logger = logging.getLogger(__name__)
 
-#: The automatic-classification activation boundary (architect
-#: requirement, 2026-09-29 review — a deterministic, durable,
-#: independently-inspectable value, NEVER an undocumented "current
-#: time" computation). Evidence with `received_at` strictly BEFORE this
-#: boundary is historical and must NEVER be reconciled/enqueued by
-#: anything in this module (see
-#: :func:`reconcile_missing_classification_jobs`), no matter how the
-#: reconciliation scan is invoked. Survives restart/deployment
-#: trivially — it is source code, shipped with this exact commit;
-#: anyone can `grep` it.
-#:
-#: Confirmed against `services.evidence.evidence.EvidenceRepository
-#: .list_evidence`'s own `received_at_from` filter (the exact field
-#: this constant is compared against — see that method's docstring and
-#: `persistence/postgres/evidence_repository.py`'s real, DB-level
-#: `EvidenceItemRow.received_at >= received_at_from` filter, not a
-#: Python-side post-filter).
-#:
-#: Value: today's real UTC date (`date -u`) at implementation time —
-#: 2026-09-29T00:00:00Z — a deliberate, one-time PL decision, not
-#: something to tune. Every real evidence item observed by this system
-#: from this delivery's activation onward has `received_at` at or after
-#: this moment; nothing genuinely historical can ever cross it.
-AUTOMATIC_CLASSIFICATION_ACTIVATION_BOUNDARY = datetime(2026, 9, 29, 0, 0, 0, tzinfo=timezone.utc)
-
 #: The closed set of `EvidenceClassificationJob` lifecycle states —
 #: identical vocabulary to `ai.jobs.BACKGROUND_JOB_STATUSES` (see
 #: module docstring).
 EVIDENCE_CLASSIFICATION_JOB_STATUSES = frozenset(
-    {"PENDING", "CLAIMED", "IN_PROGRESS", "SUCCEEDED", "FAILED_RETRYABLE", "FAILED_TERMINAL"}
+    {"PENDING", "CLAIMED", "IN_PROGRESS", "DEFERRED", "SUCCEEDED", "FAILED_RETRYABLE", "FAILED_TERMINAL"}
 )
 
-#: States from which no further transition is possible.
+#: States from which no further transition is possible. `DEFERRED` is
+#: deliberately NOT terminal (see module docstring's own "DEFERRED"
+#: section) — it is an ordinary, immediately-reclaimable resting state,
+#: exactly like `PENDING`/`FAILED_RETRYABLE`.
 EVIDENCE_CLASSIFICATION_JOB_TERMINAL_STATUSES = frozenset({"SUCCEEDED", "FAILED_TERMINAL"})
 
 #: The single source of truth for valid `EvidenceClassificationJob`
 #: state transitions — mirrors `ai.jobs.BACKGROUND_JOB_ALLOWED_TRANSITIONS`
 #: exactly (see that module's own docstring for the "PENDING is reached
-#: by two different call paths" note, which applies identically here).
+#: by two different call paths" note, which applies identically here),
+#: extended with `DEFERRED` (module docstring's own "DEFERRED" section,
+#: architect requirement WO item 3): reachable only from `IN_PROGRESS`,
+#: and itself only ever leads back to `CLAIMED` — identical shape to
+#: `FAILED_RETRYABLE`'s own single `CLAIMED` target.
 EVIDENCE_CLASSIFICATION_JOB_ALLOWED_TRANSITIONS: dict[str, frozenset[str]] = {
     "PENDING": frozenset({"CLAIMED"}),
     "CLAIMED": frozenset({"IN_PROGRESS", "PENDING"}),
-    "IN_PROGRESS": frozenset({"SUCCEEDED", "FAILED_RETRYABLE", "FAILED_TERMINAL"}),
+    "IN_PROGRESS": frozenset({"SUCCEEDED", "FAILED_RETRYABLE", "FAILED_TERMINAL", "DEFERRED"}),
+    "DEFERRED": frozenset({"CLAIMED"}),
     "FAILED_RETRYABLE": frozenset({"CLAIMED"}),
     "SUCCEEDED": frozenset(),
     "FAILED_TERMINAL": frozenset(),
@@ -294,7 +378,17 @@ def is_stale_claim(job: EvidenceClassificationJob, *, staleness_threshold_second
     ``staleness_threshold_seconds`` — mirrors `ai.jobs.is_stale_claim`
     exactly. Staleness is measured from ``claimed_at`` (never `None`
     for a `CLAIMED`/`IN_PROGRESS` row by construction — both states are
-    only ever reached via a claim, which always stamps it)."""
+    only ever reached via a claim, which always stamps it).
+
+    `DEFERRED` is deliberately excluded by this same `job.status not in
+    ("CLAIMED", "IN_PROGRESS")` check, with no further change needed
+    (confirmed, not assumed — module docstring's own "DEFERRED"
+    section): a `DEFERRED` row holds no `claimed_by`/`claimed_at` lock
+    (cleared by :meth:`EvidenceClassificationJobRepository.mark_deferred`,
+    exactly like the stale-claim recovery transitions already clear
+    them for `PENDING`), so it is an ordinary, correctly-resting,
+    immediately-reclaimable state, never a "stuck claimed" row the way
+    an abandoned `CLAIMED`/`IN_PROGRESS` row genuinely is."""
     if job.status not in ("CLAIMED", "IN_PROGRESS"):
         return False
     now = now if now is not None else utc_now()
@@ -441,6 +535,34 @@ class EvidenceClassificationJobRepository(abc.ABC):
         raise NotImplementedError
 
     @abc.abstractmethod
+    def mark_deferred(self, job_id: str, *, classification_outcome: str) -> EvidenceClassificationJob:
+        """`IN_PROGRESS -> DEFERRED` (module docstring's own "DEFERRED"
+        section, architect requirement WO item 3) — used when
+        `classify_evidence` reports `OUTCOME_AI_IN_PROGRESS`: another
+        invocation for this evidence is genuinely still active, nothing
+        failed, nothing completed. Clears `claimed_by`/`claimed_at` to
+        `None` (a `DEFERRED` row is immediately reclaimable, exactly
+        like `PENDING`), and — the critical correctness fix this status
+        exists for — DECREMENTS `attempt_count` by exactly 1, undoing
+        the increment `mark_in_progress` applied for THIS specific
+        claim: a deferred check is not a genuine classification attempt
+        at all, so it must never consume attempt/failure budget. This
+        is a deliberate, documented compensating action, not an
+        accidental double-transition — `attempt_count` is guaranteed
+        >= 1 at this point (the only path into `IN_PROGRESS` is via
+        `mark_in_progress`, which always increments first).
+
+        `classification_outcome` is REQUIRED, accepted generically like
+        `mark_succeeded`'s own parameter (always `OUTCOME_AI_IN_PROGRESS`
+        in practice, but not hardcoded here).
+
+        Raises:
+            core.errors.ValidationError: `classification_outcome` is
+                not one of `CLASSIFY_EVIDENCE_OUTCOMES`.
+        """
+        raise NotImplementedError
+
+    @abc.abstractmethod
     def get_job(self, job_id: str) -> EvidenceClassificationJob:
         raise NotImplementedError
 
@@ -554,7 +676,7 @@ class InMemoryEvidenceClassificationJobRepository(EvidenceClassificationJobRepos
             now = now if now is not None else utc_now()
             self._recover_stale_claims(staleness_threshold_seconds=STALE_RUNNING_THRESHOLD_SECONDS, now=now)
             candidates = sorted(
-                (j for j in self._by_id.values() if j.status in ("PENDING", "FAILED_RETRYABLE")),
+                (j for j in self._by_id.values() if j.status in ("PENDING", "FAILED_RETRYABLE", "DEFERRED")),
                 key=lambda j: (j.created_at, j.job_id),
             )
             claimed: list[EvidenceClassificationJob] = []
@@ -598,6 +720,32 @@ class InMemoryEvidenceClassificationJobRepository(EvidenceClassificationJobRepos
             job = self.get_job(job_id)
             target_status = "FAILED_RETRYABLE" if (retryable and job.attempt_count < job.max_attempts) else "FAILED_TERMINAL"
             updated = transition_job(job, target_status, last_error=error, classification_outcome=classification_outcome)
+            self._by_id[job_id] = updated
+            return updated
+
+    def mark_deferred(self, job_id: str, *, classification_outcome: str) -> EvidenceClassificationJob:
+        if classification_outcome not in CLASSIFY_EVIDENCE_OUTCOMES:
+            raise ValidationError(
+                f"classification_outcome '{classification_outcome}' is not one of "
+                f"{sorted(CLASSIFY_EVIDENCE_OUTCOMES)}"
+            )
+        with self._lock:
+            job = self.get_job(job_id)
+            # See ABC's own mark_deferred docstring — this is a
+            # deliberate compensating decrement, undoing the increment
+            # mark_in_progress applied for THIS claim, never an
+            # accidental double-transition. attempt_count is guaranteed
+            # >= 1 here: the only path into IN_PROGRESS is via
+            # mark_in_progress.
+            assert job.attempt_count >= 1  # noqa: S101 - guaranteed by construction, see docstring
+            updated = transition_job(
+                job,
+                "DEFERRED",
+                classification_outcome=classification_outcome,
+                claimed_by=None,
+                claimed_at=None,
+                attempt_count=job.attempt_count - 1,
+            )
             self._by_id[job_id] = updated
             return updated
 
@@ -665,8 +813,9 @@ def enqueue_classification_job_for_evidence(
             "failed to enqueue EvidenceClassificationJob for evidence_id=%s — evidence registration "
             "itself is unaffected; this evidence item will be picked up by the next bounded "
             "reconciliation pass (reconcile_missing_classification_jobs, if received_at is on/after "
-            "AUTOMATIC_CLASSIFICATION_ACTIVATION_BOUNDARY) or can be re-triggered by hand via the "
-            "existing HTTP endpoints",
+            "the operator-configured activation boundary — see "
+            "scripts/process_evidence_classification_jobs.py's own module docstring for where that "
+            "value comes from) or can be re-triggered by hand via the existing HTTP endpoints",
             evidence_id,
             exc_info=True,
         )
@@ -679,8 +828,10 @@ def reconcile_missing_classification_jobs(
     classification_repository,
     actor_type: str,
     actor_id: str,
-    limit: int = 200,
-    now: Optional[datetime] = None,
+    activation_boundary: datetime,
+    repair_limit: int = 200,
+    page_size: int = 200,
+    max_rows_scanned: int = 5000,
 ) -> int:
     """The bounded, prospective repair path for the disclosed
     "post-commit enqueue can be skipped" gap (see
@@ -688,82 +839,110 @@ def reconcile_missing_classification_jobs(
     this function is what actually closes that gap, superseding the
     earlier "accepted, not-closed-here" framing).
 
-    Scans the `limit` MOST RECENTLY RECEIVED eligible evidence items
-    with `received_at >= AUTOMATIC_CLASSIFICATION_ACTIVATION_BOUNDARY`
-    (via the existing `EvidenceRepository.list_evidence(received_at_from=...)`
-    — no new query surface), and for each one that has NEITHER an
+    ``activation_boundary`` is an explicit, REQUIRED parameter — see
+    module docstring's own "The activation boundary is Layer-2 runtime
+    configuration" section. This function itself has no knowledge of
+    where the value comes from (no env-var coupling here — that lives
+    entirely in ``scripts/process_evidence_classification_jobs.py``'s
+    ``main()``), which keeps it pure and directly testable: evidence
+    with `received_at` strictly BEFORE ``activation_boundary`` can
+    NEVER be found by this scan, at any `repair_limit`/`page_size`, no
+    matter how many times it runs — the `received_at_from` filter is
+    unconditional and applies to every page of every call.
+
+    Genuine paging, not a single fixed-window scan (CORRECTED
+    2026-09-29, architect review, WO item 2 — an earlier version of
+    this function called `list_evidence(limit=limit)` exactly once,
+    treating `limit` as "how many rows to inspect"; that only ever saw
+    the newest `limit` evidence rows, so older orphans below that
+    window could never be reached by repeated same-limit calls — the
+    old `test_a_second_call_with_the_same_limit_makes_no_further_progress...`
+    test proved this weakness directly, and has since been rewritten to
+    prove the opposite). `repair_limit` (default 200) now means "the
+    maximum number of missing jobs to CREATE this run", not "how many
+    rows to look at": this function pages through
+    `EvidenceRepository.list_evidence`'s own EXISTING `limit`+`offset`
+    parameters (real DB-level `OFFSET` in the Postgres implementation —
+    no new query surface), `page_size` (default 200) rows at a time,
+    starting at `offset=0`, until either `repair_limit` jobs have been
+    submitted or the evidence set (bounded by `max_rows_scanned`, see
+    below) is exhausted.
+
+    No persisted cross-call cursor is needed, and none is kept: each
+    call starts scanning from `offset=0` again, but already-resolved
+    evidence (a job already exists, or a current classification already
+    exists) is CHEAPLY skipped — two lookups per row, never a full row
+    reload or a new classification attempt — so a repeated call with
+    the SAME `repair_limit` naturally makes forward progress over time
+    as the "already-resolved" prefix at the front of the scan grows:
+    once enough of the front of the window is resolved, the scan walks
+    past it (still re-reading those rows, but skipping them almost for
+    free) and reaches genuinely still-orphaned rows further back. This
+    replaces the previous implementation's "no offset, recency-biased,
+    may need a wider --limit" framing entirely — that framing was
+    correct for the single-fixed-window implementation this replaces,
+    and is no longer true now (see
+    `tests/persistence/test_evidence_classification_job_reconciliation.py`'s
+    own paging-progress tests for the exact, proven behaviour).
+
+    `max_rows_scanned` (default 5000) — a NEW, explicitly documented
+    judgment call, NOT part of the architect's own required pseudocode:
+    a defensive, generous, narrow bound on how many evidence rows a
+    single call will ever read across all its pages, added purely to
+    prevent a genuinely pathological case (`repair_limit` orphans exist
+    but are scattered thinly across an enormous, mostly-already-resolved
+    evidence corpus) from turning one worker invocation into an
+    effectively unbounded full-table scan. It is consistent with
+    "bounded" being a repeated requirement throughout this whole
+    delivery (`repair_limit` itself, the worker's own `--limit`, the
+    stale-claim staleness threshold, ...) and is set far larger than
+    any single test in this delivery's own suite will ever need, so it
+    never interferes with a genuine repair in realistic use — it is a
+    safety backstop, not a tuned operational parameter.
+
+    For each row this function actually inspects that has NEITHER an
     existing `EvidenceClassificationJob` NOR a current classification
-    already, submits the missing job — idempotently, relying on the
+    already, it submits the missing job — idempotently, relying on the
     real `evidence_id` unique constraint exactly like the normal
     enqueue path (a genuine race between this function and a normal
     `enqueue_classification_job_for_evidence` call for the same
     evidence resolves to exactly one row, never two — same DB-level
-    guarantee, not a new one).
-
-    Deliberately bounded (`limit`, default 200) and deliberately
-    recency-biased (relies on `list_evidence`'s own `received_at DESC`
-    ordering, with NO offset/cursor between calls — see
-    `tests/persistence/test_evidence_classification_job_reconciliation.py`'s
-    own "same-limit repeat call" and "widen the limit" tests for the
-    exact, proven behaviour below) — NOT an attempt to exhaustively
-    reconcile the entire evidence corpus in one call.
-
-    CORRECTED, honest characterisation of what this actually guarantees
-    (an earlier draft of this docstring overclaimed "will keep
-    surfacing... until caught" unconditionally — the tests below prove
-    that is only true while the orphan count stays within `limit`):
-    for the realistic case this gap-repair path exists for — a small
-    number of rare, crash-induced orphans, never a backlog approaching
-    `limit` — routine periodic runs at the default `limit` resolve them
-    without operator intervention, since each still-unjobbed item keeps
-    appearing in the "most recent `limit`" window until it is caught. If
-    the number of orphans awaiting a job at once ever EXCEEDS `limit`,
-    an identical repeat call at the same `limit` makes ZERO further
-    progress on the OLDER excess (it keeps re-resolving whatever is
-    currently most-recent, which — once resolved — is naturally pushed
-    out of a later call's own "most recent `limit`" window by ordinary
-    new evidence arriving in the meantime); reaching that older excess
-    requires an operator to re-run with a larger `--limit` (a real,
-    simple, always-effective, DB-safe recovery lever — never a
-    permanent loss the way the pre-reconciliation gap was — just not an
-    unconditionally-automatic one once a backlog exceeds the default
-    window).
-
-    Historical evidence (received before the activation boundary) can
-    NEVER be found by this scan, at any limit, no matter how many times
-    it runs — the `received_at_from` filter is unconditional and
-    applies to every call.
-
-    `now` is accepted purely for test-determinism symmetry with the
-    rest of this module's functions (mirroring
-    `EvidenceClassificationJobRepository.claim_next_pending`'s own
-    `now` parameter) — this function does not itself compare `now`
-    against anything; the activation boundary is a fixed constant, not
-    derived from `now`.
+    guarantee, not a new one); no second, application-level guard is
+    added here.
 
     Returns the number of jobs actually submitted (0 in the common
     case — most evidence already has a job via the immediate-enqueue
     path; this function exists for the rare gap, not as the normal
     path).
     """
-    candidates = evidence_repository.list_evidence(
-        received_at_from=AUTOMATIC_CLASSIFICATION_ACTIVATION_BOUNDARY, limit=limit,
-    )
-
-    submitted_count = 0
-    for item in candidates:
-        if classification_job_repository.get_by_evidence(item.evidence_id) is not None:
-            continue
-        if classification_repository.get_current_classification(
-            item.evidence_id, CLASSIFICATION_TYPE_DOCUMENT_TYPE
-        ) is not None:
-            continue
-        # submit_job's own idempotency (the real evidence_id unique
-        # constraint) is the real safety net if a race occurs mid-scan
-        # — no second guard is added here (see docstring).
-        classification_job_repository.submit_job(
-            evidence_id=item.evidence_id, actor_type=actor_type, actor_id=actor_id,
+    offset = 0
+    submitted = 0
+    rows_scanned = 0
+    while submitted < repair_limit and rows_scanned < max_rows_scanned:
+        page = evidence_repository.list_evidence(
+            received_at_from=activation_boundary, limit=page_size, offset=offset,
         )
-        submitted_count += 1
+        if not page:
+            break
+        rows_scanned += len(page)
+        for item in page:
+            if submitted >= repair_limit:
+                break
+            if classification_job_repository.get_by_evidence(item.evidence_id) is not None:
+                continue
+            if classification_repository.get_current_classification(
+                item.evidence_id, CLASSIFICATION_TYPE_DOCUMENT_TYPE
+            ) is not None:
+                continue
+            # submit_job's own idempotency (the real evidence_id unique
+            # constraint) is the real safety net if a race occurs
+            # mid-scan — no second guard is added here (see docstring).
+            classification_job_repository.submit_job(
+                evidence_id=item.evidence_id, actor_type=actor_type, actor_id=actor_id,
+            )
+            submitted += 1
+        offset += len(page)
+        if len(page) < page_size:
+            break
 
-    return submitted_count
+    return submitted

@@ -14,7 +14,8 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 import pytest
 
@@ -598,11 +599,22 @@ def test_outcome_ai_prior_failure_maps_to_failed_terminal(
     assert job.classification_outcome == OUTCOME_AI_PRIOR_FAILURE
 
 
-def test_outcome_ai_in_progress_maps_to_failed_retryable_and_is_reclaimable(
+def test_outcome_ai_in_progress_maps_to_deferred_and_is_reclaimable(
     evidence_repository, rule_repository, classification_repository, ai_invocation_repository, litellm_client,
     object_store, audit_repository, needs_you_repository, classification_job_repository,
 ):
-    """Mirrors `tests/integration/test_classification_orchestrator.py
+    """Renamed/rewritten from
+    `test_outcome_ai_in_progress_maps_to_failed_retryable_and_is_reclaimable`
+    (architect review, 2026-09-29, WO item 3): the destination status is
+    now `DEFERRED`, not `FAILED_RETRYABLE` (see
+    `services.evidence.classification_job`'s own module docstring,
+    "DEFERRED" section) — a `FAILED_RETRYABLE` mapping DOES consume a
+    real `attempt_count` slot even though nothing about `AI_IN_PROGRESS`
+    is a genuine failed attempt; `DEFERRED`'s own `mark_deferred`
+    transition compensates for `mark_in_progress`'s increment instead,
+    so `attempt_count` is back to 0 (a wash), never consumed.
+
+    Mirrors `tests/integration/test_classification_orchestrator.py
     ::test_active_invocation_guard_returns_ai_in_progress_never_launches_duplicate`'s
     own exact fixture shape: a genuinely non-terminal (freshly-created,
     still `REQUESTED`) `AIInvocation` for the same
@@ -628,19 +640,55 @@ def test_outcome_ai_in_progress_maps_to_failed_retryable_and_is_reclaimable(
         audit_repository=audit_repository, needs_you_repository=needs_you_repository,
     )
     [record] = result["records"]
-    assert record["outcome"] == "DEFERRED_RETRYABLE"
-    assert record["job_status"] == "FAILED_RETRYABLE"
+    assert record["outcome"] == "DEFERRED"
+    assert record["job_status"] == "DEFERRED"
     assert record["classify_evidence_outcome"] == OUTCOME_AI_IN_PROGRESS
     assert record["classification_outcome"] == OUTCOME_AI_IN_PROGRESS
     assert litellm_client.calls == []  # never a duplicate model call
 
     job = classification_job_repository.get_by_evidence(evidence_id)
-    assert job.status == "FAILED_RETRYABLE"
+    assert job.status == "DEFERRED"
     assert job.classification_outcome == OUTCOME_AI_IN_PROGRESS
+    assert job.attempt_count == 0, "mark_in_progress's +1 and mark_deferred's -1 must be a wash"
+    assert job.claimed_by is None
+    assert job.claimed_at is None
 
     # IS reclaimable — not stuck.
     reclaimed = classification_job_repository.claim_next_pending(limit=5, claimed_by="later-worker")
     assert [j.job_id for j in reclaimed] == [job.job_id]
+
+
+def test_in_memory_mark_deferred_round_trip(classification_job_repository, evidence_repository, object_store):
+    """Test plan item 9: `mark_deferred` is a real, working repository
+    method — round-trip proof on the `InMemoryEvidenceClassificationJobRepository`
+    implementation (the Postgres implementation's own equivalent lives
+    in `tests/persistence/test_evidence_classification_job_repository.py
+    ::test_mark_deferred_round_trip`)."""
+    evidence_id = _register_email_evidence(
+        evidence_repository, object_store,
+        content=_rfc822_email(sender="a@b.com", subject="Deferred round trip", body="body"),
+    )
+    enqueue_classification_job_for_evidence(
+        evidence_id, classification_job_repository=classification_job_repository, actor_type=actor.SYSTEM, actor_id=ACTOR_ID,
+    )
+    job = classification_job_repository.get_by_evidence(evidence_id)
+    [claimed] = classification_job_repository.claim_next_pending(limit=1, claimed_by="worker-1")
+    in_progress = classification_job_repository.mark_in_progress(claimed.job_id)
+    assert in_progress.attempt_count == 1
+
+    deferred = classification_job_repository.mark_deferred(job.job_id, classification_outcome=OUTCOME_AI_IN_PROGRESS)
+    assert deferred.status == "DEFERRED"
+    assert deferred.classification_outcome == OUTCOME_AI_IN_PROGRESS
+    assert deferred.attempt_count == 0
+    assert deferred.claimed_by is None
+    assert deferred.claimed_at is None
+
+    fetched = classification_job_repository.get_job(job.job_id)
+    assert fetched.status == "DEFERRED"
+    assert fetched.attempt_count == 0
+
+    [reclaimed] = classification_job_repository.claim_next_pending(limit=5, claimed_by="worker-2")
+    assert reclaimed.job_id == job.job_id
 
 
 def test_no_ai_failure_outcome_is_ever_reported_as_a_job_succeeded(
@@ -696,3 +744,177 @@ def test_no_ai_failure_outcome_is_ever_reported_as_a_job_succeeded(
                 f"on a SUCCEEDED job — this must never happen: {record}"
             )
     assert scanned == 2, "both scripted AI-failure scenarios must actually have been scanned"
+
+
+# ---------------------------------------------------------------------
+# Test plan items 4/5/6 — the activation-boundary env var: unset,
+# malformed, and valid resolution, plus main()'s own extracted
+# dispatch helper (`_run_worker`) never letting a skipped reconciliation
+# block ordinary claim/process work.
+# ---------------------------------------------------------------------
+
+
+def test_resolve_activation_boundary_unset_skips_with_a_clear_reason():
+    boundary, skip_reason = worker._resolve_activation_boundary(None)
+    assert boundary is None
+    assert skip_reason is not None
+    assert worker._ACTIVATION_BOUNDARY_ENV_VAR in skip_reason
+    assert "not set" in skip_reason
+
+
+def test_resolve_activation_boundary_empty_string_skips_with_a_clear_reason():
+    boundary, skip_reason = worker._resolve_activation_boundary("")
+    assert boundary is None
+    assert skip_reason is not None
+
+
+def test_resolve_activation_boundary_malformed_skips_never_raises():
+    boundary, skip_reason = worker._resolve_activation_boundary("not-a-real-timestamp")
+    assert boundary is None
+    assert skip_reason is not None
+    assert "not-a-real-timestamp" in skip_reason
+
+
+def test_resolve_activation_boundary_valid_value_parses_correctly():
+    boundary, skip_reason = worker._resolve_activation_boundary("2026-10-15T00:00:00Z")
+    assert skip_reason is None
+    assert boundary == datetime(2026, 10, 15, 0, 0, 0, tzinfo=timezone.utc)
+
+
+def test_resolve_activation_boundary_valid_value_without_trailing_z():
+    # datetime.fromisoformat's own native "+HH:MM" form — the same
+    # helper handles both, mirroring services/xero/client.py's own
+    # `_parse_xero_wire_datetime` doctrine exactly.
+    boundary, skip_reason = worker._resolve_activation_boundary("2026-10-15T00:00:00+00:00")
+    assert skip_reason is None
+    assert boundary == datetime(2026, 10, 15, 0, 0, 0, tzinfo=timezone.utc)
+
+
+def _fake_composition(
+    *, classification_job_repository, evidence_repository, rule_repository, classification_repository,
+    ai_invocation_repository, litellm_client, object_store, audit_repository, needs_you_repository,
+):
+    """A minimal stand-in for `app.api.composition.Composition`,
+    exposing only the attributes `_run_worker` actually reads — lets
+    `_run_worker`'s own dispatch logic (resolve boundary, maybe
+    reconcile, always process) be exercised directly with real
+    in-memory repositories and no env vars/database at all (see
+    `scripts/process_evidence_classification_jobs.py`'s own module
+    docstring, "The activation boundary is operator-set Layer-2
+    configuration" section, for why this extraction exists)."""
+    api = SimpleNamespace(
+        evidence_repository=evidence_repository, audit_repository=audit_repository,
+        record_audit_event=audit_repository.record_audit_event,
+    )
+    return SimpleNamespace(
+        api=api,
+        classification_job_repository=classification_job_repository,
+        classification_repository=classification_repository,
+        classification_rule_repository=rule_repository,
+        ai_invocation_repository=ai_invocation_repository,
+        litellm_client=litellm_client,
+        object_store=object_store,
+        needs_you_repository=needs_you_repository,
+    )
+
+
+def test_run_worker_skips_reconciliation_when_env_var_unset_but_still_processes_existing_jobs(
+    evidence_repository, rule_repository, classification_repository, ai_invocation_repository, litellm_client,
+    object_store, audit_repository, needs_you_repository, classification_job_repository,
+):
+    """Test plan item 4: env var unset -> `_run_worker` (main()'s own
+    dispatch logic) skips reconciliation, reports why, but ordinary
+    claim/process work for an ALREADY-enqueued job proceeds completely
+    normally."""
+    # An evidence item with a job ALREADY enqueued (the immediate-
+    # enqueue path) — this must still be claimed/processed even though
+    # reconciliation itself will be skipped.
+    evidence_id = _register_email_evidence(
+        evidence_repository, object_store,
+        content=_rfc822_email(sender="new-vendor@example.com", subject="Needs processing", body="pay up"),
+        sender_address="new-vendor@example.com", subject="Needs processing",
+    )
+    enqueue_classification_job_for_evidence(
+        evidence_id, classification_job_repository=classification_job_repository, actor_type=actor.SYSTEM, actor_id=ACTOR_ID,
+    )
+    _queue_proposal(litellm_client, proposed_type=DOCUMENT_TYPE_SUPPLIER_INVOICE, confidence=0.8)
+
+    # A SEPARATE evidence item with NO job at all — proves reconciliation
+    # genuinely did not run (it would otherwise have enqueued one).
+    orphan_evidence_id = _register_email_evidence(
+        evidence_repository, object_store,
+        content=_rfc822_email(sender="a@b.com", subject="Orphan", body="body"),
+    )
+    assert classification_job_repository.get_by_evidence(orphan_evidence_id) is None
+
+    composition = _fake_composition(
+        classification_job_repository=classification_job_repository, evidence_repository=evidence_repository,
+        rule_repository=rule_repository, classification_repository=classification_repository,
+        ai_invocation_repository=ai_invocation_repository, litellm_client=litellm_client, object_store=object_store,
+        audit_repository=audit_repository, needs_you_repository=needs_you_repository,
+    )
+    args = SimpleNamespace(limit=5, reconciliation_repair_limit=200)
+
+    outcome = worker._run_worker(
+        args=args, composition=composition, run_id="test-run-1", started_at=datetime.now(timezone.utc),
+        worker_id="test-worker-1", env={},
+    )
+    report = outcome["report"]
+
+    assert report["reconciled_count"] == 0
+    assert report["reconciliation_skipped_reason"] is not None
+    assert worker._ACTIVATION_BOUNDARY_ENV_VAR in report["reconciliation_skipped_reason"]
+
+    # Ordinary claim/process still happened normally.
+    assert report["claimed_count"] == 1
+    [record] = report["records"]
+    assert record["evidence_id"] == evidence_id
+    assert record["outcome"] == "SUCCEEDED"
+
+    # And reconciliation genuinely did not run — the orphan is still unjobbed.
+    assert classification_job_repository.get_by_evidence(orphan_evidence_id) is None
+
+
+def test_run_worker_runs_reconciliation_with_the_exact_env_supplied_boundary(
+    evidence_repository, rule_repository, classification_repository, ai_invocation_repository, litellm_client,
+    object_store, audit_repository, needs_you_repository, classification_job_repository,
+):
+    """Test plan item 6: env var set to a valid value -> reconciliation
+    genuinely runs, with that exact boundary (parse-and-use correctness,
+    not merely parse correctness)."""
+    boundary = datetime.now(timezone.utc)
+
+    # Prospective orphan — registered AFTER `boundary` was captured, so
+    # its own received_at is >= boundary (the inclusive filter).
+    prospective_id = _register_email_evidence(
+        evidence_repository, object_store, content=_rfc822_email(sender="a@b.com", subject="Prospective", body="body"),
+    )
+    # Historical evidence (received_at BEFORE the boundary) — must
+    # remain untouched.
+    historical_evidence = evidence_repository.register_evidence(
+        entity_id=None, evidence_type="EMAIL", source_id=identity.generate_id(),
+        observed_at=boundary - timedelta(days=1),
+        received_at=boundary - timedelta(days=1),
+        content_hash={"algorithm": "SHA-256", "value": hashlib.sha256(b"historical").hexdigest()},
+        mime_type="message/rfc822", size_bytes=10, storage_reference=None,
+    )
+
+    composition = _fake_composition(
+        classification_job_repository=classification_job_repository, evidence_repository=evidence_repository,
+        rule_repository=rule_repository, classification_repository=classification_repository,
+        ai_invocation_repository=ai_invocation_repository, litellm_client=litellm_client, object_store=object_store,
+        audit_repository=audit_repository, needs_you_repository=needs_you_repository,
+    )
+    args = SimpleNamespace(limit=5, reconciliation_repair_limit=200)
+    env = {worker._ACTIVATION_BOUNDARY_ENV_VAR: boundary.strftime("%Y-%m-%dT%H:%M:%S.%fZ")}
+
+    outcome = worker._run_worker(
+        args=args, composition=composition, run_id="test-run-2", started_at=boundary,
+        worker_id="test-worker-2", env=env,
+    )
+    report = outcome["report"]
+
+    assert report["reconciliation_skipped_reason"] is None
+    assert report["reconciled_count"] == 1
+    assert classification_job_repository.get_by_evidence(prospective_id) is not None
+    assert classification_job_repository.get_by_evidence(historical_evidence.evidence_id) is None
