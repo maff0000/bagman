@@ -566,6 +566,7 @@ async def sweep_microsoft(mailbox_id: str, payload: SweepMicrosoftRequest) -> di
             api=composition.api,
             object_store=composition.object_store,
             scanner=composition.scanner,
+            classification_job_repository=composition.classification_job_repository,
             actor_type=payload.actor_type,
             actor_id=payload.actor_id,
         )
@@ -970,6 +971,7 @@ def _resolve_mailbox_domain_review_core(
         api=composition.api,
         object_store=composition.object_store,
         scanner=composition.scanner,
+        classification_job_repository=composition.classification_job_repository,
         adapter=composition.microsoft_mailbox_adapter,
         sweep_lock=composition.mailbox_sweep_lock,
         mailbox=mailbox,
@@ -1247,6 +1249,7 @@ async def resolve_microsoft_security_review(
         api=composition.api,
         object_store=composition.object_store,
         scanner=composition.scanner,
+        classification_job_repository=composition.classification_job_repository,
         adapter=composition.microsoft_mailbox_adapter,
         mailbox=mailbox,
         mailbox_id=mailbox_id,

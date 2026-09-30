@@ -232,6 +232,17 @@ class _ObjectStoreProtocol(Protocol):
     def put_prefixed(self, prefix: Any, object_id: Any, content_hash: Any, data: Any) -> Any: ...
 
 
+class _ClassificationJobRepositoryProtocol(Protocol):
+    """Mirrors `services.mailbox.sweep._ClassificationJobRepositoryProtocol`
+    exactly — both functions below only ever pass
+    `classification_job_repository` straight through to
+    `services.mailbox.sweep`'s own public functions, never call a
+    method on it directly themselves (evidence/automatic-classification
+    -activation WO)."""
+
+    def submit_job(self, **kwargs: Any) -> Any: ...
+
+
 _SECURITY_REVIEW_DECISIONS = ("PROCESS_THIS_MESSAGE_ONCE", "DO_NOT_PROCESS_THIS_MESSAGE")
 
 #: Domain-review `resolution` dicts recorded BEFORE this delivery (real
@@ -383,6 +394,7 @@ def resolve_domain_review(
     api: _EvidenceAPIProtocol,
     object_store: _ObjectStoreProtocol,
     scanner: EvidenceSafetyScanner,
+    classification_job_repository: Optional[_ClassificationJobRepositoryProtocol] = None,
     adapter: _AdapterProtocol,
     sweep_lock: MailboxSweepLock,
     mailbox: MailboxSource,
@@ -1047,6 +1059,7 @@ def resolve_domain_review(
                 api=api,
                 object_store=object_store,
                 scanner=scanner,
+                classification_job_repository=classification_job_repository,
                 sweep_lock=sweep_lock,
                 actor_type=actor_type,
                 actor_id=actor_id,
@@ -1194,6 +1207,7 @@ def resolve_domain_review(
             api=api,
             object_store=object_store,
             scanner=scanner,
+            classification_job_repository=classification_job_repository,
             sweep_lock=sweep_lock,
             actor_type=actor_type,
             actor_id=actor_id,
@@ -1246,6 +1260,7 @@ def resolve_security_review(
     api: _EvidenceAPIProtocol,
     object_store: _ObjectStoreProtocol,
     scanner: EvidenceSafetyScanner,
+    classification_job_repository: Optional[_ClassificationJobRepositoryProtocol] = None,
     adapter: _AdapterProtocol,
     mailbox: MailboxSource,
     mailbox_id: str,
@@ -1343,6 +1358,7 @@ def resolve_security_review(
         api=api,
         object_store=object_store,
         scanner=scanner,
+        classification_job_repository=classification_job_repository,
         actor_type=actor_type,
         actor_id=actor_id,
         correlation_id=item.correlation_id,

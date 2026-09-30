@@ -46,6 +46,7 @@ EXPECTED_TABLES = {
     "background_jobs",  # CD-6 §103 Inference Architecture Ruling
     "xero_account_suggestions",  # xero/account-suggestion-producer WO
     "xero_account_assignments",  # xero/account-suggestion-producer WO
+    "evidence_classification_jobs",  # evidence/automatic-classification-activation WO
 }
 
 
@@ -112,6 +113,7 @@ def test_xero_migration_downgrade_genuinely_undoes_the_upgrade(postgres_containe
         "background_jobs",  # CD-6 §103 Inference Architecture Ruling, chained downstream of b4d8f1a92c65
         "xero_account_suggestions",  # xero/account-suggestion-producer WO, chained downstream of c7a3f9e1b542
         "xero_account_assignments",  # xero/account-suggestion-producer WO, chained downstream of c7a3f9e1b542
+        "evidence_classification_jobs",  # evidence/automatic-classification-activation WO, chained downstream of e8c4a1f97b23
     }
     try:
         command.downgrade(cfg, "712c5a2aab92")
@@ -155,6 +157,7 @@ def test_mailbox_migration_downgrade_genuinely_undoes_the_upgrade(postgres_conta
         "background_jobs",  # CD-6 §103 Inference Architecture Ruling, chained downstream of b4d8f1a92c65
         "xero_account_suggestions",  # xero/account-suggestion-producer WO, chained downstream of c7a3f9e1b542
         "xero_account_assignments",  # xero/account-suggestion-producer WO, chained downstream of c7a3f9e1b542
+        "evidence_classification_jobs",  # evidence/automatic-classification-activation WO, chained downstream of e8c4a1f97b23
     }
     try:
         command.downgrade(cfg, "5e8c1f42b9a7")
@@ -187,6 +190,7 @@ def test_mailbox_microsoft_sweep_migration_downgrade_genuinely_undoes_the_upgrad
         "background_jobs",  # CD-6 §103 Inference Architecture Ruling, chained downstream of b4d8f1a92c65
         "xero_account_suggestions",  # xero/account-suggestion-producer WO, chained downstream of c7a3f9e1b542
         "xero_account_assignments",  # xero/account-suggestion-producer WO, chained downstream of c7a3f9e1b542
+        "evidence_classification_jobs",  # evidence/automatic-classification-activation WO, chained downstream of e8c4a1f97b23
     }
     try:
         command.downgrade(cfg, "a3d7c1f9e246")

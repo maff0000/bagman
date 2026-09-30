@@ -79,6 +79,7 @@ from datetime import datetime
 from typing import Any, Mapping, Optional, Protocol
 
 from core.errors import BagmanError, FileTooLargeError
+from services.evidence.classification_job import enqueue_classification_job_for_evidence
 from services.evidence.intake.policy import EMAIL_MESSAGE_MIME_TYPE
 from services.evidence.intake.scanner import EvidenceSafetyScanner, ScanVerdict
 from services.evidence.intake.streaming import spool_stream
@@ -117,6 +118,19 @@ class _EvidenceAPI(Protocol):
     def record_provenance(self, **kwargs: Any) -> Any: ...
 
 
+class _ClassificationJobRepository(Protocol):
+    """The exact facade surface this module needs from
+    `services.evidence.classification_job.EvidenceClassificationJobRepository`
+    — a structural Protocol for the same reason `_ObjectStore`/
+    `_EvidenceAPI` above are: this module stays composition-root-
+    agnostic (dependency-injected, never importing `app.api.composition`
+    itself — mirrors `services.evidence.classification_orchestrator`'s
+    own documented "Dependency-injected, not composition-coupled"
+    doctrine)."""
+
+    def submit_job(self, **kwargs: Any) -> Any: ...
+
+
 @dataclass(frozen=True)
 class EmailIngestOutcome:
     status: str  # INGESTED | QUARANTINED | FAILED
@@ -141,6 +155,7 @@ def ingest_email_evidence(
     scanner: EvidenceSafetyScanner,
     actor_type: str,
     actor_id: str,
+    classification_job_repository: Optional[_ClassificationJobRepository] = None,
     correlation_id: Optional[str] = None,
     causation_id: Optional[str] = None,
     max_size_bytes: int = DEFAULT_MAX_MESSAGE_SIZE_BYTES,
@@ -221,6 +236,43 @@ def ingest_email_evidence(
                 correlation_id=correlation_id,
                 causation_id=causation_id,
             )
+
+            # evidence/automatic-classification-activation WO — the
+            # first of the two real evidence-creation call sites (the
+            # other is app/api/routers/intake.py's own manual-upload
+            # handoff). Enqueue the durable, automatic classification
+            # trigger IMMEDIATELY after register_evidence() returns
+            # (its own transaction has already fully committed — see
+            # services.evidence.classification_job's module docstring)
+            # — idempotent per evidence_id (a replayed sweep of the
+            # same message is always safe), and NEVER raises (a failed
+            # enqueue must never corrupt an otherwise-successful
+            # ingest). `classification_job_repository` defaults to
+            # `None` (a documented judgment call): every REAL caller in
+            # this codebase (services/mailbox/sweep.py's `run_sweep`/
+            # `_reprocess_one_message`/
+            # `reprocess_all_historical_candidates_for_domain`/
+            # `process_security_reviewed_message_once`, threaded from
+            # `app/api/routers/mailboxes_{microsoft,imap,gmail}.py` with
+            # the real `composition.classification_job_repository`)
+            # always supplies a real repository; `None` exists only so
+            # this already-large, already-heavily-tested call chain's
+            # many pre-existing unit/integration tests that construct
+            # `ingest_email_evidence`/`run_sweep`/etc. directly (with no
+            # interest in this WO's own new capability) do not all need
+            # a mechanical, purely-additive kwarg edit — skipping the
+            # enqueue in that case is exactly as safe as any other
+            # "enqueue was skipped" gap this module's own docstring
+            # already discloses and accepts (never a reason to fail
+            # ingestion itself).
+            if classification_job_repository is not None:
+                enqueue_classification_job_for_evidence(
+                    evidence.evidence_id,
+                    classification_job_repository=classification_job_repository,
+                    actor_type="SYSTEM",
+                    actor_id="bagman-evidence-classification-trigger",
+                    correlation_id=correlation_id,
+                )
             return EmailIngestOutcome(
                 status=INGEST_STATUS_INGESTED,
                 evidence=evidence,

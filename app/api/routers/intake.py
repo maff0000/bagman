@@ -170,6 +170,7 @@ from pydantic import BaseModel, ValidationError as PydanticValidationError
 
 from core import identity
 from core.errors import BagmanError, InvalidStateTransitionError
+from services.evidence.classification_job import enqueue_classification_job_for_evidence
 from services.evidence.intake.validation_pipeline import run_intake_validation
 from services.needs_you.needs_you import (
     ALLOWED_ACTION_COMPANY_WHAT_WHY as NEEDS_YOU_ALLOWED_ACTION_COMPANY_WHAT_WHY,
@@ -301,6 +302,23 @@ def _register_accepted_evidence(*, composition, record, meta: IntakeUploadMetada
             },
             correlation_id=record.correlation_id,
             causation_id=stored_event.audit_event_id,
+        )
+
+        # evidence/automatic-classification-activation WO — the second
+        # of the two real evidence-creation call sites (the other is
+        # services/mailbox/microsoft/evidence_ingest.py's own
+        # ingest_email_evidence). Enqueue the durable, automatic
+        # classification trigger IMMEDIATELY after register_evidence()
+        # returns (its own transaction has already fully committed —
+        # see services.evidence.classification_job's module docstring)
+        # — idempotent per evidence_id, and NEVER raises (a failed
+        # enqueue must never corrupt an otherwise-successful intake).
+        enqueue_classification_job_for_evidence(
+            evidence.evidence_id,
+            classification_job_repository=composition.classification_job_repository,
+            actor_type="SYSTEM",
+            actor_id="bagman-evidence-classification-trigger",
+            correlation_id=record.correlation_id,
         )
 
         # register_evidence() already emitted its own EVIDENCE_OBSERVED
