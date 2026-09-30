@@ -152,8 +152,18 @@ def test_never_stores_raw_mime_in_the_evidence_metadata(api, object_store, sourc
 # ---------------------------------------------------------------------
 
 
-def test_clean_ingest_enqueues_exactly_one_classification_job(api, object_store, source_id):
-    from services.evidence.classification_job import InMemoryEvidenceClassificationJobRepository
+def test_clean_ingest_enqueues_exactly_one_classification_job(api, object_store, source_id, monkeypatch):
+    from services.evidence.classification_job import (
+        EVIDENCE_CLASSIFICATION_ACTIVATION_BOUNDARY_ENV_VAR,
+        InMemoryEvidenceClassificationJobRepository,
+    )
+
+    # Preflight review correction, item C: the real call site now gates
+    # enqueue on the operator-configured activation boundary — set it
+    # to something safely in the past so this test's own concern (the
+    # mailbox call site's wiring, once activated) is exercised, not the
+    # gate itself (which has its own dedicated tests).
+    monkeypatch.setenv(EVIDENCE_CLASSIFICATION_ACTIVATION_BOUNDARY_ENV_VAR, "2000-01-01T00:00:00Z")
 
     classification_job_repository = InMemoryEvidenceClassificationJobRepository()
     scanner = ScriptedScanner(ScanVerdict.CLEAN)
@@ -219,11 +229,17 @@ def test_quarantined_ingest_never_enqueues_a_classification_job(api, object_stor
     assert classification_job_repository._by_id == {}  # noqa: SLF001 - direct internal-state proof, test-only
 
 
-def test_enqueue_never_raises_even_when_the_job_repository_itself_fails(api, object_store, source_id):
+def test_enqueue_never_raises_even_when_the_job_repository_itself_fails(api, object_store, source_id, monkeypatch):
     """The invariant `enqueue_classification_job_for_evidence`'s own
     docstring states: 'no ENQUEUE failure may corrupt evidence
     ingestion either' — proven here with a repository whose
     `submit_job` always raises."""
+    from services.evidence.classification_job import EVIDENCE_CLASSIFICATION_ACTIVATION_BOUNDARY_ENV_VAR
+
+    # Activation boundary set safely in the past so this test genuinely
+    # reaches submit_job (proving THAT never raises), rather than being
+    # gated out before ever calling it — see the sibling test above.
+    monkeypatch.setenv(EVIDENCE_CLASSIFICATION_ACTIVATION_BOUNDARY_ENV_VAR, "2000-01-01T00:00:00Z")
 
     class _AlwaysRaisingJobRepository:
         def submit_job(self, **kwargs):

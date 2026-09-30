@@ -30,6 +30,7 @@ with "prove the real mechanism, not a busier-looking test".
 from __future__ import annotations
 
 import hashlib
+from datetime import datetime, timezone
 
 import scripts.process_evidence_classification_jobs as worker
 from ai.invocation import InMemoryAIInvocationRepository
@@ -117,11 +118,17 @@ def test_ai_in_progress_across_more_polls_than_max_attempts_never_exhausts_or_te
     )
 
     job_repository = PostgresEvidenceClassificationJobRepository()
+    evidence_created_at = _evidence_repository().get_evidence(evidence_id).created_at
     enqueue_classification_job_for_evidence(
         evidence_id,
         classification_job_repository=job_repository,
         actor_type=actor.SYSTEM,
         actor_id=ACTOR_ID,
+        # This module's own test exercises DEFERRED polling behaviour —
+        # never the preflight-review enqueue-side activation gate (item
+        # C) — so a boundary far enough in the past always satisfies it.
+        evidence_created_at=evidence_created_at,
+        activation_boundary=datetime.min.replace(tzinfo=timezone.utc),
         # max_attempts is NOT a parameter of enqueue_classification_job_for_evidence
         # (it always defaults to 3 there) — submit directly instead so
         # this test's own max_attempts is explicit and independent of

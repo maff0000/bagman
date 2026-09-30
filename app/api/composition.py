@@ -68,6 +68,9 @@ from core.api import BagmanCanonicalAPI
 from persistence.objects.store import EvidenceObjectStore
 from services.evidence.classification import EvidenceClassificationRepository
 from services.evidence.classification_job import EvidenceClassificationJobRepository
+from services.evidence.classification_reconciliation_cursor import (
+    EvidenceClassificationReconciliationCursorRepository,
+)
 from services.evidence.classification_rule import EvidenceClassificationRuleRepository
 from services.evidence.intake.intake import IntakeRepository
 from services.evidence.intake.scanner import EvidenceSafetyScanner, ScanResult, ScanVerdict
@@ -484,6 +487,19 @@ class RuntimeComposition:
     #: own "bounded operator/maintenance-mode procedure, not a
     #: background service" precedent).
     classification_job_repository: EvidenceClassificationJobRepository
+    #: Preflight review correction, item B — the durable, per-
+    #: activation-boundary reconciliation-scan cursor (see
+    #: `services.evidence.classification_reconciliation_cursor`'s own
+    #: module docstring) that closes the reconciliation-starvation bug.
+    #: In-memory in development/test, a real
+    #: `PostgresEvidenceClassificationReconciliationCursorRepository`
+    #: (sharing `engine`) in production — same never-mixed-across-modes
+    #: discipline as every repository above. Consumed ONLY by
+    #: `services.evidence.classification_job
+    #: .reconcile_missing_classification_jobs`, threaded from
+    #: `scripts/process_evidence_classification_jobs.py` — no HTTP
+    #: router reads it directly.
+    classification_reconciliation_cursor_repository: EvidenceClassificationReconciliationCursorRepository
 
 
 def _build_development_or_test(runtime_environment: str) -> RuntimeComposition:
@@ -623,6 +639,15 @@ def _build_development_or_test(runtime_environment: str) -> RuntimeComposition:
         audit_repository=api.audit_repository
     )
 
+    # Preflight review correction, item B — the durable reconciliation
+    # cursor (see `RuntimeComposition.classification_reconciliation_cursor_repository`'s
+    # own docstring).
+    from services.evidence.classification_reconciliation_cursor import (
+        InMemoryEvidenceClassificationReconciliationCursorRepository,
+    )
+
+    classification_reconciliation_cursor_repository = InMemoryEvidenceClassificationReconciliationCursorRepository()
+
     # `default_response` closes the WI-4 dev-mode gap documented on
     # `_dev_mode_litellm_default_response` above — without it, a real
     # click on the GUI's "Run analysis" button in a live dev server
@@ -679,6 +704,7 @@ def _build_development_or_test(runtime_environment: str) -> RuntimeComposition:
         classification_rule_repository=classification_rule_repository,
         classification_repository=classification_repository,
         classification_job_repository=classification_job_repository,
+        classification_reconciliation_cursor_repository=classification_reconciliation_cursor_repository,
     )
 
 
@@ -708,6 +734,9 @@ def _build_production() -> RuntimeComposition:
     )
     from persistence.postgres.evidence_classification_job_repository import (
         PostgresEvidenceClassificationJobRepository,
+    )
+    from persistence.postgres.evidence_classification_reconciliation_cursor_repository import (
+        PostgresEvidenceClassificationReconciliationCursorRepository,
     )
     from persistence.postgres.evidence_classification_repository import PostgresEvidenceClassificationRepository
     from persistence.postgres.evidence_classification_rule_repository import (
@@ -841,6 +870,13 @@ def _build_production() -> RuntimeComposition:
     # `background_job_repository` above.
     classification_job_repository = PostgresEvidenceClassificationJobRepository(
         engine, audit_repository=api.audit_repository
+    )
+
+    # Preflight review correction, item B — durable reconciliation
+    # cursor, sharing `engine` exactly like every other Postgres-backed
+    # repository above.
+    classification_reconciliation_cursor_repository = PostgresEvidenceClassificationReconciliationCursorRepository(
+        engine
     )
 
     litellm_client = LiteLLMClient(
@@ -1005,6 +1041,7 @@ def _build_production() -> RuntimeComposition:
         classification_rule_repository=classification_rule_repository,
         classification_repository=classification_repository,
         classification_job_repository=classification_job_repository,
+        classification_reconciliation_cursor_repository=classification_reconciliation_cursor_repository,
     )
 
 
