@@ -94,6 +94,14 @@ class EvidenceClassificationReconciliationCursorRow(Base):
     __tablename__ = "evidence_classification_reconciliation_cursors"
 
     cursor_key: Mapped[str] = mapped_column(String, primary_key=True)
+    #: Monotonically non-decreasing generation counter — see
+    #: `services.evidence.classification_reconciliation_cursor`'s own
+    #: docstring, "lap" section (evidence/classification-activation-
+    #: preflight WO, this round's own permanent-stall correction). Plain
+    #: non-nullable `Integer`, mirroring `EvidenceClassificationJobRow
+    #: .attempt_count`/`.max_attempts`'s own "always explicitly supplied
+    #: by application code, no column default relied on" convention.
+    lap: Mapped[int] = mapped_column(Integer, nullable=False)
     last_created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     #: EVERY `evidence_id` actually inspected (never merely
     #: cursor-skipped) at exactly `last_created_at` — a plain JSONB

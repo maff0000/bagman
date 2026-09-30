@@ -36,6 +36,14 @@ def upgrade() -> None:
     op.create_table(
         'evidence_classification_reconciliation_cursors',
         sa.Column('cursor_key', sa.String(), nullable=False),
+        # Monotonically non-decreasing lap-generation counter — added
+        # IN PLACE (widening this same, never-yet-merged/never-yet-
+        # deployed table definition, not a new chained migration; see
+        # services.evidence.classification_reconciliation_cursor's own
+        # docstring, "lap" section, and this WO's own established
+        # practice of widening this exact migration for a table that
+        # has never shipped).
+        sa.Column('lap', sa.Integer(), nullable=False),
         sa.Column('last_created_at', sa.DateTime(timezone=True), nullable=False),
         # JSONB list of evidence_id strings — the set of every id
         # actually inspected at exactly `last_created_at` (post-merge

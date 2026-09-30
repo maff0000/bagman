@@ -982,6 +982,135 @@ def enqueue_classification_job_for_evidence(
         )
 
 
+def _scan_and_repair_evidence_missing_classification_jobs(
+    *,
+    evidence_repository,
+    classification_job_repository: EvidenceClassificationJobRepository,
+    classification_repository,
+    cursor_repository: EvidenceClassificationReconciliationCursorRepository,
+    actor_type: str,
+    actor_id: str,
+    cursor_key: str,
+    scan_created_at_from: datetime,
+    created_at_to: Optional[datetime],
+    already_inspected_ids_at_boundary: set[str],
+    has_existing_cursor: bool,
+    repair_limit: int,
+    page_size: int,
+    max_rows_scanned: int,
+    lap: int,
+) -> int:
+    """ONE bounded scan-and-repair pass, in REGISTRATION (`created_at
+    ASC, evidence_id ASC`) order, over `[scan_created_at_from,
+    created_at_to]` (`created_at_to=None` means unbounded above) —
+    factored out so `reconcile_missing_classification_jobs` can run
+    the IDENTICAL scan/skip/inspect/submit/track-watermark logic twice
+    per call (once for the forward pass, once for the "safety sweep"
+    pass — see that function's own docstring) without two
+    near-duplicate loops silently drifting apart over time.
+
+    `cursor_key`/`scan_created_at_from`/`already_inspected_ids_at_boundary`/
+    `has_existing_cursor` together describe where THIS pass's own
+    cursor currently sits (the set-membership tie-break discipline is
+    identical regardless of which cursor_key is passed — see
+    `services.evidence.classification_reconciliation_cursor`'s own
+    docstring, "Why the tie-break is SET membership" section); this
+    pass advances `cursor_repository`'s own `cursor_key` row via
+    `advance_cursor`'s merge-on-write contract (see that module's own
+    "Why advance_cursor merges instead of overwrites" AND "lap"
+    docstring sections) if, and only if, it actually inspected anything
+    new — exactly the existing single-pass discipline, unchanged.
+
+    `lap` is the generation counter THIS call proposes for
+    `cursor_key` (see `services.evidence
+    .classification_reconciliation_cursor`'s own "lap" docstring
+    section) — this helper never computes it itself, only threads the
+    caller's own decision through to `advance_cursor`: the forward pass
+    always passes its existing cursor's own `lap` back unchanged; the
+    sweep pass passes either its existing cursor's own `lap` (continuing
+    a lap) or that value plus one (starting a new one) — see
+    `reconcile_missing_classification_jobs`'s own docstring for the
+    full reasoning.
+
+    Returns the number of jobs submitted by THIS pass alone (never
+    includes the other pass's own count — the caller sums both).
+    """
+    offset = 0
+    submitted = 0
+    rows_scanned = 0
+    running_created_at: Optional[datetime] = scan_created_at_from if has_existing_cursor else None
+    running_ids: set[str] = set(already_inspected_ids_at_boundary)
+    any_inspected = False
+
+    while submitted < repair_limit and rows_scanned < max_rows_scanned:
+        page = evidence_repository.list_evidence(
+            created_at_from=scan_created_at_from,
+            created_at_to=created_at_to,
+            limit=page_size,
+            offset=offset,
+            order_by_created_at=True,
+        )
+        if not page:
+            break
+        for item in page:
+            if submitted >= repair_limit or rows_scanned >= max_rows_scanned:
+                # Stop INSPECTING entirely — never advance the running
+                # watermark past a row we never actually
+                # resolved-or-submitted.
+                break
+            if (
+                has_existing_cursor
+                and item.created_at == scan_created_at_from
+                and item.evidence_id in already_inspected_ids_at_boundary
+            ):
+                # Already fully handled by a previous call at this
+                # exact cursor_key — a cheap set-membership check,
+                # never counted against rows_scanned/repair_limit. Only
+                # ever matters for rows sharing the exact
+                # scan_created_at_from timestamp.
+                continue
+
+            rows_scanned += 1
+            any_inspected = True
+            if running_created_at is None or item.created_at > running_created_at:
+                # The watermark has moved to a new, later timestamp —
+                # the old timestamp's ids are irrelevant to any future
+                # call at this cursor_key, so do NOT carry them forward.
+                running_created_at = item.created_at
+                running_ids = {item.evidence_id}
+            else:
+                # item.created_at == running_created_at (it can never
+                # be less — order_by_created_at=True and the skip
+                # condition above already excluded anything at or
+                # behind scan_created_at_from that was already
+                # inspected). Add to, never replace, the running set.
+                running_ids.add(item.evidence_id)
+
+            if classification_job_repository.get_by_evidence(item.evidence_id) is not None:
+                continue
+            if classification_repository.get_current_classification(
+                item.evidence_id, CLASSIFICATION_TYPE_DOCUMENT_TYPE
+            ) is not None:
+                continue
+            # submit_job's own idempotency (the real evidence_id unique
+            # constraint) is the real safety net if a race occurs
+            # mid-scan — no second guard is added here.
+            classification_job_repository.submit_job(
+                evidence_id=item.evidence_id, actor_type=actor_type, actor_id=actor_id,
+            )
+            submitted += 1
+        offset += len(page)
+        if len(page) < page_size:
+            break
+
+    if any_inspected:
+        cursor_repository.advance_cursor(
+            cursor_key, lap=lap, last_created_at=running_created_at, last_evidence_ids=running_ids,
+        )
+
+    return submitted
+
+
 def reconcile_missing_classification_jobs(
     *,
     evidence_repository,
@@ -994,6 +1123,9 @@ def reconcile_missing_classification_jobs(
     repair_limit: int = 200,
     page_size: int = 200,
     max_rows_scanned: int = 5000,
+    sweep_repair_limit: int = 50,
+    sweep_page_size: int = 200,
+    sweep_max_rows_scanned: int = 1000,
 ) -> int:
     """The bounded, prospective repair path for the disclosed
     "post-commit enqueue can be skipped" gap (see
@@ -1143,112 +1275,234 @@ def reconcile_missing_classification_jobs(
     guarantee, not a new one); no second, application-level guard is
     added here.
 
-    Returns the number of jobs actually submitted (0 in the common
-    case — most evidence already has a job via the immediate-enqueue
-    path; this function exists for the rare gap, not as the normal
-    path).
+    A second, bounded, cyclic "safety sweep" cursor closes a genuine
+    commit-order-vs-created_at-order inversion gap (architect-confirmed,
+    this round's own correction)
+    ------------------------------------------------------------------
+    `PostgresEvidenceRepository.register_evidence` assigns
+    `EvidenceItem.created_at` in Python (`utc_now()`) BEFORE its own
+    transaction commits. Under Postgres's default READ COMMITTED
+    isolation, two concurrent registrations can COMMIT in an order
+    DIFFERENT from their `created_at` VALUE order: transaction A can
+    start first (an earlier `created_at`) but commit LATER than
+    transaction B (a later `created_at`, committed first). If a forward
+    reconciliation pass runs while A is still uncommitted (invisible to
+    that scan's snapshot), sees B, and advances the forward cursor's
+    watermark to B's timestamp, then A commits afterward — A's
+    `created_at` is now STRICTLY BEFORE the forward cursor's watermark,
+    so `created_at_from` excludes it from the forward pass's own scan
+    forever, even though it only just became visible and may never have
+    gotten its immediate-enqueue job either (that enqueue call happens
+    inside the SAME window this gap exploits). The forward cursor above
+    is correct and remains the primary, low-latency discovery mechanism
+    for the common case (evidence usually commits promptly, in roughly
+    `created_at` order) — it is NOT removed or weakened here.
+
+    The safety sweep is a SEPARATE, independent cursor, keyed
+    `f"{activation_boundary.isoformat()}::sweep"` under the exact SAME
+    `EvidenceClassificationReconciliationCursor` dataclass/repository/
+    Postgres table the forward cursor already uses — a distinct,
+    deterministic key under the exact same persistence, no new table,
+    no new repository class, no new migration. Each call:
+
+    1. Reads the forward cursor's CURRENT position (re-read AFTER the
+       forward pass above has run, so it reflects whatever the forward
+       pass may have JUST advanced it to this same call) as
+       `forward_frontier`. If the forward cursor has never advanced at
+       all yet (`forward_frontier is None` — nothing has ever been
+       forward-scanned), the sweep has nothing to safety-net yet and
+       does zero work this call.
+    2. Derives `effective_sweep_start`, purely at read time, from the
+       sweep cursor's own persisted position: if no sweep cursor exists
+       yet, OR the sweep has already fully caught up to
+       `forward_frontier` (`sweep_cursor.last_created_at >=
+       forward_frontier` — it completed a full lap), START A NEW LAP at
+       `activation_boundary`; otherwise CONTINUE the current lap from
+       `sweep_cursor.last_created_at`. This is a derived-at-read-time
+       decision only — no separate "reset" WRITE operation exists; the
+       persisted sweep position is simply reinterpreted as "start over"
+       once it has caught up.
+    3. Scans `[effective_sweep_start, forward_frontier]` — the SAME
+       `_scan_and_repair_evidence_missing_classification_jobs` helper
+       the forward pass uses, with its own, smaller `sweep_repair_limit`
+       /`sweep_page_size`/`sweep_max_rows_scanned` budget (the sweep is
+       a background safety net, not the primary discovery path) — the
+       upper bound (`created_at_to=forward_frontier`) means the sweep
+       NEVER races ahead into territory the forward pass has not
+       reached yet (redundant: the forward pass will get there on its
+       own).
+
+    `sweep_repair_limit=50`/`sweep_page_size=200`/
+    `sweep_max_rows_scanned=1000` (vs. the forward pass's own 200/200/
+    5000): a documented judgment call, not architect-mandated values —
+    generous enough that a normal-sized backlog between the forward
+    cursor and the sweep converges in a handful of calls, small enough
+    that the sweep's own inherently-redundant re-scanning of
+    already-resolved evidence (a cheap `get_by_evidence`/
+    `get_current_classification` lookup per row, never a full
+    resolution) never dominates a reconciliation call's own cost next
+    to the forward pass's primary work.
+
+    What this backstop actually guarantees, and what it costs (honest,
+    not overclaimed — this delivery's own established documentation
+    discipline)
+    ------------------------------------------------------------------
+    Guarantees: no post-activation `EvidenceItem` is EVER permanently
+    unreachable once its own transaction commits, regardless of any
+    commit-order-vs-created_at-order inversion — "eventually, within
+    finitely many calls, never permanently", NOT a specific bounded
+    latency. Job submission happens DURING each scan pass itself, the
+    instant a row is actually inspected — it is never contingent on the
+    sweep cursor's own write succeeding afterward, so an orphan within
+    reach of a single sweep pass's budget gets its job that same call
+    regardless of what happens to cursor bookkeeping next.
+
+    Costs: a bounded amount of extra, mostly-cheap-skip re-scanning
+    work per call (the sweep's own budget, on top of the forward pass's
+    own); and a discovery LATENCY for a late-committing row that
+    depends on how long the sweep takes to complete its current lap —
+    which GROWS as the eligible evidence volume grows, since each
+    call's sweep budget is fixed.
+
+    The `lap` generation counter — corrected this round; the previous
+    "self-resolves" claim below was FALSE and has been retracted
+    ------------------------------------------------------------------
+    An earlier version of this function's own docstring claimed that a
+    newly-started lap whose first, budget-bounded call does not yet
+    reach the previous lap's completion point "self-resolves the
+    moment the forward frontier advances again even slightly". That
+    claim was FALSE — independently confirmed both by an external audit
+    and by direct reproduction (see
+    `tests/persistence/test_evidence_classification_job_reconciliation_sweep.py`'s
+    own bug-reproduction test): under the single-dimension, plain
+    `created_at` merge-on-write comparison `advance_cursor` used to
+    apply, a newly-started lap's own first write is compared directly
+    against the OLD, already-completed lap's much-further-along
+    persisted watermark and is rejected as "behind" — and this rejection
+    does NOT depend on the forward frontier at all, so it never
+    self-resolves; every subsequent call re-proposes the same early,
+    already-rejected position, forever. Any evidence in the unswept
+    remainder of that window — precisely the case this whole mechanism
+    exists to catch — was never found.
+
+    The actual fix: `EvidenceClassificationReconciliationCursor` now
+    carries a second, independent ordering dimension, `lap` — a
+    monotonically non-decreasing generation counter compared BEFORE
+    `created_at` (lexicographic `(lap, created_at)` ordering; see
+    `services.evidence.classification_reconciliation_cursor`'s own
+    docstring, "lap" section, for the full mechanism and its
+    concurrency-safety argument). A genuinely NEWER lap's `(lap,
+    created_at)` proposal always supersedes an OLDER lap's persisted
+    position entirely — regardless of where the new lap's own first,
+    partial scan happens to land — because the two are no longer
+    compared on `created_at` at all once `lap` differs. This function
+    threads `lap` through both passes below:
+
+    * Forward pass: always proposes `lap = existing_forward_cursor.lap`
+      (or `0` if no forward cursor exists yet) — a pure read-and-pass-
+      through, never invented or incremented; the forward cursor's own
+      `lap` dimension is a permanent non-event (see that module's own
+      docstring).
+    * Sweep pass: proposes `existing_sweep_cursor.lap + 1` (or `0` if no
+      sweep cursor exists yet) exactly when it decides to start a NEW
+      lap (the existing "caught up to `forward_frontier`" condition,
+      unchanged); proposes `existing_sweep_cursor.lap` unchanged when
+      CONTINUING an already-in-progress lap (also unchanged from
+      today's `created_at`/`last_evidence_ids` continuation logic).
+
+    This genuinely closes the permanent-stall class of bug: a lap
+    transition's own cursor write is no longer contingent on catching
+    up to where the previous lap ended before it is allowed to persist
+    any progress at all.
+
+    Returns the SUM of jobs submitted by both passes this call (the
+    forward pass's own count plus the sweep pass's own count) —
+    unchanged external contract: still a single `int`, "number of jobs
+    submitted this call". 0 in the common case — most evidence already
+    has a job via the immediate-enqueue path; this function exists for
+    the rare gap, not as the normal path.
     """
-    cursor_key = activation_boundary.isoformat()
-    existing_cursor = cursor_repository.get_cursor(cursor_key)
-    scan_created_at_from = existing_cursor.last_created_at if existing_cursor is not None else activation_boundary
-    # Set-membership tie-break (post-merge audit correction — see this
-    # function's own docstring, "Why the tie-break is set membership"
-    # section, and services.evidence.classification_reconciliation_cursor's
-    # own docstring): the ONLY thing ever used to decide whether a row
-    # at exactly scan_created_at_from was already inspected. Never an
-    # ordering comparison — cross-process UUIDv7 ordering is not
-    # guaranteed (core.identity.generate_id's own docstring).
-    already_inspected_ids_at_boundary: set[str] = (
-        set(existing_cursor.last_evidence_ids) if existing_cursor is not None else set()
+    forward_cursor_key = activation_boundary.isoformat()
+    existing_forward_cursor = cursor_repository.get_cursor(forward_cursor_key)
+    forward_scan_from = (
+        existing_forward_cursor.last_created_at if existing_forward_cursor is not None else activation_boundary
+    )
+    forward_already_inspected: set[str] = (
+        set(existing_forward_cursor.last_evidence_ids) if existing_forward_cursor is not None else set()
+    )
+    # The forward cursor's own `lap` dimension is a permanent non-event
+    # — always read-and-passed-through unchanged, never invented or
+    # incremented here (see docstring's own "lap" section above).
+    forward_lap = existing_forward_cursor.lap if existing_forward_cursor is not None else 0
+
+    forward_submitted = _scan_and_repair_evidence_missing_classification_jobs(
+        evidence_repository=evidence_repository,
+        classification_job_repository=classification_job_repository,
+        classification_repository=classification_repository,
+        cursor_repository=cursor_repository,
+        actor_type=actor_type,
+        actor_id=actor_id,
+        cursor_key=forward_cursor_key,
+        scan_created_at_from=forward_scan_from,
+        created_at_to=None,
+        already_inspected_ids_at_boundary=forward_already_inspected,
+        has_existing_cursor=existing_forward_cursor is not None,
+        repair_limit=repair_limit,
+        page_size=page_size,
+        max_rows_scanned=max_rows_scanned,
+        lap=forward_lap,
     )
 
-    offset = 0
-    submitted = 0
-    rows_scanned = 0
-    # The running watermark this call is building up, to be persisted
-    # via advance_cursor once the loop ends — but ONLY if any_inspected
-    # ends up True (the cursor must only ever advance past rows this
-    # call genuinely inspected; see docstring). running_created_at
-    # starts at scan_created_at_from (not None) whenever a cursor
-    # already exists, paired with running_ids starting as a COPY of
-    # already_inspected_ids_at_boundary: if this call's own inspected
-    # rows never move the watermark past that same timestamp, the ids
-    # ultimately persisted must be the UNION of what was already there
-    # and whatever this call newly inspected at that same timestamp —
-    # never fewer than the starting set (see docstring). any_inspected
-    # is tracked SEPARATELY from "running_created_at is not None"
-    # precisely because the latter can be non-None from the very start
-    # (an existing cursor) even when this call inspects nothing new.
-    running_created_at: Optional[datetime] = scan_created_at_from if existing_cursor is not None else None
-    running_ids: set[str] = set(already_inspected_ids_at_boundary)
-    any_inspected = False
+    # --- The "safety sweep" backstop pass (see docstring above) ---
+    sweep_submitted = 0
+    # Re-read fresh: the forward pass above may have JUST advanced this
+    # same call, so the sweep's own upper bound must reflect the MOST
+    # current forward position, never a stale pre-call snapshot.
+    forward_frontier_cursor = cursor_repository.get_cursor(forward_cursor_key)
+    forward_frontier = forward_frontier_cursor.last_created_at if forward_frontier_cursor is not None else None
 
-    while submitted < repair_limit and rows_scanned < max_rows_scanned:
-        page = evidence_repository.list_evidence(
-            created_at_from=scan_created_at_from, limit=page_size, offset=offset, order_by_created_at=True,
-        )
-        if not page:
-            break
-        for item in page:
-            if submitted >= repair_limit or rows_scanned >= max_rows_scanned:
-                # Stop INSPECTING entirely — never advance the running
-                # watermark past a row we never actually
-                # resolved-or-submitted.
-                break
-            if (
-                existing_cursor is not None
-                and item.created_at == scan_created_at_from
-                and item.evidence_id in already_inspected_ids_at_boundary
-            ):
-                # Already fully handled by a previous call — a cheap
-                # set-membership check, never counted against
-                # rows_scanned/repair_limit (see docstring). Only ever
-                # matters for rows sharing the exact
-                # scan_created_at_from timestamp.
-                continue
+    if forward_frontier is not None:
+        sweep_cursor_key = f"{forward_cursor_key}::sweep"
+        existing_sweep_cursor = cursor_repository.get_cursor(sweep_cursor_key)
+        if existing_sweep_cursor is None or existing_sweep_cursor.last_created_at >= forward_frontier:
+            # No sweep cursor yet, or it already completed a full lap
+            # (caught up to forward_frontier) — start a NEW lap. Purely
+            # derived at read time; no "reset" write is ever performed
+            # (see docstring). A NEW lap always proposes a STRICTLY
+            # HIGHER `lap` than whatever is currently persisted (see
+            # docstring's own "lap" section) — this is what lets this
+            # call's write land even though its own bounded scan cannot
+            # yet reach the OLD lap's much-further-along position.
+            sweep_scan_from = activation_boundary
+            sweep_already_inspected: set[str] = set()
+            sweep_has_existing_cursor = False
+            sweep_lap = (existing_sweep_cursor.lap + 1) if existing_sweep_cursor is not None else 0
+        else:
+            sweep_scan_from = existing_sweep_cursor.last_created_at
+            sweep_already_inspected = set(existing_sweep_cursor.last_evidence_ids)
+            sweep_has_existing_cursor = True
+            # Continuing an in-progress lap — propose the SAME `lap`
+            # value unchanged (falls into _resolve_cursor_advance's own
+            # "proposed.lap == existing.lap" branch, the ordinary,
+            # already-safe created_at/ids merge).
+            sweep_lap = existing_sweep_cursor.lap
 
-            rows_scanned += 1
-            any_inspected = True
-            if running_created_at is None or item.created_at > running_created_at:
-                # The watermark has moved to a new, later timestamp —
-                # the old timestamp's ids are irrelevant to any future
-                # call (which will only ever compare against the NEW
-                # last_created_at), so do NOT carry them forward.
-                running_created_at = item.created_at
-                running_ids = {item.evidence_id}
-            else:
-                # item.created_at == running_created_at (it can never
-                # be less — order_by_created_at=True and the skip
-                # condition above already excluded anything at or
-                # behind scan_created_at_from that was already
-                # inspected). Add to, never replace, the running set —
-                # this is the UNION with whatever was already there
-                # (already_inspected_ids_at_boundary, if running_ids
-                # still equals that starting copy) or with whatever
-                # else this same call already saw at this timestamp.
-                running_ids.add(item.evidence_id)
-
-            if classification_job_repository.get_by_evidence(item.evidence_id) is not None:
-                continue
-            if classification_repository.get_current_classification(
-                item.evidence_id, CLASSIFICATION_TYPE_DOCUMENT_TYPE
-            ) is not None:
-                continue
-            # submit_job's own idempotency (the real evidence_id
-            # unique constraint) is the real safety net if a race
-            # occurs mid-scan — no second guard is added here (see
-            # docstring).
-            classification_job_repository.submit_job(
-                evidence_id=item.evidence_id, actor_type=actor_type, actor_id=actor_id,
-            )
-            submitted += 1
-        offset += len(page)
-        if len(page) < page_size:
-            break
-
-    if any_inspected:
-        cursor_repository.advance_cursor(
-            cursor_key, last_created_at=running_created_at, last_evidence_ids=running_ids,
+        sweep_submitted = _scan_and_repair_evidence_missing_classification_jobs(
+            evidence_repository=evidence_repository,
+            classification_job_repository=classification_job_repository,
+            classification_repository=classification_repository,
+            cursor_repository=cursor_repository,
+            actor_type=actor_type,
+            actor_id=actor_id,
+            cursor_key=sweep_cursor_key,
+            scan_created_at_from=sweep_scan_from,
+            created_at_to=forward_frontier,
+            already_inspected_ids_at_boundary=sweep_already_inspected,
+            has_existing_cursor=sweep_has_existing_cursor,
+            repair_limit=sweep_repair_limit,
+            page_size=sweep_page_size,
+            max_rows_scanned=sweep_max_rows_scanned,
+            lap=sweep_lap,
         )
 
-    return submitted
+    return forward_submitted + sweep_submitted
