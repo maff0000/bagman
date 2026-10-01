@@ -1,5 +1,34 @@
 # BAGMAN PID v5 — AI Foundation, Claude Operator & GUI Integration
 
+> ## ⚠ CURRENT PRODUCTION AUTHORITY — READ BEFORE ANY PRODUCTION ACTION
+>
+> **Sole writable production runtime: Mac mini appliance, `192.168.11.4`.**
+> Canonical PostgreSQL (`bagman-db`), canonical object store (`bagman-objects`),
+> and the application (`bagman-api`) all run there. See §100.9 for the full
+> cutover record (2026-09-17).
+>
+> **Trinity is a retired, read-only migration archive and backup source only.**
+> Its `bagman-db`/`bagman-objects` volumes are intentionally preserved as a
+> controlled fallback — they must NEVER be given a `bagman-api` writer again,
+> and must never be treated as a deployment target.
+>
+> **Every future production work order MUST, before any mutation:**
+> 1. fetch canonical `origin/main` fresh (`git fetch origin main`);
+> 2. re-read this block at the head of `origin/main:PID.md` (not a local or
+>    cached checkout);
+> 3. identify the actual target host from it;
+> 4. prove — by direct inspection (image tag, Alembic revision, row counts)
+>    — that the host about to be mutated is the one this block names, before
+>    taking any action.
+>
+> This block exists because a 2026-09-26 Trinity `bagman-api` rebuild was
+> mistaken for production throughout a later delivery, despite the correct
+> authority already being recorded in §100.9 — the earlier record used a
+> `##`-level heading inconsistent with every other top-level section in this
+> document, which caused a heading-anchored search to miss it entirely. This
+> block is deliberately flat, top-of-document, and heading-regular so no
+> search pattern can skip it. Incident record: PID §110.
+
 **AMENDED before dispatch, per Matt's locked AI-topology ruling (2026-09-13, prior to any WI-1 dispatch).** This version supersedes the original CD-5 PID text in full. The amendment replaces every "Trinity is BAGMAN's primary background worker" assumption with a three-tier topology (Claude / dedicated Mac mini / Trinity-as-escalation). Everything else in the original CD-5 doctrine — the hard AI invariant, one gateway, typed contracts, durable provenance, GUI-first, no silent fallback, no canonical AI writes — is unchanged and remains fully binding.
 
 ## 1. Product Identity
@@ -2573,3 +2602,38 @@ PR #17 (`xero/account-suggestion-producer`) merged to `main` via a normal true m
 **PRODUCTION DEPLOYMENT: CLOSED GREEN.** Canonical code `4a49f282...` (PR #17, correct two-parent merge topology) built, migrated (both `e8c4a1f97b23` and `f1a2b3c4d5e6` applied cleanly, final head confirmed `f1a2b3c4d5e6`), and deployed as `bagman-api:main-4a49f28` — healthy, zero exceptions, zero drift on every pre-existing governed table, zero Xero mutation, zero producer-triggered rows, zero AI invocations, zero new Needs You items. One real, transparently-disclosed sequencing deviation occurred during the migration gate (the entrypoint's own hardcoded migrate-then-serve behaviour caused the governed `alembic upgrade head` to run earlier, and via a briefly-live stray container, than the WO's intended separate step) — the migration itself was correct, additive-only, and fully re-verified before application deployment proceeded; no data was created, no live traffic was ever served by the stray container, and the real application container was never affected.
 
 **Not authorised or attempted in this gate** (per explicit architect instruction): no real production evidence was run through the producer; no `XERO_ACCOUNT_REQUIRED` item was resolved; no automatic suggestion triggering was begun; the failed-invocation retry-cooldown backlog item remains open, disclosed, not addressed here.
+
+# 110. Incident — Trinity Canonical-Authority Violation (2026-10-01)
+
+## 110.1 What happened
+
+During the preflight for the evidence-classification production rollout (the delivery that produced PR #19/#20), the PL inspected what was believed to be BAGMAN production — a `bagman-api`/`bagman-db` docker-compose stack running on Trinity — and found its schema/data materially behind what PID §109 recorded as the post-Xero-rollout production state (Alembic `b4d8f1a92c65` vs. the expected `f1a2b3c4d5e6`; 296 `EvidenceItem` vs. 689; zero mailbox/Xero activity ever recorded).
+
+Read-only investigation (Docker metadata, PostgreSQL system catalogs/lifetime statistics, filesystem timestamps, checksum-verified backup content, and direct read-only inspection of the Mac mini appliance) established:
+
+- Real BAGMAN production has run on the Mac mini appliance (`192.168.11.4`) since the Phase B cutover recorded in §99–§100 (2026-09-17). It was found healthy, current, and completely unaffected throughout this incident: `bagman-api:main-4a49f28`, Alembic `f1a2b3c4d5e6`, `EvidenceItem=689`, `MailboxMessage=25056`, `MailboxSource=4`, `AIInvocation=375`, `NeedsYou=395/332 open`, `XeroAccount=138`, `XeroConnection=2` — exactly matching §109.
+- Trinity's `bagman-db` is the retired post-cutover archive §100.8/§100.9 explicitly preserved, never deleted, never reinitialized (its Postgres cluster's own `PG_VERSION` file mtime and the Docker volume's `CreatedAt` both read `2026-09-16T04:34:47Z`, unchanged since cluster creation). Its lifetime `pg_stat_user_tables` counters (never reset since cluster init) prove it never held mailbox or Xero data at any point in its existence — it is not a rolled-back or restored copy of the real production data, simply a different, much earlier, mailbox/Xero-naive database.
+- A `bagman-api` container was found running on Trinity against this archive, created 2026-09-26T11:55:39Z, built with `GIT_COMMIT=unknown` from worktree `cd-6-pid`, image tag `bagman-api:dev` (the compose file's own default fallback tag) — re-establishing exactly the writer §100.8's split-brain-prevention step explicitly removed, against exactly the database §100.9 designated archive-only.
+- Every "production rollout"/health-check/verification this delivery's own sessions performed prior to this incident's discovery targeted Trinity, not the Mac mini. Real production was never touched by, and remains entirely unaffected by, any of that work.
+
+## 110.2 Why the existing canonical-authority record (§100.9) was missed
+
+§100.9 was correctly committed to `origin/main:PID.md` the entire time, with content byte-for-byte consistent with the Mac mini's own `/opt/bagman/README-CANONICAL-AUTHORITY.md` marker. It was not stale, not missing, and not in a different repository.
+
+The miss was a search-methodology defect: sections 99–102 are the only four top-level sections in this document (of 110) that use a `##` (second-level) Markdown heading for their own section number, where every other section (1–98, 103+) uses a single `#`. A heading-anchored search for top-level sections (`^# [0-9]*\.`) structurally cannot match a line beginning `##`, so it silently skipped from `# 98.` straight to `# 103.` without ever surfacing §99–§102 — even against a freshly-fetched, fully up-to-date `origin/main`. This was reproduced and confirmed directly, not inferred.
+
+## 110.3 Containment action taken (Trinity only; Mac production untouched throughout)
+
+Read-only evidence captured before any mutation (`docker inspect` of both containers and the `bagman-api:dev` image, compose labels, network membership, full container logs, Trinity's Alembic revision and full lifetime table counters) — archived at `/srv/backup/bagman/incident-trinity-canonical-authority-2026-10-01/`.
+
+Trinity's `bagman-api` container stopped and removed (`docker stop` + `docker rm`, container id `39a50335cae8...`, image `bagman-api:dev`). `bagman-db`/`bagman-objects`/`bagman-scan` left running untouched. No volume deleted, no schema altered, no Alembic command run, no object-store data touched, no backup restored.
+
+Post-removal, verified directly: `bagman-api` absent from `docker ps -a`; `bagman-db` still running and healthy; `bagman-postgres-data` volume's `CreatedAt`/mountpoint unchanged; no host-published PostgreSQL port; only `bagman-scan`/`bagman-objects`/`bagman-db` remain on `bagman-net` (no application container capable of writing); Alembic revision and every table's lifetime insert/update/delete counters identical to the pre-removal baseline.
+
+## 110.4 Governance hardening
+
+A prominent, uniformly-`#`-heading-formatted **CURRENT PRODUCTION AUTHORITY** block was added at the very top of this document (before §1), restating what §100.9 already established — the Mac mini as sole writable production runtime, Trinity as retired archive forbidden as a deployment target — and requiring every future production work order to fetch canonical `origin/main`, re-read that block, and prove the actual target host matches it before any mutation. Deliberately documentation-only: no new application/runtime machinery was introduced to solve what was a documentation-prominence and search-methodology failure, not a system-design gap.
+
+## 110.5 Verdict
+
+**INCIDENT CONTAINED GREEN.** Root cause identified with no remaining speculation (§110.2). Trinity restored to its intended §100.8 post-cutover state (no canonical writer). Real production (Mac mini, `bagman-api:main-4a49f28`, Alembic `f1a2b3c4d5e6`) independently confirmed untouched and intact throughout. The evidence-classification delivery (PR #19/#20) has not been deployed to either host and remains pending a separate, correctly-targeted production rollout gate.
