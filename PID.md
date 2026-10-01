@@ -1,33 +1,34 @@
 # BAGMAN PID v5 — AI Foundation, Claude Operator & GUI Integration
 
-> ## ⚠ CURRENT PRODUCTION AUTHORITY — READ BEFORE ANY PRODUCTION ACTION
->
-> **Sole writable production runtime: Mac mini appliance, `192.168.11.4`.**
-> Canonical PostgreSQL (`bagman-db`), canonical object store (`bagman-objects`),
-> and the application (`bagman-api`) all run there. See §100.9 for the full
-> cutover record (2026-09-17).
->
-> **Trinity is a retired, read-only migration archive and backup source only.**
-> Its `bagman-db`/`bagman-objects` volumes are intentionally preserved as a
-> controlled fallback — they must NEVER be given a `bagman-api` writer again,
-> and must never be treated as a deployment target.
->
-> **Every future production work order MUST, before any mutation:**
-> 1. fetch canonical `origin/main` fresh (`git fetch origin main`);
-> 2. re-read this block at the head of `origin/main:PID.md` (not a local or
->    cached checkout);
-> 3. identify the actual target host from it;
-> 4. prove — by direct inspection (image tag, Alembic revision, row counts)
->    — that the host about to be mutated is the one this block names, before
->    taking any action.
->
-> This block exists because a 2026-09-26 Trinity `bagman-api` rebuild was
-> mistaken for production throughout a later delivery, despite the correct
-> authority already being recorded in §100.9 — the earlier record used a
-> `##`-level heading inconsistent with every other top-level section in this
-> document, which caused a heading-anchored search to miss it entirely. This
-> block is deliberately flat, top-of-document, and heading-regular so no
-> search pattern can skip it. Incident record: PID §110.
+# 0. CURRENT PRODUCTION AUTHORITY — READ BEFORE ANY PRODUCTION ACTION
+
+**Sole writable production runtime: Mac mini appliance, `192.168.11.4`.**
+Canonical PostgreSQL (`bagman-db`), canonical object store (`bagman-objects`),
+and the application (`bagman-api`) all run there. See §100.9 for the full
+cutover record (2026-09-17).
+
+**Trinity is a retired, read-only migration archive and backup source only.**
+Its `bagman-db`/`bagman-objects` volumes are intentionally preserved as a
+controlled fallback — they must NEVER be given a `bagman-api` writer again,
+and must never be treated as a deployment target.
+
+**Every future production work order MUST, before any mutation:**
+1. fetch canonical `origin/main` fresh (`git fetch origin main`);
+2. re-read this section at the head of `origin/main:PID.md` (not a local or
+   cached checkout);
+3. identify the actual target host from it;
+4. prove — by direct inspection (image tag, Alembic revision, row counts)
+   — that the host about to be mutated is the one this section names, before
+   taking any action.
+
+This section exists because a 2026-09-26 Trinity `bagman-api` rebuild was
+mistaken for production throughout a later delivery, despite the correct
+authority already being recorded in §100.9 — the earlier record used a
+`##`-level heading inconsistent with every other top-level section in this
+document, which caused a heading-anchored search to miss it entirely. This
+section is a genuine top-level `# 0.` heading, matching the same
+`^# [0-9]*\.` pattern any future heading enumeration would use, so it cannot
+be silently skipped the way §99–§102 were. Incident record: PID §110.
 
 **AMENDED before dispatch, per Matt's locked AI-topology ruling (2026-09-13, prior to any WI-1 dispatch).** This version supersedes the original CD-5 PID text in full. The amendment replaces every "Trinity is BAGMAN's primary background worker" assumption with a three-tier topology (Claude / dedicated Mac mini / Trinity-as-escalation). Everything else in the original CD-5 doctrine — the hard AI invariant, one gateway, typed contracts, durable provenance, GUI-first, no silent fallback, no canonical AI writes — is unchanged and remains fully binding.
 
