@@ -170,7 +170,10 @@ from pydantic import BaseModel, ValidationError as PydanticValidationError
 
 from core import identity
 from core.errors import BagmanError, InvalidStateTransitionError
-from services.evidence.classification_job import enqueue_classification_job_for_evidence
+from services.evidence.classification_job import (
+    enqueue_classification_job_for_evidence,
+    resolve_evidence_classification_activation_boundary_from_env,
+)
 from services.evidence.intake.validation_pipeline import run_intake_validation
 from services.needs_you.needs_you import (
     ALLOWED_ACTION_COMPANY_WHAT_WHY as NEEDS_YOU_ALLOWED_ACTION_COMPANY_WHAT_WHY,
@@ -313,12 +316,21 @@ def _register_accepted_evidence(*, composition, record, meta: IntakeUploadMetada
         # see services.evidence.classification_job's module docstring)
         # — idempotent per evidence_id, and NEVER raises (a failed
         # enqueue must never corrupt an otherwise-successful intake).
+        # Preflight review correction, item C — resolved fresh on every
+        # call (cheap, no caching needed; see
+        # services.evidence.classification_job's own module docstring)
+        # so this call site's own gate is always driven by the CURRENT
+        # operator-configured activation boundary, never a value cached
+        # from process start.
+        activation_boundary, _ = resolve_evidence_classification_activation_boundary_from_env()
         enqueue_classification_job_for_evidence(
             evidence.evidence_id,
             classification_job_repository=composition.classification_job_repository,
             actor_type="SYSTEM",
             actor_id="bagman-evidence-classification-trigger",
             correlation_id=record.correlation_id,
+            evidence_created_at=evidence.created_at,
+            activation_boundary=activation_boundary,
         )
 
         # register_evidence() already emitted its own EVIDENCE_OBSERVED

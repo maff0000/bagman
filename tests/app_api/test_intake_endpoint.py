@@ -343,14 +343,23 @@ def test_direct_upload_bypass_is_closed(client):
 # ---------------------------------------------------------------------
 
 
-def test_successful_upload_enqueues_exactly_one_classification_job(client):
+def test_successful_upload_enqueues_exactly_one_classification_job(client, monkeypatch):
     """`app/api/routers/intake.py::_register_accepted_evidence` calls
     `enqueue_classification_job_for_evidence` immediately after its own
     `composition.api.register_evidence(...)` succeeds — this proves it
     against the REAL, disposable-PostgreSQL production composition
     `client` builds (never in-memory), a genuine round trip through
-    `PostgresEvidenceClassificationJobRepository`."""
+    `PostgresEvidenceClassificationJobRepository`.
+
+    Preflight review correction, item C: the real call site now gates
+    enqueue on the operator-configured activation boundary — set it
+    safely in the past so this test's own concern (the manual-upload
+    call site's wiring) is exercised, not the gate itself (which has
+    its own dedicated tests)."""
     from app.api.composition import get_composition
+    from services.evidence.classification_job import EVIDENCE_CLASSIFICATION_ACTIVATION_BOUNDARY_ENV_VAR
+
+    monkeypatch.setenv(EVIDENCE_CLASSIFICATION_ACTIVATION_BOUNDARY_ENV_VAR, "2000-01-01T00:00:00Z")
 
     response = _post_intake(
         client,
@@ -368,12 +377,15 @@ def test_successful_upload_enqueues_exactly_one_classification_job(client):
     assert job.actor_type == "SYSTEM"
 
 
-def test_a_second_upload_replaying_the_same_idempotency_key_never_creates_a_second_job(client):
+def test_a_second_upload_replaying_the_same_idempotency_key_never_creates_a_second_job(client, monkeypatch):
     """A replayed intake (same `Idempotency-Key`) resolves to the SAME
     `EvidenceItem` (CD-4's own idempotent-observation doctrine) —
     `enqueue_classification_job_for_evidence`'s own evidence_id-keyed
     idempotency must therefore never create a second job either."""
     from app.api.composition import get_composition
+    from services.evidence.classification_job import EVIDENCE_CLASSIFICATION_ACTIVATION_BOUNDARY_ENV_VAR
+
+    monkeypatch.setenv(EVIDENCE_CLASSIFICATION_ACTIVATION_BOUNDARY_ENV_VAR, "2000-01-01T00:00:00Z")
 
     key = "auto-classification-replay-key"  # gitleaks:allow
     first = _post_intake(client, content=SYNTHETIC_PDF, filename="replay.pdf", actor_id="matt", idempotency_key=key)

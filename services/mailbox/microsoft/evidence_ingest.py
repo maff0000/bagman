@@ -79,7 +79,10 @@ from datetime import datetime
 from typing import Any, Mapping, Optional, Protocol
 
 from core.errors import BagmanError, FileTooLargeError
-from services.evidence.classification_job import enqueue_classification_job_for_evidence
+from services.evidence.classification_job import (
+    enqueue_classification_job_for_evidence,
+    resolve_evidence_classification_activation_boundary_from_env,
+)
 from services.evidence.intake.policy import EMAIL_MESSAGE_MIME_TYPE
 from services.evidence.intake.scanner import EvidenceSafetyScanner, ScanVerdict
 from services.evidence.intake.streaming import spool_stream
@@ -266,12 +269,21 @@ def ingest_email_evidence(
             # already discloses and accepts (never a reason to fail
             # ingestion itself).
             if classification_job_repository is not None:
+                # Preflight review correction, item C — resolved fresh on
+                # every call (cheap, no caching needed; see
+                # services.evidence.classification_job's own module
+                # docstring) so this call site's own gate is always
+                # driven by the CURRENT operator-configured activation
+                # boundary, never a value cached from process start.
+                activation_boundary, _ = resolve_evidence_classification_activation_boundary_from_env()
                 enqueue_classification_job_for_evidence(
                     evidence.evidence_id,
                     classification_job_repository=classification_job_repository,
                     actor_type="SYSTEM",
                     actor_id="bagman-evidence-classification-trigger",
                     correlation_id=correlation_id,
+                    evidence_created_at=evidence.created_at,
+                    activation_boundary=activation_boundary,
                 )
             return EmailIngestOutcome(
                 status=INGEST_STATUS_INGESTED,

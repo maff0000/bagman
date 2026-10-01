@@ -155,8 +155,10 @@ canonical Layer 2 example) — as an ISO-8601 UTC string (e.g.
 `datetime.fromisoformat(value.replace("Z", "+00:00"))` pattern already
 established at `services/xero/client.py`'s own `_parse_xero_wire_datetime`,
 wrapped so a malformed value fails loudly and specifically (see
-`_resolve_activation_boundary` below) rather than with a bare
-traceback.
+`services.evidence.classification_job
+.resolve_evidence_classification_activation_boundary`, relocated there
+from this script — preflight review correction, item C) rather than
+with a bare traceback.
 
 Deliberately env-var-only, NEVER a CLI flag: per the architect's own
 explicit "set during the later production-activation WO" instruction,
@@ -239,8 +241,10 @@ from core import identity  # noqa: E402
 from core.errors import NotFoundError, PersistenceError  # noqa: E402
 from core.timestamps import to_contract_string, utc_now  # noqa: E402
 from services.evidence.classification_job import (  # noqa: E402
+    EVIDENCE_CLASSIFICATION_ACTIVATION_BOUNDARY_ENV_VAR,
     EvidenceClassificationJob,
     reconcile_missing_classification_jobs,
+    resolve_evidence_classification_activation_boundary,
 )
 from services.evidence.classification_orchestrator import (  # noqa: E402
     OUTCOME_AI_IN_PROGRESS,
@@ -268,71 +272,26 @@ _WORKER_ACTOR_ID = "bagman-evidence-classification-worker"
 #: immediate-enqueue path or recovered by the reconciliation pass.
 _RECONCILIATION_ACTOR_ID = "bagman-evidence-classification-reconciliation"
 
-#: Layer-2 runtime environment configuration (see module docstring's
-#: "The activation boundary is operator-set Layer-2 configuration"
-#: section) — an ISO-8601 UTC string, e.g. `2026-10-15T00:00:00Z`.
-#: Deliberately env-var-only, never a CLI flag (see that section).
-_ACTIVATION_BOUNDARY_ENV_VAR = "BAGMAN_EVIDENCE_CLASSIFICATION_ACTIVATION_BOUNDARY"
-
 #: Default `--reconciliation-repair-limit`, matching
 #: `services.evidence.classification_job.reconcile_missing_classification_jobs`'s
 #: own default `repair_limit`.
 _DEFAULT_RECONCILIATION_REPAIR_LIMIT = 200
 
-
-def _resolve_activation_boundary(raw: Optional[str]) -> tuple[Optional[datetime], Optional[str]]:
-    """Parse `_ACTIVATION_BOUNDARY_ENV_VAR`'s raw value (or `None`, if
-    unset) into `(activation_boundary, skip_reason)` — exactly one of
-    the pair is ever non-`None`. A pure function, deliberately taking
-    the raw string rather than reading `os.environ` itself, so it is
-    directly unit-testable with no environment mutation required (see
-    module docstring's "The activation boundary is operator-set Layer-2
-    configuration" section).
-
-    Mirrors `services/xero/client.py`'s own `_parse_xero_wire_datetime`
-    parsing pattern exactly (`datetime.fromisoformat(value.replace("Z",
-    "+00:00"))`), but — unlike that helper, which silently returns
-    `None` for an unparseable value because a single cosmetic Xero
-    field is not worth failing a whole sync over — a malformed
-    activation boundary here fails LOUDLY and SPECIFICALLY: the
-    returned `skip_reason` names the exact env var, the exact raw value
-    received, and the exact parse error, so an operator reading a run's
-    own summary JSON never has to guess why reconciliation did not run.
-
-    Never raises. Fails CLOSED: `raw` missing/empty, or present but not
-    valid ISO-8601, both return `(None, <reason>)` — never a silent
-    default to "now" or to any other value.
-    """
-    if not raw:
-        return None, (
-            f"{_ACTIVATION_BOUNDARY_ENV_VAR} is not set — reconciliation skipped for this run "
-            "(fail closed; set it to a real ISO-8601 UTC value, e.g. 2026-10-15T00:00:00Z, at the "
-            "production-activation WO)"
-        )
-    try:
-        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-    except ValueError as exc:
-        return None, (
-            f"{_ACTIVATION_BOUNDARY_ENV_VAR}={raw!r} could not be parsed as ISO-8601 ({exc}) — "
-            "reconciliation skipped for this run (fail closed)"
-        )
-    # Independent-audit finding (third re-audit round): `fromisoformat`
-    # happily accepts a value with no timezone/offset at all (e.g.
-    # "2026-10-15T00:00:00", no trailing "Z") and silently returns a
-    # NAIVE datetime — comparing that against `received_at`'s own real,
-    # timezone-AWARE column would not raise, but would be resolved
-    # ambiguously (session/server-local time), a genuine silent-
-    # correctness risk directly inside the one guarantee this function
-    # exists to provide ("fail loudly on malformed input, never guess").
-    # A naive value is therefore treated as malformed too — fail closed,
-    # exactly like any other parse failure, never silently accepted.
-    if parsed.tzinfo is None:
-        return None, (
-            f"{_ACTIVATION_BOUNDARY_ENV_VAR}={raw!r} has no timezone/offset (e.g. no trailing 'Z') — "
-            "an activation boundary must be explicit and unambiguous; reconciliation skipped for this "
-            "run (fail closed)"
-        )
-    return parsed, None
+#: RELOCATED (preflight review correction, item C — "one coherent
+#: activation contract"): `EVIDENCE_CLASSIFICATION_ACTIVATION_BOUNDARY_ENV_VAR`/
+#: `resolve_evidence_classification_activation_boundary` used to be
+#: defined here as this script's own private
+#: `_ACTIVATION_BOUNDARY_ENV_VAR`/`_resolve_activation_boundary` — they
+#: now live in `services.evidence.classification_job` (imported above)
+#: as the ONE, public, canonical definitions both real enqueue call
+#: sites (`services/mailbox/microsoft/evidence_ingest.py`,
+#: `app/api/routers/intake.py`) and this script's own reconciliation
+#: trigger resolve against — never two independently-maintained copies
+#: of the same parsing logic. This is a mechanical relocation only; the
+#: parsing/validation behaviour itself (the `Z`-suffix handling,
+#: explicit-offset handling, timezone-naive rejection, malformed-value
+#: rejection, fail-closed `(None, skip_reason)` returns) is completely
+#: unchanged — see that module's own docstring for the full doctrine.
 
 #: See module docstring's "Per-job outcome doctrine" section for the
 #: full reasoning behind this classification.
@@ -621,7 +580,7 @@ def _parse_args(argv: Optional[Iterable[str]]) -> argparse.Namespace:
             "bounded max number of missing jobs a single reconciliation pass may create this run "
             f"(default {_DEFAULT_RECONCILIATION_REPAIR_LIMIT}) — a separate concern from --limit, "
             "which governs claim_next_pending's own claim count; has no effect at all if "
-            f"{_ACTIVATION_BOUNDARY_ENV_VAR} is unset/malformed (reconciliation is skipped entirely — "
+            f"{EVIDENCE_CLASSIFICATION_ACTIVATION_BOUNDARY_ENV_VAR} is unset/malformed (reconciliation is skipped entirely — "
             "see module docstring)"
         ),
     )
@@ -674,7 +633,9 @@ def _run_worker(
     Returns `{"report": <dict>, "exit_code": <int>}`.
     """
     env = env if env is not None else os.environ
-    activation_boundary, skip_reason = _resolve_activation_boundary(env.get(_ACTIVATION_BOUNDARY_ENV_VAR))
+    activation_boundary, skip_reason = resolve_evidence_classification_activation_boundary(
+        env.get(EVIDENCE_CLASSIFICATION_ACTIVATION_BOUNDARY_ENV_VAR)
+    )
 
     # Bounded, prospective reconciliation FIRST — see module docstring's
     # "Reconciliation is wired in BEFORE claiming" section. Deliberately
@@ -690,6 +651,7 @@ def _run_worker(
             evidence_repository=composition.api.evidence_repository,
             classification_job_repository=composition.classification_job_repository,
             classification_repository=composition.classification_repository,
+            cursor_repository=composition.classification_reconciliation_cursor_repository,
             actor_type=_ACTOR_TYPE,
             actor_id=_RECONCILIATION_ACTOR_ID,
             activation_boundary=activation_boundary,

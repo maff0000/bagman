@@ -38,6 +38,9 @@ from services.evidence.classification_job import (
     InMemoryEvidenceClassificationJobRepository,
     enqueue_classification_job_for_evidence,
 )
+from services.evidence.classification_reconciliation_cursor import (
+    InMemoryEvidenceClassificationReconciliationCursorRepository,
+)
 from services.evidence.classification_orchestrator import (
     OUTCOME_AI_IN_PROGRESS,
     OUTCOME_AI_INVOCATION_FAILED,
@@ -55,6 +58,36 @@ from services.needs_you.needs_you import InMemoryNeedsYouRepository
 import scripts.process_evidence_classification_jobs as worker
 
 ACTOR_ID = "evidence-classification-job-worker-tests"
+
+#: This module's own tests exercise job/worker PROCESSING — never the
+#: preflight-review enqueue-side activation gate (item C) itself, which
+#: has its own dedicated tests (see
+#: tests/persistence/test_evidence_classification_job_reconciliation.py
+#: and tests/integration/test_evidence_classification_job_activation_gate.py).
+#: A boundary far enough in the past that every evidence item this
+#: module creates always satisfies that gate.
+_ALWAYS_ACTIVE_BOUNDARY = datetime(2000, 1, 1, tzinfo=timezone.utc)
+
+
+def _enqueue(
+    evidence_id: str, *, classification_job_repository, evidence_repository, actor_type=actor.SYSTEM,
+    actor_id=ACTOR_ID, correlation_id=None,
+) -> None:
+    """Thin wrapper around `enqueue_classification_job_for_evidence` for
+    this module's own tests — resolves the real evidence's own
+    `created_at` and always passes `_ALWAYS_ACTIVE_BOUNDARY` so the
+    activation gate never interferes with what these tests are actually
+    proving (job/worker processing behaviour)."""
+    evidence_created_at = evidence_repository.get_evidence(evidence_id).created_at
+    enqueue_classification_job_for_evidence(
+        evidence_id,
+        classification_job_repository=classification_job_repository,
+        actor_type=actor_type,
+        actor_id=actor_id,
+        correlation_id=correlation_id,
+        evidence_created_at=evidence_created_at,
+        activation_boundary=_ALWAYS_ACTIVE_BOUNDARY,
+    )
 
 
 @pytest.fixture
@@ -174,8 +207,8 @@ def test_enqueue_creates_exactly_one_pending_job(evidence_repository, object_sto
         evidence_repository, object_store,
         content=_rfc822_email(sender="billing@vendor.com", subject="Invoice #1", body="pay up"),
     )
-    enqueue_classification_job_for_evidence(
-        evidence_id, classification_job_repository=classification_job_repository, actor_type=actor.SYSTEM, actor_id=ACTOR_ID,
+    _enqueue(
+        evidence_id, classification_job_repository=classification_job_repository, evidence_repository=evidence_repository,
     )
     job = classification_job_repository.get_by_evidence(evidence_id)
     assert job is not None
@@ -187,12 +220,13 @@ def test_second_enqueue_for_the_same_evidence_is_idempotent(evidence_repository,
         evidence_repository, object_store,
         content=_rfc822_email(sender="billing@vendor.com", subject="Invoice #2", body="pay up"),
     )
-    enqueue_classification_job_for_evidence(
-        evidence_id, classification_job_repository=classification_job_repository, actor_type=actor.SYSTEM, actor_id=ACTOR_ID,
+    _enqueue(
+        evidence_id, classification_job_repository=classification_job_repository, evidence_repository=evidence_repository,
     )
     first = classification_job_repository.get_by_evidence(evidence_id)
-    enqueue_classification_job_for_evidence(
-        evidence_id, classification_job_repository=classification_job_repository, actor_type=actor.SYSTEM, actor_id="a-different-caller",
+    _enqueue(
+        evidence_id, classification_job_repository=classification_job_repository, evidence_repository=evidence_repository,
+        actor_id="a-different-caller",
     )
     second = classification_job_repository.get_by_evidence(evidence_id)
     assert second.job_id == first.job_id
@@ -208,6 +242,7 @@ def test_enqueue_never_raises_when_the_repository_call_fails():
     enqueue_classification_job_for_evidence(
         identity.generate_id(), classification_job_repository=_AlwaysRaisingRepository(),
         actor_type=actor.SYSTEM, actor_id=ACTOR_ID,
+        evidence_created_at=datetime.now(timezone.utc), activation_boundary=_ALWAYS_ACTIVE_BOUNDARY,
     )
 
 
@@ -227,8 +262,8 @@ def test_worker_processes_pending_job_ai_succeeds_creates_one_review_item(
         content=_rfc822_email(sender="new-vendor@example.com", subject="Your invoice", body="pay up"),
         sender_address="new-vendor@example.com", subject="Your invoice",
     )
-    enqueue_classification_job_for_evidence(
-        evidence_id, classification_job_repository=classification_job_repository, actor_type=actor.SYSTEM, actor_id=ACTOR_ID,
+    _enqueue(
+        evidence_id, classification_job_repository=classification_job_repository, evidence_repository=evidence_repository,
     )
     _queue_proposal(litellm_client, proposed_type=DOCUMENT_TYPE_SUPPLIER_INVOICE, confidence=0.8)
 
@@ -285,8 +320,8 @@ def test_worker_processes_job_deterministic_rule_match_zero_ai_calls(
         content=_rfc822_email(sender="billing@vendor.com", subject="Monthly Statement", body="pay up"),
         sender_address="billing@vendor.com", subject="Monthly Statement",
     )
-    enqueue_classification_job_for_evidence(
-        evidence_id, classification_job_repository=classification_job_repository, actor_type=actor.SYSTEM, actor_id=ACTOR_ID,
+    _enqueue(
+        evidence_id, classification_job_repository=classification_job_repository, evidence_repository=evidence_repository,
     )
 
     result = _run_process(
@@ -325,8 +360,8 @@ def test_worker_processes_job_for_already_classified_evidence_succeeds_no_duplic
         document_type=DOCUMENT_TYPE_SUPPLIER_INVOICE, status=STATUS_CLASSIFIED, source=SOURCE_OPERATOR_ASSIGNED,
         operator_action_id="pre-existing-operator-action",
     )
-    enqueue_classification_job_for_evidence(
-        evidence_id, classification_job_repository=classification_job_repository, actor_type=actor.SYSTEM, actor_id=ACTOR_ID,
+    _enqueue(
+        evidence_id, classification_job_repository=classification_job_repository, evidence_repository=evidence_repository,
     )
     before_history = classification_repository.list_classification_history(evidence_id, CLASSIFICATION_TYPE_DOCUMENT_TYPE)
 
@@ -488,8 +523,8 @@ def test_outcome_context_unsupported_maps_to_succeeded_no_real_classification(
     audit_repository, needs_you_repository, classification_job_repository,
 ):
     evidence_id = _register_document_evidence_no_storage_reference(evidence_repository)
-    enqueue_classification_job_for_evidence(
-        evidence_id, classification_job_repository=classification_job_repository, actor_type=actor.SYSTEM, actor_id=ACTOR_ID,
+    _enqueue(
+        evidence_id, classification_job_repository=classification_job_repository, evidence_repository=evidence_repository,
     )
     # Deliberately no object_store passed through — CONTEXT_UNSUPPORTED
     # is reached before object_store.get is ever called (no
@@ -522,8 +557,8 @@ def test_outcome_ai_invocation_failed_maps_to_failed_terminal(
         evidence_repository, object_store,
         content=_rfc822_email(sender="a@b.com", subject="Will fail", body="body"),
     )
-    enqueue_classification_job_for_evidence(
-        evidence_id, classification_job_repository=classification_job_repository, actor_type=actor.SYSTEM, actor_id=ACTOR_ID,
+    _enqueue(
+        evidence_id, classification_job_repository=classification_job_repository, evidence_repository=evidence_repository,
     )
     litellm_client.queue_failure(capability_alias="bagman-core", status=LiteLLMOutcomeStatus.TIMEOUT, error_detail="boom")
 
@@ -578,8 +613,8 @@ def test_outcome_ai_prior_failure_maps_to_failed_terminal(
     assert first.outcome == OUTCOME_AI_INVOCATION_FAILED
     assert len(litellm_client.calls) == 1
 
-    enqueue_classification_job_for_evidence(
-        evidence_id, classification_job_repository=classification_job_repository, actor_type=actor.SYSTEM, actor_id=ACTOR_ID,
+    _enqueue(
+        evidence_id, classification_job_repository=classification_job_repository, evidence_repository=evidence_repository,
     )
     result = _run_process(
         limit=5, classification_job_repository=classification_job_repository, evidence_repository=evidence_repository,
@@ -630,8 +665,8 @@ def test_outcome_ai_in_progress_maps_to_deferred_and_is_reclaimable(
         capability_alias="bagman-core", input_references={"evidence_id": evidence_id},
         actor_type=actor.SYSTEM, actor_id="a-concurrent-caller",
     )
-    enqueue_classification_job_for_evidence(
-        evidence_id, classification_job_repository=classification_job_repository, actor_type=actor.SYSTEM, actor_id=ACTOR_ID,
+    _enqueue(
+        evidence_id, classification_job_repository=classification_job_repository, evidence_repository=evidence_repository,
     )
     result = _run_process(
         limit=5, classification_job_repository=classification_job_repository, evidence_repository=evidence_repository,
@@ -668,8 +703,8 @@ def test_in_memory_mark_deferred_round_trip(classification_job_repository, evide
         evidence_repository, object_store,
         content=_rfc822_email(sender="a@b.com", subject="Deferred round trip", body="body"),
     )
-    enqueue_classification_job_for_evidence(
-        evidence_id, classification_job_repository=classification_job_repository, actor_type=actor.SYSTEM, actor_id=ACTOR_ID,
+    _enqueue(
+        evidence_id, classification_job_repository=classification_job_repository, evidence_repository=evidence_repository,
     )
     job = classification_job_repository.get_by_evidence(evidence_id)
     [claimed] = classification_job_repository.claim_next_pending(limit=1, claimed_by="worker-1")
@@ -706,8 +741,8 @@ def test_no_ai_failure_outcome_is_ever_reported_as_a_job_succeeded(
         content=_rfc822_email(sender="a@b.com", subject="Fails A", body="body"),
     )
     litellm_client.queue_failure(capability_alias="bagman-core", status=LiteLLMOutcomeStatus.TIMEOUT)
-    enqueue_classification_job_for_evidence(
-        evidence_id_a, classification_job_repository=classification_job_repository, actor_type=actor.SYSTEM, actor_id=ACTOR_ID,
+    _enqueue(
+        evidence_id_a, classification_job_repository=classification_job_repository, evidence_repository=evidence_repository,
     )
 
     # Scenario B: AI_PRIOR_FAILURE (a distinct evidence item, its own
@@ -724,8 +759,8 @@ def test_no_ai_failure_outcome_is_ever_reported_as_a_job_succeeded(
         audit_repository=audit_repository, record_audit_event=audit_repository.record_audit_event,
         needs_you_repository=needs_you_repository, actor_type=actor.SYSTEM, actor_id="pre-existing-dispatch",
     )
-    enqueue_classification_job_for_evidence(
-        evidence_id_b, classification_job_repository=classification_job_repository, actor_type=actor.SYSTEM, actor_id=ACTOR_ID,
+    _enqueue(
+        evidence_id_b, classification_job_repository=classification_job_repository, evidence_repository=evidence_repository,
     )
 
     result = _run_process(
@@ -755,21 +790,21 @@ def test_no_ai_failure_outcome_is_ever_reported_as_a_job_succeeded(
 
 
 def test_resolve_activation_boundary_unset_skips_with_a_clear_reason():
-    boundary, skip_reason = worker._resolve_activation_boundary(None)
+    boundary, skip_reason = worker.resolve_evidence_classification_activation_boundary(None)
     assert boundary is None
     assert skip_reason is not None
-    assert worker._ACTIVATION_BOUNDARY_ENV_VAR in skip_reason
+    assert worker.EVIDENCE_CLASSIFICATION_ACTIVATION_BOUNDARY_ENV_VAR in skip_reason
     assert "not set" in skip_reason
 
 
 def test_resolve_activation_boundary_empty_string_skips_with_a_clear_reason():
-    boundary, skip_reason = worker._resolve_activation_boundary("")
+    boundary, skip_reason = worker.resolve_evidence_classification_activation_boundary("")
     assert boundary is None
     assert skip_reason is not None
 
 
 def test_resolve_activation_boundary_malformed_skips_never_raises():
-    boundary, skip_reason = worker._resolve_activation_boundary("not-a-real-timestamp")
+    boundary, skip_reason = worker.resolve_evidence_classification_activation_boundary("not-a-real-timestamp")
     assert boundary is None
     assert skip_reason is not None
     assert "not-a-real-timestamp" in skip_reason
@@ -783,14 +818,14 @@ def test_resolve_activation_boundary_naive_value_with_no_timezone_fails_closed()
     timezone-aware column. A naive value must be treated as malformed,
     never silently accepted, per this function's own "fail loudly,
     never guess" contract."""
-    boundary, skip_reason = worker._resolve_activation_boundary("2026-10-15T00:00:00")
+    boundary, skip_reason = worker.resolve_evidence_classification_activation_boundary("2026-10-15T00:00:00")
     assert boundary is None
     assert skip_reason is not None
     assert "timezone" in skip_reason.lower()
 
 
 def test_resolve_activation_boundary_valid_value_parses_correctly():
-    boundary, skip_reason = worker._resolve_activation_boundary("2026-10-15T00:00:00Z")
+    boundary, skip_reason = worker.resolve_evidence_classification_activation_boundary("2026-10-15T00:00:00Z")
     assert skip_reason is None
     assert boundary == datetime(2026, 10, 15, 0, 0, 0, tzinfo=timezone.utc)
 
@@ -799,7 +834,7 @@ def test_resolve_activation_boundary_valid_value_without_trailing_z():
     # datetime.fromisoformat's own native "+HH:MM" form — the same
     # helper handles both, mirroring services/xero/client.py's own
     # `_parse_xero_wire_datetime` doctrine exactly.
-    boundary, skip_reason = worker._resolve_activation_boundary("2026-10-15T00:00:00+00:00")
+    boundary, skip_reason = worker.resolve_evidence_classification_activation_boundary("2026-10-15T00:00:00+00:00")
     assert skip_reason is None
     assert boundary == datetime(2026, 10, 15, 0, 0, 0, tzinfo=timezone.utc)
 
@@ -825,6 +860,7 @@ def _fake_composition(
         classification_job_repository=classification_job_repository,
         classification_repository=classification_repository,
         classification_rule_repository=rule_repository,
+        classification_reconciliation_cursor_repository=InMemoryEvidenceClassificationReconciliationCursorRepository(),
         ai_invocation_repository=ai_invocation_repository,
         litellm_client=litellm_client,
         object_store=object_store,
@@ -848,8 +884,8 @@ def test_run_worker_skips_reconciliation_when_env_var_unset_but_still_processes_
         content=_rfc822_email(sender="new-vendor@example.com", subject="Needs processing", body="pay up"),
         sender_address="new-vendor@example.com", subject="Needs processing",
     )
-    enqueue_classification_job_for_evidence(
-        evidence_id, classification_job_repository=classification_job_repository, actor_type=actor.SYSTEM, actor_id=ACTOR_ID,
+    _enqueue(
+        evidence_id, classification_job_repository=classification_job_repository, evidence_repository=evidence_repository,
     )
     _queue_proposal(litellm_client, proposed_type=DOCUMENT_TYPE_SUPPLIER_INVOICE, confidence=0.8)
 
@@ -877,7 +913,7 @@ def test_run_worker_skips_reconciliation_when_env_var_unset_but_still_processes_
 
     assert report["reconciled_count"] == 0
     assert report["reconciliation_skipped_reason"] is not None
-    assert worker._ACTIVATION_BOUNDARY_ENV_VAR in report["reconciliation_skipped_reason"]
+    assert worker.EVIDENCE_CLASSIFICATION_ACTIVATION_BOUNDARY_ENV_VAR in report["reconciliation_skipped_reason"]
 
     # Ordinary claim/process still happened normally.
     assert report["claimed_count"] == 1
@@ -896,21 +932,26 @@ def test_run_worker_runs_reconciliation_with_the_exact_env_supplied_boundary(
     """Test plan item 6: env var set to a valid value -> reconciliation
     genuinely runs, with that exact boundary (parse-and-use correctness,
     not merely parse correctness)."""
+    # Historical evidence — registered (so its own server-assigned
+    # created_at is stamped) BEFORE `boundary` is captured below. Its
+    # own received_at is deliberately set to a time AFTER `boundary`
+    # (preflight review correction, item A): eligibility is now governed
+    # SOLELY by created_at, so this proves received_at no longer matters
+    # at all — the old received_at-based filter would have wrongly
+    # treated this as prospective.
+    historical_evidence = evidence_repository.register_evidence(
+        entity_id=None, evidence_type="EMAIL", source_id=identity.generate_id(),
+        observed_at=datetime.now(timezone.utc), received_at=datetime.now(timezone.utc) + timedelta(days=1),
+        content_hash={"algorithm": "SHA-256", "value": hashlib.sha256(b"historical").hexdigest()},
+        mime_type="message/rfc822", size_bytes=10, storage_reference=None,
+    )
+
     boundary = datetime.now(timezone.utc)
 
     # Prospective orphan — registered AFTER `boundary` was captured, so
-    # its own received_at is >= boundary (the inclusive filter).
+    # its own created_at is >= boundary (the inclusive filter).
     prospective_id = _register_email_evidence(
         evidence_repository, object_store, content=_rfc822_email(sender="a@b.com", subject="Prospective", body="body"),
-    )
-    # Historical evidence (received_at BEFORE the boundary) — must
-    # remain untouched.
-    historical_evidence = evidence_repository.register_evidence(
-        entity_id=None, evidence_type="EMAIL", source_id=identity.generate_id(),
-        observed_at=boundary - timedelta(days=1),
-        received_at=boundary - timedelta(days=1),
-        content_hash={"algorithm": "SHA-256", "value": hashlib.sha256(b"historical").hexdigest()},
-        mime_type="message/rfc822", size_bytes=10, storage_reference=None,
     )
 
     composition = _fake_composition(
@@ -920,7 +961,7 @@ def test_run_worker_runs_reconciliation_with_the_exact_env_supplied_boundary(
         audit_repository=audit_repository, needs_you_repository=needs_you_repository,
     )
     args = SimpleNamespace(limit=5, reconciliation_repair_limit=200)
-    env = {worker._ACTIVATION_BOUNDARY_ENV_VAR: boundary.strftime("%Y-%m-%dT%H:%M:%S.%fZ")}
+    env = {worker.EVIDENCE_CLASSIFICATION_ACTIVATION_BOUNDARY_ENV_VAR: boundary.strftime("%Y-%m-%dT%H:%M:%S.%fZ")}
 
     outcome = worker._run_worker(
         args=args, composition=composition, run_id="test-run-2", started_at=boundary,

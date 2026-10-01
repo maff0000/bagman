@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import hashlib
 import threading
+from datetime import datetime, timezone
 
 import pytest
 
@@ -38,13 +39,23 @@ from services.evidence.classification_job import enqueue_classification_job_for_
 
 ACTOR_ID = "evidence-classification-job-concurrency-test"
 
+#: This module's own tests exercise SUBMIT/ENQUEUE concurrency — never
+#: the preflight-review enqueue-side activation gate (item C) itself.
+#: A boundary far enough in the past that every evidence item this
+#: module creates always satisfies that gate.
+_ALWAYS_ACTIVE_BOUNDARY = datetime(2000, 1, 1, tzinfo=timezone.utc)
+
 
 def _real_evidence_id() -> str:
+    return _real_evidence().evidence_id
+
+
+def _real_evidence():
     source = PostgresSourceRepository().register_source(
         source_type="MANUAL_UPLOAD", provider="INTERNAL", status="ACTIVE"
     )
     now = utc_now()
-    evidence = PostgresEvidenceRepository(PostgresExternalReferenceRepository()).register_evidence(
+    return PostgresEvidenceRepository(PostgresExternalReferenceRepository()).register_evidence(
         entity_id=None,
         evidence_type="DOCUMENT",
         source_id=source.source_id,
@@ -58,7 +69,6 @@ def _real_evidence_id() -> str:
         size_bytes=100,
         storage_reference=None,
     )
-    return evidence.evidence_id
 
 
 class _BarrierGatedJobRepository(PostgresEvidenceClassificationJobRepository):
@@ -92,13 +102,14 @@ def _run_submit(*, evidence_id: str, repo, results: list, errors: list) -> None:
         errors.append(exc)
 
 
-def _run_enqueue(*, evidence_id: str, repo, barrier: threading.Barrier, errors: list) -> None:
+def _run_enqueue(*, evidence_id: str, evidence_created_at, repo, barrier: threading.Barrier, errors: list) -> None:
     # enqueue_classification_job_for_evidence never raises by contract
     # — any exception observed here would itself be a defect.
     try:
         barrier.wait(timeout=10)
         enqueue_classification_job_for_evidence(
             evidence_id, classification_job_repository=repo, actor_type="SYSTEM", actor_id=ACTOR_ID,
+            evidence_created_at=evidence_created_at, activation_boundary=_ALWAYS_ACTIVE_BOUNDARY,
         )
     except Exception as exc:  # noqa: BLE001 - must never happen; captured to fail loudly if it does
         errors.append(exc)
@@ -144,14 +155,19 @@ def test_two_genuinely_concurrent_enqueue_calls_for_the_same_evidence_id(fresh_e
     (`enqueue_classification_job_for_evidence`), not the repository
     method directly — proves the end-to-end path is race-safe, not
     merely the repository in isolation."""
-    evidence_id = _real_evidence_id()
+    evidence = _real_evidence()
+    evidence_id = evidence.evidence_id
     barrier = threading.Barrier(2)
     shared_gated_repo = _BarrierGatedJobRepository(barrier)
 
     errors: list = []
     threads = [
         threading.Thread(
-            target=_run_enqueue, kwargs=dict(evidence_id=evidence_id, repo=shared_gated_repo, barrier=barrier, errors=errors)
+            target=_run_enqueue,
+            kwargs=dict(
+                evidence_id=evidence_id, evidence_created_at=evidence.created_at, repo=shared_gated_repo,
+                barrier=barrier, errors=errors,
+            ),
         )
         for _ in range(2)
     ]

@@ -32,7 +32,7 @@ from datetime import datetime
 from typing import Optional
 
 from sqlalchemy import DateTime, ForeignKey, Index, Integer, String, UniqueConstraint
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from persistence.postgres.models import Base
@@ -75,3 +75,57 @@ class EvidenceClassificationJobRow(Base):
     #: RAISED infrastructure exception (which never reaches
     #: `classify_evidence`'s own outcome vocabulary at all).
     classification_outcome: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+
+
+class EvidenceClassificationReconciliationCursorRow(Base):
+    """Persisted form of `services.evidence
+    .classification_reconciliation_cursor.EvidenceClassificationReconciliationCursor`
+    (preflight review correction, item B — closes the reconciliation
+    starvation bug; see that module's own docstring for the full
+    reasoning). Primary-keyed directly on `cursor_key` (the value's own
+    identity IS the lookup key — mirrors
+    `persistence/postgres/mailbox_microsoft_models.py
+    ::MailboxFolderCursorRow`'s own equivalent reasoning), kept
+    colocated with `EvidenceClassificationJobRow` above: both back the
+    same `evidence/automatic-classification-activation` WO's
+    reconciliation subsystem, and this table has no meaning independent
+    of it."""
+
+    __tablename__ = "evidence_classification_reconciliation_cursors"
+
+    cursor_key: Mapped[str] = mapped_column(String, primary_key=True)
+    #: Monotonically non-decreasing generation counter — see
+    #: `services.evidence.classification_reconciliation_cursor`'s own
+    #: docstring, "lap" section (evidence/classification-activation-
+    #: preflight WO, this round's own permanent-stall correction). Plain
+    #: non-nullable `Integer`, mirroring `EvidenceClassificationJobRow
+    #: .attempt_count`/`.max_attempts`'s own "always explicitly supplied
+    #: by application code, no column default relied on" convention.
+    lap: Mapped[int] = mapped_column(Integer, nullable=False)
+    last_created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    #: EVERY `evidence_id` actually inspected (never merely
+    #: cursor-skipped) at exactly `last_created_at` — a plain JSONB
+    #: list of strings, per this codebase's own "a plain list of short
+    #: strings is JSONB" convention (mirrors
+    #: `EvidenceClassificationRow.reason_codes`/
+    #: `XeroAccountSuggestionRow.signals`). Post-merge audit correction:
+    #: replaces the earlier single-scalar `last_evidence_id` column —
+    #: see `services.evidence.classification_reconciliation_cursor`'s
+    #: own docstring, "Why the tie-break is SET membership" section,
+    #: for why an ordering-based scalar tie-break was wrong (UUIDv7
+    #: monotonicity is only ever guaranteed within one process, never
+    #: across two).
+    last_evidence_ids: Mapped[list[str]] = mapped_column(JSONB, nullable=False)
+    #: The IMMUTABLE upper bound (`created_at` value) for the CURRENT
+    #: lap generation (evidence/classification-activation-preflight WO,
+    #: this round's own final lap-boundary-liveness correction) — see
+    #: `services.evidence.classification_reconciliation_cursor`'s own
+    #: docstring, "target" section. Meaningful only for the sweep
+    #: cursor; the forward cursor carries this column for schema
+    #: uniformity only (mirrors how it already carries `lap` as a
+    #: permanent non-event), never meaningfully using it. Plain
+    #: non-nullable `DateTime(timezone=True)`, identical column shape to
+    #: `last_created_at` above.
+    target: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)

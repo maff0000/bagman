@@ -252,8 +252,11 @@ class PostgresEvidenceRepository(EvidenceRepository):
         evidence_type: Optional[str] = None,
         received_at_from=None,
         received_at_to=None,
+        created_at_from=None,
+        created_at_to=None,
         limit: Optional[int] = None,
         offset: int = 0,
+        order_by_created_at: bool = False,
     ) -> list[EvidenceItem]:
         try:
             with session_scope(self._engine) as session:
@@ -266,9 +269,18 @@ class PostgresEvidenceRepository(EvidenceRepository):
                     query = query.filter(EvidenceItemRow.received_at >= received_at_from)
                 if received_at_to is not None:
                     query = query.filter(EvidenceItemRow.received_at <= received_at_to)
-                query = query.order_by(
-                    EvidenceItemRow.received_at.desc(), EvidenceItemRow.evidence_id.desc()
-                )
+                if created_at_from is not None:
+                    query = query.filter(EvidenceItemRow.created_at >= created_at_from)
+                if created_at_to is not None:
+                    query = query.filter(EvidenceItemRow.created_at <= created_at_to)
+                if order_by_created_at:
+                    query = query.order_by(
+                        EvidenceItemRow.created_at.asc(), EvidenceItemRow.evidence_id.asc()
+                    )
+                else:
+                    query = query.order_by(
+                        EvidenceItemRow.received_at.desc(), EvidenceItemRow.evidence_id.desc()
+                    )
                 if offset:
                     query = query.offset(offset)
                 if limit is not None:
