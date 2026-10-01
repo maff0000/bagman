@@ -286,8 +286,22 @@ def _old_forward_only_reconcile_missing_classification_jobs(
         # means `_resolve_cursor_advance` always takes its
         # "proposed.lap == existing.lap" branch, collapsing to exactly
         # the single-dimension `created_at` comparison this reconstructs.
+        # `target` is a required field on the REAL, current
+        # `advance_cursor` (this reconstruction calls the real,
+        # production repository method — only the SCAN logic above is
+        # reconstructed, not the cursor-write plumbing) — this
+        # reconstruction predates `target` entirely too, so it proposes
+        # `running_created_at` itself, a value never actually consulted:
+        # `lap` is always 0 here, so the real `advance_cursor` always
+        # takes its "proposed.lap == existing.lap" branch, which NEVER
+        # changes an already-persisted target regardless of what is
+        # proposed for it.
         cursor_repository.advance_cursor(
-            cursor_key, lap=0, last_created_at=running_created_at, last_evidence_ids=running_ids,
+            cursor_key,
+            lap=0,
+            last_created_at=running_created_at,
+            last_evidence_ids=running_ids,
+            target=running_created_at,
         )
     return submitted
 
@@ -320,6 +334,14 @@ def _old_overwriting_advance_cursor(
                     lap=0,
                     last_created_at=last_created_at,
                     last_evidence_ids=evidence_ids_list,
+                    # This reconstruction predates `target` entirely —
+                    # a placeholder value is all a brand-new row needs
+                    # (never meaningfully exercised by this
+                    # reconstruction's own "blind overwrite" behaviour,
+                    # which this function exists to reproduce on the
+                    # `last_created_at`/`last_evidence_ids` dimensions
+                    # only).
+                    target=last_created_at,
                     created_at=now,
                     updated_at=now,
                 )
@@ -426,9 +448,18 @@ def _old_no_lap_scan_and_repair_evidence_missing_classification_jobs(
         # in this reconstruction, so a newly-started lap's own partial
         # position is compared on created_at ALONE against whatever the
         # old, completed lap left persisted, and loses forever once
-        # that old position is further ahead.
+        # that old position is further ahead. `target` is likewise
+        # proposed as a placeholder (`running_created_at`) — this
+        # reconstruction predates `target` entirely, and since `lap` is
+        # always 0 here, the real `advance_cursor`'s "proposed.lap ==
+        # existing.lap" branch never lets a proposed target change
+        # whatever is already persisted anyway.
         cursor_repository.advance_cursor(
-            cursor_key, lap=0, last_created_at=running_created_at, last_evidence_ids=running_ids,
+            cursor_key,
+            lap=0,
+            last_created_at=running_created_at,
+            last_evidence_ids=running_ids,
+            target=running_created_at,
         )
 
     return submitted
@@ -507,6 +538,209 @@ def _old_no_lap_reconcile_missing_classification_jobs(
             repair_limit=sweep_repair_limit,
             page_size=sweep_page_size,
             max_rows_scanned=sweep_max_rows_scanned,
+        )
+
+    return forward_submitted + sweep_submitted
+
+
+# ---------------------------------------------------------------------
+# Old (pre-this-round), LAP-AWARE but UNFROZEN-target sweep
+# reconstruction — this is the CURRENT, pre-this-round sweep mechanism
+# EXACTLY as it existed (exists) in this delivery's own previously-
+# reviewed, already-committed state (it DOES thread a real `lap` value
+# through `advance_cursor`, closing the permanent-STALL bug the
+# `test_old_no_lap_...` reconstruction above reproduces) — but still
+# decides "has this lap finished" by comparing against a FRESHLY
+# RE-READ `forward_frontier` on every call, and uses that same
+# freshly-re-read value directly as the scan's own upper bound
+# (`created_at_to`) for whichever lap is in progress, NEVER a frozen,
+# persisted `target`. Used ONLY to directly reproduce the SECOND,
+# independent liveness gap this round's own `target` correction closes:
+# if the forward frontier keeps growing faster than the sweep's own
+# bounded per-call budget, this lap's own completion condition
+# (`last_created_at >= forward_frontier`) can never be satisfied — the
+# lap never completes, a new lap never starts, and a late-committing
+# row sorting behind the sweep's current in-lap position is never
+# found. See `services.evidence.classification_reconciliation_cursor`'s
+# own docstring, "target" section, and
+# `reconcile_missing_classification_jobs`'s own corrected docstring,
+# "Freezing each lap's own upper bound at target" section, for the full,
+# now-honest account. This exact code path no longer exists in
+# production: the real, fixed version threads a real, FROZEN `target`
+# value through `advance_cursor`, reusing it unchanged across every
+# continuing call within a lap; this reconstruction always proposes
+# whatever `forward_frontier` happened to be at write time as a
+# stand-in `target` value (needed only to satisfy the real, now-
+# required `advance_cursor` parameter — never consulted by this
+# reconstruction's own scan-bound/lap-completion decisions, which use
+# `forward_frontier` directly instead, exactly reproducing the bug).
+# ---------------------------------------------------------------------
+
+
+def _old_lap_aware_no_target_scan_and_repair_evidence_missing_classification_jobs(
+    *,
+    evidence_repository,
+    classification_job_repository,
+    classification_repository,
+    cursor_repository,
+    actor_type: str,
+    actor_id: str,
+    cursor_key: str,
+    scan_created_at_from: datetime.datetime,
+    created_at_to,
+    already_inspected_ids_at_boundary: set,
+    has_existing_cursor: bool,
+    repair_limit: int,
+    page_size: int,
+    max_rows_scanned: int,
+    lap: int,
+    stand_in_target: datetime.datetime,
+) -> int:
+    offset = 0
+    submitted = 0
+    rows_scanned = 0
+    running_created_at = scan_created_at_from if has_existing_cursor else None
+    running_ids: set = set(already_inspected_ids_at_boundary)
+    any_inspected = False
+
+    while submitted < repair_limit and rows_scanned < max_rows_scanned:
+        page = evidence_repository.list_evidence(
+            created_at_from=scan_created_at_from,
+            created_at_to=created_at_to,
+            limit=page_size,
+            offset=offset,
+            order_by_created_at=True,
+        )
+        if not page:
+            break
+        for item in page:
+            if submitted >= repair_limit or rows_scanned >= max_rows_scanned:
+                break
+            if (
+                has_existing_cursor
+                and item.created_at == scan_created_at_from
+                and item.evidence_id in already_inspected_ids_at_boundary
+            ):
+                continue
+            rows_scanned += 1
+            any_inspected = True
+            if running_created_at is None or item.created_at > running_created_at:
+                running_created_at = item.created_at
+                running_ids = {item.evidence_id}
+            else:
+                running_ids.add(item.evidence_id)
+            if classification_job_repository.get_by_evidence(item.evidence_id) is not None:
+                continue
+            if classification_repository.get_current_classification(
+                item.evidence_id, CLASSIFICATION_TYPE_DOCUMENT_TYPE
+            ) is not None:
+                continue
+            classification_job_repository.submit_job(
+                evidence_id=item.evidence_id, actor_type=actor_type, actor_id=actor_id,
+            )
+            submitted += 1
+        offset += len(page)
+        if len(page) < page_size:
+            break
+
+    if any_inspected:
+        # THE BUG (second, independent liveness gap): `target` is
+        # proposed as a mere stand-in (`stand_in_target`, whatever
+        # `forward_frontier` happened to be at write time) — this
+        # reconstruction's own lap-completion/scan-bound decisions
+        # (below, in the caller) never read a persisted target back at
+        # all, they always re-read `forward_frontier` fresh instead.
+        cursor_repository.advance_cursor(
+            cursor_key, lap=lap, last_created_at=running_created_at, last_evidence_ids=running_ids,
+            target=stand_in_target,
+        )
+
+    return submitted
+
+
+def _old_lap_aware_no_target_reconcile_missing_classification_jobs(
+    *,
+    evidence_repository,
+    classification_job_repository,
+    classification_repository,
+    cursor_repository,
+    activation_boundary: datetime.datetime,
+    actor_type: str = "SYSTEM",
+    actor_id: str = ACTOR_ID,
+    repair_limit: int = 200,
+    page_size: int = 200,
+    max_rows_scanned: int = 5000,
+    sweep_repair_limit: int = 50,
+    sweep_page_size: int = 200,
+    sweep_max_rows_scanned: int = 1000,
+) -> int:
+    forward_cursor_key = activation_boundary.isoformat()
+    existing_forward_cursor = cursor_repository.get_cursor(forward_cursor_key)
+    forward_scan_from = (
+        existing_forward_cursor.last_created_at if existing_forward_cursor is not None else activation_boundary
+    )
+    forward_already_inspected: set = (
+        set(existing_forward_cursor.last_evidence_ids) if existing_forward_cursor is not None else set()
+    )
+    forward_lap = existing_forward_cursor.lap if existing_forward_cursor is not None else 0
+
+    forward_submitted = _old_lap_aware_no_target_scan_and_repair_evidence_missing_classification_jobs(
+        evidence_repository=evidence_repository,
+        classification_job_repository=classification_job_repository,
+        classification_repository=classification_repository,
+        cursor_repository=cursor_repository,
+        actor_type=actor_type,
+        actor_id=actor_id,
+        cursor_key=forward_cursor_key,
+        scan_created_at_from=forward_scan_from,
+        created_at_to=None,
+        already_inspected_ids_at_boundary=forward_already_inspected,
+        has_existing_cursor=existing_forward_cursor is not None,
+        repair_limit=repair_limit,
+        page_size=page_size,
+        max_rows_scanned=max_rows_scanned,
+        lap=forward_lap,
+        stand_in_target=activation_boundary,
+    )
+
+    sweep_submitted = 0
+    # THE BUG: re-read fresh every call and used DIRECTLY as both the
+    # lap-completion comparison AND the scan's own upper bound — see
+    # this helper's own module-level docstring above.
+    forward_frontier_cursor = cursor_repository.get_cursor(forward_cursor_key)
+    forward_frontier = forward_frontier_cursor.last_created_at if forward_frontier_cursor is not None else None
+
+    if forward_frontier is not None:
+        sweep_cursor_key = f"{forward_cursor_key}::sweep"
+        existing_sweep_cursor = cursor_repository.get_cursor(sweep_cursor_key)
+        if existing_sweep_cursor is None or existing_sweep_cursor.last_created_at >= forward_frontier:
+            sweep_scan_from = activation_boundary
+            sweep_already_inspected: set = set()
+            sweep_has_existing_cursor = False
+            sweep_lap = (existing_sweep_cursor.lap + 1) if existing_sweep_cursor is not None else 0
+        else:
+            sweep_scan_from = existing_sweep_cursor.last_created_at
+            sweep_already_inspected = set(existing_sweep_cursor.last_evidence_ids)
+            sweep_has_existing_cursor = True
+            sweep_lap = existing_sweep_cursor.lap
+
+        sweep_submitted = _old_lap_aware_no_target_scan_and_repair_evidence_missing_classification_jobs(
+            evidence_repository=evidence_repository,
+            classification_job_repository=classification_job_repository,
+            classification_repository=classification_repository,
+            cursor_repository=cursor_repository,
+            actor_type=actor_type,
+            actor_id=actor_id,
+            cursor_key=sweep_cursor_key,
+            scan_created_at_from=sweep_scan_from,
+            created_at_to=forward_frontier,
+            already_inspected_ids_at_boundary=sweep_already_inspected,
+            has_existing_cursor=sweep_has_existing_cursor,
+            repair_limit=sweep_repair_limit,
+            page_size=sweep_page_size,
+            max_rows_scanned=sweep_max_rows_scanned,
+            lap=sweep_lap,
+            stand_in_target=forward_frontier,
         )
 
     return forward_submitted + sweep_submitted
@@ -723,7 +957,7 @@ def test_advance_cursor_never_regresses_a_more_advanced_persisted_cursor_real_th
     def _fast_writer():
         try:
             barrier.wait(timeout=10)
-            repo.advance_cursor(new_key, lap=0, last_created_at=t_high, last_evidence_ids=["fast-writer"])
+            repo.advance_cursor(new_key, lap=0, last_created_at=t_high, last_evidence_ids=["fast-writer"], target=t_high)
         except Exception as exc:  # noqa: BLE001 - captured, never swallowed
             errors.append(exc)
 
@@ -738,7 +972,7 @@ def test_advance_cursor_never_regresses_a_more_advanced_persisted_cursor_real_th
             # slower call's own proposal arrives after a faster one
             # already committed a higher watermark").
             time.sleep(0.2)
-            repo.advance_cursor(new_key, lap=0, last_created_at=t_low, last_evidence_ids=["slow-writer"])
+            repo.advance_cursor(new_key, lap=0, last_created_at=t_low, last_evidence_ids=["slow-writer"], target=t_low)
         except Exception as exc:  # noqa: BLE001 - captured, never swallowed
             errors.append(exc)
 
@@ -757,6 +991,10 @@ def test_advance_cursor_never_regresses_a_more_advanced_persisted_cursor_real_th
         "behaviour proven above against the identical pair of proposals"
     )
     assert "fast-writer" in final.last_evidence_ids
+    assert final.target == t_high, (
+        "whichever writer's proposal actually established the row first fixes target permanently — the "
+        "slower writer's own, different proposed target is discarded"
+    )
 
 
 @pytest.mark.usefixtures("fresh_engine")
@@ -775,7 +1013,7 @@ def test_advance_cursor_unions_evidence_ids_when_concurrent_proposals_share_the_
     def _writer(evidence_id: str):
         try:
             barrier.wait(timeout=10)
-            repo.advance_cursor(key, lap=0, last_created_at=t_shared, last_evidence_ids=[evidence_id])
+            repo.advance_cursor(key, lap=0, last_created_at=t_shared, last_evidence_ids=[evidence_id], target=t_shared)
         except Exception as exc:  # noqa: BLE001 - captured, never swallowed
             errors.append(exc)
 
@@ -876,7 +1114,11 @@ def test_cursor_regression_would_have_permanently_starved_new_evidence_under_old
     # new_orphan without first needing to re-cross any redundant
     # ground. ---
     real_cursor_repo.advance_cursor(
-        boundary.isoformat(), lap=0, last_created_at=backlog[3].created_at, last_evidence_ids=[backlog[3].evidence_id],
+        boundary.isoformat(),
+        lap=0,
+        last_created_at=backlog[3].created_at,
+        last_evidence_ids=[backlog[3].evidence_id],
+        target=backlog[3].created_at,
     )
     assert real_cursor_repo.get_cursor(boundary.isoformat()).last_created_at == advanced_frontier, (
         "the merge-protected repository must reject the stale proposal outright — the cursor never moved"
@@ -1274,20 +1516,28 @@ def test_lap_transition_concurrent_writers_union_evidence_ids_at_the_same_new_la
     key = f"lap-transition-union-{identity.generate_id()}"
 
     t_old_lap = datetime.datetime.now(datetime.timezone.utc)
-    repo.advance_cursor(key, lap=0, last_created_at=t_old_lap, last_evidence_ids=["old-lap-final"])
+    repo.advance_cursor(key, lap=0, last_created_at=t_old_lap, last_evidence_ids=["old-lap-final"], target=t_old_lap)
 
     # Both callers' own independent new-lap scans land on the exact SAME
     # new watermark — far EARLIER than the old lap's final position
     # (exactly the "a new lap's first call cannot yet reach the old
-    # lap's position" shape the whole fix exists for).
+    # lap's position" shape the whole fix exists for). Both ALSO
+    # snapshot the exact SAME new target (a realistic case: both read
+    # the same forward frontier at nearly the same moment) — the
+    # dedicated "different target" variant lives in
+    # `test_lap_transition_concurrent_writers_propose_different_targets_the_first_to_land_wins`
+    # below.
     t_new_lap_shared = t_old_lap - datetime.timedelta(hours=1)
+    t_new_lap_target = t_old_lap + datetime.timedelta(hours=1)
     barrier = threading.Barrier(2)
     errors: list = []
 
     def _writer(evidence_id: str):
         try:
             barrier.wait(timeout=10)
-            repo.advance_cursor(key, lap=1, last_created_at=t_new_lap_shared, last_evidence_ids=[evidence_id])
+            repo.advance_cursor(
+                key, lap=1, last_created_at=t_new_lap_shared, last_evidence_ids=[evidence_id], target=t_new_lap_target
+            )
         except Exception as exc:  # noqa: BLE001 - captured, never swallowed
             errors.append(exc)
 
@@ -1310,6 +1560,7 @@ def test_lap_transition_concurrent_writers_union_evidence_ids_at_the_same_new_la
         "both concurrent lap-transition callers' ids sharing the exact same new-lap watermark must be "
         "UNIONED — never replaced, never dropped"
     )
+    assert final.target == t_new_lap_target
 
 
 @pytest.mark.usefixtures("fresh_engine")
@@ -1328,17 +1579,24 @@ def test_lap_transition_concurrent_writers_at_different_positions_the_later_one_
     key = f"lap-transition-diff-{identity.generate_id()}"
 
     t_old_lap = datetime.datetime.now(datetime.timezone.utc)
-    repo.advance_cursor(key, lap=0, last_created_at=t_old_lap, last_evidence_ids=["old-lap-final"])
+    repo.advance_cursor(key, lap=0, last_created_at=t_old_lap, last_evidence_ids=["old-lap-final"], target=t_old_lap)
 
     t_first = t_old_lap - datetime.timedelta(hours=2)
     t_second = t_old_lap - datetime.timedelta(hours=1)  # further along than t_first, still far behind t_old_lap
+    # Both writers propose the SAME target here too (this test's own
+    # focus is the created_at/last_evidence_ids dimension, already
+    # covered) — the DIFFERENT-target race is its own dedicated test,
+    # directly below.
+    t_shared_target = t_old_lap + datetime.timedelta(hours=1)
     barrier = threading.Barrier(2)
     errors: list = []
 
     def _first_writer():
         try:
             barrier.wait(timeout=10)
-            repo.advance_cursor(key, lap=1, last_created_at=t_first, last_evidence_ids=["first-writer"])
+            repo.advance_cursor(
+                key, lap=1, last_created_at=t_first, last_evidence_ids=["first-writer"], target=t_shared_target
+            )
         except Exception as exc:  # noqa: BLE001 - captured, never swallowed
             errors.append(exc)
 
@@ -1349,7 +1607,9 @@ def test_lap_transition_concurrent_writers_at_different_positions_the_later_one_
             # AFTER the first writer's — mirrors the existing
             # fast/slow-writer real-thread proof's own discipline.
             time.sleep(0.2)
-            repo.advance_cursor(key, lap=1, last_created_at=t_second, last_evidence_ids=["second-writer"])
+            repo.advance_cursor(
+                key, lap=1, last_created_at=t_second, last_evidence_ids=["second-writer"], target=t_shared_target
+            )
         except Exception as exc:  # noqa: BLE001 - captured, never swallowed
             errors.append(exc)
 
@@ -1372,3 +1632,407 @@ def test_lap_transition_concurrent_writers_at_different_positions_the_later_one_
         "a strictly greater created_at within the SAME lap replaces last_evidence_ids wholesale — mirrors "
         "the ordinary same-lap 'greater' semantics exactly, unchanged"
     )
+    assert final.target == t_shared_target, "target is unaffected by the created_at/ids dimension racing above"
+
+
+# =======================================================================
+# THIS ROUND's own final correction: `target` — freezing each lap's own
+# upper bound at the moment it starts, closing the SECOND, independent
+# liveness gap `lap` alone did not close (a continuing lap's own scan
+# bound used to be re-read fresh from the forward cursor on every call,
+# so a continuously-advancing frontier could keep the lap from EVER
+# completing). See `services.evidence.classification_reconciliation_cursor`'s
+# own docstring, "target" section, and
+# `reconcile_missing_classification_jobs`'s own corrected docstring,
+# "Freezing each lap's own upper bound at target" section, for the full
+# mechanism.
+# =======================================================================
+
+
+@pytest.mark.usefixtures("fresh_engine")
+def test_lap_transition_concurrent_writers_propose_different_targets_the_first_to_land_wins(fresh_engine):
+    """The architect's own exact "concurrent-writer semantics"
+    requirement for `target`: two real threads/real Postgres callers
+    BOTH independently decide 'time to start lap N+1' for the SAME
+    sweep `cursor_key` (both having read the same old `lap=N` persisted
+    cursor) and each snapshots a DIFFERENT forward-frontier value at a
+    slightly different moment, proposing DIFFERENT `target`s alongside
+    the identical `lap=N+1`. Proves: whichever write lands FIRST, inside
+    the row lock, establishes `target` for that lap generation
+    PERMANENTLY; the second writer's own, different proposed `target`
+    is silently discarded, never applied — mirrors
+    `test_advance_cursor_never_regresses_a_more_advanced_persisted_cursor_real_threads`'s
+    own fast/slow-writer discipline exactly, now proving the dedicated
+    `target` invariant rather than `last_created_at`."""
+    engine = fresh_engine
+    repo = PostgresEvidenceClassificationReconciliationCursorRepository(engine)
+    key = f"lap-transition-diff-target-{identity.generate_id()}"
+
+    t_old_lap = datetime.datetime.now(datetime.timezone.utc)
+    repo.advance_cursor(key, lap=0, last_created_at=t_old_lap, last_evidence_ids=["old-lap-final"], target=t_old_lap)
+
+    # Both writers' own independent new-lap scans land on the exact SAME
+    # new watermark/ids (irrelevant to this test's own focus) — the
+    # thing that differs is EACH ONE'S OWN SNAPSHOTTED target, exactly
+    # the architect's own "two callers independently decided 'start lap
+    # N+1' and each snapshotted a DIFFERENT forward-frontier value"
+    # scenario.
+    t_new_lap_position = t_old_lap - datetime.timedelta(hours=1)
+    t_fast_target = t_old_lap + datetime.timedelta(hours=1)
+    t_slow_target = t_old_lap + datetime.timedelta(hours=2)  # a DIFFERENT snapshot than the fast writer's
+    barrier = threading.Barrier(2)
+    errors: list = []
+
+    def _fast_writer():
+        try:
+            barrier.wait(timeout=10)
+            repo.advance_cursor(
+                key, lap=1, last_created_at=t_new_lap_position, last_evidence_ids=["fast-writer"],
+                target=t_fast_target,
+            )
+        except Exception as exc:  # noqa: BLE001 - captured, never swallowed
+            errors.append(exc)
+
+    def _slow_writer():
+        try:
+            barrier.wait(timeout=10)
+            # A small, deliberate delay so this write reliably lands
+            # AFTER the fast writer's — mirrors this file's own
+            # established fast/slow-writer discipline.
+            time.sleep(0.2)
+            repo.advance_cursor(
+                key, lap=1, last_created_at=t_new_lap_position, last_evidence_ids=["slow-writer"],
+                target=t_slow_target,
+            )
+        except Exception as exc:  # noqa: BLE001 - captured, never swallowed
+            errors.append(exc)
+
+    threads = [threading.Thread(target=_fast_writer), threading.Thread(target=_slow_writer)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=15)
+        assert not t.is_alive(), "a thread deadlocked/timed out"
+    assert not errors, f"advance_cursor must never raise under a genuine lap-transition target race: {errors}"
+
+    final = repo.get_cursor(key)
+    assert final is not None
+    assert final.lap == 1, "the new lap must be accepted even though both writers proposed DIFFERENT targets"
+    assert final.target == t_fast_target, (
+        "whichever writer's lap=1 proposal actually lands FIRST (inside the row lock) establishes target "
+        "for that lap generation PERMANENTLY — the fast writer's write is the one that creates the row "
+        "(existing=None at that moment), so its OWN proposed target is what gets persisted"
+    )
+    assert final.target != t_slow_target, (
+        "the slow writer's own, DIFFERENT proposed target must be silently discarded, never applied — it "
+        "finds proposed.lap == existing.lap once it takes the lock (the fast writer already bumped lap to "
+        "1) and falls into the ordinary same-lap merge path, which never changes an already-persisted target"
+    )
+    # Both writers' identical created_at/ids proposal still unions
+    # correctly — the target race above does not disturb that dimension.
+    assert final.last_created_at == t_new_lap_position
+    assert set(final.last_evidence_ids) == {"fast-writer", "slow-writer"}
+
+
+# =======================================================================
+# Test plan item: the architect's own exact 7-step growing-frontier
+# liveness proof — NOT a static corpus (the earlier "wraps correctly"
+# test above, `test_sweep_makes_monotonic_lap_progress_and_wraps_correctly_once_caught_up`,
+# was specifically called out as unable to exercise this: its own
+# forward frontier never moves once established). Here the forward
+# frontier genuinely keeps growing WHILE the sweep is working, across
+# every subsequent call, faster than the sweep's own tiny per-call
+# budget could ever catch up to it if `target` were NOT frozen.
+# =======================================================================
+
+
+def _setup_growing_frontier_scenario(*, reconcile_fn, boundary: datetime.datetime, job_repo, cursor_repo, sweep_budget: int):
+    """Shared setup for the two growing-frontier tests below (steps 1-2
+    of the architect's own 7-step plan): seeds a 200-row already-
+    resolved backlog, resolves the forward cursor over it in one
+    generous call, advances the sweep cursor PARTWAY through its first
+    lap (3 bounded calls at `sweep_budget` rows/call — genuinely
+    partway: neither at the very start nor finished), then BEGINS (does
+    not yet commit — the caller must) a genuine commit-order-inversion
+    orphan, using the exact SAME `_begin_uncommitted_evidence_insert`
+    technique `test_commit_order_inversion_reproduction_and_sweep_fix`
+    already establishes, positioned BEHIND wherever the sweep has
+    already scanned to within this in-progress lap.
+
+    `reconcile_fn` is whichever reconciliation callable the caller
+    drives this scenario with — either the OLD, lap-aware-but-
+    unfrozen-target reconstruction above, or the REAL, fixed
+    `reconcile_missing_classification_jobs` — so the two tests below
+    run a STRUCTURALLY IDENTICAL scenario, differing only in which
+    implementation drives it.
+    """
+    evidence_repo = _evidence_repository()
+    classification_repo = _classification_repository()
+    forward_key = boundary.isoformat()
+    sweep_key = _sweep_cursor_key(boundary)
+
+    backlog = _bulk_insert_resolved_evidence_and_jobs(boundary=boundary, count=200)
+
+    def _call(**overrides):
+        defaults = dict(
+            evidence_repository=evidence_repo,
+            classification_job_repository=job_repo,
+            classification_repository=classification_repo,
+            cursor_repository=cursor_repo,
+            actor_type="SYSTEM",
+            actor_id=ACTOR_ID,
+            activation_boundary=boundary,
+            repair_limit=100_000, page_size=1000, max_rows_scanned=100_000,
+            sweep_repair_limit=sweep_budget, sweep_page_size=sweep_budget, sweep_max_rows_scanned=sweep_budget,
+        )
+        defaults.update(overrides)
+        return reconcile_fn(**defaults)
+
+    # Forward pass resolves the whole 200-row backlog in one
+    # generously-budgeted call (the forward budget above is large
+    # enough on every call this scenario ever makes — the forward pass
+    # is never this test's own bottleneck, only the sweep's tiny budget
+    # is).
+    _call()
+    forward_frontier_before_growth = cursor_repo.get_cursor(forward_key).last_created_at
+    assert forward_frontier_before_growth == backlog[-1][1]
+
+    for _ in range(3):  # bounded — advances the sweep PARTWAY through lap 0, never completing it here
+        _call()
+    partway_cursor = cursor_repo.get_cursor(sweep_key)
+    assert partway_cursor is not None
+    assert partway_cursor.lap == 0
+    partway_position = partway_cursor.last_created_at
+    assert boundary < partway_position < forward_frontier_before_growth, (
+        "the sweep must be genuinely PARTWAY through its first lap — neither at its very start nor finished "
+        "(step 1 of the architect's own 7-step plan)"
+    )
+
+    orphan_created_at = boundary + datetime.timedelta(milliseconds=45, microseconds=500)
+    assert orphan_created_at < partway_position, (
+        "the orphan must sit BEHIND wherever the sweep has already scanned to within this in-progress lap "
+        "(step 2 of the architect's own 7-step plan)"
+    )
+    orphan_id, orphan_conn, orphan_txn = _begin_uncommitted_evidence_insert(
+        created_at=orphan_created_at, received_at=boundary
+    )
+
+    return {
+        "call": _call,
+        "forward_key": forward_key,
+        "sweep_key": sweep_key,
+        "forward_frontier_before_growth": forward_frontier_before_growth,
+        "partway_position": partway_position,
+        "orphan_id": orphan_id,
+        "orphan_conn": orphan_conn,
+        "orphan_txn": orphan_txn,
+        "next_start_index": 200,
+    }
+
+
+_GROWING_FRONTIER_SWEEP_BUDGET = 30
+_GROWING_FRONTIER_GROWTH_PER_CALL = 150
+
+
+def test_old_lap_aware_unfrozen_target_sweep_never_completes_its_lap_against_a_continuously_growing_frontier():
+    """Steps 1-4 of the architect's own 7-step growing-frontier
+    liveness plan, against the OLD, lap-aware-but-unfrozen-target
+    reconstruction: proves the SECOND, independent liveness gap is
+    real — once the forward frontier keeps growing, on EVERY
+    subsequent call, faster than the sweep's own tiny per-call budget
+    (30 rows) could ever catch up to it, the in-progress lap's own
+    completion condition (`last_created_at >= a FRESHLY RE-READ
+    forward_frontier`) can never be satisfied: the lap never completes,
+    a new lap is therefore never started, and the orphan — sitting
+    BEHIND the sweep's own stuck position — is never found, across a
+    bounded (never infinite) number of repeated calls."""
+    boundary = utc_now()
+    job_repo = PostgresEvidenceClassificationJobRepository()
+    cursor_repo = PostgresEvidenceClassificationReconciliationCursorRepository()
+
+    state = _setup_growing_frontier_scenario(
+        reconcile_fn=_old_lap_aware_no_target_reconcile_missing_classification_jobs,
+        boundary=boundary, job_repo=job_repo, cursor_repo=cursor_repo, sweep_budget=_GROWING_FRONTIER_SWEEP_BUDGET,
+    )
+    call = state["call"]
+    orphan_id = state["orphan_id"]
+    sweep_key = state["sweep_key"]
+    forward_key = state["forward_key"]
+    next_start_index = state["next_start_index"]
+
+    try:
+        # --- Step 3 (first iteration): a growth batch arrives, and this
+        # call runs while the orphan is STILL uncommitted/invisible. ---
+        _bulk_insert_resolved_evidence_and_jobs(
+            boundary=boundary, count=_GROWING_FRONTIER_GROWTH_PER_CALL, start_index=next_start_index
+        )
+        next_start_index += _GROWING_FRONTIER_GROWTH_PER_CALL
+        call()
+        assert job_repo.get_by_evidence(orphan_id) is None, "the orphan is still genuinely uncommitted — invisible"
+
+        # Now commit it — a real, late commit, already sorting BEHIND
+        # the sweep's own current (stuck) position.
+        state["orphan_txn"].commit()
+        state["orphan_conn"].close()
+
+        # --- Step 3 (continued) + step 4: every subsequent call ALSO
+        # inserts a fresh growth batch, advancing the forward frontier
+        # far beyond what the sweep's own 30-row budget could ever
+        # cross in one call — bounded, never an infinite loop. ---
+        previous_sweep_position = cursor_repo.get_cursor(sweep_key).last_created_at
+        for _ in range(8):  # bounded
+            _bulk_insert_resolved_evidence_and_jobs(
+                boundary=boundary, count=_GROWING_FRONTIER_GROWTH_PER_CALL, start_index=next_start_index
+            )
+            next_start_index += _GROWING_FRONTIER_GROWTH_PER_CALL
+            call()
+            assert job_repo.get_by_evidence(orphan_id) is None, (
+                "confirmed: the OLD, lap-aware-but-unfrozen-target sweep NEVER finds the orphan while the "
+                "forward frontier keeps growing faster than its own bounded per-call budget — the "
+                "architect-confirmed SECOND, independent liveness gap, reproduced directly"
+            )
+            current_sweep_cursor = cursor_repo.get_cursor(sweep_key)
+            current_forward_frontier = cursor_repo.get_cursor(forward_key).last_created_at
+            assert current_sweep_cursor.lap == 0, (
+                "confirmed: this lap's own completion condition (last_created_at >= a FRESHLY RE-READ "
+                "forward_frontier) can never be satisfied while the frontier keeps growing faster than the "
+                "sweep's own budget — the lap never completes, so a new lap is never started either"
+            )
+            assert current_sweep_cursor.last_created_at >= previous_sweep_position, (
+                "the sweep still makes SOME bounded forward progress each call — it is not frozen in place, "
+                "it simply never catches up to the ever-receding finish line"
+            )
+            assert current_sweep_cursor.last_created_at < current_forward_frontier, (
+                "the sweep's own position must remain STRICTLY BEHIND the ever-growing forward frontier — "
+                "this is precisely why its completion condition is never satisfied"
+            )
+            previous_sweep_position = current_sweep_cursor.last_created_at
+
+        assert job_repo.get_by_evidence(orphan_id) is None
+        assert cursor_repo.get_cursor(sweep_key).lap == 0
+    finally:
+        if not state["orphan_conn"].closed:
+            state["orphan_txn"].rollback()
+            state["orphan_conn"].close()
+
+
+def test_sweep_target_freeze_proves_liveness_against_a_continuously_growing_frontier_and_recovers_the_orphan():
+    """Steps 1-7 of the architect's own 7-step growing-frontier liveness
+    plan, against the REAL, fixed implementation: the IDENTICAL
+    scenario (structurally) the OLD reconstruction above fails —
+    proves the real fix (a) never changes an in-progress lap's own
+    FROZEN `target` no matter how much the forward frontier grows in
+    the meantime, (b) still completes that lap within a small, bounded
+    number of further calls despite the continued growth, (c) starts a
+    new lap whose own freshly-snapshotted `target` is strictly LARGER
+    than the old lap's frozen one (since evidence kept arriving), and
+    (d) that new lap — restarting from `activation_boundary` — recovers
+    the orphan within a further small, bounded number of calls."""
+    boundary = utc_now()
+    job_repo = PostgresEvidenceClassificationJobRepository()
+    cursor_repo = PostgresEvidenceClassificationReconciliationCursorRepository()
+
+    state = _setup_growing_frontier_scenario(
+        reconcile_fn=reconcile_missing_classification_jobs,
+        boundary=boundary, job_repo=job_repo, cursor_repo=cursor_repo, sweep_budget=_GROWING_FRONTIER_SWEEP_BUDGET,
+    )
+    call = state["call"]
+    orphan_id = state["orphan_id"]
+    sweep_key = state["sweep_key"]
+    forward_key = state["forward_key"]
+    next_start_index = state["next_start_index"]
+
+    try:
+        frozen_target_before = cursor_repo.get_cursor(sweep_key).target
+        assert frozen_target_before == state["forward_frontier_before_growth"], (
+            "lap 0's own target was snapshotted at the moment lap 0 started — BEFORE any growth — and must "
+            "equal the forward frontier as of that exact moment"
+        )
+
+        # --- Step 3 (first iteration): a growth batch arrives, and this
+        # call runs while the orphan is STILL uncommitted/invisible. ---
+        _bulk_insert_resolved_evidence_and_jobs(
+            boundary=boundary, count=_GROWING_FRONTIER_GROWTH_PER_CALL, start_index=next_start_index
+        )
+        next_start_index += _GROWING_FRONTIER_GROWTH_PER_CALL
+        call()
+        assert job_repo.get_by_evidence(orphan_id) is None, "the orphan is still genuinely uncommitted — invisible"
+        assert cursor_repo.get_cursor(sweep_key).target == frozen_target_before, (
+            "still CONTINUING lap 0 — the frozen target must not have moved despite this call's own growth"
+        )
+
+        # Now commit it — a real, late commit, already sorting BEHIND
+        # the sweep's own current (stuck) position.
+        state["orphan_txn"].commit()
+        state["orphan_conn"].close()
+
+        # --- Step 3 (continued) + step 5: every subsequent call ALSO
+        # inserts a fresh growth batch — yet lap 0 still completes
+        # within a small, bounded number of further calls, BECAUSE its
+        # own target is frozen and therefore immune to that growth. ---
+        lap_completed = False
+        new_target = None
+        for _ in range(8):  # bounded
+            _bulk_insert_resolved_evidence_and_jobs(
+                boundary=boundary, count=_GROWING_FRONTIER_GROWTH_PER_CALL, start_index=next_start_index
+            )
+            next_start_index += _GROWING_FRONTIER_GROWTH_PER_CALL
+            call()
+            current = cursor_repo.get_cursor(sweep_key)
+            if current.lap == 0:
+                assert current.target == frozen_target_before, (
+                    "the frozen target must NEVER change while CONTINUING lap 0, no matter how much the "
+                    "forward frontier has grown in the meantime — this is the actual fix (step 5)"
+                )
+            else:
+                lap_completed = True
+                new_target = current.target
+                break
+        assert lap_completed, (
+            "lap 0 must complete within a small, bounded number of further calls despite continued forward "
+            "growth — step 5 of the architect's own 7-step plan"
+        )
+        assert current.lap == 1, "step 6: lap must have incremented to a new generation"
+        assert new_target is not None and new_target > frozen_target_before, (
+            "step 6: the NEW lap's own target must be strictly LARGER than lap 0's own frozen target, since "
+            "evidence kept arriving while lap 0 was in progress"
+        )
+        assert new_target == cursor_repo.get_cursor(forward_key).last_created_at, (
+            "the new lap's own target is exactly the forward frontier AS OF the moment it was snapshotted"
+        )
+
+        # --- Step 7: lap 1 (restarting scanning from activation_boundary)
+        # must eventually discover the orphan, within a further bounded
+        # number of calls — no further growth needed here; this phase
+        # isolates pure discovery. ---
+        found = False
+        for _ in range(5):  # bounded
+            call()
+            if job_repo.get_by_evidence(orphan_id) is not None:
+                found = True
+                break
+        assert found, (
+            "step 7: lap 1 (restarting from activation_boundary) must discover the orphan within a bounded "
+            "number of further calls"
+        )
+        recovered_job = job_repo.get_by_evidence(orphan_id)
+        assert recovered_job.status == "PENDING"
+    finally:
+        if not state["orphan_conn"].closed:
+            state["orphan_txn"].rollback()
+            state["orphan_conn"].close()
+
+
+# =======================================================================
+# Re-proving what this round's `target` correction must NOT regress:
+# pre-activation exclusion, bounded per-call repair, and job/evidence_id
+# uniqueness are all already covered by this file's own existing tests
+# above (which were updated to also thread/assert `target`, never
+# removed or weakened) — see, respectively,
+# `test_sweep_never_scans_below_activation_boundary_across_many_laps`,
+# every bounded-budget assertion throughout this file (e.g.
+# `test_sweep_requires_and_completes_within_multiple_calls_at_realistic_scale_with_production_defaults`),
+# and `test_normal_enqueue_plus_forward_plus_sweep_together_produce_exactly_one_job_per_evidence`
+# (the real `evidence_id` unique constraint, unaffected by this round's
+# correction).
+# =======================================================================

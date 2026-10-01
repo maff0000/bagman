@@ -999,6 +999,7 @@ def _scan_and_repair_evidence_missing_classification_jobs(
     page_size: int,
     max_rows_scanned: int,
     lap: int,
+    target: datetime,
 ) -> int:
     """ONE bounded scan-and-repair pass, in REGISTRATION (`created_at
     ASC, evidence_id ASC`) order, over `[scan_created_at_from,
@@ -1031,6 +1032,21 @@ def _scan_and_repair_evidence_missing_classification_jobs(
     a lap) or that value plus one (starting a new one) — see
     `reconcile_missing_classification_jobs`'s own docstring for the
     full reasoning.
+
+    `target` is the IMMUTABLE per-lap upper bound THIS call proposes for
+    `cursor_key` (see `services.evidence.classification_reconciliation_cursor`'s
+    own "target" docstring section) — likewise never computed here,
+    only threaded through to `advance_cursor`, which itself enforces
+    (never merely trusts the caller on) the invariant that an
+    equal-`lap` proposal can never change an already-persisted `target`.
+    The forward pass always passes its existing cursor's own `target`
+    back unchanged (a permanent non-event, mirroring `lap`); the sweep
+    pass passes either its existing cursor's own `target` (continuing a
+    lap — this is the actual fix: NEVER a freshly re-read forward
+    frontier) or a freshly-snapshotted forward frontier (starting a new
+    lap, the one moment a new `target` is ever introduced) — see
+    `reconcile_missing_classification_jobs`'s own docstring for the full
+    reasoning.
 
     Returns the number of jobs submitted by THIS pass alone (never
     includes the other pass's own count — the caller sums both).
@@ -1105,7 +1121,7 @@ def _scan_and_repair_evidence_missing_classification_jobs(
 
     if any_inspected:
         cursor_repository.advance_cursor(
-            cursor_key, lap=lap, last_created_at=running_created_at, last_evidence_ids=running_ids,
+            cursor_key, lap=lap, last_created_at=running_created_at, last_evidence_ids=running_ids, target=target,
         )
 
     return submitted
@@ -1311,25 +1327,36 @@ def reconcile_missing_classification_jobs(
        `forward_frontier`. If the forward cursor has never advanced at
        all yet (`forward_frontier is None` — nothing has ever been
        forward-scanned), the sweep has nothing to safety-net yet and
-       does zero work this call.
+       does zero work this call. This read is used ONLY for this
+       "nothing to sweep yet" gate and, when a lap genuinely completes
+       this call (see step 2), to snapshot the brand-new lap's own
+       FROZEN `target` — see this function's own corrected "freezing
+       each lap's own upper bound" section below for why it is NEVER
+       used as the scan's own upper bound directly.
     2. Derives `effective_sweep_start`, purely at read time, from the
        sweep cursor's own persisted position: if no sweep cursor exists
-       yet, OR the sweep has already fully caught up to
-       `forward_frontier` (`sweep_cursor.last_created_at >=
-       forward_frontier` — it completed a full lap), START A NEW LAP at
-       `activation_boundary`; otherwise CONTINUE the current lap from
-       `sweep_cursor.last_created_at`. This is a derived-at-read-time
-       decision only — no separate "reset" WRITE operation exists; the
-       persisted sweep position is simply reinterpreted as "start over"
-       once it has caught up.
-    3. Scans `[effective_sweep_start, forward_frontier]` — the SAME
-       `_scan_and_repair_evidence_missing_classification_jobs` helper
-       the forward pass uses, with its own, smaller `sweep_repair_limit`
-       /`sweep_page_size`/`sweep_max_rows_scanned` budget (the sweep is
-       a background safety net, not the primary discovery path) — the
-       upper bound (`created_at_to=forward_frontier`) means the sweep
-       NEVER races ahead into territory the forward pass has not
-       reached yet (redundant: the forward pass will get there on its
+       yet, OR the sweep has already fully caught up to its OWN,
+       PERSISTED, FROZEN `target` (`sweep_cursor.last_created_at >=
+       sweep_cursor.target` — it completed a full lap), START A NEW LAP
+       at `activation_boundary`, snapshotting the CURRENT
+       `forward_frontier` as that new lap's own `target`; otherwise
+       CONTINUE the current lap from `sweep_cursor.last_created_at`,
+       reusing `sweep_cursor.target` UNCHANGED (never recomputed). This
+       is a derived-at-read-time decision only — no separate "reset"
+       WRITE operation exists; the persisted sweep position is simply
+       reinterpreted as "start over" once it has caught up to its own
+       frozen target.
+    3. Scans `[effective_sweep_start, target]` (`target` being whichever
+       of the two values step 2 derived: the existing lap's own frozen
+       target, or the brand-new lap's freshly-snapshotted one) — the
+       SAME `_scan_and_repair_evidence_missing_classification_jobs`
+       helper the forward pass uses, with its own, smaller
+       `sweep_repair_limit`/`sweep_page_size`/`sweep_max_rows_scanned`
+       budget (the sweep is a background safety net, not the primary
+       discovery path) — the upper bound (`created_at_to=target`) means
+       the sweep NEVER races ahead into territory the forward pass had
+       not reached as of the moment this lap's own target was
+       snapshotted (redundant: the forward pass will get there on its
        own).
 
     `sweep_repair_limit=50`/`sweep_page_size=200`/
@@ -1415,6 +1442,65 @@ def reconcile_missing_classification_jobs(
     up to where the previous lap ended before it is allowed to persist
     any progress at all.
 
+    Freezing each lap's own upper bound at `target` — a SECOND,
+    independent liveness gap `lap` alone does NOT close (evidence/
+    classification-activation-preflight WO, this round's own final
+    correction; the previous framing below was FALSE and has been
+    retracted)
+    ------------------------------------------------------------------
+    An earlier version of this function's own docstring (and this
+    module's own inline comment at the sweep pass's forward-frontier
+    re-read, below) claimed that re-reading `forward_frontier` FRESH on
+    every single call, and using that freshly-re-read value as the
+    scan's own upper bound (`created_at_to`) for whichever lap is
+    currently in progress, was the CORRECT, intended design — framed
+    as "the sweep's own upper bound must reflect the MOST current
+    forward position, never a stale pre-call snapshot". That framing
+    was itself the bug, not a feature, and is retracted here.
+
+    The actual defect: if new evidence keeps arriving and advancing the
+    forward cursor faster than the sweep's own bounded per-call budget
+    can make progress, `forward_frontier` keeps growing out from under
+    the CURRENT lap. The current lap's own completion condition used to
+    be `existing_sweep_cursor.last_created_at >= forward_frontier` —
+    read fresh every call — so if forward growth keeps outpacing the
+    sweep, that condition can NEVER be satisfied: the lap never
+    completes, a new lap is therefore never started (the `lap`
+    mechanism above only ever triggers at the MOMENT a lap is observed
+    to have completed), and since a lap only ever scans FORWARD from
+    wherever it currently sits (same forward-only, set-membership-
+    tie-break discipline as the main forward cursor — it cannot go back
+    WITHIN itself to find something it has already scanned past), a row
+    that commits late — after the sweep has already passed its
+    `created_at` position within this exact, now-permanently-stuck lap
+    — remains undiscovered indefinitely, for as long as forward growth
+    keeps outpacing the sweep. This is a genuinely different failure
+    mode from the `lap`-counter stall above (that one strikes on a
+    lap's own FIRST, partial write; this one strikes an
+    ALREADY-IN-PROGRESS lap that can never reach its own, constantly-
+    moving finish line) — see
+    `tests/persistence/test_evidence_classification_job_reconciliation_sweep.py`'s
+    own growing-frontier reproduction test for the direct proof.
+
+    The fix: `target` (see `services.evidence
+    .classification_reconciliation_cursor`'s own docstring, "target"
+    section, for the full mechanism) freezes each lap's own upper bound
+    at the EXACT MOMENT that lap is proposed, never recomputing it on
+    any later, continuing call. The lap-completion decision above is
+    therefore corrected to compare the persisted sweep cursor's own
+    `last_created_at` against its OWN PERSISTED `target` —
+    `existing_sweep_cursor.last_created_at >= existing_sweep_cursor
+    .target` — never against a freshly re-read `forward_frontier`
+    directly. `forward_frontier` is read only to decide whether the
+    sweep has anything to do at all, and, exactly at the moment a new
+    lap is started, to snapshot ITS one-time `target`. A lap's own
+    scan upper bound (`created_at_to`, passed to
+    :func:`_scan_and_repair_evidence_missing_classification_jobs`) is
+    therefore always the FROZEN, persisted `target` for an ongoing,
+    continuing lap — never a freshly re-read forward frontier — closing
+    this liveness gap independently of, and in addition to, the `lap`
+    counter's own fix for the permanent-stall class of bug above.
+
     Returns the SUM of jobs submitted by both passes this call (the
     forward pass's own count plus the sweep pass's own count) —
     unchanged external contract: still a single `int`, "number of jobs
@@ -1432,8 +1518,15 @@ def reconcile_missing_classification_jobs(
     )
     # The forward cursor's own `lap` dimension is a permanent non-event
     # — always read-and-passed-through unchanged, never invented or
-    # incremented here (see docstring's own "lap" section above).
+    # incremented here (see docstring's own "lap" section above). Its
+    # `target` dimension is likewise a permanent non-event (see
+    # docstring's own "target" section) — the forward cursor's very
+    # first call has no meaningful value to propose, so it proposes
+    # `activation_boundary` itself (never used for anything after that:
+    # every later call just reads this same persisted value back,
+    # exactly like `lap`).
     forward_lap = existing_forward_cursor.lap if existing_forward_cursor is not None else 0
+    forward_target = existing_forward_cursor.target if existing_forward_cursor is not None else activation_boundary
 
     forward_submitted = _scan_and_repair_evidence_missing_classification_jobs(
         evidence_repository=evidence_repository,
@@ -1451,32 +1544,46 @@ def reconcile_missing_classification_jobs(
         page_size=page_size,
         max_rows_scanned=max_rows_scanned,
         lap=forward_lap,
+        target=forward_target,
     )
 
     # --- The "safety sweep" backstop pass (see docstring above) ---
     sweep_submitted = 0
     # Re-read fresh: the forward pass above may have JUST advanced this
-    # same call, so the sweep's own upper bound must reflect the MOST
-    # current forward position, never a stale pre-call snapshot.
+    # same call. This value is used ONLY to decide whether the sweep
+    # has anything to safety-net yet at all (nothing has ever been
+    # forward-scanned), and, if a lap completes THIS call (below), to
+    # snapshot the brand-new lap's own FROZEN `target` — it is NEVER
+    # used directly as a continuing lap's own scan upper bound (see
+    # docstring's own corrected "Freezing each lap's own upper bound"
+    # section — using the freshest frontier as the bound on every call
+    # was exactly the bug this round's correction closes, not a
+    # feature).
     forward_frontier_cursor = cursor_repository.get_cursor(forward_cursor_key)
     forward_frontier = forward_frontier_cursor.last_created_at if forward_frontier_cursor is not None else None
 
     if forward_frontier is not None:
         sweep_cursor_key = f"{forward_cursor_key}::sweep"
         existing_sweep_cursor = cursor_repository.get_cursor(sweep_cursor_key)
-        if existing_sweep_cursor is None or existing_sweep_cursor.last_created_at >= forward_frontier:
-            # No sweep cursor yet, or it already completed a full lap
-            # (caught up to forward_frontier) — start a NEW lap. Purely
-            # derived at read time; no "reset" write is ever performed
-            # (see docstring). A NEW lap always proposes a STRICTLY
-            # HIGHER `lap` than whatever is currently persisted (see
-            # docstring's own "lap" section) — this is what lets this
-            # call's write land even though its own bounded scan cannot
-            # yet reach the OLD lap's much-further-along position.
+        if existing_sweep_cursor is None or existing_sweep_cursor.last_created_at >= existing_sweep_cursor.target:
+            # No sweep cursor yet, or the CURRENT lap has genuinely
+            # finished (caught up to ITS OWN frozen target, never a
+            # freshly re-read forward_frontier) — start a NEW lap.
+            # Purely derived at read time; no "reset" write is ever
+            # performed (see docstring). A NEW lap always proposes a
+            # STRICTLY HIGHER `lap` than whatever is currently persisted
+            # (see docstring's own "lap" section) — this is what lets
+            # this call's write land even though its own bounded scan
+            # cannot yet reach the OLD lap's much-further-along
+            # position. The NEW lap's own `target` is snapshotted HERE,
+            # exactly once, from the CURRENT forward_frontier — see
+            # docstring's own "target" section for why this must happen
+            # only at this exact moment, never on every continuing call.
             sweep_scan_from = activation_boundary
             sweep_already_inspected: set[str] = set()
             sweep_has_existing_cursor = False
             sweep_lap = (existing_sweep_cursor.lap + 1) if existing_sweep_cursor is not None else 0
+            sweep_target = forward_frontier
         else:
             sweep_scan_from = existing_sweep_cursor.last_created_at
             sweep_already_inspected = set(existing_sweep_cursor.last_evidence_ids)
@@ -1484,8 +1591,16 @@ def reconcile_missing_classification_jobs(
             # Continuing an in-progress lap — propose the SAME `lap`
             # value unchanged (falls into _resolve_cursor_advance's own
             # "proposed.lap == existing.lap" branch, the ordinary,
-            # already-safe created_at/ids merge).
+            # already-safe created_at/ids merge), and reuse the ALREADY
+            # PERSISTED `target` verbatim — never recomputed from the
+            # current forward_frontier (the actual fix this round; see
+            # docstring's own "target" section). `advance_cursor` also
+            # enforces this itself as an invariant regardless of what is
+            # proposed here, but this call proposes the correct,
+            # already-persisted value anyway — never a stale/incorrect
+            # one relying solely on that enforcement.
             sweep_lap = existing_sweep_cursor.lap
+            sweep_target = existing_sweep_cursor.target
 
         sweep_submitted = _scan_and_repair_evidence_missing_classification_jobs(
             evidence_repository=evidence_repository,
@@ -1496,13 +1611,14 @@ def reconcile_missing_classification_jobs(
             actor_id=actor_id,
             cursor_key=sweep_cursor_key,
             scan_created_at_from=sweep_scan_from,
-            created_at_to=forward_frontier,
+            created_at_to=sweep_target,
             already_inspected_ids_at_boundary=sweep_already_inspected,
             has_existing_cursor=sweep_has_existing_cursor,
             repair_limit=sweep_repair_limit,
             page_size=sweep_page_size,
             max_rows_scanned=sweep_max_rows_scanned,
             lap=sweep_lap,
+            target=sweep_target,
         )
 
     return forward_submitted + sweep_submitted

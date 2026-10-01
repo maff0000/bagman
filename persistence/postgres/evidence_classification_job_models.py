@@ -116,5 +116,16 @@ class EvidenceClassificationReconciliationCursorRow(Base):
     #: monotonicity is only ever guaranteed within one process, never
     #: across two).
     last_evidence_ids: Mapped[list[str]] = mapped_column(JSONB, nullable=False)
+    #: The IMMUTABLE upper bound (`created_at` value) for the CURRENT
+    #: lap generation (evidence/classification-activation-preflight WO,
+    #: this round's own final lap-boundary-liveness correction) — see
+    #: `services.evidence.classification_reconciliation_cursor`'s own
+    #: docstring, "target" section. Meaningful only for the sweep
+    #: cursor; the forward cursor carries this column for schema
+    #: uniformity only (mirrors how it already carries `lap` as a
+    #: permanent non-event), never meaningfully using it. Plain
+    #: non-nullable `DateTime(timezone=True)`, identical column shape to
+    #: `last_created_at` above.
+    target: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)

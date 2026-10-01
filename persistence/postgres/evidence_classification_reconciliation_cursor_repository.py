@@ -60,6 +60,16 @@ independently-confirmed permanent-stall bug in the sweep cursor's own
 lap-restart mechanism). `row.lap` is updated alongside `row.last_created_at`/
 `row.last_evidence_ids` in every branch below that actually writes.
 
+CORRECTED YET AGAIN this round (evidence/classification-activation-
+preflight WO — final lap-boundary-liveness correction): `row.target`
+is now updated alongside the fields above in every branch that
+actually writes, per `_resolve_cursor_advance`'s own "target" rule —
+see `services.evidence.classification_reconciliation_cursor`'s own
+module docstring, "target" section, for the full reasoning (a lap's
+own upper bound is frozen at the moment the lap starts, never
+recomputed from a freshly-read forward frontier on every continuing
+call).
+
 `last_evidence_ids` (post-merge audit correction — see
 `services.evidence.classification_reconciliation_cursor`'s own
 docstring, "Why the tie-break is SET membership" section) is stored as
@@ -100,6 +110,7 @@ def _row_to_cursor(row: EvidenceClassificationReconciliationCursorRow) -> Eviden
         lap=row.lap,
         last_created_at=row.last_created_at,
         last_evidence_ids=tuple(sorted(row.last_evidence_ids)),
+        target=row.target,
         created_at=row.created_at,
         updated_at=row.updated_at,
     )
@@ -127,7 +138,13 @@ class PostgresEvidenceClassificationReconciliationCursorRepository(
             ) from exc
 
     def advance_cursor(
-        self, cursor_key: str, *, lap: int, last_created_at: datetime, last_evidence_ids: Collection[str]
+        self,
+        cursor_key: str,
+        *,
+        lap: int,
+        last_created_at: datetime,
+        last_evidence_ids: Collection[str],
+        target: datetime,
     ) -> EvidenceClassificationReconciliationCursor:
         try:
             with session_scope(self._engine) as session:
@@ -138,14 +155,15 @@ class PostgresEvidenceClassificationReconciliationCursorRepository(
                 # Merge-on-write, decided INSIDE this SELECT ... FOR
                 # UPDATE lock — see services.evidence
                 # .classification_reconciliation_cursor's own "Why
-                # advance_cursor merges instead of overwrites" AND "lap"
-                # docstring sections, and _resolve_cursor_advance's own
-                # docstring.
-                merged_lap, merged_created_at, merged_ids, changed = _resolve_cursor_advance(
+                # advance_cursor merges instead of overwrites", "lap",
+                # AND "target" docstring sections, and
+                # _resolve_cursor_advance's own docstring.
+                merged_lap, merged_created_at, merged_ids, merged_target, changed = _resolve_cursor_advance(
                     existing=existing,
                     proposed_lap=lap,
                     proposed_last_created_at=last_created_at,
                     proposed_last_evidence_ids=last_evidence_ids,
+                    proposed_target=target,
                 )
 
                 if row is not None:
@@ -158,6 +176,7 @@ class PostgresEvidenceClassificationReconciliationCursorRepository(
                     row.lap = merged_lap
                     row.last_created_at = merged_created_at
                     row.last_evidence_ids = list(merged_ids)
+                    row.target = merged_target
                     row.updated_at = utc_now()
                     session.flush()
                     return _row_to_cursor(row)
@@ -171,6 +190,7 @@ class PostgresEvidenceClassificationReconciliationCursorRepository(
                     lap=merged_lap,
                     last_created_at=merged_created_at,
                     last_evidence_ids=list(merged_ids),
+                    target=merged_target,
                     created_at=now,
                     updated_at=now,
                 )
@@ -195,17 +215,19 @@ class PostgresEvidenceClassificationReconciliationCursorRepository(
                             f"cursor_key {cursor_key!r} but no existing row could be re-read"
                         ) from exc
                     existing = _row_to_cursor(row)
-                    merged_lap, merged_created_at, merged_ids, changed = _resolve_cursor_advance(
+                    merged_lap, merged_created_at, merged_ids, merged_target, changed = _resolve_cursor_advance(
                         existing=existing,
                         proposed_lap=lap,
                         proposed_last_created_at=last_created_at,
                         proposed_last_evidence_ids=last_evidence_ids,
+                        proposed_target=target,
                     )
                     if not changed:
                         return existing
                     row.lap = merged_lap
                     row.last_created_at = merged_created_at
                     row.last_evidence_ids = list(merged_ids)
+                    row.target = merged_target
                     row.updated_at = utc_now()
                     session.flush()
                     return _row_to_cursor(row)

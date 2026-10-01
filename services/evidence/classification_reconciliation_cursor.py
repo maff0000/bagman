@@ -242,6 +242,91 @@ comparison — exactly the same "compare against whatever is CURRENTLY
 persisted at write time, inside the same lock" discipline the
 ``created_at`` dimension already relies on, just applied one dimension
 higher first.
+
+``target`` — freezing each lap's own upper bound at the moment it
+starts (evidence/classification-activation-preflight WO, this round's
+own final lap-boundary-liveness correction)
+------------------------------------------------------------------------
+``lap`` (above) fixes the permanent-STALL class of bug — a new lap's
+own first, partial write can now always land. It does NOT, by itself,
+fix a second, independent liveness gap: ``services.evidence
+.classification_job.reconcile_missing_classification_jobs``'s sweep
+section used to decide "has the current lap finished" by comparing the
+persisted sweep cursor's own ``last_created_at`` against a FRESHLY
+RE-READ forward-cursor frontier on every single call, and used that
+same freshly-re-read frontier as the scan's own upper bound
+(``created_at_to``) for the lap in progress. If new evidence keeps
+arriving and advancing the forward cursor faster than the sweep's own
+bounded per-call budget can make progress, that freshly-read frontier
+keeps growing out from under the lap — the lap's own completion
+condition (``last_created_at >= forward_frontier``) can then never be
+satisfied, the lap never completes, a new lap never starts, and a row
+that commits late, behind the sweep's current in-lap scan position,
+can remain undiscovered indefinitely, as long as forward growth keeps
+outpacing the sweep. An earlier version of both this module's and that
+function's own docstrings framed "always use the freshest frontier" as
+the CORRECT, intended design ("the sweep's own upper bound must
+reflect the MOST current forward position, never a stale pre-call
+snapshot") — that framing was itself the bug, not a feature, and is
+retracted here.
+
+The fix: ``EvidenceClassificationReconciliationCursor`` carries a
+third persisted field, ``target`` — the IMMUTABLE upper bound
+(``created_at`` value) for the CURRENT lap generation, established
+EXACTLY ONCE, at the moment a NEW lap is proposed (exactly when the
+caller proposes ``lap = existing.lap + 1``): the caller snapshots
+whatever the forward frontier currently is AT THAT MOMENT and proposes
+it as ``target`` alongside the new ``lap`` value. Every subsequent
+call that CONTINUES that same lap (proposes the SAME ``lap`` back)
+must reuse whatever ``target`` is ALREADY persisted for that lap —
+never recompute or re-propose a fresh one from whatever the forward
+frontier has grown to by then. The lap's own completion decision
+becomes purely internal to the cursor itself:
+``existing_sweep_cursor.last_created_at >=
+existing_sweep_cursor.target`` — never compared against a freshly
+re-read forward frontier at all. Only once that is true (the lap is
+genuinely finished) does a NEW lap get started, snapshotting the
+forward frontier ONE more time for the NEW lap's own frozen target.
+
+Meaningful for the sweep cursor only, exactly like ``lap`` is
+meaningful for the sweep cursor only: the forward cursor also carries
+this field (schema uniformity — one shared dataclass/table for both
+cursor keys, same as ``lap``), but never meaningfully uses it; it
+always proposes its own currently-persisted ``target`` value back
+unchanged, a permanent non-event for that cursor, mirroring exactly
+how the forward cursor already treats ``lap``.
+
+:func:`_resolve_cursor_advance`'s rule for ``target``, precisely —
+enforced by the merge function ITSELF, as an invariant, never merely
+relied upon from callers behaving correctly (the "concurrent-writer
+semantics" requirement: two callers can each independently decide
+"start lap N+1" and each snapshot a DIFFERENT forward-frontier value
+at slightly different moments; only whichever write actually lands
+FIRST, inside the row lock, may establish ``target`` for that lap
+generation):
+
+* No existing row -> insert the proposal's ``target`` as given
+  (nothing to merge against — both the forward cursor's and a sweep
+  cursor's very first-ever call propose whatever single value they
+  have; see above for the forward cursor's own non-meaningful initial
+  value).
+* Proposed ``lap`` STRICTLY GREATER than existing ``lap`` -> ``target``
+  is accepted WHOLESALE, as part of the exact same "accept the
+  proposal's `(lap, last_created_at, last_evidence_ids)` wholesale"
+  bundle the "lap" section above already documents — this is the ONE
+  path by which a new ``target`` value may ever be introduced.
+* Proposed ``lap`` EQUAL to existing ``lap`` -> ``target`` is NEVER
+  changed, REGARDLESS of what the caller proposes for it — always keep
+  ``existing.target``. This is what makes the race above safe:
+  whichever of the two "start lap N+1" writers lands first establishes
+  ``target`` permanently for that generation; the second writer's own
+  write then finds ``proposed.lap == existing.lap`` (the first already
+  bumped it) and falls into this ordinary same-lap path, where its
+  own, different proposed ``target`` is simply discarded in favor of
+  the already-persisted one.
+* Proposed ``lap`` STRICTLY LESS than existing ``lap`` -> no-op exactly
+  as today, trivially leaving ``target`` untouched (nothing changes on
+  a no-op).
 """
 from __future__ import annotations
 
@@ -281,6 +366,16 @@ class EvidenceClassificationReconciliationCursor:
     #: UUIDv7 ordering is not guaranteed). A sorted tuple for a
     #: deterministic, hashable value on this frozen dataclass.
     last_evidence_ids: tuple[str, ...]
+    #: The IMMUTABLE upper bound (``created_at`` value) for the CURRENT
+    #: lap generation — see module docstring's own "target" section.
+    #: Established exactly once per lap, at the moment that lap is
+    #: proposed (a strictly-greater `lap` proposal); never changed by
+    #: an equal-lap proposal, regardless of what that proposal supplies
+    #: for it. Meaningful only for the sweep cursor — the forward
+    #: cursor carries this field for schema uniformity only (mirrors
+    #: how it already carries ``lap`` as a permanent non-event) and
+    #: never meaningfully uses it.
+    target: datetime
     created_at: datetime
     updated_at: datetime
 
@@ -291,7 +386,8 @@ def _resolve_cursor_advance(
     proposed_lap: int,
     proposed_last_created_at: datetime,
     proposed_last_evidence_ids: Collection[str],
-) -> tuple[int, datetime, tuple[str, ...], bool]:
+    proposed_target: datetime,
+) -> tuple[int, datetime, tuple[str, ...], datetime, bool]:
     """The one, pure, shared merge-on-write decision every concrete
     `advance_cursor` implementation applies from inside its own row
     lock (see this module's own "Why advance_cursor merges instead of
@@ -305,11 +401,24 @@ def _resolve_cursor_advance(
     be treated as "behind" an older, already-completed lap's final
     position).
 
-    Returns `(lap, last_created_at, last_evidence_ids, changed)`: the
-    cursor fields that should end up persisted, and whether that is
-    actually DIFFERENT from `existing` (`existing=None` is always
-    `changed=True` — there is nothing to compare against yet).
-    `changed=False` tells the caller to skip a genuinely needless
+    `target` (module docstring's own "target" section) is resolved by
+    the SAME `lap` comparison, as an invariant this function itself
+    enforces rather than merely relying on callers to propose it
+    correctly: a strictly GREATER proposed `lap` introduces the
+    proposal's own `target` (part of the same "accept wholesale"
+    bundle); an EQUAL proposed `lap` NEVER changes `target` — always
+    keeps `existing.target`, regardless of what is proposed — this is
+    what makes two concurrent "start a new lap" proposals, each
+    snapshotting a different target, resolve safely: whichever lands
+    first establishes `target` for that generation permanently, and
+    the second, now finding `proposed.lap == existing.lap`, falls into
+    this same "never changed" rule.
+
+    Returns `(lap, last_created_at, last_evidence_ids, target,
+    changed)`: the cursor fields that should end up persisted, and
+    whether that is actually DIFFERENT from `existing` (`existing=None`
+    is always `changed=True` — there is nothing to compare against
+    yet). `changed=False` tells the caller to skip a genuinely needless
     write and return `existing` completely unchanged (not even
     `updated_at` bumped) — the "a slower/stale-started caller's
     proposal never regresses a more-advanced persisted cursor" case,
@@ -317,32 +426,46 @@ def _resolve_cursor_advance(
     """
     proposed_ids = tuple(sorted(set(proposed_last_evidence_ids)))
     if existing is None:
-        return proposed_lap, proposed_last_created_at, proposed_ids, True
+        return proposed_lap, proposed_last_created_at, proposed_ids, proposed_target, True
     if proposed_lap > existing.lap:
         # A genuinely NEWER lap always supersedes the old lap's
         # position entirely — accept wholesale, regardless of where
         # proposed_last_created_at sits relative to existing's (see
         # module docstring's own "lap" section — this is the actual
-        # fix for the permanent-stall class of bug).
-        return proposed_lap, proposed_last_created_at, proposed_ids, True
+        # fix for the permanent-stall class of bug). `target` is part
+        # of this same wholesale acceptance — see "target" section:
+        # this is the ONE path by which a new target value may ever be
+        # introduced.
+        return proposed_lap, proposed_last_created_at, proposed_ids, proposed_target, True
     if proposed_lap < existing.lap:
         # A stale caller proposing an older lap generation than what is
         # already persisted — never regress the lap counter either;
-        # mirrors the existing created_at "less" case exactly.
-        return existing.lap, existing.last_created_at, existing.last_evidence_ids, False
+        # mirrors the existing created_at "less" case exactly. `target`
+        # is trivially untouched (nothing changes on a no-op).
+        return existing.lap, existing.last_created_at, existing.last_evidence_ids, existing.target, False
     # proposed_lap == existing.lap: fall through to EXACTLY the
     # pre-existing created_at-based comparison — unchanged, still safe
     # under concurrent same-lap writers (see module docstring's own
     # "Why advance_cursor merges instead of overwrites" section).
+    # `target` is NEVER changed on this branch, regardless of what is
+    # proposed for it — see module docstring's own "target" section;
+    # this is the concurrency-safety invariant for a lap's own frozen
+    # upper bound.
     if proposed_last_created_at > existing.last_created_at:
-        return existing.lap, proposed_last_created_at, proposed_ids, True
+        return existing.lap, proposed_last_created_at, proposed_ids, existing.target, True
     if proposed_last_created_at == existing.last_created_at:
         merged_ids = tuple(sorted(set(existing.last_evidence_ids) | set(proposed_last_evidence_ids)))
-        return existing.lap, existing.last_created_at, merged_ids, merged_ids != existing.last_evidence_ids
+        return (
+            existing.lap,
+            existing.last_created_at,
+            merged_ids,
+            existing.target,
+            merged_ids != existing.last_evidence_ids,
+        )
     # proposed_last_created_at < existing.last_created_at: another,
     # faster-or-earlier-starting caller already advanced this cursor_key
     # further within the SAME lap — never regress; no-op.
-    return existing.lap, existing.last_created_at, existing.last_evidence_ids, False
+    return existing.lap, existing.last_created_at, existing.last_evidence_ids, existing.target, False
 
 
 class EvidenceClassificationReconciliationCursorRepository(abc.ABC):
@@ -355,7 +478,13 @@ class EvidenceClassificationReconciliationCursorRepository(abc.ABC):
 
     @abc.abstractmethod
     def advance_cursor(
-        self, cursor_key: str, *, lap: int, last_created_at: datetime, last_evidence_ids: Collection[str]
+        self,
+        cursor_key: str,
+        *,
+        lap: int,
+        last_created_at: datetime,
+        last_evidence_ids: Collection[str],
+        target: datetime,
     ) -> EvidenceClassificationReconciliationCursor:
         """MERGE-ON-WRITE upsert (corrected this round — see module
         docstring's own "Why advance_cursor merges instead of
@@ -368,7 +497,7 @@ class EvidenceClassificationReconciliationCursorRepository(abc.ABC):
         be stale) via :func:`_resolve_cursor_advance`, and:
 
         * proposed `lap` > persisted `lap` -> accepts the proposal's
-          `(lap, last_created_at, last_evidence_ids)` WHOLESALE,
+          `(lap, last_created_at, last_evidence_ids, target)` WHOLESALE,
           unconditionally (a genuinely newer lap always supersedes an
           older lap's position — see module docstring's own "lap"
           section; this is what closes the permanent-stall class of
@@ -383,7 +512,10 @@ class EvidenceClassificationReconciliationCursorRepository(abc.ABC):
           either side); proposed < persisted -> NO-OP, returns the
           EXISTING row completely unchanged (not even `updated_at`
           bumped) — never regresses a more-advanced persisted
-          watermark.
+          watermark. On this `lap == persisted lap` branch, `target` is
+          NEVER changed, regardless of what the caller proposes for it
+          — see module docstring's own "target" section for the full
+          concurrency-safety reasoning.
 
         `lap` is meaningful for BOTH the forward and sweep cursor keys
         (see module docstring's own "lap" section): a caller advancing
@@ -391,7 +523,17 @@ class EvidenceClassificationReconciliationCursorRepository(abc.ABC):
         `lap` value back, unchanged (never invents or increments one);
         only the sweep cursor's own "start a new lap" decision ever
         proposes a strictly higher value than what is currently
-        persisted.
+        persisted. `target` (module docstring's own "target" section)
+        follows the identical rule: a caller advancing the forward
+        cursor always proposes its own current persisted `target` value
+        back unchanged (a permanent non-event, mirroring `lap`); the
+        sweep cursor snapshots a fresh `target` ONLY at the exact
+        moment it proposes a strictly higher `lap` (starting a new lap),
+        and otherwise proposes its own current persisted `target` value
+        back unchanged too (continuing the SAME lap) — though this
+        repository enforces the "never changed on an equal-lap
+        proposal" half of that rule itself, regardless of what the
+        caller proposes.
 
         The caller's own `last_evidence_ids` must be the FULL set of
         ids IT inspected at ITS OWN proposed `last_created_at` (the
@@ -423,15 +565,22 @@ class InMemoryEvidenceClassificationReconciliationCursorRepository(
             return self._by_key.get(cursor_key)
 
     def advance_cursor(
-        self, cursor_key: str, *, lap: int, last_created_at: datetime, last_evidence_ids: Collection[str]
+        self,
+        cursor_key: str,
+        *,
+        lap: int,
+        last_created_at: datetime,
+        last_evidence_ids: Collection[str],
+        target: datetime,
     ) -> EvidenceClassificationReconciliationCursor:
         with self._lock:
             existing = self._by_key.get(cursor_key)
-            merged_lap, merged_created_at, merged_ids, changed = _resolve_cursor_advance(
+            merged_lap, merged_created_at, merged_ids, merged_target, changed = _resolve_cursor_advance(
                 existing=existing,
                 proposed_lap=lap,
                 proposed_last_created_at=last_created_at,
                 proposed_last_evidence_ids=last_evidence_ids,
+                proposed_target=target,
             )
             if not changed:
                 # existing is guaranteed non-None here: changed is only
@@ -445,6 +594,7 @@ class InMemoryEvidenceClassificationReconciliationCursorRepository(
                 lap=merged_lap,
                 last_created_at=merged_created_at,
                 last_evidence_ids=merged_ids,
+                target=merged_target,
                 created_at=existing.created_at if existing is not None else now,
                 updated_at=now,
             )

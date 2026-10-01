@@ -53,6 +53,16 @@ def upgrade() -> None:
         # services.evidence.classification_reconciliation_cursor's own
         # docstring).
         sa.Column('last_evidence_ids', postgresql.JSONB(astext_type=sa.Text()), nullable=False),
+        # The IMMUTABLE upper bound (`created_at` value) for the
+        # CURRENT lap generation — added IN PLACE AGAIN (widening this
+        # same, never-yet-merged/never-yet-deployed table definition a
+        # second time, not a new chained migration; re-verified absent
+        # from origin/main immediately before this widening — see
+        # services.evidence.classification_reconciliation_cursor's own
+        # docstring, "target" section, evidence/classification-
+        # activation-preflight WO, this round's own final lap-boundary-
+        # liveness correction).
+        sa.Column('target', sa.DateTime(timezone=True), nullable=False),
         sa.Column('created_at', sa.DateTime(timezone=True), nullable=False),
         sa.Column('updated_at', sa.DateTime(timezone=True), nullable=False),
         sa.PrimaryKeyConstraint('cursor_key'),
