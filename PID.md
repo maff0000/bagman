@@ -2714,6 +2714,8 @@ This boundary must remain stable for all future recurring worker executions. It 
 
 ## 112.C Production state
 
+The facts below are the **reported** results of the 2026-10-02 rollout, recorded provisionally pending the governance-recovery independent audit required by §112.F.
+
 Canonical code deployed:
 
 ```text
@@ -2742,6 +2744,8 @@ The obsolete reconciliation-cursor migration, `143b86b2ab44`, was never deployed
 
 ## 112.D Canary result
 
+The facts below are, likewise, the **reported** results of the 2026-10-02 canary, recorded provisionally pending the governance-recovery independent audit required by §112.F — not yet independently re-verified under §111.
+
 Recorded factually, not interpretively:
 
 - `T_ACT`: `2026-10-02T09:58:51Z`.
@@ -2762,13 +2766,15 @@ During the canary's search for legitimate post-activation evidence, two Gmail ma
 
 ## 112.F Governance deviation — recorded honestly
 
-The 2026-10-02 production deployment and one-job canary (§112.C/§112.D) were executed successfully and are technically correct, independently verified. However, they were initiated from a chat-issued rollout instruction **before** the governed delivery doctrine now recorded at §111 had been embodied as a Git-tracked `PID/Amendment → Work Order → Delivery Controller → Implementer` chain.
+The 2026-10-02 production deployment and one-job canary (§112.C/§112.D) were **reported technically GREEN by the executing delivery stream** — the rollout report was returned through the ordinary BAGMAN execution stream, not through a separately-dispatched, fresh Independent Auditor with no inherited conclusions. They were, in addition, initiated from a chat-issued rollout instruction **before** the governed delivery doctrine now recorded at §111 had been embodied as a Git-tracked `PID/Amendment → Work Order → Delivery Controller → Implementer` chain.
+
+**Reported technical GREEN is not the same thing as governed independent audit closure.** This section does not claim the reported result is wrong, nor that the deployment failed — only that the distinct, separate step of independent re-verification under §111 has not yet happened.
 
 Therefore:
-- the technical result (§112.C/§112.D) is accepted **provisionally** by the Architect, on the strength of the independent verification already performed at the time;
-- it must **not** be represented, in any future record, as having followed the full governed chain established at §111 — it did not;
+- the Architect has **provisionally accepted the reported technical result** (§112.C/§112.D) — provisional acceptance of what was reported, not a finding that it has been independently confirmed;
+- it has **not yet been independently re-verified under §111**, and must **not** be represented, in any future record, as having followed the full governed chain established at §111 — it did not;
 - durable closure of this deployment requires a **separate governance-recovery Work Order**, created AFTER this amendment is merged, issued through the full §111 chain;
-- that Work Order must require an independent live-state audit of production (re-verifying, under the governed process, everything §112.C/§112.D currently record from the ungoverned rollout) and produce its own Git-tracked closure record;
+- that Work Order's specific purpose is to perform the fresh, independent live-state audit of production that has not yet occurred (re-verifying, under the governed process, everything §112.C/§112.D currently record only as reported) and produce its own Git-tracked closure record;
 - **no further classification-production mutation, and no scheduler installation, may occur before that governance-recovery closure lands.**
 
 ## 112.G Future scheduler — not authorised here
