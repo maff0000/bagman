@@ -42,8 +42,7 @@ top-of-function "current classification already exists" guard, WI-3
 §31/§38, already makes a second classification attempt a no-op) — a
 second job would never do anything ``classify_evidence`` had not
 already made idempotent, so there is no reason to ever create one. A
-second :func:`enqueue_classification_job_for_evidence`/``submit_job``
-call for the SAME ``evidence_id`` returns the existing row UNCHANGED,
+second ``submit_job`` call for the SAME ``evidence_id`` returns the existing row UNCHANGED,
 never a second row — enforced by a REAL database-level unique
 constraint on ``evidence_id`` in the Postgres implementation (mirrors
 the concurrency-safety fix
@@ -70,43 +69,61 @@ actually happened — this job row exists only to answer "was this
 evidence handed to the classifier at least once, and did that attempt
 complete without an infrastructure-level exception", nothing more.
 
-The enqueue-loss gap, and how it is closed (architect requirement,
-2026-09-29 review of this WO)
+Simplified design (`evidence/classification-simplification` WO —
+supersedes the enqueue-at-ingestion + reconciliation-cursor design
+below)
 ------------------------------------------------------------------------
-There is no outbox/LISTEN-NOTIFY/DB-trigger mechanism ANYWHERE in this
-codebase (verified: neither ``ai.jobs``/``BackgroundJob`` nor any other
-durable-job mechanism in this repository has one either) — so if the
-process enqueuing a job crashes between
-``core.api.BagmanCanonicalAPI.register_evidence``'s own transaction
-committing and :func:`enqueue_classification_job_for_evidence` actually
-being called (or if that call itself fails and its own exception is
-swallowed — see that function's own docstring), that one
-``EvidenceItem`` would never get an automatic job on its own. An
-earlier version of this delivery disclosed this as an accepted, narrow,
-NOT-closed-here limitation and left it there. The architect's review of
-this WO REQUIRED that gap be closed — narrowly, prospectively, never as
-a historical bulk backfill (the WO's own "no historical bulk
-classification" non-goal is unchanged and remains absolute).
-:func:`reconcile_missing_classification_jobs`, below, is that closure:
-a bounded, activation-boundary-scoped, genuinely-paging scan (reusing
-:meth:`services.evidence.evidence.EvidenceRepository.list_evidence`'s
-own existing ``received_at_from``/``limit``/``offset`` filtering — no
-new query surface anywhere) that finds evidence with `received_at` on
-or after an explicit, caller-supplied ``activation_boundary`` that has
-neither a job nor a current classification yet, and submits the
-missing job for it — see that function's own docstring for the full
-paging doctrine, and ``scripts/process_evidence_classification_jobs.py``'s
-module docstring for how it is wired into the worker's own run
-sequence and where ``activation_boundary`` actually comes from.
-Evidence received BEFORE the activation boundary remains permanently
-untouched by anything in this module, at any scan size, on any call —
-that is the explicit, durable boundary between "this WO's own narrow,
-prospective repair" and "a historical bulk backfill", which stays out
-of scope. The registration transaction itself
-(``persistence/postgres/evidence_repository.py``'s own ``session_scope``
-covering the ``EvidenceItem`` + external-reference rows) is unaffected
-either way — this gap was always scoped ENTIRELY to "does a job get
-enqueued", never to evidence durability itself.
+Three prior delivery rounds (`evidence/automatic-classification-
+activation`, `evidence/classification-activation-preflight`, and this
+module's own second architect-review delta) built an automatic-
+classification trigger shaped as "enqueue a durable job the moment
+evidence is registered, plus a durable, cyclic reconciliation cursor
+(with a `lap` generation counter and a frozen-per-lap `target` upper
+bound) to recover an enqueue that gets lost" — real architectural
+complexity, all of it in service of one narrow problem: a second
+durable write (the enqueue) at ingestion time can be lost between
+`register_evidence`'s own commit and the enqueue call actually running.
+
+This WO removes that problem at its root instead of building more
+machinery to recover from it: ingestion no longer attempts a second
+durable write at all. There is nothing to enqueue, so there is nothing
+to lose, and therefore nothing to reconcile. Classification job
+creation now happens entirely on the WORKER side, via
+:func:`create_missing_classification_jobs` (below), which asks
+PostgreSQL itself — fresh, every single call, via
+:meth:`EvidenceClassificationJobRepository.list_missing_classification_candidates`'s
+own real `NOT EXISTS`/anti-join query — "which post-activation evidence
+items have neither a job nor a current classification yet". No cursor
+is needed because PostgreSQL's own current state already IS the
+durable state: there is nothing to remember between worker invocations
+beyond what the tables already contain. A late-committing `EvidenceItem`
+is found the moment it becomes query-visible (never excluded by a
+stale watermark the way the old cursor design could exclude it under a
+commit-order-vs-`created_at`-order inversion — see the now-deleted
+`services.evidence.classification_reconciliation_cursor` module's own
+former docstring for the full class of bug this simply cannot
+reproduce, because there is no cursor position to invert against); a
+worker outage merely delays discovery, never loses it; and a backlog
+larger than one call's `limit` drains naturally across repeated calls,
+because each call's own job creation shrinks the NEXT call's own
+candidate set at the database level.
+
+`enqueue_classification_job_for_evidence` (the ingestion-side trigger)
+and `reconcile_missing_classification_jobs`/
+`_scan_and_repair_evidence_missing_classification_jobs` (the
+cursor-based recovery scan, together with the whole
+`EvidenceClassificationReconciliationCursor` module/table they
+depended on) are DELETED entirely by this WO — not deprecated, not
+superseded-but-kept. Evidence registration
+(`services/mailbox/microsoft/evidence_ingest.py`,
+`app/api/routers/intake.py`) no longer references
+`EvidenceClassificationJobRepository`/the activation boundary at all;
+see each call site's own history for what was removed. The activation
+boundary concept itself is UNCHANGED and still required — see
+:func:`resolve_evidence_classification_activation_boundary` below — it
+is just consumed by exactly one caller now
+(`scripts/process_evidence_classification_jobs.py`'s own worker),
+never by ingestion.
 
 The activation boundary is Layer-2 runtime configuration, NEVER a
 hardcoded constant (corrected 2026-09-29, architect review, WO item 1)
@@ -121,7 +138,7 @@ time — evidence received between the hardcoded date and the eventual
 real activation moment would have been wrongly treated as prospective
 (reconcilable) when it is actually historical (pre-activation),
 violating the "no historical backfill" boundary above. This module no
-longer defines any such constant. :func:`reconcile_missing_classification_jobs`
+longer defines any such constant. :func:`create_missing_classification_jobs`
 below takes ``activation_boundary`` as an explicit, REQUIRED keyword
 parameter instead — this keeps the function itself pure and directly
 testable, with no environment-variable coupling of its own (consistent
@@ -229,7 +246,6 @@ from __future__ import annotations
 import abc
 import dataclasses
 import logging
-import os
 import threading
 from dataclasses import dataclass
 from datetime import datetime
@@ -242,9 +258,7 @@ from core.errors import InvalidStateTransitionError, NotFoundError, ValidationEr
 from core.timestamps import utc_now
 from services.evidence.classification import CLASSIFICATION_TYPE_DOCUMENT_TYPE
 from services.evidence.classification_orchestrator import CLASSIFY_EVIDENCE_OUTCOMES
-from services.evidence.classification_reconciliation_cursor import (
-    EvidenceClassificationReconciliationCursorRepository,
-)
+from services.evidence.evidence import EvidenceRepository
 
 logger = logging.getLogger(__name__)
 
@@ -252,13 +266,13 @@ logger = logging.getLogger(__name__)
 #: "The activation boundary is Layer-2 runtime configuration" section)
 #: — an ISO-8601 UTC string, e.g. `2026-10-15T00:00:00Z`. RELOCATED HERE
 #: from `scripts/process_evidence_classification_jobs.py` (preflight
-#: review correction, item C) — this is now the ONE, public, canonical
-#: name both the worker script's reconciliation trigger AND the two
-#: real enqueue call sites (`services/mailbox/microsoft/evidence_ingest.py`,
-#: `app/api/routers/intake.py`) resolve against, so "unset/malformed"
-#: means exactly the same thing everywhere it is checked — "one
-#: coherent activation contract", never two independently-maintained
-#: copies of the same parsing logic.
+#: review correction, item C) — as of the `evidence/classification-
+#: simplification` WO this is consumed by exactly ONE real caller (that
+#: same worker script's own job-discovery trigger,
+#: :func:`create_missing_classification_jobs`) — evidence ingestion no
+#: longer references it at all (see
+#: :func:`resolve_evidence_classification_activation_boundary`'s own
+#: docstring).
 EVIDENCE_CLASSIFICATION_ACTIVATION_BOUNDARY_ENV_VAR = "BAGMAN_EVIDENCE_CLASSIFICATION_ACTIVATION_BOUNDARY"
 
 
@@ -268,7 +282,18 @@ def resolve_evidence_classification_activation_boundary(raw: Optional[str]) -> t
     skip_reason)` — exactly one of the pair is ever non-`None`. A PURE
     function — no env/I/O of its own — deliberately taking the raw
     string rather than reading `os.environ` itself, so it is directly
-    unit-testable with no environment mutation required. RELOCATED HERE
+    unit-testable with no environment mutation required.
+
+    Consumed ONLY by the classification worker's own execution
+    environment (`scripts/process_evidence_classification_jobs.py`'s
+    `main()`/`_run_worker`) as of the `evidence/classification-
+    simplification` WO — evidence ingestion
+    (`services/mailbox/microsoft/evidence_ingest.py`,
+    `app/api/routers/intake.py`) no longer references the activation
+    boundary (or any classification-job concept) at all; it never
+    attempts a classification-job enqueue in the first place, so it has
+    nothing left to gate. See :func:`create_missing_classification_jobs`
+    below for where this value is actually used. RELOCATED HERE
     (unchanged behavior) from `scripts/process_evidence_classification_jobs.py`'s
     own former `_resolve_activation_boundary` (preflight review
     correction, item C) — see :func:`resolve_evidence_classification_activation_boundary_from_env`
@@ -322,26 +347,6 @@ def resolve_evidence_classification_activation_boundary(raw: Optional[str]) -> t
         )
     return parsed, None
 
-
-def resolve_evidence_classification_activation_boundary_from_env() -> tuple[Optional[datetime], Optional[str]]:
-    """Thin, env-reading convenience wrapper around
-    :func:`resolve_evidence_classification_activation_boundary` — reads
-    `EVIDENCE_CLASSIFICATION_ACTIVATION_BOUNDARY_ENV_VAR` from
-    `os.environ` fresh on every call (cheap; no caching — the value is
-    operator/deployment configuration, never expected to change
-    mid-process, but re-reading costs nothing and avoids any staleness
-    question) and delegates. This is what every REAL call site actually
-    calls — :func:`enqueue_classification_job_for_evidence`'s own two
-    real callers (`services/mailbox/microsoft/evidence_ingest.py`,
-    `app/api/routers/intake.py`) and
-    `scripts/process_evidence_classification_jobs.py`'s own worker —
-    keeping :func:`resolve_evidence_classification_activation_boundary`
-    itself independently unit-testable with no environment coupling at
-    all.
-    """
-    return resolve_evidence_classification_activation_boundary(
-        os.environ.get(EVIDENCE_CLASSIFICATION_ACTIVATION_BOUNDARY_ENV_VAR)
-    )
 
 #: The closed set of `EvidenceClassificationJob` lifecycle states —
 #: identical vocabulary to `ai.jobs.BACKGROUND_JOB_STATUSES` (see
@@ -672,6 +677,29 @@ class EvidenceClassificationJobRepository(abc.ABC):
         can ever exist for `evidence_id` (see module docstring)."""
         raise NotImplementedError
 
+    @abc.abstractmethod
+    def list_missing_classification_candidates(
+        self, *, activation_boundary: datetime, limit: int,
+    ) -> list[str]:
+        """Up to `limit` `evidence_id`s for `EvidenceItem`s whose
+        `created_at` is `>= activation_boundary`, that have NEITHER an
+        existing `EvidenceClassificationJob` NOR a current
+        (`CLASSIFICATION_TYPE_DOCUMENT_TYPE`) `EvidenceClassification` —
+        ordered `EvidenceItem.created_at ASC` (oldest-eligible-first),
+        with `evidence_id ASC` as a deterministic tie-break.
+
+        This is the entire discovery mechanism
+        :func:`create_missing_classification_jobs` relies on (module
+        docstring's own "Simplified design" section): a real PostgreSQL
+        `NOT EXISTS`/anti-join query against tables that already exist
+        (`evidence_items`, `evidence_classification_jobs`,
+        `evidence_classifications`), run fresh every call — never a
+        full-table Python-side scan, never a persisted cursor. Returns
+        an empty list if nothing qualifies — never raises for the
+        ordinary "nothing to do" case.
+        """
+        raise NotImplementedError
+
 
 class InMemoryEvidenceClassificationJobRepository(EvidenceClassificationJobRepository):
     """Narrow in-memory reference implementation, mirroring
@@ -681,7 +709,13 @@ class InMemoryEvidenceClassificationJobRepository(EvidenceClassificationJobRepos
     against here, unlike the Postgres implementation's
     `SELECT ... FOR UPDATE SKIP LOCKED`)."""
 
-    def __init__(self, *, audit_repository: Optional[AuditRepository] = None) -> None:
+    def __init__(
+        self,
+        *,
+        audit_repository: Optional[AuditRepository] = None,
+        evidence_repository: Optional[EvidenceRepository] = None,
+        classification_repository=None,
+    ) -> None:
         self._by_id: dict[str, EvidenceClassificationJob] = {}
         self._by_evidence: dict[str, str] = {}
         # RLock, not Lock: recover_stale_claims() (called internally by
@@ -692,6 +726,15 @@ class InMemoryEvidenceClassificationJobRepository(EvidenceClassificationJobRepos
         # identical reasoning).
         self._lock = threading.RLock()
         self._audit_repository: AuditRepository = audit_repository or InMemoryAuditRepository()
+        # Both OPTIONAL, defaulting to `None` so every EXISTING
+        # no-arg/audit-only construction call keeps working unchanged —
+        # only needed by :meth:`list_missing_classification_candidates`
+        # below (a duck-typed `EvidenceRepository`/
+        # `EvidenceClassificationRepository`-shaped pair; never imported
+        # as a concrete type here, mirroring every other cross-repository
+        # dependency in this codebase).
+        self._evidence_repository = evidence_repository
+        self._classification_repository = classification_repository
 
     def _recover_if_stale(
         self, job: EvidenceClassificationJob, *, staleness_threshold_seconds: float, now: Optional[datetime]
@@ -858,767 +901,117 @@ class InMemoryEvidenceClassificationJobRepository(EvidenceClassificationJobRepos
         existing_id = self._by_evidence.get(evidence_id)
         return self._by_id[existing_id] if existing_id is not None else None
 
-
-def enqueue_classification_job_for_evidence(
-    evidence_id: str,
-    *,
-    classification_job_repository: EvidenceClassificationJobRepository,
-    actor_type: str,
-    actor_id: str,
-    evidence_created_at: datetime,
-    activation_boundary: Optional[datetime],
-    correlation_id: Optional[str] = None,
-) -> None:
-    """The ONE new integration point both real evidence-creation call
-    sites invoke, immediately after their own
-    `core.api.BagmanCanonicalAPI.register_evidence` call has returned
-    successfully (see `services/mailbox/microsoft/evidence_ingest.py`
-    and `app/api/routers/intake.py`) — enqueues a durable
-    `EvidenceClassificationJob` for `evidence_id`, idempotently (see
-    module docstring's own idempotency doctrine: a replayed
-    `register_evidence` call, or any other repeat call for the same
-    `evidence_id`, is always safe).
-
-    The activation gate (preflight review correction, item C — "one
-    coherent activation contract")
-    ------------------------------------------------------------------
-    `evidence_created_at`/`activation_boundary` are REQUIRED keyword
-    parameters: if `activation_boundary is None` (unset/malformed —
-    see :func:`resolve_evidence_classification_activation_boundary`)
-    OR `evidence_created_at < activation_boundary`, this function does
-    NOT enqueue a job at all — it logs at `INFO` (never `ERROR`: this
-    is normal, expected, not-yet-activated-or-pre-boundary behaviour,
-    never a failure) naming exactly which of the two conditions
-    applied, then returns. This closes the gap an earlier version of
-    this delivery left open: before this correction, BOTH real call
-    sites invoked this function UNCONDITIONALLY (the mailbox call site
-    was gated only on `classification_job_repository is not None`, a
-    wiring concern, not an activation concern; the intake call site had
-    no gating at all), so the moment this code ran in any environment —
-    even with the activation boundary env var completely unset — every
-    new mailbox/manual-upload evidence registration immediately created
-    a durable `EvidenceClassificationJob` that would sit `PENDING`
-    forever with no worker ever configured to process it. Now, exactly
-    one function (this one) decides whether a given evidence item is
-    "activated" for automatic classification, used identically by both
-    real call sites and driven by the SAME
-    `EVIDENCE_CLASSIFICATION_ACTIVATION_BOUNDARY_ENV_VAR`/
-    `resolve_evidence_classification_activation_boundary_from_env`
-    :func:`reconcile_missing_classification_jobs` (below) also reads —
-    "one coherent activation contract", never two independently-tuned
-    gates.
-
-    Critically, this enqueue-side gate does NOT make
-    `reconcile_missing_classification_jobs` any less necessary:
-    reconciliation receives its own explicit `activation_boundary`
-    parameter and is the sole recovery path for anything this gate
-    causes to be skipped — by design, "a missed enqueue after
-    activation remains recoverable" (see
-    `tests/persistence/test_evidence_classification_job_reconciliation.py
-    ::test_reconciliation_finds_evidence_the_enqueue_side_gate_skipped`).
-
-    **Never raises**, for the ordinary "the repository call itself
-    failed" case (unchanged from before this correction). The invariant
-    "no classification failure may corrupt evidence ingestion" (already
-    true of `classify_evidence` itself — it never raises for an
-    ordinary AI/context failure) extends here to "no ENQUEUE failure
-    may corrupt evidence ingestion either": `EvidenceItem` registration
-    is the primary, already-durably-committed operation (see module
-    docstring's "The enqueue-loss gap, and how it is closed" section —
-    the transaction that commits the `EvidenceItem` has ALREADY
-    completed by the time either call site reaches this function);
-    losing the automatic classification trigger for one evidence item
-    is a real but bounded degradation — closed, prospectively, by
-    :func:`reconcile_missing_classification_jobs` (below), and an
-    operator can always re-trigger classification for it by hand via
-    the existing HTTP endpoints too — never a reason to fail an
-    otherwise-successful evidence observation. There is no established
-    "log a non-fatal side-effect failure" helper elsewhere in this
-    codebase to reuse (checked: neither `services/` nor `core/` defines
-    one — only `app/api/` configures the stdlib `logging` module, which
-    is an application-layer concern this module deliberately does not
-    depend on) — this function's own documented judgment call is a
-    plain, module-level `logging.getLogger(__name__)` call (stdlib
-    only, no new dependency, no app-layer coupling), logged at `ERROR`
-    with `exc_info=True` so the failure is fully visible in ordinary
-    process logs/log aggregation without ever propagating to the
-    caller.
-    """
-    if activation_boundary is None:
-        logger.info(
-            "skipping EvidenceClassificationJob enqueue for evidence_id=%s — no activation boundary is "
-            "configured (%s is unset/malformed); this evidence item remains recoverable later by "
-            "reconcile_missing_classification_jobs once a real boundary is configured and this "
-            "evidence's own created_at qualifies",
-            evidence_id,
-            EVIDENCE_CLASSIFICATION_ACTIVATION_BOUNDARY_ENV_VAR,
-        )
-        return
-    if evidence_created_at < activation_boundary:
-        logger.info(
-            "skipping EvidenceClassificationJob enqueue for evidence_id=%s — evidence_created_at=%s is "
-            "strictly before the configured activation_boundary=%s (historical evidence; this WO's own "
-            "'no historical bulk backfill' boundary applies identically to the enqueue-side gate)",
-            evidence_id,
-            evidence_created_at,
-            activation_boundary,
-        )
-        return
-
-    try:
-        classification_job_repository.submit_job(
-            evidence_id=evidence_id, actor_type=actor_type, actor_id=actor_id, correlation_id=correlation_id,
-        )
-    except Exception:  # noqa: BLE001 - must never propagate; see docstring
-        logger.error(
-            "failed to enqueue EvidenceClassificationJob for evidence_id=%s — evidence registration "
-            "itself is unaffected; this evidence item will be picked up by the next bounded "
-            "reconciliation pass (reconcile_missing_classification_jobs, if created_at is on/after "
-            "the operator-configured activation boundary — see "
-            "scripts/process_evidence_classification_jobs.py's own module docstring for where that "
-            "value comes from) or can be re-triggered by hand via the existing HTTP endpoints",
-            evidence_id,
-            exc_info=True,
-        )
-
-
-def _scan_and_repair_evidence_missing_classification_jobs(
-    *,
-    evidence_repository,
-    classification_job_repository: EvidenceClassificationJobRepository,
-    classification_repository,
-    cursor_repository: EvidenceClassificationReconciliationCursorRepository,
-    actor_type: str,
-    actor_id: str,
-    cursor_key: str,
-    scan_created_at_from: datetime,
-    created_at_to: Optional[datetime],
-    already_inspected_ids_at_boundary: set[str],
-    has_existing_cursor: bool,
-    repair_limit: int,
-    page_size: int,
-    max_rows_scanned: int,
-    lap: int,
-    target: datetime,
-) -> int:
-    """ONE bounded scan-and-repair pass, in REGISTRATION (`created_at
-    ASC, evidence_id ASC`) order, over `[scan_created_at_from,
-    created_at_to]` (`created_at_to=None` means unbounded above) —
-    factored out so `reconcile_missing_classification_jobs` can run
-    the IDENTICAL scan/skip/inspect/submit/track-watermark logic twice
-    per call (once for the forward pass, once for the "safety sweep"
-    pass — see that function's own docstring) without two
-    near-duplicate loops silently drifting apart over time.
-
-    `cursor_key`/`scan_created_at_from`/`already_inspected_ids_at_boundary`/
-    `has_existing_cursor` together describe where THIS pass's own
-    cursor currently sits (the set-membership tie-break discipline is
-    identical regardless of which cursor_key is passed — see
-    `services.evidence.classification_reconciliation_cursor`'s own
-    docstring, "Why the tie-break is SET membership" section); this
-    pass advances `cursor_repository`'s own `cursor_key` row via
-    `advance_cursor`'s merge-on-write contract (see that module's own
-    "Why advance_cursor merges instead of overwrites" AND "lap"
-    docstring sections) if, and only if, it actually inspected anything
-    new — exactly the existing single-pass discipline, unchanged.
-
-    `lap` is the generation counter THIS call proposes for
-    `cursor_key` (see `services.evidence
-    .classification_reconciliation_cursor`'s own "lap" docstring
-    section) — this helper never computes it itself, only threads the
-    caller's own decision through to `advance_cursor`: the forward pass
-    always passes its existing cursor's own `lap` back unchanged; the
-    sweep pass passes either its existing cursor's own `lap` (continuing
-    a lap) or that value plus one (starting a new one) — see
-    `reconcile_missing_classification_jobs`'s own docstring for the
-    full reasoning.
-
-    `target` is the IMMUTABLE per-lap upper bound THIS call proposes for
-    `cursor_key` (see `services.evidence.classification_reconciliation_cursor`'s
-    own "target" docstring section) — likewise never computed here,
-    only threaded through to `advance_cursor`, which itself enforces
-    (never merely trusts the caller on) the invariant that an
-    equal-`lap` proposal can never change an already-persisted `target`.
-    The forward pass always passes its existing cursor's own `target`
-    back unchanged (a permanent non-event, mirroring `lap`); the sweep
-    pass passes either its existing cursor's own `target` (continuing a
-    lap — this is the actual fix: NEVER a freshly re-read forward
-    frontier) or a freshly-snapshotted forward frontier (starting a new
-    lap, the one moment a new `target` is ever introduced) — see
-    `reconcile_missing_classification_jobs`'s own docstring for the full
-    reasoning.
-
-    Returns the number of jobs submitted by THIS pass alone (never
-    includes the other pass's own count — the caller sums both).
-    """
-    offset = 0
-    submitted = 0
-    rows_scanned = 0
-    running_created_at: Optional[datetime] = scan_created_at_from if has_existing_cursor else None
-    running_ids: set[str] = set(already_inspected_ids_at_boundary)
-    any_inspected = False
-
-    while submitted < repair_limit and rows_scanned < max_rows_scanned:
-        page = evidence_repository.list_evidence(
-            created_at_from=scan_created_at_from,
-            created_at_to=created_at_to,
-            limit=page_size,
-            offset=offset,
-            order_by_created_at=True,
-        )
-        if not page:
-            break
-        for item in page:
-            if submitted >= repair_limit or rows_scanned >= max_rows_scanned:
-                # Stop INSPECTING entirely — never advance the running
-                # watermark past a row we never actually
-                # resolved-or-submitted.
-                break
-            if (
-                has_existing_cursor
-                and item.created_at == scan_created_at_from
-                and item.evidence_id in already_inspected_ids_at_boundary
-            ):
-                # Already fully handled by a previous call at this
-                # exact cursor_key — a cheap set-membership check,
-                # never counted against rows_scanned/repair_limit. Only
-                # ever matters for rows sharing the exact
-                # scan_created_at_from timestamp.
-                continue
-
-            rows_scanned += 1
-            any_inspected = True
-            if running_created_at is None or item.created_at > running_created_at:
-                # The watermark has moved to a new, later timestamp —
-                # the old timestamp's ids are irrelevant to any future
-                # call at this cursor_key, so do NOT carry them forward.
-                running_created_at = item.created_at
-                running_ids = {item.evidence_id}
-            else:
-                # item.created_at == running_created_at (it can never
-                # be less — order_by_created_at=True and the skip
-                # condition above already excluded anything at or
-                # behind scan_created_at_from that was already
-                # inspected). Add to, never replace, the running set.
-                running_ids.add(item.evidence_id)
-
-            if classification_job_repository.get_by_evidence(item.evidence_id) is not None:
-                continue
-            if classification_repository.get_current_classification(
-                item.evidence_id, CLASSIFICATION_TYPE_DOCUMENT_TYPE
-            ) is not None:
-                continue
-            # submit_job's own idempotency (the real evidence_id unique
-            # constraint) is the real safety net if a race occurs
-            # mid-scan — no second guard is added here.
-            classification_job_repository.submit_job(
-                evidence_id=item.evidence_id, actor_type=actor_type, actor_id=actor_id,
+    def list_missing_classification_candidates(
+        self, *, activation_boundary: datetime, limit: int,
+    ) -> list[str]:
+        """A plain, narrow, equivalent-semantics Python implementation —
+        this is the IN-MEMORY reference implementation for unit tests,
+        never the thing this delivery is trying to make efficient (see
+        the Postgres implementation's own docstring for the real,
+        single-query anti-join this mirrors). Requires both
+        `evidence_repository`/`classification_repository` to have been
+        supplied at construction time; raises a clear `RuntimeError`
+        naming what is missing otherwise — never silently returns an
+        empty/wrong result for a misconfigured repository."""
+        missing: list[str] = []
+        if self._evidence_repository is None:
+            missing.append("evidence_repository")
+        if self._classification_repository is None:
+            missing.append("classification_repository")
+        if missing:
+            raise RuntimeError(
+                "InMemoryEvidenceClassificationJobRepository.list_missing_classification_candidates "
+                f"requires the following to have been supplied at construction time: {missing}"
             )
-            submitted += 1
-        offset += len(page)
-        if len(page) < page_size:
-            break
+        if limit <= 0:
+            return []
 
-    if any_inspected:
-        cursor_repository.advance_cursor(
-            cursor_key, lap=lap, last_created_at=running_created_at, last_evidence_ids=running_ids, target=target,
-        )
+        with self._lock:
+            eligible = sorted(
+                (
+                    item
+                    for item in self._evidence_repository.list_evidence()
+                    if item.created_at >= activation_boundary
+                ),
+                key=lambda item: (item.created_at, item.evidence_id),
+            )
+            candidate_ids: list[str] = []
+            for item in eligible:
+                if len(candidate_ids) >= limit:
+                    break
+                if self.get_by_evidence(item.evidence_id) is not None:
+                    continue
+                if (
+                    self._classification_repository.get_current_classification(
+                        item.evidence_id, CLASSIFICATION_TYPE_DOCUMENT_TYPE
+                    )
+                    is not None
+                ):
+                    continue
+                candidate_ids.append(item.evidence_id)
+            return candidate_ids
 
-    return submitted
 
-
-def reconcile_missing_classification_jobs(
+def create_missing_classification_jobs(
     *,
-    evidence_repository,
     classification_job_repository: EvidenceClassificationJobRepository,
-    classification_repository,
-    cursor_repository: EvidenceClassificationReconciliationCursorRepository,
     actor_type: str,
     actor_id: str,
     activation_boundary: datetime,
-    repair_limit: int = 200,
-    page_size: int = 200,
-    max_rows_scanned: int = 5000,
-    sweep_repair_limit: int = 50,
-    sweep_page_size: int = 200,
-    sweep_max_rows_scanned: int = 1000,
+    limit: int = 200,
 ) -> int:
-    """The bounded, prospective repair path for the disclosed
-    "post-commit enqueue can be skipped" gap (see
-    :func:`enqueue_classification_job_for_evidence`'s own docstring —
-    this function is what actually closes that gap, superseding the
-    earlier "accepted, not-closed-here" framing) — now ALSO the sole
-    recovery path for evidence that function's own preflight-review
-    activation gate (item C) skipped.
+    """Discovers up to `limit` post-activation `EvidenceItem`s missing a
+    classification job (via :meth:`EvidenceClassificationJobRepository
+    .list_missing_classification_candidates`'s own real PostgreSQL
+    anti-join — never a Python-side scan), and creates a job for each,
+    idempotently.
 
-    ``activation_boundary`` is an explicit, REQUIRED parameter — see
-    module docstring's own "The activation boundary is Layer-2 runtime
-    configuration" section. This function itself has no knowledge of
-    where the value comes from (no env-var coupling here — that lives
-    entirely in ``scripts/process_evidence_classification_jobs.py``'s
-    ``main()``), which keeps it pure and directly testable: evidence
-    with `created_at` strictly BEFORE ``activation_boundary`` can NEVER
-    be found by this scan, at any `repair_limit`/`page_size`, no matter
-    how many times it runs — the `created_at_from` filter is
-    unconditional and applies to every page of every call.
+    The real `evidence_id` unique constraint
+    (`uq_evidence_classification_jobs_evidence_id`) is still the final
+    safety net under a genuine concurrent race — no second,
+    application-level guard is added here, consistent with this
+    codebase's established doctrine (see
+    :meth:`EvidenceClassificationJobRepository.submit_job`'s own module
+    docstring).
 
-    Eligibility is now `created_at`-based, not `received_at`-based
-    (preflight review correction, item A) — CORRECTED
-    ------------------------------------------------------------------
-    An earlier version of this function filtered on
-    `received_at_from=activation_boundary`. That was wrong:
-    `received_at` is the (possibly much earlier) time the underlying
-    artifact was actually received/observed, never the time BAGMAN
-    itself registered it — an operator flipping the activation boundary
-    "on" prospectively governs "what gets registered from now on", not
-    "what was historically received". Evidence whose `received_at` is
-    old but whose `created_at` (registration time) is on/after the
-    boundary is a genuine, recoverable late registration and MUST be
-    reconciled; evidence whose `created_at` is genuinely historical
-    (before the boundary) must NEVER be touched, regardless of what its
-    own `received_at` happens to be (even a `received_at` that looks
-    "prospective"). `created_at` — server-assigned, monotonic with
-    registration order — is the sole authority here now.
+    Returns the number of `submit_job` calls made, i.e. the number of
+    candidates this call's own discovery query returned — NOT
+    necessarily the number of rows freshly inserted: `submit_job`
+    itself does not report whether it created a new row or idempotently
+    returned an existing one, so if a genuine concurrent caller wins a
+    race for the same `evidence_id` in between discovery and submission,
+    this call's own count still includes that candidate even though no
+    new row resulted. In ordinary (non-racing) operation this never
+    diverges from "jobs created", since a candidate this function was
+    just handed, by definition, had no job yet at the moment it was
+    selected — the divergence is a narrow, honestly-disclosed edge case,
+    never a correctness issue (the real constraint still prevents any
+    duplicate row).
 
-    A durable, per-activation-boundary cursor closes a genuine
-    starvation bug (preflight review correction, item B) — CORRECTED
-    ------------------------------------------------------------------
-    An earlier version of this function kept NO persisted cross-call
-    state at all: every call started scanning from `offset=0` again
-    (ordered `received_at DESC, evidence_id DESC`), relying on
-    already-resolved evidence being "cheaply skipped" to make forward
-    progress over repeated calls. That reasoning is WRONG in general —
-    it is exactly the bug this correction fixes: if more than
-    `max_rows_scanned` already-resolved rows sort ahead of a genuinely
-    orphaned row in that fixed ordering, the orphan can NEVER be
-    reached by any number of repeated calls, because every call
-    re-scans exactly the same window and stops there. Worse, under
-    `received_at DESC` ordering, an orphan's position only ever gets
-    WORSE over time as more evidence is registered — a permanent,
-    unrecoverable starvation, not merely a slow-convergence issue (see
-    `tests/persistence/test_evidence_classification_job_reconciliation.py
-    ::test_old_fixed_window_scan_would_starve_an_orphan_behind_more_than_max_rows_scanned_resolved_rows`
-    for the regression proof).
+    No cursor, no scan state, nothing to remember between calls (module
+    docstring's own "Simplified design" section): PostgreSQL's own
+    current state (which evidence has a job, which has a current
+    classification) is queried fresh every single call — a
+    late-committing `EvidenceItem` is found the moment it becomes
+    query-visible, a worker outage merely delays discovery (never loses
+    it), and a backlog larger than `limit` drains naturally across
+    repeated calls because each call's own job creation shrinks the
+    NEXT call's own candidate set at the database level.
 
-    The fix is two things together: (1) `cursor_repository`
-    (:mod:`services.evidence.classification_reconciliation_cursor`) — a
-    REQUIRED parameter — persists, per `cursor_key =
-    activation_boundary.isoformat()` (see that module's own docstring
-    for why the key is the boundary's own value, not a constant), the
-    `(created_at, evidence_id)` of the highest-ordered evidence row this
-    function has actually INSPECTED so far; and (2) every page is now
-    fetched via `evidence_repository.list_evidence(created_at_from=...,
-    order_by_created_at=True, ...)` — REGISTRATION order, the only
-    ordering under which an orphan's scan position is FIXED forever
-    once it exists (new evidence only ever appends after it, never in
-    front of it). Together these guarantee genuine, monotonic,
-    PERMANENT forward progress with a FIXED `max_rows_scanned` no
-    matter how large the resolved-evidence corpus grows — the property
-    a single-fixed-window scan (in either ordering) can never provide.
-
-    Concretely: `scan_created_at_from` starts at the cursor's own
-    `last_created_at` if one already exists for this `cursor_key`, else
-    at `activation_boundary` itself (this cursor's very first call).
-    `already_inspected_ids_at_boundary` (the cursor's own
-    `last_evidence_ids`) is used ONLY to skip rows that share that
-    exact `created_at` timestamp AND whose `evidence_id` is a MEMBER of
-    that set — pure set membership, never an ordering comparison — this
-    only ever matters for the handful of rows sharing the exact
-    boundary timestamp: a narrow, correctly-handled edge case, not the
-    common case. After the scan loop, IF any row was actually inspected
-    this call (not merely cursor-skipped), the cursor is advanced to
-    `(last_seen_created_at, ids_seen_at_last_created_at)` — the highest
-    `created_at` this call actually inspected, paired with EVERY
-    `evidence_id` inspected (across this call and, if the watermark
-    never moved past `scan_created_at_from`, every prior call too) at
-    that exact timestamp — so the NEXT call's window starts exactly
-    where this one left off.
-
-    Why the tie-break is set membership, never `evidence_id <=
-    scan_after_evidence_id` (post-merge audit correction)
-    ------------------------------------------------------------------
-    An earlier version of this function compared a single scalar
-    cursor value (`evidence_id <= scan_after_evidence_id`, plain string
-    comparison) to decide whether a row sharing the exact boundary
-    timestamp had "already" been inspected. That is unsound:
-    `evidence_id` is a UUIDv7 (`core.identity.generate_id`), and that
-    module's own docstring is explicit that its monotonic-counter
-    guarantee ("later-generated sorts later") holds only WITHIN one
-    process — BAGMAN registers evidence from at least two separate OS
-    processes (the API server and the mailbox-ingestion worker), and
-    nothing guarantees ordering between ids minted by two different
-    ones. If two evidence rows registered by different processes
-    happened to share the exact same microsecond-precision
-    `created_at`, and the later-registered row's id happened to sort
-    `<=` the earlier one's, the old `<=` skip condition would silently
-    and PERMANENTLY discard it — never inspected, never jobbed, with no
-    error and no log (see `tests/persistence
-    /test_evidence_classification_job_reconciliation.py
-    ::test_cross_process_created_at_tie_evidence_id_inversion_is_not_permanently_lost`
-    for the regression proof). Set membership has no such assumption:
-    correctness depends only on exact-id membership in "the ids already
-    confirmed-inspected at this exact timestamp", never on how any two
-    ids sharing that timestamp happen to compare as strings.
-
-    Genuine paging within one call is unchanged from the previous
-    correction (architect review, WO item 2): `repair_limit` (default
-    200) means "the maximum number of missing jobs to CREATE this
-    run", not "how many rows to look at"; this function pages through
-    `EvidenceRepository.list_evidence`'s own `limit`+`offset`
-    parameters (real DB-level `OFFSET` in the Postgres implementation —
-    no new query surface), `page_size` (default 200) rows at a time,
-    until either `repair_limit` jobs have been submitted or the
-    evidence set (bounded by `max_rows_scanned`, see below) is
-    exhausted.
-
-    `max_rows_scanned` (default 5000) bounds how many rows a single
-    call actually INSPECTS (resolves-or-submits) across all its pages —
-    a cursor-skipped row costs only a cheap in-memory string comparison,
-    never a real resolution attempt, so it does NOT count against this
-    bound (nor against `repair_limit`) — a defensive, generous, narrow
-    safety backstop against a genuinely pathological corpus, not a
-    tuned operational parameter (unchanged reasoning from the previous
-    correction).
-
-    For each row this function actually inspects (i.e. not
-    cursor-skipped) that has NEITHER an existing
-    `EvidenceClassificationJob` NOR a current classification already,
-    it submits the missing job — idempotently, relying on the real
-    `evidence_id` unique constraint exactly like the normal enqueue path
-    (a genuine race between this function and a normal
-    `enqueue_classification_job_for_evidence` call for the same
-    evidence resolves to exactly one row, never two — same DB-level
-    guarantee, not a new one); no second, application-level guard is
-    added here.
-
-    A second, bounded, cyclic "safety sweep" cursor closes a genuine
-    commit-order-vs-created_at-order inversion gap (architect-confirmed,
-    this round's own correction)
-    ------------------------------------------------------------------
-    `PostgresEvidenceRepository.register_evidence` assigns
-    `EvidenceItem.created_at` in Python (`utc_now()`) BEFORE its own
-    transaction commits. Under Postgres's default READ COMMITTED
-    isolation, two concurrent registrations can COMMIT in an order
-    DIFFERENT from their `created_at` VALUE order: transaction A can
-    start first (an earlier `created_at`) but commit LATER than
-    transaction B (a later `created_at`, committed first). If a forward
-    reconciliation pass runs while A is still uncommitted (invisible to
-    that scan's snapshot), sees B, and advances the forward cursor's
-    watermark to B's timestamp, then A commits afterward — A's
-    `created_at` is now STRICTLY BEFORE the forward cursor's watermark,
-    so `created_at_from` excludes it from the forward pass's own scan
-    forever, even though it only just became visible and may never have
-    gotten its immediate-enqueue job either (that enqueue call happens
-    inside the SAME window this gap exploits). The forward cursor above
-    is correct and remains the primary, low-latency discovery mechanism
-    for the common case (evidence usually commits promptly, in roughly
-    `created_at` order) — it is NOT removed or weakened here.
-
-    The safety sweep is a SEPARATE, independent cursor, keyed
-    `f"{activation_boundary.isoformat()}::sweep"` under the exact SAME
-    `EvidenceClassificationReconciliationCursor` dataclass/repository/
-    Postgres table the forward cursor already uses — a distinct,
-    deterministic key under the exact same persistence, no new table,
-    no new repository class, no new migration. Each call:
-
-    1. Reads the forward cursor's CURRENT position (re-read AFTER the
-       forward pass above has run, so it reflects whatever the forward
-       pass may have JUST advanced it to this same call) as
-       `forward_frontier`. If the forward cursor has never advanced at
-       all yet (`forward_frontier is None` — nothing has ever been
-       forward-scanned), the sweep has nothing to safety-net yet and
-       does zero work this call. This read is used ONLY for this
-       "nothing to sweep yet" gate and, when a lap genuinely completes
-       this call (see step 2), to snapshot the brand-new lap's own
-       FROZEN `target` — see this function's own corrected "freezing
-       each lap's own upper bound" section below for why it is NEVER
-       used as the scan's own upper bound directly.
-    2. Derives `effective_sweep_start`, purely at read time, from the
-       sweep cursor's own persisted position: if no sweep cursor exists
-       yet, OR the sweep has already fully caught up to its OWN,
-       PERSISTED, FROZEN `target` (`sweep_cursor.last_created_at >=
-       sweep_cursor.target` — it completed a full lap), START A NEW LAP
-       at `activation_boundary`, snapshotting the CURRENT
-       `forward_frontier` as that new lap's own `target`; otherwise
-       CONTINUE the current lap from `sweep_cursor.last_created_at`,
-       reusing `sweep_cursor.target` UNCHANGED (never recomputed). This
-       is a derived-at-read-time decision only — no separate "reset"
-       WRITE operation exists; the persisted sweep position is simply
-       reinterpreted as "start over" once it has caught up to its own
-       frozen target.
-    3. Scans `[effective_sweep_start, target]` (`target` being whichever
-       of the two values step 2 derived: the existing lap's own frozen
-       target, or the brand-new lap's freshly-snapshotted one) — the
-       SAME `_scan_and_repair_evidence_missing_classification_jobs`
-       helper the forward pass uses, with its own, smaller
-       `sweep_repair_limit`/`sweep_page_size`/`sweep_max_rows_scanned`
-       budget (the sweep is a background safety net, not the primary
-       discovery path) — the upper bound (`created_at_to=target`) means
-       the sweep NEVER races ahead into territory the forward pass had
-       not reached as of the moment this lap's own target was
-       snapshotted (redundant: the forward pass will get there on its
-       own).
-
-    `sweep_repair_limit=50`/`sweep_page_size=200`/
-    `sweep_max_rows_scanned=1000` (vs. the forward pass's own 200/200/
-    5000): a documented judgment call, not architect-mandated values —
-    generous enough that a normal-sized backlog between the forward
-    cursor and the sweep converges in a handful of calls, small enough
-    that the sweep's own inherently-redundant re-scanning of
-    already-resolved evidence (a cheap `get_by_evidence`/
-    `get_current_classification` lookup per row, never a full
-    resolution) never dominates a reconciliation call's own cost next
-    to the forward pass's primary work.
-
-    What this backstop actually guarantees, and what it costs (honest,
-    not overclaimed — this delivery's own established documentation
-    discipline)
-    ------------------------------------------------------------------
-    Guarantees: no post-activation `EvidenceItem` is EVER permanently
-    unreachable once its own transaction commits, regardless of any
-    commit-order-vs-created_at-order inversion — "eventually, within
-    finitely many calls, never permanently", NOT a specific bounded
-    latency. Job submission happens DURING each scan pass itself, the
-    instant a row is actually inspected — it is never contingent on the
-    sweep cursor's own write succeeding afterward, so an orphan within
-    reach of a single sweep pass's budget gets its job that same call
-    regardless of what happens to cursor bookkeeping next.
-
-    Costs: a bounded amount of extra, mostly-cheap-skip re-scanning
-    work per call (the sweep's own budget, on top of the forward pass's
-    own); and a discovery LATENCY for a late-committing row that
-    depends on how long the sweep takes to complete its current lap —
-    which GROWS as the eligible evidence volume grows, since each
-    call's sweep budget is fixed.
-
-    The `lap` generation counter — corrected this round; the previous
-    "self-resolves" claim below was FALSE and has been retracted
-    ------------------------------------------------------------------
-    An earlier version of this function's own docstring claimed that a
-    newly-started lap whose first, budget-bounded call does not yet
-    reach the previous lap's completion point "self-resolves the
-    moment the forward frontier advances again even slightly". That
-    claim was FALSE — independently confirmed both by an external audit
-    and by direct reproduction (see
-    `tests/persistence/test_evidence_classification_job_reconciliation_sweep.py`'s
-    own bug-reproduction test): under the single-dimension, plain
-    `created_at` merge-on-write comparison `advance_cursor` used to
-    apply, a newly-started lap's own first write is compared directly
-    against the OLD, already-completed lap's much-further-along
-    persisted watermark and is rejected as "behind" — and this rejection
-    does NOT depend on the forward frontier at all, so it never
-    self-resolves; every subsequent call re-proposes the same early,
-    already-rejected position, forever. Any evidence in the unswept
-    remainder of that window — precisely the case this whole mechanism
-    exists to catch — was never found.
-
-    The actual fix: `EvidenceClassificationReconciliationCursor` now
-    carries a second, independent ordering dimension, `lap` — a
-    monotonically non-decreasing generation counter compared BEFORE
-    `created_at` (lexicographic `(lap, created_at)` ordering; see
-    `services.evidence.classification_reconciliation_cursor`'s own
-    docstring, "lap" section, for the full mechanism and its
-    concurrency-safety argument). A genuinely NEWER lap's `(lap,
-    created_at)` proposal always supersedes an OLDER lap's persisted
-    position entirely — regardless of where the new lap's own first,
-    partial scan happens to land — because the two are no longer
-    compared on `created_at` at all once `lap` differs. This function
-    threads `lap` through both passes below:
-
-    * Forward pass: always proposes `lap = existing_forward_cursor.lap`
-      (or `0` if no forward cursor exists yet) — a pure read-and-pass-
-      through, never invented or incremented; the forward cursor's own
-      `lap` dimension is a permanent non-event (see that module's own
-      docstring).
-    * Sweep pass: proposes `existing_sweep_cursor.lap + 1` (or `0` if no
-      sweep cursor exists yet) exactly when it decides to start a NEW
-      lap (the existing "caught up to `forward_frontier`" condition,
-      unchanged); proposes `existing_sweep_cursor.lap` unchanged when
-      CONTINUING an already-in-progress lap (also unchanged from
-      today's `created_at`/`last_evidence_ids` continuation logic).
-
-    This genuinely closes the permanent-stall class of bug: a lap
-    transition's own cursor write is no longer contingent on catching
-    up to where the previous lap ended before it is allowed to persist
-    any progress at all.
-
-    Freezing each lap's own upper bound at `target` — a SECOND,
-    independent liveness gap `lap` alone does NOT close (evidence/
-    classification-activation-preflight WO, this round's own final
-    correction; the previous framing below was FALSE and has been
-    retracted)
-    ------------------------------------------------------------------
-    An earlier version of this function's own docstring (and this
-    module's own inline comment at the sweep pass's forward-frontier
-    re-read, below) claimed that re-reading `forward_frontier` FRESH on
-    every single call, and using that freshly-re-read value as the
-    scan's own upper bound (`created_at_to`) for whichever lap is
-    currently in progress, was the CORRECT, intended design — framed
-    as "the sweep's own upper bound must reflect the MOST current
-    forward position, never a stale pre-call snapshot". That framing
-    was itself the bug, not a feature, and is retracted here.
-
-    The actual defect: if new evidence keeps arriving and advancing the
-    forward cursor faster than the sweep's own bounded per-call budget
-    can make progress, `forward_frontier` keeps growing out from under
-    the CURRENT lap. The current lap's own completion condition used to
-    be `existing_sweep_cursor.last_created_at >= forward_frontier` —
-    read fresh every call — so if forward growth keeps outpacing the
-    sweep, that condition can NEVER be satisfied: the lap never
-    completes, a new lap is therefore never started (the `lap`
-    mechanism above only ever triggers at the MOMENT a lap is observed
-    to have completed), and since a lap only ever scans FORWARD from
-    wherever it currently sits (same forward-only, set-membership-
-    tie-break discipline as the main forward cursor — it cannot go back
-    WITHIN itself to find something it has already scanned past), a row
-    that commits late — after the sweep has already passed its
-    `created_at` position within this exact, now-permanently-stuck lap
-    — remains undiscovered indefinitely, for as long as forward growth
-    keeps outpacing the sweep. This is a genuinely different failure
-    mode from the `lap`-counter stall above (that one strikes on a
-    lap's own FIRST, partial write; this one strikes an
-    ALREADY-IN-PROGRESS lap that can never reach its own, constantly-
-    moving finish line) — see
-    `tests/persistence/test_evidence_classification_job_reconciliation_sweep.py`'s
-    own growing-frontier reproduction test for the direct proof.
-
-    The fix: `target` (see `services.evidence
-    .classification_reconciliation_cursor`'s own docstring, "target"
-    section, for the full mechanism) freezes each lap's own upper bound
-    at the EXACT MOMENT that lap is proposed, never recomputing it on
-    any later, continuing call. The lap-completion decision above is
-    therefore corrected to compare the persisted sweep cursor's own
-    `last_created_at` against its OWN PERSISTED `target` —
-    `existing_sweep_cursor.last_created_at >= existing_sweep_cursor
-    .target` — never against a freshly re-read `forward_frontier`
-    directly. `forward_frontier` is read only to decide whether the
-    sweep has anything to do at all, and, exactly at the moment a new
-    lap is started, to snapshot ITS one-time `target`. A lap's own
-    scan upper bound (`created_at_to`, passed to
-    :func:`_scan_and_repair_evidence_missing_classification_jobs`) is
-    therefore always the FROZEN, persisted `target` for an ongoing,
-    continuing lap — never a freshly re-read forward frontier — closing
-    this liveness gap independently of, and in addition to, the `lap`
-    counter's own fix for the permanent-stall class of bug above.
-
-    Returns the SUM of jobs submitted by both passes this call (the
-    forward pass's own count plus the sweep pass's own count) —
-    unchanged external contract: still a single `int`, "number of jobs
-    submitted this call". 0 in the common case — most evidence already
-    has a job via the immediate-enqueue path; this function exists for
-    the rare gap, not as the normal path.
+    A single bounded pass per call — deliberately no limit-exhaustion
+    loop, no retry logic, no cursor of any kind. `limit` default (200)
+    matches the WO's own established convention for this family of
+    bounded operator-invoked passes
+    (`scripts/process_evidence_classification_jobs.py`'s own
+    `claim_next_pending` default usage).
     """
-    forward_cursor_key = activation_boundary.isoformat()
-    existing_forward_cursor = cursor_repository.get_cursor(forward_cursor_key)
-    forward_scan_from = (
-        existing_forward_cursor.last_created_at if existing_forward_cursor is not None else activation_boundary
+    evidence_ids = classification_job_repository.list_missing_classification_candidates(
+        activation_boundary=activation_boundary, limit=limit,
     )
-    forward_already_inspected: set[str] = (
-        set(existing_forward_cursor.last_evidence_ids) if existing_forward_cursor is not None else set()
-    )
-    # The forward cursor's own `lap` dimension is a permanent non-event
-    # — always read-and-passed-through unchanged, never invented or
-    # incremented here (see docstring's own "lap" section above). Its
-    # `target` dimension is likewise a permanent non-event (see
-    # docstring's own "target" section) — the forward cursor's very
-    # first call has no meaningful value to propose, so it proposes
-    # `activation_boundary` itself (never used for anything after that:
-    # every later call just reads this same persisted value back,
-    # exactly like `lap`).
-    forward_lap = existing_forward_cursor.lap if existing_forward_cursor is not None else 0
-    forward_target = existing_forward_cursor.target if existing_forward_cursor is not None else activation_boundary
-
-    forward_submitted = _scan_and_repair_evidence_missing_classification_jobs(
-        evidence_repository=evidence_repository,
-        classification_job_repository=classification_job_repository,
-        classification_repository=classification_repository,
-        cursor_repository=cursor_repository,
-        actor_type=actor_type,
-        actor_id=actor_id,
-        cursor_key=forward_cursor_key,
-        scan_created_at_from=forward_scan_from,
-        created_at_to=None,
-        already_inspected_ids_at_boundary=forward_already_inspected,
-        has_existing_cursor=existing_forward_cursor is not None,
-        repair_limit=repair_limit,
-        page_size=page_size,
-        max_rows_scanned=max_rows_scanned,
-        lap=forward_lap,
-        target=forward_target,
-    )
-
-    # --- The "safety sweep" backstop pass (see docstring above) ---
-    sweep_submitted = 0
-    # Re-read fresh: the forward pass above may have JUST advanced this
-    # same call. This value is used ONLY to decide whether the sweep
-    # has anything to safety-net yet at all (nothing has ever been
-    # forward-scanned), and, if a lap completes THIS call (below), to
-    # snapshot the brand-new lap's own FROZEN `target` — it is NEVER
-    # used directly as a continuing lap's own scan upper bound (see
-    # docstring's own corrected "Freezing each lap's own upper bound"
-    # section — using the freshest frontier as the bound on every call
-    # was exactly the bug this round's correction closes, not a
-    # feature).
-    forward_frontier_cursor = cursor_repository.get_cursor(forward_cursor_key)
-    forward_frontier = forward_frontier_cursor.last_created_at if forward_frontier_cursor is not None else None
-
-    if forward_frontier is not None:
-        sweep_cursor_key = f"{forward_cursor_key}::sweep"
-        existing_sweep_cursor = cursor_repository.get_cursor(sweep_cursor_key)
-        if existing_sweep_cursor is None or existing_sweep_cursor.last_created_at >= existing_sweep_cursor.target:
-            # No sweep cursor yet, or the CURRENT lap has genuinely
-            # finished (caught up to ITS OWN frozen target, never a
-            # freshly re-read forward_frontier) — start a NEW lap.
-            # Purely derived at read time; no "reset" write is ever
-            # performed (see docstring). A NEW lap always proposes a
-            # STRICTLY HIGHER `lap` than whatever is currently persisted
-            # (see docstring's own "lap" section) — this is what lets
-            # this call's write land even though its own bounded scan
-            # cannot yet reach the OLD lap's much-further-along
-            # position. The NEW lap's own `target` is snapshotted HERE,
-            # exactly once, from the CURRENT forward_frontier — see
-            # docstring's own "target" section for why this must happen
-            # only at this exact moment, never on every continuing call.
-            sweep_scan_from = activation_boundary
-            sweep_already_inspected: set[str] = set()
-            sweep_has_existing_cursor = False
-            sweep_lap = (existing_sweep_cursor.lap + 1) if existing_sweep_cursor is not None else 0
-            sweep_target = forward_frontier
-        else:
-            sweep_scan_from = existing_sweep_cursor.last_created_at
-            sweep_already_inspected = set(existing_sweep_cursor.last_evidence_ids)
-            sweep_has_existing_cursor = True
-            # Continuing an in-progress lap — propose the SAME `lap`
-            # value unchanged (falls into _resolve_cursor_advance's own
-            # "proposed.lap == existing.lap" branch, the ordinary,
-            # already-safe created_at/ids merge), and reuse the ALREADY
-            # PERSISTED `target` verbatim — never recomputed from the
-            # current forward_frontier (the actual fix this round; see
-            # docstring's own "target" section). `advance_cursor` also
-            # enforces this itself as an invariant regardless of what is
-            # proposed here, but this call proposes the correct,
-            # already-persisted value anyway — never a stale/incorrect
-            # one relying solely on that enforcement.
-            sweep_lap = existing_sweep_cursor.lap
-            sweep_target = existing_sweep_cursor.target
-
-        sweep_submitted = _scan_and_repair_evidence_missing_classification_jobs(
-            evidence_repository=evidence_repository,
-            classification_job_repository=classification_job_repository,
-            classification_repository=classification_repository,
-            cursor_repository=cursor_repository,
-            actor_type=actor_type,
-            actor_id=actor_id,
-            cursor_key=sweep_cursor_key,
-            scan_created_at_from=sweep_scan_from,
-            created_at_to=sweep_target,
-            already_inspected_ids_at_boundary=sweep_already_inspected,
-            has_existing_cursor=sweep_has_existing_cursor,
-            repair_limit=sweep_repair_limit,
-            page_size=sweep_page_size,
-            max_rows_scanned=sweep_max_rows_scanned,
-            lap=sweep_lap,
-            target=sweep_target,
+    created = 0
+    for evidence_id in evidence_ids:
+        classification_job_repository.submit_job(
+            evidence_id=evidence_id, actor_type=actor_type, actor_id=actor_id,
         )
-
-    return forward_submitted + sweep_submitted
+        created += 1
+    return created

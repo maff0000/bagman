@@ -1,21 +1,25 @@
 #!/usr/bin/env python3
 """scripts/process_evidence_classification_jobs.py — the bounded,
 operator/cron-invoked worker for `EvidenceClassificationJob`
-(BAGMAN accounting platform, `evidence/automatic-classification-activation`
-WO).
+(BAGMAN accounting platform; originally
+`evidence/automatic-classification-activation` WO, simplified by the
+`evidence/classification-simplification` WO).
 
 BAGMAN's evidence-classification subsystem
 (`services.evidence.classification_orchestrator.classify_evidence` —
 deterministic-rule-first, AI-fallback, human review via
 `CLASSIFICATION_REVIEW` Needs You items) has always been fully
-governed but had NO automatic trigger. This delivery's other half
-(`services/evidence/classification_job.py`'s
-`enqueue_classification_job_for_evidence`, wired into both real
-evidence-creation call sites — `services/mailbox/microsoft/evidence_ingest.py`
-and `app/api/routers/intake.py`) enqueues a durable
-`EvidenceClassificationJob` the moment new evidence is created. THIS
-script is what claims and actually processes those jobs — the one,
-bounded, explicit mechanism for doing so.
+governed but had NO automatic trigger. THIS script is both halves of
+that trigger now: it DISCOVERS post-activation evidence missing a
+classification job (`services.evidence.classification_job
+.create_missing_classification_jobs`, via a real PostgreSQL anti-join
+query — see that function's own docstring and
+`services.evidence.classification_job`'s own module docstring,
+"Simplified design" section, for why this replaced an earlier
+enqueue-at-ingestion + durable-reconciliation-cursor design), creates a
+job for each, and then claims and processes those (and any
+already-existing) jobs — the one, bounded, explicit mechanism for doing
+either.
 
 Mirrors `scripts/process_background_job_overflow.py`'s own structure
 closely (that module's own docstring states plainly: *"There is no
@@ -27,9 +31,8 @@ testable with zero env vars set), a bounded claim-and-process loop,
 per-job try/except, a real JSON summary report. Genuinely different in
 one respect: there is no `--submit` mode here at all (unlike
 `process_background_job_overflow.py`'s own two-mode CLI) — jobs are
-submitted automatically, by `enqueue_classification_job_for_evidence`,
-never manually via this script; `--process --limit N` is this script's
-only mode.
+created by this script's own discovery step, never submitted manually
+via a separate mode; `--process --limit N` is this script's only mode.
 
 Per-job outcome doctrine — corrected 2026-09-29 (architect review, WO
 item 3)
@@ -103,61 +106,53 @@ docstring section and identical reasoning):
   explicitly, mirroring `process_background_job_overflow.py`'s own
   named, itemised exceptions — not invent a second implicit default.
 
-Reconciliation is wired in BEFORE claiming (architect requirement, WO
-item 1)
+Discovery is wired in BEFORE claiming
 ------------------------------------------------------------------------
 `main()` (never `run_process()` — see that decision's own note at the
 call site below) calls
-`services.evidence.classification_job.reconcile_missing_classification_jobs`
-exactly once, BEFORE `classification_job_repository.claim_next_pending`,
-matching the architect's required flow: normal evidence creation ->
-best-effort immediate enqueue -> worker invocation -> bounded
-prospective reconciliation -> claim/process jobs. Reconciliation runs
-with its own distinct `actor_id`
-(`bagman-evidence-classification-reconciliation`, vs. this worker's own
+`services.evidence.classification_job.create_missing_classification_jobs`
+exactly once, BEFORE `classification_job_repository.claim_next_pending`
+— discover-and-create missing jobs, THEN claim/process jobs. Discovery
+runs with its own distinct `actor_id`
+(`bagman-evidence-classification-discovery`, vs. this worker's own
 `bagman-evidence-classification-worker`) so a job's `actor_id` alone
-tells an operator whether it was submitted by the immediate-enqueue
-path or recovered by reconciliation — `EvidenceClassificationJob
-.actor_id` is a plain persisted column, queryable like any other, so
-this distinction costs nothing and is worth keeping (a documented,
-non-blocking judgment call — no dedicated reporting surface for it
-exists yet). The reconciled count is folded into this script's own
-summary report as `reconciled_count`, alongside `claimed_count`.
-`run_process()` itself is deliberately NOT changed to call
-reconciliation internally — it is exercised directly, without
-reconciliation, by `tests/integration/test_evidence_classification_job_worker.py
+tells an operator it was created by this script's own discovery step
+(there is no other path that creates one any more — ingestion never
+enqueues a job itself) — `EvidenceClassificationJob.actor_id` is a
+plain persisted column, queryable like any other, so this distinction
+costs nothing and is worth keeping (a documented, non-blocking
+judgment call — no dedicated reporting surface for it exists yet). The
+created count is folded into this script's own summary report as
+`created_count`, alongside `claimed_count`. `run_process()` itself is
+deliberately NOT changed to call discovery internally — it is
+exercised directly, without discovery, by
+`tests/integration/test_evidence_classification_job_worker.py
 ::test_run_process_never_creates_jobs_itself` (a pre-existing, still-
 authoritative proof that `--process` alone never conjures a job into
-existence for un-enqueued evidence); wiring reconciliation into
-`run_process()` itself would make that specific, deliberate guarantee
-false. `main()` is the correct seam: it is the one, real, operator-
-invoked entrypoint that always wants both steps, and it is what
-production imports/runs. (Nothing prevents a future revision from
-splitting this into two explicit CLI flags — not attempted here, the
-WO's own spec asks for exactly one wired-in call.)
+existence); wiring discovery into `run_process()` itself would make
+that specific, deliberate guarantee false. `main()` is the correct
+seam: it is the one, real, operator-invoked entrypoint that always
+wants both steps, and it is what production imports/runs.
 
 The activation boundary is operator-set Layer-2 configuration, and
-reconciliation fails CLOSED, never silently, when it is unavailable
-(corrected 2026-09-29, architect review, WO item 1)
+discovery fails CLOSED, never silently, when it is unavailable
 ------------------------------------------------------------------------
-`reconcile_missing_classification_jobs` now takes `activation_boundary`
-as a required parameter (see
-`services.evidence.classification_job`'s own module docstring — an
-earlier version of that module hardcoded a hidden
-`AUTOMATIC_CLASSIFICATION_ACTIVATION_BOUNDARY` constant instead, which
-was wrong given this feature had not yet been deployed to production).
-THIS script is the one real caller that supplies it, reading the
-`BAGMAN_EVIDENCE_CLASSIFICATION_ACTIVATION_BOUNDARY` environment
-variable — BAGMAN's own documented Layer 2 "runtime environment
-configuration" (`config/README.md`, which lists "feature flags" as a
-canonical Layer 2 example) — as an ISO-8601 UTC string (e.g.
-`2026-10-15T00:00:00Z`), parsed with the exact same
+`create_missing_classification_jobs` takes `activation_boundary` as a
+required parameter (see `services.evidence.classification_job`'s own
+module docstring — an earlier version of that module hardcoded a
+hidden `AUTOMATIC_CLASSIFICATION_ACTIVATION_BOUNDARY` constant instead,
+which was wrong given this feature had not yet been deployed to
+production). THIS script is the one real caller that supplies it,
+reading the `BAGMAN_EVIDENCE_CLASSIFICATION_ACTIVATION_BOUNDARY`
+environment variable — BAGMAN's own documented Layer 2 "runtime
+environment configuration" (`config/README.md`, which lists "feature
+flags" as a canonical Layer 2 example) — as an ISO-8601 UTC string
+(e.g. `2026-10-15T00:00:00Z`), parsed with the exact same
 `datetime.fromisoformat(value.replace("Z", "+00:00"))` pattern already
 established at `services/xero/client.py`'s own `_parse_xero_wire_datetime`,
 wrapped so a malformed value fails loudly and specifically (see
 `services.evidence.classification_job
-.resolve_evidence_classification_activation_boundary`, relocated there
-from this script — preflight review correction, item C) rather than
+.resolve_evidence_classification_activation_boundary`) rather than
 with a bare traceback.
 
 Deliberately env-var-only, NEVER a CLI flag: per the architect's own
@@ -167,15 +162,15 @@ per-invocation argument that could accidentally be passed differently
 on different runs.
 
 If the variable is unset, or set to something that does not parse,
-reconciliation is SKIPPED ENTIRELY for that run — fail closed, never a
+discovery is SKIPPED ENTIRELY for that run — fail closed, never a
 silent default to "now" or to any other value. This is reported
 explicitly in the run's own summary JSON as
-`reconciliation_skipped_reason` (a human-readable string; `None` when
-reconciliation actually ran). Critically, a skipped reconciliation NEVER
+`discovery_skipped_reason` (a human-readable string; `None` when
+discovery actually ran). Critically, a skipped discovery pass NEVER
 blocks the worker's OTHER responsibility — claiming and processing
 already-existing `PENDING`/`FAILED_RETRYABLE`/`DEFERRED`/reclaimed jobs
-proceeds completely normally regardless of whether reconciliation ran.
-`main()` delegates this whole "resolve boundary, maybe reconcile, then
+proceeds completely normally regardless of whether discovery ran.
+`main()` delegates this whole "resolve boundary, maybe discover, then
 always process" sequence to `_run_worker` (below) — a small,
 dependency-injected extraction (`composition` passed in explicitly,
 rather than fetched via `get_composition()` internally) added
@@ -186,24 +181,23 @@ this directory, so this is a documented, narrow, test-motivated
 addition — `main()` itself remains the one, thin, real entrypoint that
 calls `get_composition()` and does file/stdout I/O).
 
-Reconciliation's own bound is a separate CLI concern from the worker's
-claim count
+Discovery's own bound is a separate CLI concern from the worker's claim
+count
 ------------------------------------------------------------------------
 `--limit` continues to govern only `claim_next_pending`'s own claim
-count (unrelated to reconciliation). A new, distinct
-`--reconciliation-repair-limit` flag (default 200, matching
-`reconcile_missing_classification_jobs`'s own default `repair_limit`)
-governs how many missing jobs a single reconciliation pass may create —
-deliberately NOT conflated with `--limit`, since the two bound
-genuinely different things (jobs claimed-and-processed vs. jobs
-newly-created-by-repair) that an operator may reasonably want to tune
-independently.
+count (unrelated to discovery). A distinct `--discovery-limit` flag
+(default 200, matching `create_missing_classification_jobs`'s own
+default `limit`) governs how many missing jobs a single discovery pass
+may create — deliberately NOT conflated with `--limit`, since the two
+bound genuinely different things (jobs claimed-and-processed vs. jobs
+newly-discovered-and-created) that an operator may reasonably want to
+tune independently.
 
 Usage
 -----
     python3 scripts/process_evidence_classification_jobs.py \\
         --runtime-dir /opt/bagman/runtime/evidence-classification-jobs \\
-        --process --limit 10 --reconciliation-repair-limit 200 \\
+        --process --limit 10 --discovery-limit 200 \\
         --worker-id operator-manual-run-1
 
 `--runtime-dir` may also be supplied via
@@ -216,12 +210,12 @@ operator script in this directory. Never installed as a live periodic
 job (cron/systemd timer) by this delivery — that is a separate, future
 production-activation decision (WO non-goal).
 
-Reconciliation only actually runs once
+Discovery only actually runs once
 `BAGMAN_EVIDENCE_CLASSIFICATION_ACTIVATION_BOUNDARY` is set to a real
 value (see "The activation boundary is operator-set Layer-2
 configuration" section above) — deliberately NOT set by this delivery;
 that is a separate, later, production-activation decision. Until then,
-every run's own summary JSON reports `reconciliation_skipped_reason`
+every run's own summary JSON reports `discovery_skipped_reason`
 explaining why, and ordinary claim/process work is entirely unaffected.
 """
 from __future__ import annotations
@@ -243,7 +237,7 @@ from core.timestamps import to_contract_string, utc_now  # noqa: E402
 from services.evidence.classification_job import (  # noqa: E402
     EVIDENCE_CLASSIFICATION_ACTIVATION_BOUNDARY_ENV_VAR,
     EvidenceClassificationJob,
-    reconcile_missing_classification_jobs,
+    create_missing_classification_jobs,
     resolve_evidence_classification_activation_boundary,
 )
 from services.evidence.classification_orchestrator import (  # noqa: E402
@@ -267,27 +261,21 @@ _MAX_PROCESS_LIMIT = 200
 _ACTOR_TYPE = "SYSTEM"
 _WORKER_ACTOR_ID = "bagman-evidence-classification-worker"
 #: Distinct from `_WORKER_ACTOR_ID` (see module docstring's
-#: "Reconciliation is wired in BEFORE claiming" section) — lets a job's
-#: own `actor_id` tell an operator whether it was submitted by the
-#: immediate-enqueue path or recovered by the reconciliation pass.
-_RECONCILIATION_ACTOR_ID = "bagman-evidence-classification-reconciliation"
+#: "Discovery is wired in BEFORE claiming" section) — lets a job's own
+#: `actor_id` tell an operator it was created by this script's own
+#: discovery step.
+_DISCOVERY_ACTOR_ID = "bagman-evidence-classification-discovery"
 
-#: Default `--reconciliation-repair-limit`, matching
-#: `services.evidence.classification_job.reconcile_missing_classification_jobs`'s
-#: own default `repair_limit`.
-_DEFAULT_RECONCILIATION_REPAIR_LIMIT = 200
+#: Default `--discovery-limit`, matching
+#: `services.evidence.classification_job.create_missing_classification_jobs`'s
+#: own default `limit`.
+_DEFAULT_DISCOVERY_LIMIT = 200
 
-#: RELOCATED (preflight review correction, item C — "one coherent
-#: activation contract"): `EVIDENCE_CLASSIFICATION_ACTIVATION_BOUNDARY_ENV_VAR`/
-#: `resolve_evidence_classification_activation_boundary` used to be
-#: defined here as this script's own private
-#: `_ACTIVATION_BOUNDARY_ENV_VAR`/`_resolve_activation_boundary` — they
-#: now live in `services.evidence.classification_job` (imported above)
-#: as the ONE, public, canonical definitions both real enqueue call
-#: sites (`services/mailbox/microsoft/evidence_ingest.py`,
-#: `app/api/routers/intake.py`) and this script's own reconciliation
-#: trigger resolve against — never two independently-maintained copies
-#: of the same parsing logic. This is a mechanical relocation only; the
+#: `EVIDENCE_CLASSIFICATION_ACTIVATION_BOUNDARY_ENV_VAR`/
+#: `resolve_evidence_classification_activation_boundary` live in
+#: `services.evidence.classification_job` (imported above) as the ONE,
+#: public, canonical definitions this script's own discovery trigger
+#: resolves against. This is a mechanical relocation only; the
 #: parsing/validation behaviour itself (the `Z`-suffix handling,
 #: explicit-offset handling, timezone-naive rejection, malformed-value
 #: rejection, fail-closed `(None, skip_reason)` returns) is completely
@@ -573,14 +561,14 @@ def _parse_args(argv: Optional[Iterable[str]]) -> argparse.Namespace:
     parser.add_argument("--process", action="store_true", required=True, help="claim and execute pending/retryable jobs right now (the only mode)")
     parser.add_argument("--limit", type=int, required=True, help=f"bounded claim count (1-{_MAX_PROCESS_LIMIT})")
     parser.add_argument(
-        "--reconciliation-repair-limit",
+        "--discovery-limit",
         type=int,
-        default=_DEFAULT_RECONCILIATION_REPAIR_LIMIT,
+        default=_DEFAULT_DISCOVERY_LIMIT,
         help=(
-            "bounded max number of missing jobs a single reconciliation pass may create this run "
-            f"(default {_DEFAULT_RECONCILIATION_REPAIR_LIMIT}) — a separate concern from --limit, "
+            "bounded max number of missing jobs a single discovery pass may create this run "
+            f"(default {_DEFAULT_DISCOVERY_LIMIT}) — a separate concern from --limit, "
             "which governs claim_next_pending's own claim count; has no effect at all if "
-            f"{EVIDENCE_CLASSIFICATION_ACTIVATION_BOUNDARY_ENV_VAR} is unset/malformed (reconciliation is skipped entirely — "
+            f"{EVIDENCE_CLASSIFICATION_ACTIVATION_BOUNDARY_ENV_VAR} is unset/malformed (discovery is skipped entirely — "
             "see module docstring)"
         ),
     )
@@ -590,8 +578,8 @@ def _parse_args(argv: Optional[Iterable[str]]) -> argparse.Namespace:
 
     if not (1 <= args.limit <= _MAX_PROCESS_LIMIT):
         parser.error(f"--limit must be between 1 and {_MAX_PROCESS_LIMIT} (got {args.limit})")
-    if args.reconciliation_repair_limit < 1:
-        parser.error(f"--reconciliation-repair-limit must be >= 1 (got {args.reconciliation_repair_limit})")
+    if args.discovery_limit < 1:
+        parser.error(f"--discovery-limit must be >= 1 (got {args.discovery_limit})")
 
     runtime_dir = args.runtime_dir or os.environ.get("BAGMAN_EVIDENCE_CLASSIFICATION_JOB_RUNTIME_DIR")
     if not runtime_dir:
@@ -614,13 +602,13 @@ def _run_worker(
     env: Optional[dict] = None,
 ) -> dict:
     """Everything `main()` does once it has a `composition` and parsed
-    `args`: resolve the activation boundary, reconcile-or-skip, always
+    `args`: resolve the activation boundary, discover-or-skip, always
     process, and assemble the run's own summary report. Extracted as a
     small, dependency-injected function (`composition` passed in
     explicitly, `env` defaulting to `os.environ`) specifically so this
     dispatch logic — most importantly, "an unset/malformed activation
-    boundary skips reconciliation but never blocks ordinary claim/
-    process work" — is directly unit-testable with a fake/in-memory
+    boundary skips discovery but never blocks ordinary claim/process
+    work" — is directly unit-testable with a fake/in-memory
     `composition` and no real env vars or database (see module
     docstring's "The activation boundary is operator-set Layer-2
     configuration" section for why this extraction exists; this
@@ -637,30 +625,27 @@ def _run_worker(
         env.get(EVIDENCE_CLASSIFICATION_ACTIVATION_BOUNDARY_ENV_VAR)
     )
 
-    # Bounded, prospective reconciliation FIRST — see module docstring's
-    # "Reconciliation is wired in BEFORE claiming" section. Deliberately
-    # called here, never inside run_process() itself (that would
-    # falsify test_run_process_never_creates_jobs_itself's own, still-
+    # Bounded discovery FIRST — see module docstring's "Discovery is
+    # wired in BEFORE claiming" section. Deliberately called here, never
+    # inside run_process() itself (that would falsify
+    # test_run_process_never_creates_jobs_itself's own, still-
     # authoritative "--process alone never conjures a job into
     # existence" guarantee — see that section for the full reasoning).
-    # A skipped reconciliation (activation_boundary is None) NEVER
+    # A skipped discovery pass (activation_boundary is None) NEVER
     # blocks the ordinary claim/process work below — see module
     # docstring's own "fails CLOSED, never silently" section.
     if activation_boundary is not None:
-        reconciled_count = reconcile_missing_classification_jobs(
-            evidence_repository=composition.api.evidence_repository,
+        created_count = create_missing_classification_jobs(
             classification_job_repository=composition.classification_job_repository,
-            classification_repository=composition.classification_repository,
-            cursor_repository=composition.classification_reconciliation_cursor_repository,
             actor_type=_ACTOR_TYPE,
-            actor_id=_RECONCILIATION_ACTOR_ID,
+            actor_id=_DISCOVERY_ACTOR_ID,
             activation_boundary=activation_boundary,
-            repair_limit=args.reconciliation_repair_limit,
+            limit=args.discovery_limit,
         )
-        reconciliation_skipped_reason = None
+        discovery_skipped_reason = None
     else:
-        reconciled_count = 0
-        reconciliation_skipped_reason = skip_reason
+        created_count = 0
+        discovery_skipped_reason = skip_reason
 
     result = run_process(
         limit=args.limit,
@@ -683,8 +668,8 @@ def _run_worker(
 
     report = {
         "run_id": run_id,
-        "reconciled_count": reconciled_count,
-        "reconciliation_skipped_reason": reconciliation_skipped_reason,
+        "created_count": created_count,
+        "discovery_skipped_reason": discovery_skipped_reason,
         **result,
         "started_at": to_contract_string(started_at),
         "completed_at": to_contract_string(utc_now()),

@@ -1,7 +1,8 @@
 """Real, disposable-PostgreSQL concurrency proof for
 `EvidenceClassificationJobRepository.submit_job`'s own evidence_id-
 keyed idempotency doctrine (BAGMAN accounting platform,
-`evidence/automatic-classification-activation` WO).
+`evidence/automatic-classification-activation` WO; updated for
+`evidence/classification-simplification`).
 
 Mirrors `tests/persistence/test_xero_account_suggestion_concurrency.py`'s
 exact discipline (genuine OS threads + a `threading.Barrier`, never
@@ -16,8 +17,8 @@ committed, producing two rows for the same `evidence_id`. This test
 proves `uq_evidence_classification_jobs_evidence_id` (migration
 `a7f34c9e2d18`) actually prevents that under genuine concurrency, both
 via `EvidenceClassificationJobRepository.submit_job` directly and via
-the real `enqueue_classification_job_for_evidence` integration point
-both real evidence-creation call sites use.
+the real `create_missing_classification_jobs` discovery entry point
+the classification worker uses.
 """
 from __future__ import annotations
 
@@ -35,7 +36,7 @@ from persistence.postgres.evidence_repository import PostgresEvidenceRepository
 from persistence.postgres.external_reference_repository import PostgresExternalReferenceRepository
 from persistence.postgres.session import get_engine, session_scope
 from persistence.postgres.source_repository import PostgresSourceRepository
-from services.evidence.classification_job import enqueue_classification_job_for_evidence
+from services.evidence.classification_job import create_missing_classification_jobs
 
 ACTOR_ID = "evidence-classification-job-concurrency-test"
 
@@ -102,14 +103,18 @@ def _run_submit(*, evidence_id: str, repo, results: list, errors: list) -> None:
         errors.append(exc)
 
 
-def _run_enqueue(*, evidence_id: str, evidence_created_at, repo, barrier: threading.Barrier, errors: list) -> None:
-    # enqueue_classification_job_for_evidence never raises by contract
-    # — any exception observed here would itself be a defect.
+def _run_discover_and_create(*, repo, barrier: threading.Barrier, errors: list) -> None:
+    # create_missing_classification_jobs never raises by contract for
+    # the ordinary case — any exception observed here would itself be a
+    # defect. The barrier is inside `repo.submit_job` itself (see
+    # `_BarrierGatedJobRepository` above) — `list_missing_classification_candidates`
+    # runs unbarriered, so both threads discover the SAME candidate
+    # before either one's `submit_job` call reaches the real race
+    # window.
     try:
-        barrier.wait(timeout=10)
-        enqueue_classification_job_for_evidence(
-            evidence_id, classification_job_repository=repo, actor_type="SYSTEM", actor_id=ACTOR_ID,
-            evidence_created_at=evidence_created_at, activation_boundary=_ALWAYS_ACTIVE_BOUNDARY,
+        create_missing_classification_jobs(
+            classification_job_repository=repo, actor_type="SYSTEM", actor_id=ACTOR_ID,
+            activation_boundary=_ALWAYS_ACTIVE_BOUNDARY,
         )
     except Exception as exc:  # noqa: BLE001 - must never happen; captured to fail loudly if it does
         errors.append(exc)
@@ -149,12 +154,14 @@ def test_two_genuinely_concurrent_submit_job_calls_for_the_same_evidence_id(fres
 
 
 @pytest.mark.usefixtures("fresh_engine")
-def test_two_genuinely_concurrent_enqueue_calls_for_the_same_evidence_id(fresh_engine):
-    """Same proof, but through the REAL integration-point function both
-    evidence-creation call sites invoke
-    (`enqueue_classification_job_for_evidence`), not the repository
-    method directly — proves the end-to-end path is race-safe, not
-    merely the repository in isolation."""
+def test_two_genuinely_concurrent_discover_and_create_calls_for_the_same_evidence_id(fresh_engine):
+    """Same proof, but through the REAL discovery entry point the
+    classification worker uses (`create_missing_classification_jobs`),
+    not the repository method directly — proves the end-to-end path is
+    race-safe, not merely the repository in isolation. This is also the
+    direct proof for required scenario (9): two REAL concurrent
+    discovery+create calls still produce exactly one job per
+    evidence_id, relying on the real unique constraint."""
     evidence = _real_evidence()
     evidence_id = evidence.evidence_id
     barrier = threading.Barrier(2)
@@ -163,11 +170,8 @@ def test_two_genuinely_concurrent_enqueue_calls_for_the_same_evidence_id(fresh_e
     errors: list = []
     threads = [
         threading.Thread(
-            target=_run_enqueue,
-            kwargs=dict(
-                evidence_id=evidence_id, evidence_created_at=evidence.created_at, repo=shared_gated_repo,
-                barrier=barrier, errors=errors,
-            ),
+            target=_run_discover_and_create,
+            kwargs=dict(repo=shared_gated_repo, barrier=barrier, errors=errors),
         )
         for _ in range(2)
     ]
@@ -175,13 +179,13 @@ def test_two_genuinely_concurrent_enqueue_calls_for_the_same_evidence_id(fresh_e
         t.start()
     for t in threads:
         t.join(timeout=15)
-        assert not t.is_alive(), "an enqueue thread deadlocked/timed out"
+        assert not t.is_alive(), "a discover-and-create thread deadlocked/timed out"
 
-    assert not errors, f"enqueue_classification_job_for_evidence must never raise: {errors}"
+    assert not errors, f"create_missing_classification_jobs must never raise: {errors}"
     row_count = _row_count(evidence_id)
     assert row_count == 1, (
         f"DUPLICATE JOB ROWS: {row_count} EvidenceClassificationJob rows exist for one evidence_id "
-        "after two genuinely concurrent enqueue_classification_job_for_evidence calls."
+        "after two genuinely concurrent create_missing_classification_jobs calls."
     )
 
 
