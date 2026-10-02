@@ -3,7 +3,7 @@
 # contracts/manifest/bagman.component_manifest.v1.schema.json.
 
 id: BAGMAN.SERVICES.EVIDENCE
-version: 6
+version: 7
 
 responsibility: >
   Own canonical EvidenceItem identity and its immutability and
@@ -110,6 +110,36 @@ responsibility: >
   `AI_PRIOR_FAILURE` again without a new model call); this is a
   documentation-only correction, no reset/retry mechanism is built
   (architect's own "Option A" ruling).
+
+  As of this version (version 7, `evidence/classification-simplification`
+  WO) the enqueue-at-ingestion + durable reconciliation-cursor design
+  (versions 4-6 above) is REMOVED entirely and replaced with a simpler
+  mechanism: evidence ingestion
+  (`services/mailbox/microsoft/evidence_ingest.py`,
+  `app/api/routers/intake.py`) no longer enqueues a classification job
+  of any kind — `enqueue_classification_job_for_evidence` is deleted.
+  Instead, `EvidenceClassificationJobRepository` gains one new method,
+  `list_missing_classification_candidates` (a single real PostgreSQL
+  `NOT EXISTS`/anti-join query against `evidence_items`,
+  `evidence_classification_jobs`, and `evidence_classifications` —
+  reproducing `_current_classification_query`'s own exact "current
+  classification" semantics, generalised across many evidence_ids at
+  once, never reimplemented differently), and a new, small function,
+  `create_missing_classification_jobs`, replaces
+  `reconcile_missing_classification_jobs` as the worker's own
+  discovery-and-create entry point
+  (`scripts/process_evidence_classification_jobs.py`). No cursor, lap
+  counter, frozen target, or sweep pass of any kind remains — every
+  call queries PostgreSQL's own current state fresh, which is itself
+  already the durable state; there is nothing to remember between
+  worker invocations. The whole
+  `services.evidence.classification_reconciliation_cursor` module, its
+  Postgres repository, and the
+  `evidence_classification_reconciliation_cursors` table/migration
+  (`143b86b2ab44`) are deleted outright — `ae936a444eae` is now the
+  single Alembic head for this component's own migration history. No
+  schema/migration change was otherwise needed: the new discovery query
+  is a pure read against tables that already exist.
 
 owns:
   - EvidenceItem

@@ -79,10 +79,6 @@ from datetime import datetime
 from typing import Any, Mapping, Optional, Protocol
 
 from core.errors import BagmanError, FileTooLargeError
-from services.evidence.classification_job import (
-    enqueue_classification_job_for_evidence,
-    resolve_evidence_classification_activation_boundary_from_env,
-)
 from services.evidence.intake.policy import EMAIL_MESSAGE_MIME_TYPE
 from services.evidence.intake.scanner import EvidenceSafetyScanner, ScanVerdict
 from services.evidence.intake.streaming import spool_stream
@@ -122,14 +118,25 @@ class _EvidenceAPI(Protocol):
 
 
 class _ClassificationJobRepository(Protocol):
-    """The exact facade surface this module needs from
-    `services.evidence.classification_job.EvidenceClassificationJobRepository`
-    — a structural Protocol for the same reason `_ObjectStore`/
-    `_EvidenceAPI` above are: this module stays composition-root-
-    agnostic (dependency-injected, never importing `app.api.composition`
-    itself — mirrors `services.evidence.classification_orchestrator`'s
-    own documented "Dependency-injected, not composition-coupled"
-    doctrine)."""
+    """The exact facade surface `ingest_email_evidence`'s own
+    `classification_job_repository` parameter used to need, back when
+    this module enqueued a durable `EvidenceClassificationJob` itself
+    immediately after registration (`evidence/automatic-classification-
+    activation` WO). The `evidence/classification-simplification` WO
+    removed that enqueue entirely — classification-job discovery now
+    happens entirely on the WORKER side (see
+    `services.evidence.classification_job.create_missing_classification_jobs`)
+    — so `ingest_email_evidence` no longer calls anything on this
+    Protocol. It is kept, and the parameter below retained
+    (accepted-and-ignored), purely to avoid rippling a signature change
+    through `services/mailbox/sweep.py` (4 functions),
+    `services/mailbox/review_resolution.py` (3 functions), and the
+    `app/api/routers/mailboxes_{microsoft,imap,gmail}.py` call sites (9
+    in total) that all thread this same keyword argument straight
+    through with no use of their own either — a mechanical,
+    purely-cosmetic signature change with zero functional benefit,
+    deferred to a dedicated follow-up cleanup rather than bundled into
+    this WO's own, unrelated simplification."""
 
     def submit_job(self, **kwargs: Any) -> Any: ...
 
@@ -174,6 +181,20 @@ def ingest_email_evidence(
     meaningfully recover from inline (propagated as a `BagmanError`
     subclass, exactly like `EvidenceRepository.register_evidence`
     itself would).
+
+    `classification_job_repository` is accepted-and-ignored
+    (`evidence/classification-simplification` WO — see
+    `_ClassificationJobRepository`'s own docstring): this function used
+    to enqueue a durable `EvidenceClassificationJob` immediately after
+    `register_evidence()` returned; that enqueue is now removed
+    entirely. Ingestion no longer creates, or even references,
+    anything classification-job-shaped — classification-job discovery
+    happens entirely on the worker side now (see
+    `services.evidence.classification_job.create_missing_classification_jobs`).
+    Ingestion succeeds identically whether or not a real repository is
+    passed here, and regardless of whether
+    `BAGMAN_EVIDENCE_CLASSIFICATION_ACTIVATION_BOUNDARY` is set in this
+    process's environment at all.
     """
     try:
         with spool_stream(io.BytesIO(raw_mime_bytes), max_size_bytes=max_size_bytes) as spooled:
@@ -240,51 +261,14 @@ def ingest_email_evidence(
                 causation_id=causation_id,
             )
 
-            # evidence/automatic-classification-activation WO — the
-            # first of the two real evidence-creation call sites (the
-            # other is app/api/routers/intake.py's own manual-upload
-            # handoff). Enqueue the durable, automatic classification
-            # trigger IMMEDIATELY after register_evidence() returns
-            # (its own transaction has already fully committed — see
-            # services.evidence.classification_job's module docstring)
-            # — idempotent per evidence_id (a replayed sweep of the
-            # same message is always safe), and NEVER raises (a failed
-            # enqueue must never corrupt an otherwise-successful
-            # ingest). `classification_job_repository` defaults to
-            # `None` (a documented judgment call): every REAL caller in
-            # this codebase (services/mailbox/sweep.py's `run_sweep`/
-            # `_reprocess_one_message`/
-            # `reprocess_all_historical_candidates_for_domain`/
-            # `process_security_reviewed_message_once`, threaded from
-            # `app/api/routers/mailboxes_{microsoft,imap,gmail}.py` with
-            # the real `composition.classification_job_repository`)
-            # always supplies a real repository; `None` exists only so
-            # this already-large, already-heavily-tested call chain's
-            # many pre-existing unit/integration tests that construct
-            # `ingest_email_evidence`/`run_sweep`/etc. directly (with no
-            # interest in this WO's own new capability) do not all need
-            # a mechanical, purely-additive kwarg edit — skipping the
-            # enqueue in that case is exactly as safe as any other
-            # "enqueue was skipped" gap this module's own docstring
-            # already discloses and accepts (never a reason to fail
-            # ingestion itself).
-            if classification_job_repository is not None:
-                # Preflight review correction, item C — resolved fresh on
-                # every call (cheap, no caching needed; see
-                # services.evidence.classification_job's own module
-                # docstring) so this call site's own gate is always
-                # driven by the CURRENT operator-configured activation
-                # boundary, never a value cached from process start.
-                activation_boundary, _ = resolve_evidence_classification_activation_boundary_from_env()
-                enqueue_classification_job_for_evidence(
-                    evidence.evidence_id,
-                    classification_job_repository=classification_job_repository,
-                    actor_type="SYSTEM",
-                    actor_id="bagman-evidence-classification-trigger",
-                    correlation_id=correlation_id,
-                    evidence_created_at=evidence.created_at,
-                    activation_boundary=activation_boundary,
-                )
+            # evidence/classification-simplification WO: ingestion no
+            # longer enqueues a classification job of any kind — see
+            # this function's own docstring and
+            # `_ClassificationJobRepository`'s own docstring for why
+            # `classification_job_repository` is still accepted as a
+            # parameter but is never read here. Classification-job
+            # discovery now happens entirely on the worker side (see
+            # `services.evidence.classification_job.create_missing_classification_jobs`).
             return EmailIngestOutcome(
                 status=INGEST_STATUS_INGESTED,
                 evidence=evidence,

@@ -335,58 +335,46 @@ def test_direct_upload_bypass_is_closed(client):
 
 
 # ---------------------------------------------------------------------
-# evidence/automatic-classification-activation WO — the manual-upload
-# call site's own automatic-classification-trigger wiring. See
-# services/evidence/classification_job.py's own module docstring and
+# evidence/classification-simplification WO — the manual-upload call
+# site no longer enqueues a classification job of any kind at all
+# (classification-job discovery now happens entirely on the worker
+# side — see services/evidence/classification_job.py's own module
+# docstring, "Simplified design" section). These tests prove the
+# decoupling against the REAL, disposable-PostgreSQL production
+# composition `client` builds (never in-memory). See
 # tests/integration/test_mailbox_evidence_ingest.py for the mailbox
 # call site's equivalent proof.
 # ---------------------------------------------------------------------
 
 
-def test_successful_upload_enqueues_exactly_one_classification_job(client, monkeypatch):
-    """`app/api/routers/intake.py::_register_accepted_evidence` calls
-    `enqueue_classification_job_for_evidence` immediately after its own
-    `composition.api.register_evidence(...)` succeeds — this proves it
-    against the REAL, disposable-PostgreSQL production composition
-    `client` builds (never in-memory), a genuine round trip through
-    `PostgresEvidenceClassificationJobRepository`.
-
-    Preflight review correction, item C: the real call site now gates
-    enqueue on the operator-configured activation boundary — set it
-    safely in the past so this test's own concern (the manual-upload
-    call site's wiring) is exercised, not the gate itself (which has
-    its own dedicated tests)."""
+def test_successful_upload_creates_zero_classification_jobs(client):
+    """`app/api/routers/intake.py::_register_accepted_evidence` no
+    longer calls anything classification-job-shaped after its own
+    `composition.api.register_evidence(...)` succeeds — proves exactly
+    zero `EvidenceClassificationJob` rows exist for the new evidence,
+    with `BAGMAN_EVIDENCE_CLASSIFICATION_ACTIVATION_BOUNDARY`
+    deliberately left UNSET in this test's own environment (proving
+    ingestion's behaviour is unaffected by it either way)."""
     from app.api.composition import get_composition
-    from services.evidence.classification_job import EVIDENCE_CLASSIFICATION_ACTIVATION_BOUNDARY_ENV_VAR
-
-    monkeypatch.setenv(EVIDENCE_CLASSIFICATION_ACTIVATION_BOUNDARY_ENV_VAR, "2000-01-01T00:00:00Z")
 
     response = _post_intake(
         client,
         content=SYNTHETIC_PDF,
-        filename="auto-classification.pdf",
+        filename="no-auto-classification.pdf",
         actor_id="matt",
     )
     assert response.status_code == 201
     evidence_id = response.json()["evidence"]["evidence_id"]
 
     job = get_composition().classification_job_repository.get_by_evidence(evidence_id)
-    assert job is not None
-    assert job.evidence_id == evidence_id
-    assert job.status == "PENDING"
-    assert job.actor_type == "SYSTEM"
+    assert job is None
 
 
-def test_a_second_upload_replaying_the_same_idempotency_key_never_creates_a_second_job(client, monkeypatch):
+def test_a_second_upload_replaying_the_same_idempotency_key_also_creates_zero_jobs(client):
     """A replayed intake (same `Idempotency-Key`) resolves to the SAME
-    `EvidenceItem` (CD-4's own idempotent-observation doctrine) —
-    `enqueue_classification_job_for_evidence`'s own evidence_id-keyed
-    idempotency must therefore never create a second job either."""
-    from app.api.composition import get_composition
-    from services.evidence.classification_job import EVIDENCE_CLASSIFICATION_ACTIVATION_BOUNDARY_ENV_VAR
-
-    monkeypatch.setenv(EVIDENCE_CLASSIFICATION_ACTIVATION_BOUNDARY_ENV_VAR, "2000-01-01T00:00:00Z")
-
+    `EvidenceItem` (CD-4's own idempotent-observation doctrine) — and,
+    exactly like the first request, creates no `EvidenceClassificationJob`
+    row at all."""
     key = "auto-classification-replay-key"  # gitleaks:allow
     first = _post_intake(client, content=SYNTHETIC_PDF, filename="replay.pdf", actor_id="matt", idempotency_key=key)
     assert first.status_code == 201
@@ -402,10 +390,6 @@ def test_a_second_upload_replaying_the_same_idempotency_key_never_creates_a_seco
     assert second.status_code == 200
     assert second.json()["evidence"]["evidence_id"] == evidence_id
 
-    composition = get_composition()
-    job = composition.classification_job_repository.get_by_evidence(evidence_id)
-    assert job is not None
-
     from persistence.postgres.evidence_classification_job_models import EvidenceClassificationJobRow
     from persistence.postgres.session import get_engine, session_scope
 
@@ -413,7 +397,7 @@ def test_a_second_upload_replaying_the_same_idempotency_key_never_creates_a_seco
         row_count = (
             session.query(EvidenceClassificationJobRow).filter_by(evidence_id=evidence_id).count()
         )
-    assert row_count == 1
+    assert row_count == 0
 
 
 def test_quarantined_upload_never_creates_a_classification_job(client):

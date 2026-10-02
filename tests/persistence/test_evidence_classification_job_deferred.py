@@ -30,7 +30,6 @@ with "prove the real mechanism, not a busier-looking test".
 from __future__ import annotations
 
 import hashlib
-from datetime import datetime, timezone
 
 import scripts.process_evidence_classification_jobs as worker
 from ai.invocation import InMemoryAIInvocationRepository
@@ -45,7 +44,6 @@ from persistence.postgres.evidence_classification_rule_repository import Postgre
 from persistence.postgres.evidence_repository import PostgresEvidenceRepository
 from persistence.postgres.external_reference_repository import PostgresExternalReferenceRepository
 from persistence.postgres.source_repository import PostgresSourceRepository
-from services.evidence.classification_job import enqueue_classification_job_for_evidence
 from services.evidence.classification_orchestrator import AI_TASK_ID, AI_TASK_VERSION
 from services.needs_you.needs_you import InMemoryNeedsYouRepository
 
@@ -118,22 +116,11 @@ def test_ai_in_progress_across_more_polls_than_max_attempts_never_exhausts_or_te
     )
 
     job_repository = PostgresEvidenceClassificationJobRepository()
-    evidence_created_at = _evidence_repository().get_evidence(evidence_id).created_at
-    enqueue_classification_job_for_evidence(
-        evidence_id,
-        classification_job_repository=job_repository,
-        actor_type=actor.SYSTEM,
-        actor_id=ACTOR_ID,
-        # This module's own test exercises DEFERRED polling behaviour —
-        # never the preflight-review enqueue-side activation gate (item
-        # C) — so a boundary far enough in the past always satisfies it.
-        evidence_created_at=evidence_created_at,
-        activation_boundary=datetime.min.replace(tzinfo=timezone.utc),
-        # max_attempts is NOT a parameter of enqueue_classification_job_for_evidence
-        # (it always defaults to 3 there) — submit directly instead so
-        # this test's own max_attempts is explicit and independent of
-        # that default, per the test plan's own "e.g. max_attempts=3".
-    )
+    # evidence/classification-simplification WO: ingestion no longer
+    # enqueues a job at all — submit directly instead, which also keeps
+    # this test's own max_attempts explicit (default 3, matching the
+    # test plan's own "e.g. max_attempts=3") rather than implicit.
+    job_repository.submit_job(evidence_id=evidence_id, actor_type=actor.SYSTEM, actor_id=ACTOR_ID)
     job = job_repository.get_by_evidence(evidence_id)
     assert job.max_attempts == 3, "confirms this proof exercises the same max_attempts=3 the test plan names"
 

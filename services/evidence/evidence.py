@@ -162,11 +162,8 @@ class EvidenceRepository(abc.ABC):
         evidence_type: Optional[str] = None,
         received_at_from: Optional[datetime] = None,
         received_at_to: Optional[datetime] = None,
-        created_at_from: Optional[datetime] = None,
-        created_at_to: Optional[datetime] = None,
         limit: Optional[int] = None,
         offset: int = 0,
-        order_by_created_at: bool = False,
     ) -> list[EvidenceItem]:
         """List EvidenceItems, most-recently-received first (CD-4 WI-3,
         PID §44-46). Same filter/pagination doctrine as
@@ -178,26 +175,17 @@ class EvidenceRepository(abc.ABC):
         behaviour — an explicit page-size boundary is the HTTP layer's
         job (``app/api/routers/intake.py``'s ``GET /internal/evidence``).
 
-        ``created_at_from``/``created_at_to`` (evidence/automatic-
-        classification-activation WO, preflight correction item A) —
-        inclusive bounds on ``EvidenceItem.created_at`` (server-assigned
-        registration time), mirroring ``received_at_from``/
-        ``received_at_to``'s own inclusive, independent, optional
-        semantics exactly: every filter given (of either pair, or both)
-        narrows the result further, and any filter omitted matches all.
-        ``created_at`` and ``received_at`` are genuinely independent
-        fields (an artifact can be received long before it is
-        registered) — these two filter pairs are never conflated.
-
-        ``order_by_created_at`` (same WO/item) — ``False`` (default)
-        preserves this method's original ``received_at DESC,
-        evidence_id DESC`` ordering for every existing caller unchanged;
-        ``True`` orders ``created_at ASC, evidence_id ASC`` instead —
-        the ordering
-        ``services.evidence.classification_job.reconcile_missing_classification_jobs``
-        needs to walk evidence forward in REGISTRATION order (see that
-        function's own docstring for why only that ordering keeps an
-        orphan's scan position fixed forever once it exists).
+        (The `evidence/automatic-classification-activation` WO had
+        added ``created_at_from``/``created_at_to``/``order_by_created_at``
+        here, purely to support a durable reconciliation-cursor scan
+        that walked evidence forward in registration order. The
+        `evidence/classification-simplification` WO removed that scan
+        entirely — replaced by
+        ``EvidenceClassificationJobRepository.list_missing_classification_candidates``'s
+        own direct, single SQL query against ``evidence_items`` — and,
+        with it, every caller of these three parameters; they are
+        removed here too, restoring this method to its pre-that-epic
+        shape.)
         """
         raise NotImplementedError
 
@@ -376,11 +364,8 @@ class InMemoryEvidenceRepository(EvidenceRepository):
         evidence_type: Optional[str] = None,
         received_at_from: Optional[datetime] = None,
         received_at_to: Optional[datetime] = None,
-        created_at_from: Optional[datetime] = None,
-        created_at_to: Optional[datetime] = None,
         limit: Optional[int] = None,
         offset: int = 0,
-        order_by_created_at: bool = False,
     ) -> list[EvidenceItem]:
         items = list(self._by_id.values())
         if entity_id is not None:
@@ -391,15 +376,8 @@ class InMemoryEvidenceRepository(EvidenceRepository):
             items = [i for i in items if i.received_at >= received_at_from]
         if received_at_to is not None:
             items = [i for i in items if i.received_at <= received_at_to]
-        if created_at_from is not None:
-            items = [i for i in items if i.created_at >= created_at_from]
-        if created_at_to is not None:
-            items = [i for i in items if i.created_at <= created_at_to]
 
-        if order_by_created_at:
-            items.sort(key=lambda i: (i.created_at, i.evidence_id))
-        else:
-            items.sort(key=lambda i: (i.received_at, i.evidence_id), reverse=True)
+        items.sort(key=lambda i: (i.received_at, i.evidence_id), reverse=True)
 
         if limit is None:
             return items[offset:]

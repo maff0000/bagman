@@ -144,26 +144,24 @@ def test_never_stores_raw_mime_in_the_evidence_metadata(api, object_store, sourc
 
 
 # ---------------------------------------------------------------------
-# evidence/automatic-classification-activation WO — the mailbox call
-# site's own automatic-classification-trigger wiring. See
-# services/evidence/classification_job.py's own module docstring and
+# evidence/classification-simplification WO — the mailbox call site no
+# longer enqueues a classification job of any kind at all
+# (classification-job discovery now happens entirely on the worker
+# side — see services/evidence/classification_job.py's own module
+# docstring, "Simplified design" section). See
 # tests/app_api/test_intake_endpoint.py for the manual-upload call
 # site's equivalent proof.
 # ---------------------------------------------------------------------
 
 
-def test_clean_ingest_enqueues_exactly_one_classification_job(api, object_store, source_id, monkeypatch):
-    from services.evidence.classification_job import (
-        EVIDENCE_CLASSIFICATION_ACTIVATION_BOUNDARY_ENV_VAR,
-        InMemoryEvidenceClassificationJobRepository,
-    )
-
-    # Preflight review correction, item C: the real call site now gates
-    # enqueue on the operator-configured activation boundary — set it
-    # to something safely in the past so this test's own concern (the
-    # mailbox call site's wiring, once activated) is exercised, not the
-    # gate itself (which has its own dedicated tests).
-    monkeypatch.setenv(EVIDENCE_CLASSIFICATION_ACTIVATION_BOUNDARY_ENV_VAR, "2000-01-01T00:00:00Z")
+def test_clean_ingest_creates_zero_classification_jobs(api, object_store, source_id):
+    """`classification_job_repository` is accepted-and-ignored (see
+    `ingest_email_evidence`'s own docstring and
+    `_ClassificationJobRepository`'s own docstring for why the
+    parameter is kept but never called) — proves zero
+    `EvidenceClassificationJob` rows are ever created by this call
+    site, even when a real repository IS supplied."""
+    from services.evidence.classification_job import InMemoryEvidenceClassificationJobRepository
 
     classification_job_repository = InMemoryEvidenceClassificationJobRepository()
     scanner = ScriptedScanner(ScanVerdict.CLEAN)
@@ -171,7 +169,7 @@ def test_clean_ingest_enqueues_exactly_one_classification_job(api, object_store,
         raw_mime_bytes=b"From: a@b.com\r\nSubject: Hi\r\n\r\nBody",
         mailbox_id=identity.generate_id(),
         mailbox_source_id=source_id,
-        immutable_provider_message_id="msg-auto-classify",
+        immutable_provider_message_id="msg-no-auto-classify",
         observed_at=datetime.now(timezone.utc),
         received_at=datetime.now(timezone.utc),
         sender_address="a@b.com",
@@ -186,22 +184,20 @@ def test_clean_ingest_enqueues_exactly_one_classification_job(api, object_store,
     assert outcome.status == INGEST_STATUS_INGESTED
 
     job = classification_job_repository.get_by_evidence(outcome.evidence.evidence_id)
-    assert job is not None
-    assert job.status == "PENDING"
+    assert job is None
 
 
-def test_ingest_with_no_classification_job_repository_supplied_never_enqueues_and_never_raises(api, object_store, source_id):
-    """`classification_job_repository` defaults to `None` (a documented
-    judgment call — see `ingest_email_evidence`'s own inline comment) —
-    proving the many pre-existing tests/callers in this module that
-    never pass it still ingest cleanly, with no automatic job (an
-    accepted, disclosed gap, never a crash)."""
+def test_ingest_with_no_classification_job_repository_supplied_never_raises(api, object_store, source_id):
+    """`classification_job_repository` defaults to `None` — proving
+    ingestion succeeds even when no classification-job
+    repository/worker is reachable at all, with no accidental coupling
+    remaining (required proof: ingestion decoupling)."""
     scanner = ScriptedScanner(ScanVerdict.CLEAN)
     outcome = _ingest(api, object_store, scanner, source_id=source_id, message_id="msg-no-job-repo")
     assert outcome.status == INGEST_STATUS_INGESTED
 
 
-def test_quarantined_ingest_never_enqueues_a_classification_job(api, object_store, source_id):
+def test_quarantined_ingest_creates_zero_classification_jobs(api, object_store, source_id):
     from services.evidence.classification_job import InMemoryEvidenceClassificationJobRepository
 
     classification_job_repository = InMemoryEvidenceClassificationJobRepository()
@@ -224,44 +220,6 @@ def test_quarantined_ingest_never_enqueues_a_classification_job(api, object_stor
     )
     assert outcome.status == INGEST_STATUS_QUARANTINED
     assert outcome.evidence is None
-    # No evidence_id exists to enqueue against at all — structurally
+    # No evidence_id exists to create a job against at all — structurally
     # zero jobs, proven by an empty repository.
     assert classification_job_repository._by_id == {}  # noqa: SLF001 - direct internal-state proof, test-only
-
-
-def test_enqueue_never_raises_even_when_the_job_repository_itself_fails(api, object_store, source_id, monkeypatch):
-    """The invariant `enqueue_classification_job_for_evidence`'s own
-    docstring states: 'no ENQUEUE failure may corrupt evidence
-    ingestion either' — proven here with a repository whose
-    `submit_job` always raises."""
-    from services.evidence.classification_job import EVIDENCE_CLASSIFICATION_ACTIVATION_BOUNDARY_ENV_VAR
-
-    # Activation boundary set safely in the past so this test genuinely
-    # reaches submit_job (proving THAT never raises), rather than being
-    # gated out before ever calling it — see the sibling test above.
-    monkeypatch.setenv(EVIDENCE_CLASSIFICATION_ACTIVATION_BOUNDARY_ENV_VAR, "2000-01-01T00:00:00Z")
-
-    class _AlwaysRaisingJobRepository:
-        def submit_job(self, **kwargs):
-            raise RuntimeError("simulated repository failure")
-
-    scanner = ScriptedScanner(ScanVerdict.CLEAN)
-    outcome = ingest_email_evidence(
-        raw_mime_bytes=b"From: a@b.com\r\nSubject: Hi\r\n\r\nBody",
-        mailbox_id=identity.generate_id(),
-        mailbox_source_id=source_id,
-        immutable_provider_message_id="msg-job-repo-fails",
-        observed_at=datetime.now(timezone.utc),
-        received_at=datetime.now(timezone.utc),
-        sender_address="a@b.com",
-        subject="Hi",
-        api=api,
-        object_store=object_store,
-        scanner=scanner,
-        actor_type="SYSTEM",
-        actor_id="test",
-        classification_job_repository=_AlwaysRaisingJobRepository(),
-    )
-    # The ingest itself completed successfully regardless.
-    assert outcome.status == INGEST_STATUS_INGESTED
-    assert outcome.evidence is not None

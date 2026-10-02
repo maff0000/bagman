@@ -33,6 +33,19 @@ disciplines):
    against a REAL disposable PostgreSQL container with genuine
    `threading.Thread`s in
    `tests/persistence/test_evidence_classification_job_repository.py`.
+
+`list_missing_classification_candidates` (`evidence/classification-
+simplification` WO) — the entire discovery mechanism
+`services.evidence.classification_job.create_missing_classification_jobs`
+now relies on, replacing the earlier enqueue-at-ingestion + durable
+reconciliation-cursor design — is a single, real `NOT EXISTS`/anti-join
+SQL query, run fresh on every call, never a persisted scan position.
+Its "current classification" exclusion reproduces
+`persistence.postgres.evidence_classification_repository
+._current_classification_query`'s own exact semantics (never
+reimplemented differently), generalised across every candidate
+`evidence_id` at once via a correlated subquery rather than one
+per-evidence_id query.
 """
 from __future__ import annotations
 
@@ -49,7 +62,10 @@ from core.errors import InvalidStateTransitionError, NotFoundError, PersistenceE
 from core.timestamps import utc_now
 from persistence.postgres.db_errors import is_invalid_uuid_format, unique_violation_constraint
 from persistence.postgres.evidence_classification_job_models import EvidenceClassificationJobRow
+from persistence.postgres.evidence_classification_models import EvidenceClassificationRow
+from persistence.postgres.models import EvidenceItemRow
 from persistence.postgres.session import get_engine, session_scope
+from services.evidence.classification import CLASSIFICATION_TYPE_DOCUMENT_TYPE
 from services.evidence.classification_job import (
     EVIDENCE_CLASSIFICATION_JOB_STALE_RECOVERY_AUDIT_EVENT_TYPE,
     EvidenceClassificationJob,
@@ -412,3 +428,54 @@ class PostgresEvidenceClassificationJobRepository(EvidenceClassificationJobRepos
             raise PersistenceError(f"could not look up EvidenceClassificationJob by evidence_id: {exc}") from exc
         except SQLAlchemyError as exc:
             raise PersistenceError(f"could not look up EvidenceClassificationJob by evidence_id: {exc}") from exc
+
+    def list_missing_classification_candidates(
+        self, *, activation_boundary: datetime, limit: int,
+    ) -> list[str]:
+        if limit <= 0:
+            return []
+        try:
+            with session_scope(self._engine) as session:
+                # Anti-join #1: exclude any evidence_id that already
+                # has a row in evidence_classification_jobs.
+                jobbed_evidence_ids = session.query(EvidenceClassificationJobRow.evidence_id)
+
+                # Anti-join #2: exclude any evidence_id that already
+                # has a CURRENT (non-superseded) DOCUMENT_TYPE
+                # classification — reproducing
+                # `evidence_classification_repository._current_classification_query`'s
+                # own exact "a classification row is current iff no
+                # OTHER row's supersedes_classification_id points at
+                # its own classification_id" semantics, generalised
+                # across every evidence_id at once (never reimplemented
+                # differently): the inner subquery below is identical
+                # in shape to that function's own
+                # `superseded_ids_subquery`, just without a per-
+                # evidence_id filter (supersession only ever occurs
+                # within the same evidence_id + classification_type —
+                # see create_classification's own validation — so
+                # dropping that filter here is equivalent, not a
+                # loosening).
+                superseded_ids = session.query(EvidenceClassificationRow.supersedes_classification_id).filter(
+                    EvidenceClassificationRow.classification_type == CLASSIFICATION_TYPE_DOCUMENT_TYPE,
+                    EvidenceClassificationRow.supersedes_classification_id.isnot(None),
+                )
+                currently_classified_evidence_ids = session.query(EvidenceClassificationRow.evidence_id).filter(
+                    EvidenceClassificationRow.classification_type == CLASSIFICATION_TYPE_DOCUMENT_TYPE,
+                    ~EvidenceClassificationRow.classification_id.in_(superseded_ids),
+                )
+
+                rows = (
+                    session.query(EvidenceItemRow.evidence_id)
+                    .filter(
+                        EvidenceItemRow.created_at >= activation_boundary,
+                        ~EvidenceItemRow.evidence_id.in_(jobbed_evidence_ids),
+                        ~EvidenceItemRow.evidence_id.in_(currently_classified_evidence_ids),
+                    )
+                    .order_by(EvidenceItemRow.created_at.asc(), EvidenceItemRow.evidence_id.asc())
+                    .limit(limit)
+                    .all()
+                )
+                return [row[0] for row in rows]
+        except SQLAlchemyError as exc:
+            raise PersistenceError(f"could not list missing-classification EvidenceItem candidates: {exc}") from exc

@@ -34,13 +34,7 @@ from services.evidence.classification import (
     STATUS_CLASSIFIED,
     InMemoryEvidenceClassificationRepository,
 )
-from services.evidence.classification_job import (
-    InMemoryEvidenceClassificationJobRepository,
-    enqueue_classification_job_for_evidence,
-)
-from services.evidence.classification_reconciliation_cursor import (
-    InMemoryEvidenceClassificationReconciliationCursorRepository,
-)
+from services.evidence.classification_job import InMemoryEvidenceClassificationJobRepository
 from services.evidence.classification_orchestrator import (
     OUTCOME_AI_IN_PROGRESS,
     OUTCOME_AI_INVOCATION_FAILED,
@@ -59,34 +53,28 @@ import scripts.process_evidence_classification_jobs as worker
 
 ACTOR_ID = "evidence-classification-job-worker-tests"
 
-#: This module's own tests exercise job/worker PROCESSING — never the
-#: preflight-review enqueue-side activation gate (item C) itself, which
-#: has its own dedicated tests (see
-#: tests/persistence/test_evidence_classification_job_reconciliation.py
-#: and tests/integration/test_evidence_classification_job_activation_gate.py).
-#: A boundary far enough in the past that every evidence item this
-#: module creates always satisfies that gate.
+#: This module's own tests exercise job/worker PROCESSING — never
+#: discovery (`create_missing_classification_jobs`), which has its own
+#: dedicated tests (see
+#: tests/persistence/test_evidence_classification_job_discovery.py). A
+#: boundary far enough in the past that every evidence item this module
+#: creates always satisfies it, for the tests below that DO exercise
+#: `_run_worker`'s own discovery dispatch.
 _ALWAYS_ACTIVE_BOUNDARY = datetime(2000, 1, 1, tzinfo=timezone.utc)
 
 
-def _enqueue(
-    evidence_id: str, *, classification_job_repository, evidence_repository, actor_type=actor.SYSTEM,
+def _submit_job(
+    evidence_id: str, *, classification_job_repository, actor_type=actor.SYSTEM,
     actor_id=ACTOR_ID, correlation_id=None,
 ) -> None:
-    """Thin wrapper around `enqueue_classification_job_for_evidence` for
-    this module's own tests — resolves the real evidence's own
-    `created_at` and always passes `_ALWAYS_ACTIVE_BOUNDARY` so the
-    activation gate never interferes with what these tests are actually
-    proving (job/worker processing behaviour)."""
-    evidence_created_at = evidence_repository.get_evidence(evidence_id).created_at
-    enqueue_classification_job_for_evidence(
-        evidence_id,
-        classification_job_repository=classification_job_repository,
-        actor_type=actor_type,
-        actor_id=actor_id,
-        correlation_id=correlation_id,
-        evidence_created_at=evidence_created_at,
-        activation_boundary=_ALWAYS_ACTIVE_BOUNDARY,
+    """Thin wrapper directly submitting a job for `evidence_id` — this
+    module's own tests exercise job/worker PROCESSING; evidence
+    ingestion no longer triggers a classification job at all (see
+    `services.evidence.classification_job`'s own module docstring,
+    "Simplified design" section), so there is nothing left to wrap
+    other than `submit_job` itself."""
+    classification_job_repository.submit_job(
+        evidence_id=evidence_id, actor_type=actor_type, actor_id=actor_id, correlation_id=correlation_id,
     )
 
 
@@ -134,8 +122,16 @@ def needs_you_repository():
 
 
 @pytest.fixture
-def classification_job_repository(audit_repository):
-    return InMemoryEvidenceClassificationJobRepository(audit_repository=audit_repository)
+def classification_job_repository(audit_repository, evidence_repository, classification_repository):
+    # evidence_repository/classification_repository (evidence/
+    # classification-simplification WO) back
+    # `list_missing_classification_candidates`'s own in-memory
+    # implementation — required by the `_run_worker` discovery tests
+    # below.
+    return InMemoryEvidenceClassificationJobRepository(
+        audit_repository=audit_repository, evidence_repository=evidence_repository,
+        classification_repository=classification_repository,
+    )
 
 
 def _register_email_evidence(
@@ -197,53 +193,42 @@ def _run_process(
 
 
 # ---------------------------------------------------------------------
-# Test plan item 1/2 — enqueue creates exactly one PENDING job,
-# idempotently.
+# submit_job creates exactly one PENDING job, idempotently — this is
+# the real safety net discovery (`create_missing_classification_jobs`)
+# relies on; see services.evidence.classification_job's own module
+# docstring.
 # ---------------------------------------------------------------------
 
 
-def test_enqueue_creates_exactly_one_pending_job(evidence_repository, object_store, classification_job_repository):
+def test_submit_job_creates_exactly_one_pending_job(evidence_repository, object_store, classification_job_repository):
     evidence_id = _register_email_evidence(
         evidence_repository, object_store,
         content=_rfc822_email(sender="billing@vendor.com", subject="Invoice #1", body="pay up"),
     )
-    _enqueue(
-        evidence_id, classification_job_repository=classification_job_repository, evidence_repository=evidence_repository,
+    _submit_job(
+        evidence_id, classification_job_repository=classification_job_repository,
     )
     job = classification_job_repository.get_by_evidence(evidence_id)
     assert job is not None
     assert job.status == "PENDING"
 
 
-def test_second_enqueue_for_the_same_evidence_is_idempotent(evidence_repository, object_store, classification_job_repository):
+def test_second_submit_job_for_the_same_evidence_is_idempotent(evidence_repository, object_store, classification_job_repository):
     evidence_id = _register_email_evidence(
         evidence_repository, object_store,
         content=_rfc822_email(sender="billing@vendor.com", subject="Invoice #2", body="pay up"),
     )
-    _enqueue(
-        evidence_id, classification_job_repository=classification_job_repository, evidence_repository=evidence_repository,
+    _submit_job(
+        evidence_id, classification_job_repository=classification_job_repository,
     )
     first = classification_job_repository.get_by_evidence(evidence_id)
-    _enqueue(
-        evidence_id, classification_job_repository=classification_job_repository, evidence_repository=evidence_repository,
+    _submit_job(
+        evidence_id, classification_job_repository=classification_job_repository,
         actor_id="a-different-caller",
     )
     second = classification_job_repository.get_by_evidence(evidence_id)
     assert second.job_id == first.job_id
     assert second.actor_id == first.actor_id  # unchanged — the original row
-
-
-def test_enqueue_never_raises_when_the_repository_call_fails():
-    class _AlwaysRaisingRepository:
-        def submit_job(self, **kwargs):
-            raise RuntimeError("simulated repository failure")
-
-    # Must not raise.
-    enqueue_classification_job_for_evidence(
-        identity.generate_id(), classification_job_repository=_AlwaysRaisingRepository(),
-        actor_type=actor.SYSTEM, actor_id=ACTOR_ID,
-        evidence_created_at=datetime.now(timezone.utc), activation_boundary=_ALWAYS_ACTIVE_BOUNDARY,
-    )
 
 
 # ---------------------------------------------------------------------
@@ -262,8 +247,8 @@ def test_worker_processes_pending_job_ai_succeeds_creates_one_review_item(
         content=_rfc822_email(sender="new-vendor@example.com", subject="Your invoice", body="pay up"),
         sender_address="new-vendor@example.com", subject="Your invoice",
     )
-    _enqueue(
-        evidence_id, classification_job_repository=classification_job_repository, evidence_repository=evidence_repository,
+    _submit_job(
+        evidence_id, classification_job_repository=classification_job_repository,
     )
     _queue_proposal(litellm_client, proposed_type=DOCUMENT_TYPE_SUPPLIER_INVOICE, confidence=0.8)
 
@@ -320,8 +305,8 @@ def test_worker_processes_job_deterministic_rule_match_zero_ai_calls(
         content=_rfc822_email(sender="billing@vendor.com", subject="Monthly Statement", body="pay up"),
         sender_address="billing@vendor.com", subject="Monthly Statement",
     )
-    _enqueue(
-        evidence_id, classification_job_repository=classification_job_repository, evidence_repository=evidence_repository,
+    _submit_job(
+        evidence_id, classification_job_repository=classification_job_repository,
     )
 
     result = _run_process(
@@ -360,8 +345,8 @@ def test_worker_processes_job_for_already_classified_evidence_succeeds_no_duplic
         document_type=DOCUMENT_TYPE_SUPPLIER_INVOICE, status=STATUS_CLASSIFIED, source=SOURCE_OPERATOR_ASSIGNED,
         operator_action_id="pre-existing-operator-action",
     )
-    _enqueue(
-        evidence_id, classification_job_repository=classification_job_repository, evidence_repository=evidence_repository,
+    _submit_job(
+        evidence_id, classification_job_repository=classification_job_repository,
     )
     before_history = classification_repository.list_classification_history(evidence_id, CLASSIFICATION_TYPE_DOCUMENT_TYPE)
 
@@ -442,9 +427,8 @@ def test_run_process_never_creates_jobs_itself(
     evidence_repository, rule_repository, classification_repository, ai_invocation_repository, litellm_client,
     object_store, audit_repository, needs_you_repository, classification_job_repository,
 ):
-    # Real, pre-existing evidence — created before this feature shipped,
-    # never enqueued (no call to enqueue_classification_job_for_evidence
-    # was ever made for it).
+    # Real, pre-existing evidence with no job created for it — never
+    # submitted via `submit_job`/discovery.
     historical_evidence_id = _register_email_evidence(
         evidence_repository, object_store,
         content=_rfc822_email(sender="a@b.com", subject="Historical", body="body"),
@@ -461,7 +445,7 @@ def test_run_process_never_creates_jobs_itself(
 
     # Still no job for the historical evidence — --process claims and
     # processes only what already exists, it never conjures a job into
-    # existence for evidence nothing ever enqueued.
+    # existence for evidence nothing ever submitted one for.
     assert classification_job_repository.get_by_evidence(historical_evidence_id) is None
 
 
@@ -479,6 +463,10 @@ def test_no_new_code_imports_the_xero_account_suggestion_producer():
     for relative_path in (
         "services/evidence/classification_job.py",
         "scripts/process_evidence_classification_jobs.py",
+        # evidence/classification-simplification WO — the new discovery
+        # query lives here; must remain just as isolated from Xero as
+        # every other file in this delivery's own call path.
+        "persistence/postgres/evidence_classification_job_repository.py",
     ):
         source = (repo_root / relative_path).read_text(encoding="utf-8")
         tree = ast.parse(source, filename=relative_path)
@@ -523,8 +511,8 @@ def test_outcome_context_unsupported_maps_to_succeeded_no_real_classification(
     audit_repository, needs_you_repository, classification_job_repository,
 ):
     evidence_id = _register_document_evidence_no_storage_reference(evidence_repository)
-    _enqueue(
-        evidence_id, classification_job_repository=classification_job_repository, evidence_repository=evidence_repository,
+    _submit_job(
+        evidence_id, classification_job_repository=classification_job_repository,
     )
     # Deliberately no object_store passed through — CONTEXT_UNSUPPORTED
     # is reached before object_store.get is ever called (no
@@ -557,8 +545,8 @@ def test_outcome_ai_invocation_failed_maps_to_failed_terminal(
         evidence_repository, object_store,
         content=_rfc822_email(sender="a@b.com", subject="Will fail", body="body"),
     )
-    _enqueue(
-        evidence_id, classification_job_repository=classification_job_repository, evidence_repository=evidence_repository,
+    _submit_job(
+        evidence_id, classification_job_repository=classification_job_repository,
     )
     litellm_client.queue_failure(capability_alias="bagman-core", status=LiteLLMOutcomeStatus.TIMEOUT, error_detail="boom")
 
@@ -594,7 +582,7 @@ def test_outcome_ai_prior_failure_maps_to_failed_terminal(
     already-completed dispatch attempt — not going through this WO's
     own job/worker machinery at all) establishes a real FAILED
     `AIInvocation` for this evidence's exact classifier fingerprint;
-    THEN a job is enqueued and processed by the worker, which must
+    THEN a job is submitted and processed by the worker, which must
     reach AI_PRIOR_FAILURE (not attempt a second model call — the
     FakeLiteLLMClient's queue is empty by then, so a retry would raise
     an AssertionError instead of silently succeeding)."""
@@ -613,8 +601,8 @@ def test_outcome_ai_prior_failure_maps_to_failed_terminal(
     assert first.outcome == OUTCOME_AI_INVOCATION_FAILED
     assert len(litellm_client.calls) == 1
 
-    _enqueue(
-        evidence_id, classification_job_repository=classification_job_repository, evidence_repository=evidence_repository,
+    _submit_job(
+        evidence_id, classification_job_repository=classification_job_repository,
     )
     result = _run_process(
         limit=5, classification_job_repository=classification_job_repository, evidence_repository=evidence_repository,
@@ -665,8 +653,8 @@ def test_outcome_ai_in_progress_maps_to_deferred_and_is_reclaimable(
         capability_alias="bagman-core", input_references={"evidence_id": evidence_id},
         actor_type=actor.SYSTEM, actor_id="a-concurrent-caller",
     )
-    _enqueue(
-        evidence_id, classification_job_repository=classification_job_repository, evidence_repository=evidence_repository,
+    _submit_job(
+        evidence_id, classification_job_repository=classification_job_repository,
     )
     result = _run_process(
         limit=5, classification_job_repository=classification_job_repository, evidence_repository=evidence_repository,
@@ -703,8 +691,8 @@ def test_in_memory_mark_deferred_round_trip(classification_job_repository, evide
         evidence_repository, object_store,
         content=_rfc822_email(sender="a@b.com", subject="Deferred round trip", body="body"),
     )
-    _enqueue(
-        evidence_id, classification_job_repository=classification_job_repository, evidence_repository=evidence_repository,
+    _submit_job(
+        evidence_id, classification_job_repository=classification_job_repository,
     )
     job = classification_job_repository.get_by_evidence(evidence_id)
     [claimed] = classification_job_repository.claim_next_pending(limit=1, claimed_by="worker-1")
@@ -741,8 +729,8 @@ def test_no_ai_failure_outcome_is_ever_reported_as_a_job_succeeded(
         content=_rfc822_email(sender="a@b.com", subject="Fails A", body="body"),
     )
     litellm_client.queue_failure(capability_alias="bagman-core", status=LiteLLMOutcomeStatus.TIMEOUT)
-    _enqueue(
-        evidence_id_a, classification_job_repository=classification_job_repository, evidence_repository=evidence_repository,
+    _submit_job(
+        evidence_id_a, classification_job_repository=classification_job_repository,
     )
 
     # Scenario B: AI_PRIOR_FAILURE (a distinct evidence item, its own
@@ -759,8 +747,8 @@ def test_no_ai_failure_outcome_is_ever_reported_as_a_job_succeeded(
         audit_repository=audit_repository, record_audit_event=audit_repository.record_audit_event,
         needs_you_repository=needs_you_repository, actor_type=actor.SYSTEM, actor_id="pre-existing-dispatch",
     )
-    _enqueue(
-        evidence_id_b, classification_job_repository=classification_job_repository, evidence_repository=evidence_repository,
+    _submit_job(
+        evidence_id_b, classification_job_repository=classification_job_repository,
     )
 
     result = _run_process(
@@ -782,10 +770,10 @@ def test_no_ai_failure_outcome_is_ever_reported_as_a_job_succeeded(
 
 
 # ---------------------------------------------------------------------
-# Test plan items 4/5/6 — the activation-boundary env var: unset,
-# malformed, and valid resolution, plus main()'s own extracted
-# dispatch helper (`_run_worker`) never letting a skipped reconciliation
-# block ordinary claim/process work.
+# The activation-boundary env var: unset, malformed, and valid
+# resolution, plus main()'s own extracted dispatch helper (`_run_worker`)
+# never letting a skipped discovery pass block ordinary claim/process
+# work.
 # ---------------------------------------------------------------------
 
 
@@ -846,7 +834,7 @@ def _fake_composition(
     """A minimal stand-in for `app.api.composition.Composition`,
     exposing only the attributes `_run_worker` actually reads — lets
     `_run_worker`'s own dispatch logic (resolve boundary, maybe
-    reconcile, always process) be exercised directly with real
+    discover, always process) be exercised directly with real
     in-memory repositories and no env vars/database at all (see
     `scripts/process_evidence_classification_jobs.py`'s own module
     docstring, "The activation boundary is operator-set Layer-2
@@ -860,7 +848,6 @@ def _fake_composition(
         classification_job_repository=classification_job_repository,
         classification_repository=classification_repository,
         classification_rule_repository=rule_repository,
-        classification_reconciliation_cursor_repository=InMemoryEvidenceClassificationReconciliationCursorRepository(),
         ai_invocation_repository=ai_invocation_repository,
         litellm_client=litellm_client,
         object_store=object_store,
@@ -868,29 +855,28 @@ def _fake_composition(
     )
 
 
-def test_run_worker_skips_reconciliation_when_env_var_unset_but_still_processes_existing_jobs(
+def test_run_worker_skips_discovery_when_env_var_unset_but_still_processes_existing_jobs(
     evidence_repository, rule_repository, classification_repository, ai_invocation_repository, litellm_client,
     object_store, audit_repository, needs_you_repository, classification_job_repository,
 ):
-    """Test plan item 4: env var unset -> `_run_worker` (main()'s own
-    dispatch logic) skips reconciliation, reports why, but ordinary
-    claim/process work for an ALREADY-enqueued job proceeds completely
-    normally."""
-    # An evidence item with a job ALREADY enqueued (the immediate-
-    # enqueue path) — this must still be claimed/processed even though
-    # reconciliation itself will be skipped.
+    """env var unset -> `_run_worker` (main()'s own dispatch logic)
+    skips discovery, reports why, but ordinary claim/process work for
+    an ALREADY-submitted job proceeds completely normally."""
+    # An evidence item with a job ALREADY submitted — this must still
+    # be claimed/processed even though discovery itself will be
+    # skipped.
     evidence_id = _register_email_evidence(
         evidence_repository, object_store,
         content=_rfc822_email(sender="new-vendor@example.com", subject="Needs processing", body="pay up"),
         sender_address="new-vendor@example.com", subject="Needs processing",
     )
-    _enqueue(
-        evidence_id, classification_job_repository=classification_job_repository, evidence_repository=evidence_repository,
+    _submit_job(
+        evidence_id, classification_job_repository=classification_job_repository,
     )
     _queue_proposal(litellm_client, proposed_type=DOCUMENT_TYPE_SUPPLIER_INVOICE, confidence=0.8)
 
-    # A SEPARATE evidence item with NO job at all — proves reconciliation
-    # genuinely did not run (it would otherwise have enqueued one).
+    # A SEPARATE evidence item with NO job at all — proves discovery
+    # genuinely did not run (it would otherwise have created one).
     orphan_evidence_id = _register_email_evidence(
         evidence_repository, object_store,
         content=_rfc822_email(sender="a@b.com", subject="Orphan", body="body"),
@@ -903,7 +889,7 @@ def test_run_worker_skips_reconciliation_when_env_var_unset_but_still_processes_
         ai_invocation_repository=ai_invocation_repository, litellm_client=litellm_client, object_store=object_store,
         audit_repository=audit_repository, needs_you_repository=needs_you_repository,
     )
-    args = SimpleNamespace(limit=5, reconciliation_repair_limit=200)
+    args = SimpleNamespace(limit=5, discovery_limit=200)
 
     outcome = worker._run_worker(
         args=args, composition=composition, run_id="test-run-1", started_at=datetime.now(timezone.utc),
@@ -911,9 +897,9 @@ def test_run_worker_skips_reconciliation_when_env_var_unset_but_still_processes_
     )
     report = outcome["report"]
 
-    assert report["reconciled_count"] == 0
-    assert report["reconciliation_skipped_reason"] is not None
-    assert worker.EVIDENCE_CLASSIFICATION_ACTIVATION_BOUNDARY_ENV_VAR in report["reconciliation_skipped_reason"]
+    assert report["created_count"] == 0
+    assert report["discovery_skipped_reason"] is not None
+    assert worker.EVIDENCE_CLASSIFICATION_ACTIVATION_BOUNDARY_ENV_VAR in report["discovery_skipped_reason"]
 
     # Ordinary claim/process still happened normally.
     assert report["claimed_count"] == 1
@@ -921,24 +907,23 @@ def test_run_worker_skips_reconciliation_when_env_var_unset_but_still_processes_
     assert record["evidence_id"] == evidence_id
     assert record["outcome"] == "SUCCEEDED"
 
-    # And reconciliation genuinely did not run — the orphan is still unjobbed.
+    # And discovery genuinely did not run — the orphan is still unjobbed.
     assert classification_job_repository.get_by_evidence(orphan_evidence_id) is None
 
 
-def test_run_worker_runs_reconciliation_with_the_exact_env_supplied_boundary(
+def test_run_worker_runs_discovery_with_the_exact_env_supplied_boundary(
     evidence_repository, rule_repository, classification_repository, ai_invocation_repository, litellm_client,
     object_store, audit_repository, needs_you_repository, classification_job_repository,
 ):
-    """Test plan item 6: env var set to a valid value -> reconciliation
-    genuinely runs, with that exact boundary (parse-and-use correctness,
-    not merely parse correctness)."""
+    """env var set to a valid value -> discovery genuinely runs, with
+    that exact boundary (parse-and-use correctness, not merely parse
+    correctness)."""
     # Historical evidence — registered (so its own server-assigned
     # created_at is stamped) BEFORE `boundary` is captured below. Its
-    # own received_at is deliberately set to a time AFTER `boundary`
-    # (preflight review correction, item A): eligibility is now governed
-    # SOLELY by created_at, so this proves received_at no longer matters
-    # at all — the old received_at-based filter would have wrongly
-    # treated this as prospective.
+    # own received_at is deliberately set to a time AFTER `boundary`:
+    # eligibility is governed SOLELY by created_at, so this proves
+    # received_at has zero bearing — a received_at-based filter would
+    # have wrongly treated this as prospective.
     historical_evidence = evidence_repository.register_evidence(
         entity_id=None, evidence_type="EMAIL", source_id=identity.generate_id(),
         observed_at=datetime.now(timezone.utc), received_at=datetime.now(timezone.utc) + timedelta(days=1),
@@ -960,7 +945,7 @@ def test_run_worker_runs_reconciliation_with_the_exact_env_supplied_boundary(
         ai_invocation_repository=ai_invocation_repository, litellm_client=litellm_client, object_store=object_store,
         audit_repository=audit_repository, needs_you_repository=needs_you_repository,
     )
-    args = SimpleNamespace(limit=5, reconciliation_repair_limit=200)
+    args = SimpleNamespace(limit=5, discovery_limit=200)
     env = {worker.EVIDENCE_CLASSIFICATION_ACTIVATION_BOUNDARY_ENV_VAR: boundary.strftime("%Y-%m-%dT%H:%M:%S.%fZ")}
 
     outcome = worker._run_worker(
@@ -969,7 +954,7 @@ def test_run_worker_runs_reconciliation_with_the_exact_env_supplied_boundary(
     )
     report = outcome["report"]
 
-    assert report["reconciliation_skipped_reason"] is None
-    assert report["reconciled_count"] == 1
+    assert report["discovery_skipped_reason"] is None
+    assert report["created_count"] == 1
     assert classification_job_repository.get_by_evidence(prospective_id) is not None
     assert classification_job_repository.get_by_evidence(historical_evidence.evidence_id) is None
