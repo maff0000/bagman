@@ -2638,3 +2638,155 @@ A prominent, uniformly-`#`-heading-formatted **CURRENT PRODUCTION AUTHORITY** bl
 ## 110.5 Verdict
 
 **INCIDENT CONTAINED GREEN.** Root cause identified with no remaining speculation (§110.2). Trinity restored to its intended §100.8 post-cutover state (no canonical writer). Real production (Mac mini, `bagman-api:main-4a49f28`, Alembic `f1a2b3c4d5e6`) independently confirmed untouched and intact throughout. The evidence-classification delivery (PR #19/#20) has not been deployed to either host and remains pending a separate, correctly-targeted production rollout gate.
+
+# 111. BAGMAN Delivery Governance Doctrine (Architect ruling, 2026-10-02)
+
+Standing, permanent doctrine governing how every future BAGMAN delivery is authorised and executed. Applies from this ruling forward; prior deliveries recorded elsewhere in this document (§1-§110) are not retroactively invalidated, but any NEW work must follow this chain.
+
+## 111.1 The governed delivery chain
+
+> **Architecture decision → PID/Amendment → Git-tracked Work Order → Delivery Controller → Implementer → Independent Audit → PR → Architect Acceptance → Merge → Closure**
+
+- The **Architect** owns architecture, PIDs, amendments, sequencing, and acceptance.
+- The **Delivery Controller** owns bounded execution and may dispatch an Implementer (FORGE) only against an approved, Git-tracked Work Order.
+- The **Implementer** works only within that Work Order and must not invent architecture or widen scope.
+- Every Work Order must identify its parent PID section/amendment, applicable amendments, the exact base SHA it is issued against, scope, exclusions, required tests, and acceptance criteria.
+- If implementation exposes an architectural ambiguity, the correct response is to STOP and return it to the Architect — never improvise a resolution.
+- Corrections and follow-up work require the same governed Work Order process; there is no "small enough to skip" exception.
+- Git/GitHub is the durable authority. Chat is only the control surface — a decision that exists only in chat, and not in a committed Git record, is not yet durable project authority.
+
+## 111.2 Hard invariants
+
+**NO PID → NO WORK ORDER.**
+**NO WORK ORDER → NO IMPLEMENTATION.**
+**NO INDEPENDENT AUDIT + ARCHITECT ACCEPTANCE → NO MERGE.**
+**NO GIT RECORD → NOT DURABLE PROJECT AUTHORITY.**
+
+## 111.3 Binding on prompts, not just on memory
+
+Every future BAGMAN Delivery Controller prompt and every FORGE Implementer prompt MUST reproduce this doctrine (§111.1's chain and §111.2's four invariants) explicitly, in full, inline — never by reference alone, and never left to be recalled from prior chat context. Agents must not rely on chat memory for governance rules: a fresh Delivery Controller or Implementer session has no memory of this section unless the prompt that starts it restates the doctrine directly. This is itself a hard requirement of this ruling, not a style preference.
+
+# 112. Automatic Evidence Classification — Production Activation Amendment (Architect ruling, 2026-10-02)
+
+Records, durably, the architecture now governing automatic evidence classification in production, the activation boundary established during the controlled canary, the production deployment facts, the canary result, an unrelated operational finding, and an explicit governance-process deviation this amendment exists to close out.
+
+## 112.A Automatic classification architecture (authoritative model)
+
+The authoritative automatic-classification model, superseding every earlier cursor/sweep/lap/target design (see `services/evidence/classification_job.py`'s own module docstring, "Simplified design" section, and PR #22):
+
+```text
+Evidence ingestion → durable EvidenceItem only
+
+(independently, later)
+
+classification worker → bounded PostgreSQL missing-work discovery
+                       → EvidenceClassificationJob
+                       → existing governed classify_evidence()
+```
+
+The worker discovers `EvidenceItem`s where:
+- `EvidenceItem.created_at >= activation_boundary`;
+- no `EvidenceClassificationJob` exists for it;
+- no current `DOCUMENT_TYPE` `EvidenceClassification` exists for it;
+
+ordered oldest-`created_at`-first, bounded per call (`--discovery-limit`).
+
+There is, by design:
+- no ingestion-side classification enqueue (evidence registration never creates a job);
+- no reconciliation cursor;
+- no sweep/lap/target state machine;
+- no Redis/Celery/Kafka requirement;
+- no historical automatic backfill (the activation boundary is a hard floor, never crossed).
+
+PostgreSQL itself is the durable source of work state — there is nothing else to persist between worker invocations.
+
+## 112.B Activation boundary
+
+The production activation boundary established during the controlled canary (§112.D):
+
+```text
+T_ACT = 2026-10-02T09:58:51Z
+```
+
+Eligibility is governed exclusively by `EvidenceItem.created_at >= T_ACT` — never by the underlying message's own `received_at`. A historic email imported (registered) after `T_ACT` is eligible; an `EvidenceItem` whose own `created_at` predates `T_ACT` must never be automatically discovered, regardless of its `received_at`.
+
+This boundary must remain stable for all future recurring worker executions. It must never be moved backwards merely to manufacture work. Any change to it requires an explicit Architect amendment to this section.
+
+## 112.C Production state
+
+The facts below are the **reported** results of the 2026-10-02 rollout, recorded provisionally pending the governance-recovery independent audit required by §112.F.
+
+Canonical code deployed:
+
+```text
+493af0c3923bf6f1bdd308521da8f3aca3fafac2
+```
+
+Production image:
+
+```text
+bagman-api:main-493af0c
+```
+
+Production Alembic revision:
+
+```text
+ae936a444eae
+```
+
+Migration path actually applied:
+
+```text
+f1a2b3c4d5e6 → a7f34c9e2d18 → ae936a444eae
+```
+
+The obsolete reconciliation-cursor migration, `143b86b2ab44`, was never deployed to any real or persistent environment anywhere (not this production host, not Trinity's retired archive — confirmed independently, repeatedly, before PR #22 removed it) and is not part of canonical migration history. No `evidence_classification_reconciliation_cursors` table exists, or is intended to exist, in production schema.
+
+## 112.D Canary result
+
+The facts below are, likewise, the **reported** results of the 2026-10-02 canary, recorded provisionally pending the governance-recovery independent audit required by §112.F — not yet independently re-verified under §111.
+
+Recorded factually, not interpretively:
+
+- `T_ACT`: `2026-10-02T09:58:51Z`.
+- Four legitimate post-activation `EvidenceItem` rows were created by one ordinary, bounded Microsoft Graph mailbox sweep (the existing production sweep mechanism) — not manufactured, not historical replay.
+- Worker bounds for the canary: discovery limit `1`, processing limit `1`.
+- Exactly one `EvidenceClassificationJob` was created and processed.
+- Job final status: `SUCCEEDED`.
+- `classification_outcome`: `AI_PROPOSAL_REVIEW_REQUIRED`.
+- Deterministic classification returned `NO_MATCH`; the AI fallback proposed `NON_ACCOUNTING_DOCUMENT` (`DOCUMENT_TYPE_PROPOSAL` v2, `bagman-core`, `SUCCEEDED`).
+- A `CLASSIFICATION_REVIEW` Needs You item was created and left `OPEN` — the human review this outcome requires has **not** been performed or resolved by this amendment, and this section makes no claim that it has.
+- Zero pre-`T_ACT` `EvidenceClassificationJob` rows exist (verified directly against production).
+- Zero automatic Xero Account Suggestion activity: zero `XeroAccountSuggestion`, zero `XeroAccountAssignment`, zero `XERO_ACCOUNT_REQUIRED`, zero Xero ledger mutation of any kind.
+- No scheduler, cron, timer, or daemon was installed as part of this canary — confirmed absent, both before and after.
+
+## 112.E Gmail operational finding (unrelated to classification; not remediated here)
+
+During the canary's search for legitimate post-activation evidence, two Gmail mailbox sweep attempts failed with a pre-existing `TOKEN_REFRESH_FAILED` condition (expired/revoked OAuth credentials), unrelated to the classification architecture or this delivery. This is recorded here as an operational finding for separate attention — **not** remediated as part of this amendment, and this amendment does not widen its own scope to fix Gmail authentication.
+
+## 112.F Governance deviation — recorded honestly
+
+The 2026-10-02 production deployment and one-job canary (§112.C/§112.D) were **reported technically GREEN by the executing delivery stream** — the rollout report was returned through the ordinary BAGMAN execution stream, not through a separately-dispatched, fresh Independent Auditor with no inherited conclusions. They were, in addition, initiated from a chat-issued rollout instruction **before** the governed delivery doctrine now recorded at §111 had been embodied as a Git-tracked `PID/Amendment → Work Order → Delivery Controller → Implementer` chain.
+
+**Reported technical GREEN is not the same thing as governed independent audit closure.** This section does not claim the reported result is wrong, nor that the deployment failed — only that the distinct, separate step of independent re-verification under §111 has not yet happened.
+
+Therefore:
+- the Architect has **provisionally accepted the reported technical result** (§112.C/§112.D) — provisional acceptance of what was reported, not a finding that it has been independently confirmed;
+- it has **not yet been independently re-verified under §111**, and must **not** be represented, in any future record, as having followed the full governed chain established at §111 — it did not;
+- durable closure of this deployment requires a **separate governance-recovery Work Order**, created AFTER this amendment is merged, issued through the full §111 chain;
+- that Work Order's specific purpose is to perform the fresh, independent live-state audit of production that has not yet occurred (re-verifying, under the governed process, everything §112.C/§112.D currently record only as reported) and produce its own Git-tracked closure record;
+- **no further classification-production mutation, and no scheduler installation, may occur before that governance-recovery closure lands.**
+
+## 112.G Future scheduler — not authorised here
+
+Recurring classification scheduling (cron, systemd timer, daemon, loop container, Kubernetes CronJob, or any other recurring invocation of the classification worker) is **NOT authorised** by this amendment.
+
+A scheduler requires its own future delivery, through the full chain: `Architecture decision → PID/Amendment if required → Git-tracked Work Order → Delivery Controller → Implementer → Independent Audit → PR → Architect Acceptance → Merge → Closure`.
+
+When that future scheduler delivery occurs, it must reuse the established activation boundary:
+
+```text
+T_ACT = 2026-10-02T09:58:51Z
+```
+
+unless the Architect explicitly amends §112.B first.
