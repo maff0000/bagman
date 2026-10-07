@@ -2873,3 +2873,128 @@ The canonical correction WO (`WO-BAGMAN-112F-AUTHORIZATION-STATE-CORRECTION`) re
 ## 113.6 No production authority in this amendment
 
 This section authorises governance lifecycle interpretation only. It does **not**: touch production; run classification; install scheduling; change `T_ACT`; remediate Gmail; mutate Xero; alter Trinity; bypass any production Work Order's own scope.
+
+# 114. Automatic Evidence Classification Scheduling (Architect ruling, 2026-10-07)
+
+Records, durably, the Architect's decision on how recurring automatic evidence classification is scheduled in production, following the Architecture Discovery Report Bagman returned against §112.G. This section is **architecture only** — it authorises no implementation, no Work Order, and no production action. §112.F Governance Recovery remains `CLOSED GREEN` and is not reopened by this section.
+
+## 114.1 Execution architecture
+
+Automatic classification SHALL continue to use the existing bounded, single-shot classification worker, unmodified in its own logic:
+
+```text
+scripts/process_evidence_classification_jobs.py
+```
+
+A scheduler SHALL periodically invoke that existing worker. This amendment does **not** authorise, and future delivery under it must not introduce:
+
+- a persistent BAGMAN worker daemon;
+- an application-internal timer;
+- Redis, Celery, Kafka, or any other broker/queue;
+- cursor/reconciliation architecture of any kind;
+- an ingestion-side classification enqueue.
+
+PostgreSQL remains the sole durable work-state authority, exactly as established by §112.A — there is nothing for a scheduler to persist or remember between invocations beyond what the existing tables already contain.
+
+## 114.2 Scheduler mechanism
+
+The production scheduling mechanism SHALL be **macOS `launchd`**, installed on the canonical BAGMAN production Mac mini (PID §0).
+
+Initial cadence: **300 seconds (5 minutes)**.
+
+The scheduler's responsibility is deliberately narrow: periodically invoke the existing bounded classification CLI and observe its exit/result. The scheduler does **not** own, and must not be given logic for: evidence eligibility; job durability; retries; classification logic; AI logic; Needs You logic; Xero logic; or historical-boundary authority. Those remain BAGMAN application responsibilities, unchanged by this section.
+
+## 114.3 Initial execution bounds
+
+Initial normal-operation invocation bounds SHALL be:
+
+```text
+--limit 20
+--discovery-limit 50
+```
+
+These are operational starting values, not scalability ceilings, and may be changed later only through an appropriately governed configuration change (not dynamically, and not load-sensitively adapted by the scheduler or the worker itself).
+
+## 114.4 Classification invocation model
+
+One scheduled invocation SHALL perform the existing sequence, unchanged:
+
+```text
+resolve activation boundary
+  → discover bounded eligible EvidenceItems
+  → idempotently create missing jobs
+  → claim bounded jobs
+  → process jobs
+  → write existing run report
+  → exit
+```
+
+Discovery and processing SHALL remain together in one invocation, exactly as today, unless implementation or audit evidence demonstrates a genuine correctness problem requiring a future Architect decision to separate them. They must not be split merely for architectural neatness.
+
+## 114.5 Historical activation boundary — hard invariant
+
+The permanent automatic-classification activation boundary remains exactly as established at §112.B:
+
+```text
+T_ACT = 2026-10-02T09:58:51Z
+```
+
+This is a safety boundary, not an adjustable scheduler parameter. Automatic classification MUST NOT create classification jobs for any `EvidenceItem` where `created_at < T_ACT`.
+
+The scheduler MUST NOT: contain its own copy of `T_ACT`; pass `T_ACT` as a CLI argument; override `T_ACT`; calculate `T_ACT`; default `T_ACT`; or move `T_ACT` forward or backward in any way. The BAGMAN worker SHALL continue obtaining `T_ACT` exclusively from the BAGMAN application/container environment (`BAGMAN_EVIDENCE_CLASSIFICATION_ACTIVATION_BOUNDARY`, per §112.A/B and `services/evidence/classification_job.py`'s own doctrine), and missing, malformed, or timezone-naive values SHALL continue to fail closed for discovery, exactly as already implemented — never a fallback to current time, scheduler-installation time, container-startup time, earliest unclassified evidence, zero/epoch, or any other inferred boundary.
+
+**Changing `T_ACT` requires a future, separate, Architect-authorised governance change to §112.B.** This section grants no authority to change it.
+
+## 114.6 Durable configuration authority
+
+Per §111's own "Git/GitHub is durable authority; chat is only the control surface" invariant, an undocumented, handcrafted `launchd` plist existing only on the Mac is **not** sufficient durable project authority, even though HELM owns its installation and runtime management on the appliance.
+
+Therefore: HELM may own installation and runtime management of the production `launchd` scheduler, but the canonical scheduler definition/configuration MUST be represented in Git, in this repository; the exact production scheduler configuration must be traceable to an accepted Git revision; and deployment must not depend on an undocumented handcrafted plist existing only on the Mac, outside any Git record.
+
+The cleanest existing repository convention for this artifact, identified during architecture discovery: `deployment/` already holds sibling, purpose-named subdirectories for exactly this kind of "Git-tracked definition, applied to the live appliance by whoever operates it" artifact — `deployment/compose/` (Docker Compose files and overrides, each with its own README) and `deployment/docker/` (Dockerfile/entrypoint). A new `deployment/launchd/` subdirectory, holding the canonical plist template (with its own README documenting its installation path, cadence, and invocation command, mirroring `deployment/compose/docker-compose.mac-production.yml`'s own "governed override, applied by an explicit command, not auto-generated" pattern) is the natural, zero-invention extension of this existing convention. The implementation Work Order SHALL use this location unless it finds a specific, concrete reason not to, in which case it must return that finding to the Architect rather than inventing a second repository or an ungoverned location.
+
+## 114.7 Concurrency and overlap
+
+This amendment does **not** authorise a new scheduler-level or application-level lock. The existing correctness mechanisms remain authoritative and sufficient: the database unique constraint on `EvidenceClassificationJob.evidence_id`; idempotent job submission; `SELECT ... FOR UPDATE SKIP LOCKED` claiming; and existing stale-claim recovery. An overlapping scheduled invocation must therefore remain safe by construction, exactly as today. `MailboxSweepLock` or any other advisory lock must **not** be added merely as belt-and-braces engineering.
+
+If implementation or audit evidence proves that `launchd`-driven overlap can produce a material operational or correctness issue not already handled by these PostgreSQL-level semantics, that finding must STOP delivery and return to the Architect rather than being resolved by adding a lock unilaterally.
+
+## 114.8 Retry and crash semantics
+
+This amendment preserves existing classification-job retry/crash semantics unchanged, and authorises no new retry engine:
+
+- `CLAIMED`/`IN_PROGRESS` work left stale is recoverable using the existing 600-second stale-claim threshold (`ai.invocation.STALE_RUNNING_THRESHOLD_SECONDS`, reused — not a new constant);
+- worker or container death therefore causes bounded delay before recovery, never loss of durable work;
+- retryable persistence/runtime failures retain their existing `FAILED_RETRYABLE`/budget-driven behaviour;
+- existing terminal AI same-fingerprint failure behaviour (`AI_INVOCATION_FAILED`/`AI_PRIOR_FAILURE` → `FAILED_TERMINAL`, Architect's own prior "Option A" ruling) remains unchanged;
+- this delivery does not redesign classification retry doctrine in any respect.
+
+## 114.9 Kill switch
+
+The scheduler itself is the kill switch. Disabling/unloading the `launchd` job SHALL stop new scheduled invocations without deleting jobs, changing `EvidenceItem`s, altering classifications, changing `T_ACT`, modifying Needs You items, or changing Xero state. No additional BAGMAN kill-switch subsystem is authorised or required.
+
+## 114.10 Startup/reboot doctrine
+
+The scheduler must recover naturally after a Mac restart. PostgreSQL remains authoritative for unfinished work. Missed scheduling intervals do not need to be replayed individually — after the production stack becomes available again, a subsequent normal scheduled invocation rediscovers eligible missing work and resumes persisted jobs, exactly as the existing discovery/claim mechanism already guarantees. No missed-run accounting mechanism is authorised or required.
+
+## 114.11 Observability
+
+For the first scheduler delivery under this amendment, only the minimum sufficient observability is authorised: `launchd` execution/exit visibility; stdout/stderr logging; the existing worker JSON run report; PostgreSQL job state; existing AI invocation state; existing Needs You state. A GUI dashboard/tile and any dedicated monitoring subsystem are explicitly **not** authorised as part of this delivery. GUI visibility for backlog count, last scheduler run, or classification health may be considered as a later, separately-governed product enhancement only after the scheduler is proven operational.
+
+## 114.12 Production activation doctrine
+
+The future implementation Work Order MUST require staged activation, at minimum:
+
+1. **Deploy disabled** — deploy the required Git-tracked scheduler/configuration artifacts without enabling recurring execution; verify the exact production revision/configuration.
+2. **Pre-activation safety proof** — before enablement, prove: `T_ACT` remains exactly `2026-10-02T09:58:51Z`; the scheduler cannot override it; the pre-`T_ACT` automatic-classification-job count remains exactly `0`; no unexpected historical jobs exist; production components are healthy. Any non-zero pre-`T_ACT` result is a hard STOP/RED.
+3. **Explicit enablement** — only after the Work Order's activation gate is satisfied may HELM enable the `launchd` scheduler.
+4. **Bounded observation** — observe initial scheduled executions; prove the scheduler fires at the intended cadence, discovery and processing both remain bounded, new eligible `EvidenceItem`s can create jobs, duplicate jobs are not created, worker reports are written, expected classification lineage is produced, Needs You behaviour remains correct, no historical evidence enters automatic classification, and Xero isolation remains intact. Naturally arriving evidence is preferred; evidence must not be manufactured merely to make a test pass unless the Work Order itself explicitly authorises a controlled test fixture/canary.
+5. **Normal-operation acceptance** — re-run the hard pre-`T_ACT` gate (expected `0`); verify the scheduler remains enabled and healthy; then proceed through Independent Audit → Architect Acceptance → closure for that activation delivery.
+
+## 114.13 Explicit exclusions
+
+This amendment does **not** authorise: Gmail OAuth remediation; any Xero behavioural change or ledger mutation; historical classification backfill; changing `T_ACT`; changing `classify_evidence` logic; redesigning AI inference; a persistent worker daemon; an application-internal scheduler; Redis/Celery/Kafka or any generic broker infrastructure; cursor/reconciliation architecture; an ingestion-side enqueue; a GUI classification dashboard; or any unrelated production cleanup. Gmail `TOKEN_REFRESH_FAILED` (§112.E) remains a separate, future, governed concern.
+
+## 114.14 Relationship to §112.G and next governed artifact
+
+This section is the "Architecture decision" §112.G itself required before any scheduler Work Order may be drafted. It does not itself create a Git-tracked Work Order, does not authorise FORGE dispatch, and does not touch production in any way. The next governed artifact is a Git-tracked implementation Work Order — scoped, per §114.6, to cleanly separate any BAGMAN-repository change (if any beyond the `deployment/launchd/` artifact itself) from HELM's own installation/runtime-management lane — which must itself complete the full `Delivery Controller → Implementer → Independent Audit → PR → Architect Acceptance → Merge → Closure` chain, including the staged activation doctrine at §114.12, before recurring automatic classification may run in production.
