@@ -1,9 +1,17 @@
 # WO-BAGMAN-112F-GOVERNANCE-RECOVERY
 ## Automatic Evidence Classification Production Governance Recovery
 
-**Status:** `PROPOSED — NOT AUTHORISED FOR EXECUTION`
+**Lifecycle at creation:** `PROPOSED — NOT AUTHORISED FOR EXECUTION`
+**Current execution state:** `CANONICAL — AUTHORISED FOR DELIVERY CONTROLLER DISPATCH`
 
-This document authorises creation of a Git-tracked Work Order only. It does **not** authorise dispatch of FORGE against it. FORGE may be dispatched only after this document itself has been reviewed, independently audited, Architect-accepted, and merged into canonical `main`.
+Execution authorisation became effective only after the following durable gate evidence, per PID §113:
+
+- Independent Audit review `5425424908` — GREEN;
+- Architect Acceptance review `5427495956` — GREEN;
+- PR #24 merge `f459dee0d218fd95bdd26e66098547ba81dceea5`;
+- post-merge Security CI run `37455123778` — SUCCESS.
+
+At creation, this document authorised only the creation and review of this Git-tracked Work Order — it did **not**, at that time, authorise dispatch of FORGE against it. That original, pre-approval state is preserved here as history and is not erased. This Work Order's required gates — review, Independent Audit, Architect Acceptance, and merge into canonical `main` — have since been durably completed, per the evidence cited above. Under PID §113's authoritative lifecycle rule, this Work Order is now `CANONICAL — AUTHORISED FOR DELIVERY CONTROLLER DISPATCH`. All scope, exclusions, and acceptance criteria stated elsewhere in this document (§§5–13) remain fully and unconditionally binding and unchanged by this correction.
 
 ---
 
@@ -346,8 +354,14 @@ If any material historical claim in §112.C/D cannot be independently supported,
 
 ---
 
-## 14. What this proposed WO does NOT yet authorise
+## 14. Work Order lifecycle state — authorisation complete (per PID §113)
 
-Until this Work Order is (1) reviewed, (2) independently audited as a WO document, (3) Architect-accepted, and (4) merged into canonical `main`, BAGMAN must **NOT** dispatch FORGE against it.
+This Work Order's original four authorisation conditions, stated at creation, were: (1) reviewed; (2) independently audited as a WO document; (3) Architect-accepted; (4) merged into canonical `main`. Per PID §113's authoritative lifecycle rule, required post-merge CI on the merge SHA is also now a binding gate for execution authority.
 
-This document, by itself, authorises nothing beyond its own creation and review.
+All conditions are satisfied by the durable evidence cited in the header above: Independent Audit review `5425424908` — GREEN; Architect Acceptance review `5427495956` — GREEN; merge `f459dee0d218fd95bdd26e66098547ba81dceea5`; post-merge Security CI run `37455123778` — SUCCESS.
+
+Therefore, per PID §113, this Work Order is `CANONICAL — AUTHORISED FOR DELIVERY CONTROLLER DISPATCH`, and BAGMAN **may** dispatch FORGE against it.
+
+This record changes lifecycle state only. It does not reopen, reinterpret, or alter any other content of this document. §§5–13 above remain fully and unconditionally binding and unchanged.
+
+Any later edit to this canonical Work Order's substantive content requires the same governed correction process (Independent Audit → Architect Acceptance → merge → required post-merge CI) and does not automatically inherit this existing execution authorisation — a changed head would require its own fresh audit, acceptance, merge, and CI before it, too, is authorised for dispatch.
