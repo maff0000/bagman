@@ -2790,3 +2790,86 @@ T_ACT = 2026-10-02T09:58:51Z
 ```
 
 unless the Architect explicitly amends §112.B first.
+
+# 113. BAGMAN Work Order Lifecycle and Execution-Authorisation Semantics (Architect ruling, 2026-10-07)
+
+This section resolves the Work Order lifecycle ambiguity exposed by a FORGE Implementer's correct STOP while dispatched against `work-orders/WO-BAGMAN-112F-GOVERNANCE-RECOVERY.md`.
+
+## 113.1 Problem statement
+
+BAGMAN's first Work Orders were created with static text such as `Status: PROPOSED — NOT AUTHORISED FOR EXECUTION` and self-gating language stating that execution becomes authorised only after (1) review, (2) Independent Audit, (3) Architect Acceptance, (4) merge to canonical `main`.
+
+That model created a self-consistency problem: the file accurately said `PROPOSED` when authored; the same file later became audited, accepted, and merged; but the literal static text remained unchanged afterward; a fresh Implementer reading only the current file could reasonably conclude it remained unauthorised.
+
+FORGE correctly stopped on this ambiguity. **This is a governance-model defect, not a FORGE defect.**
+
+## 113.2 Authoritative lifecycle rule
+
+### 113.2.1 Creation-time status is historical state
+
+A Work Order field such as `PROPOSED — NOT AUTHORISED FOR EXECUTION` records its state **at creation time**. It is not, by itself, an eternally-current execution-state register after the document has passed later governance gates.
+
+### 113.2.2 Execution authority derives from durable gate evidence
+
+A BAGMAN Work Order becomes authorised for Delivery Controller dispatch only when **all** applicable gates are durably satisfied for the exact audited Work Order content:
+
+1. the Work Order exists in Git;
+2. a fresh Independent Auditor returns GREEN for the exact WO head;
+3. Architect Acceptance is durably recorded for that exact head;
+4. the exact accepted head is merged into canonical `main`;
+5. required post-merge CI on the merge SHA is GREEN.
+
+When all five hold, the Work Order is `CANONICAL — AUTHORISED FOR DELIVERY CONTROLLER DISPATCH` even if its immutable creation-time prose still contains a historical `PROPOSED` marker. **No second "status-flip" PR is required merely to activate a Work Order.**
+
+### 113.2.3 Exact-content binding
+
+Audit and Architect Acceptance apply only to the exact content they name. If the Work Order head changes before merge, the prior audit lapses and the prior Architect Acceptance lapses. If the canonical Work Order is later edited, that edit requires the governed correction process — existing execution authorisation does not automatically extend to changed content.
+
+### 113.2.4 Same-PR evidence is valid
+
+Review, Independent Audit, and Architect Acceptance may all be durable records on the Work Order's own creation PR. They do **not** need to appear in a later, separate PR. A Work Order must not require a second PR merely to prove that its first PR completed its own gates.
+
+### 113.2.5 Git/GitHub gate evidence outranks stale lifecycle prose
+
+Where an already-merged Work Order contains creation-time lifecycle wording that conflicts only with later, durable gate evidence, the durable Git/GitHub gate evidence governs the current execution-authorisation state.
+
+This rule does **NOT** allow: scope expansion; technical reinterpretation; bypassing a missing audit; bypassing Architect Acceptance; bypassing merge; bypassing required CI. **It resolves lifecycle state only.**
+
+## 113.3 Existing WO rulings
+
+### 113.3.1 WO-BAGMAN-112F-GOVERNANCE-RECOVERY
+
+Its required authorisation gates were satisfied by: Independent Audit review `5425424908`; Architect Acceptance review `5427495956`; merge `f459dee0d218fd95bdd26e66098547ba81dceea5`; post-merge Security run `37455123778 — SUCCESS`.
+
+Therefore, under §113: **`WO-BAGMAN-112F-GOVERNANCE-RECOVERY — CANONICAL / AUTHORISED FOR DELIVERY CONTROLLER DISPATCH`**.
+
+Its stale creation-time `PROPOSED` wording remains misleading and may still be corrected under the already-created correction WO, but it no longer blocks dispatch once this §113 amendment becomes canonical.
+
+### 113.3.2 WO-BAGMAN-112F-AUTHORIZATION-STATE-CORRECTION
+
+Its required authorisation gates were satisfied by: Independent Audit review `5431034837`; Architect Acceptance review `5433208541`; merge `957b8fc869c67906e60fde775ec6d9e16b78756b`; post-merge Security run `37515015489 — SUCCESS`.
+
+Therefore, under §113: **`WO-BAGMAN-112F-AUTHORIZATION-STATE-CORRECTION — CANONICAL / AUTHORISED FOR DELIVERY CONTROLLER DISPATCH`**.
+
+Its own creation-time `PROPOSED` marker does not create another recursive correction requirement.
+
+## 113.4 Future Work Order drafting rule
+
+Future BAGMAN Work Orders should **not** use a mutable-looking field that implies current execution state unless BAGMAN also intends to maintain it through a governed state-update mechanism. Preferred format:
+
+```text
+Lifecycle at creation: PROPOSED
+Execution gate: authorised only when exact-head Independent Audit GREEN,
+Architect Acceptance GREEN, canonical merge complete, and required
+post-merge CI GREEN.
+```
+
+or equivalent wording — the Work Order should state that current authorisation is determined from durable Git/GitHub gate records. Do not build a workflow database, a status service, a custom state machine, or GitHub automation merely to flip Markdown status. Keep this evidence-first and simple.
+
+## 113.5 Relationship to the correction WO
+
+The canonical correction WO (`WO-BAGMAN-112F-AUTHORIZATION-STATE-CORRECTION`) remains valid. Its purpose is now: improve the human-readable clarity of the original governance-recovery WO; preserve historical chronology; remove misleading stale current-state wording. It is no longer needed to *create* execution authority — §113 defines that authority directly. After this §113 amendment is canonical, Bagman may dispatch FORGE under `WO-BAGMAN-112F-AUTHORIZATION-STATE-CORRECTION` to perform the already-specified narrow text correction. That delivery must still complete `Implementer → Independent Audit → PR → Architect Acceptance → Merge → Closure` before the text correction itself becomes canonical.
+
+## 113.6 No production authority in this amendment
+
+This section authorises governance lifecycle interpretation only. It does **not**: touch production; run classification; install scheduling; change `T_ACT`; remediate Gmail; mutate Xero; alter Trinity; bypass any production Work Order's own scope.
