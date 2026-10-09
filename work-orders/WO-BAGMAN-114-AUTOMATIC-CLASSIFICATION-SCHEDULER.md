@@ -29,7 +29,7 @@ Hard invariants:
 **NO INDEPENDENT AUDIT + ARCHITECT ACCEPTANCE → NO MERGE.**
 **NO GIT RECORD → NOT DURABLE PROJECT AUTHORITY.**
 
-Every future BAGMAN Delivery Controller, FORGE Implementer, and HELM deployment-execution prompt derived from this WO must reproduce this doctrine inline. Agents must never be expected to remember it from another conversation.
+Every future BAGMAN Delivery Controller, FORGE Implementer, and BAGMAN-authorised-production-executor prompt derived from this WO must reproduce this doctrine inline. Agents must never be expected to remember it from another conversation.
 
 ---
 
@@ -57,7 +57,7 @@ This SHA is the canonical baseline against which this Work Order was authored. T
 This Work Order exists to implement and govern the activation of the recurring automatic evidence-classification scheduler authorised, as architecture, by PID §114. It covers **two separate lanes inside one bounded delivery**, which must not be blurred:
 
 1. **Git-tracked repository implementation** — the canonical `launchd` scheduler definition and supporting documentation (Delivery Controller / FORGE / BAGMAN lane).
-2. **Governed production deployment and activation** — installing, proving, and enabling that definition on the canonical BAGMAN production Mac (HELM lane), strictly staged and gated.
+2. **Governed production deployment and activation** — installing, proving, and enabling that definition on the canonical BAGMAN production Mac (BAGMAN-authorised production-executor lane, operating under BAGMAN Delivery Controller governance), strictly staged and gated.
 
 The desired chain:
 
@@ -72,7 +72,7 @@ Fresh Independent Audit (repository content)
         ↓
 Git-tracked PR → Architect Acceptance → Merge → post-merge Security GREEN
         ↓
-HELM — Stage D: deploy disabled → Stage E: pre-activation safety proof
+BAGMAN-authorised production executor — Stage D: deploy disabled → Stage E: pre-activation safety proof
         ↓
 Stage F: explicit enablement (only after all Stage E gates GREEN)
         ↓
@@ -95,7 +95,7 @@ Recurring automatic classification scheduling CLOSED GREEN
 
 - Re-reads the canonical WO from Git before each dispatch.
 - Verifies the exact authorised SHA and that PID §114 remains canonical/unchanged at dispatch time.
-- Gives FORGE/HELM only the bounded mandate for the stage being dispatched.
+- Gives FORGE, or the BAGMAN-authorised production executor, only the bounded mandate for the stage being dispatched.
 - Does not reinterpret architecture. Stops on ambiguity.
 - Does not perform the Independent Auditor's work itself.
 - Never authorises Stage D onward until Stage A–C (repository implementation → merge → post-merge CI GREEN) is fully closed.
@@ -110,13 +110,13 @@ FORGE performs **only**:
 
 FORGE must **not** touch production, must not create `deployment/launchd/` content that embeds `T_ACT`, and must not modify classification logic, migrations, or any file outside the bounded scope at §6.A. FORGE must receive the full §0 doctrine inline in its dispatch prompt.
 
-### HELM — production deployment/activation (Stages D–G only)
+### BAGMAN-authorised production executor — production deployment/activation (Stages D–G only)
 
-HELM performs the staged, read-mostly production deployment and activation sequence at §6.D–§6.G, strictly in order, strictly gated. HELM owns installation and runtime management of the `launchd` job on the Mac (per PID §114.6) but does not own the canonical scheduler definition — that is this WO's Git-tracked artifact, merged before HELM ever installs it.
+This role operates under BAGMAN Delivery Controller governance — it is not a separate infrastructure platform, new service, or new architectural component. It performs the staged, read-mostly production deployment and activation sequence at §6.D–§6.G, strictly in order, strictly gated. It owns installation and runtime management of the `launchd` job on the Mac (per PID §114.6) but does not own the canonical scheduler definition — that is this WO's Git-tracked artifact, merged before this role ever installs it.
 
 ### Independent Auditor
 
-A fresh Auditor with **no inherited FORGE/HELM/Delivery-Controller conclusions**, dispatched **twice** under this WO: once against the repository implementation (before the implementation PR), and once against the production-activation evidence (before the activation-closure PR). Each dispatch must receive the full §0 doctrine inline and must inspect the actual evidence itself, never merely review prose.
+A fresh Auditor with **no inherited FORGE/production-executor/Delivery-Controller conclusions**, dispatched **twice** under this WO: once against the repository implementation (before the implementation PR), and once against the production-activation evidence (before the activation-closure PR). Each dispatch must receive the full §0 doctrine inline and must inspect the actual evidence itself, never merely review prose.
 
 ---
 
@@ -160,9 +160,9 @@ No production contact is authorised in Stage B. If verification genuinely cannot
 
 Repository implementation must complete `Implementer → Independent Audit (repository content) → PR → Architect Acceptance → Merge → post-merge Security GREEN` before any production deployment. No production deployment may be sourced from an unmerged branch or an un-accepted SHA — canonical deployment authority is the merged `main` SHA, and only that SHA.
 
-### 6.D — Stage D: Production deploy, disabled (HELM)
+### 6.D — Stage D: Production deploy, disabled (BAGMAN-authorised production executor)
 
-After Stage C closes GREEN, HELM may, read-mostly:
+After Stage C closes GREEN, the BAGMAN-authorised production executor may, read-mostly:
 
 1. contact only the canonical production Mac (`192.168.11.4`);
 2. install the canonical plist from the merged `main` SHA, leaving it **disabled/unloaded** — no recurring execution yet;
@@ -171,9 +171,9 @@ After Stage C closes GREEN, HELM may, read-mostly:
 
 No recurring execution, and no other production mutation, occurs in Stage D.
 
-### 6.E — Stage E: Pre-activation safety proof (HELM, read-only)
+### 6.E — Stage E: Pre-activation safety proof (BAGMAN-authorised production executor, read-only)
 
-Before enabling `launchd`, HELM must prove, all read-only:
+Before enabling `launchd`, the BAGMAN-authorised production executor must prove, all read-only:
 
 1. **Production identity** — the inspected host is the canonical Mac mini per PID §0; Trinity is not touched.
 2. **`T_ACT`** — the production `bagman-api` container environment resolves `BAGMAN_EVIDENCE_CLASSIFICATION_ACTIVATION_BOUNDARY` to exactly `2026-10-02T09:58:51Z`.
@@ -183,11 +183,11 @@ Before enabling `launchd`, HELM must prove, all read-only:
 
 Any failed gate: **STOP — RED. Do not proceed to Stage F.**
 
-### 6.F — Stage F: Explicit enablement (HELM)
+### 6.F — Stage F: Explicit enablement (BAGMAN-authorised production executor)
 
-Only after **every** Stage E gate is GREEN may HELM enable/load the `launchd` scheduler, using the exact command documented in `deployment/launchd/README.md`. Enablement is a deliberate, explicitly-invoked, individually-recorded governed action — never an incidental side effect of installing the plist in Stage D.
+Only after **every** Stage E gate is GREEN may the BAGMAN-authorised production executor enable/load the `launchd` scheduler, using the exact command documented in `deployment/launchd/README.md`. Enablement is a deliberate, explicitly-invoked, individually-recorded governed action — never an incidental side effect of installing the plist in Stage D.
 
-### 6.G — Stage G: Bounded observation (HELM + Delivery Controller)
+### 6.G — Stage G: Bounded observation (BAGMAN-authorised production executor + BAGMAN Delivery Controller)
 
 Observe enough real scheduled executions (naturally occurring, bounded in time — not open-ended) to prove:
 
@@ -248,7 +248,7 @@ Any production database query outside the explicitly-authorised Stage D/F mutati
 
 ## 10. Evidence preservation
 
-Both FORGE and HELM/the Delivery Controller must capture sufficient evidence to support every finding without exposing secrets. Do **not** commit: passwords; OAuth tokens; API keys; raw secret files; personal email bodies unless strictly necessary; sensitive production payloads unrelated to the proof. Use: IDs; timestamps; hashes; counts; redacted excerpts; schema facts; command outputs with secrets removed. Run `gitleaks` before any PR this work produces (both the repository-implementation PR and the activation-closure PR).
+Both FORGE and the BAGMAN-authorised production executor/Delivery Controller must capture sufficient evidence to support every finding without exposing secrets. Do **not** commit: passwords; OAuth tokens; API keys; raw secret files; personal email bodies unless strictly necessary; sensitive production payloads unrelated to the proof. Use: IDs; timestamps; hashes; counts; redacted excerpts; schema facts; command outputs with secrets removed. Run `gitleaks` before any PR this work produces (both the repository-implementation PR and the activation-closure PR).
 
 ---
 
@@ -284,7 +284,7 @@ containing, at minimum:
 11. Gmail finding noted but untouched, if encountered.
 12. Deviations.
 13. Evidence references.
-14. Implementer/HELM verdict.
+14. Implementer/production-executor verdict.
 
 No secrets in either deliverable.
 
