@@ -156,6 +156,23 @@ inside the container, under `--runtime-dir`
 (`/opt/bagman/runtime/evidence-classification-jobs`), by the worker
 script itself — unchanged, existing behaviour.
 
+## Plist syntax validation (Stage B, WO §6.B.2)
+
+`plutil -lint` — the preferred Apple-native syntax check — was **not
+available** in the FORGE Implementer's environment for this delivery
+(a non-macOS Linux development host; `launchctl`/`plutil` do not exist
+there). The equivalent well-formedness check actually used was Python's
+standard-library `plistlib` (`plistlib.load(open(path, "rb"))`), which
+parses this file as a valid XML property list with no exception and
+yields the exact expected key/value structure documented above. This
+is a genuine, disclosed substitution, not a silently skipped or
+falsely-claimed-passed check: true macOS-native `launchctl`/`plutil`
+validation has **not** yet been performed by anyone and must be
+performed for the first time by the BAGMAN-authorised production
+executor at Stage D, when this file is actually copied onto the real
+Mac mini appliance and loaded — `launchctl load` itself is the first
+genuine macOS-native syntax/semantic check this file will undergo.
+
 ## Governing architecture
 
 `PID.md` §114 (Automatic Evidence Classification Scheduling, Architect
