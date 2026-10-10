@@ -24,8 +24,10 @@
   Disabled-by-default: this file deliberately defines NO RunAtLoad key.
   launchd's own default for an omitted RunAtLoad is false, so installing
   (`launchctl load`) this file does not itself trigger an immediate
-  classification run — the first invocation occurs only after one full
-  StartInterval (300s) has elapsed following a load. "Disabled" during
+  classification run. This file states only the governed StartInterval
+  (300s) itself — it does not assert or guarantee an exact first-fire
+  timestamp beyond that governed interval; actual first-fire timing,
+  once loaded, is determined by launchd itself. "Disabled" during
   Stage D of the governing Work Order means this file is NOT loaded into
   launchd at all (see README.md).
 -->
