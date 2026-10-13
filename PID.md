@@ -2998,3 +2998,87 @@ This amendment does **not** authorise: Gmail OAuth remediation; any Xero behavio
 ## 114.14 Relationship to §112.G and next governed artifact
 
 This section is the "Architecture decision" §112.G itself required before any scheduler Work Order may be drafted. It does not itself create a Git-tracked Work Order, does not authorise FORGE dispatch, and does not touch production in any way. The next governed artifact is a Git-tracked implementation Work Order — scoped, per §114.6, to cleanly separate any BAGMAN-repository change (if any beyond the `deployment/launchd/` artifact itself) from the BAGMAN-authorised production executor's own installation/runtime-management lane — which must itself complete the full `Delivery Controller → Implementer → Independent Audit → PR → Architect Acceptance → Merge → Closure` chain, including the staged activation doctrine at §114.12, before recurring automatic classification may run in production.
+
+# 117. Single-Operator Authentication, Private HTTPS, and Entity Context (Architect ruling, 2026-10-13)
+
+Records, durably, the Architect's decision on BAGMAN's authentication model, private HTTPS transport, and the shared Entity Context component — following the read-only architecture discovery against canonical `main` `0452494024b39c533f067c959aec8593cff98734` (service-boundary audit; entity-context ground-truth discovery; auth/session deployment-topology discovery, all independently corroborated by the Delivery Controller).
+
+## 117.A Scope and non-goals
+
+BAGMAN is a **private, single-human-operator application** managing multiple independent governed financial entities (`NOUSTAI_LIMITED`, `INFOSECURS_LIMITED`, `MATTHEW_SCOTT_PERSONAL`). It is **not** a multi-customer SaaS platform. This amendment explicitly does **not** authorise: a users table; a role/permission framework; a customer/workspace/tenant system; public registration; SSO, LDAP, or OAuth-login providers for operator identity (Xero/Microsoft/Gmail OAuth remain unrelated, provider-connection concerns, untouched); multi-factor infrastructure; enterprise identity management; or a speculative general-purpose identity platform. Exactly one operator account, one password, one server-side session mechanism.
+
+## 117.B Ground truth this amendment is built on (independently verified facts)
+
+- **No authentication or authorization boundary exists in BAGMAN today.** `app/api/main.py` registers zero middleware beyond `correlation_id_middleware`; zero FastAPI `Depends()` calls exist anywhere in `app/api/routers/`; `actor_id`/`actor_type` are self-asserted, unverified strings. `app/api/static/shared/operator.js` and `app/api/routers/internal.py` both state this explicitly in their own code/comments.
+- **No login page, session, or credential mechanism exists anywhere in the GUI.** The static app is served as a single mounted `StaticFiles` directory (`html=True`) at `/`.
+- **No crypto/session dependency is installed.** `passlib`, `bcrypt`, `argon2-cffi`, `itsdangerous`, `python-jose`, `pyjwt`, and `authlib` are all absent from `requirements.txt`/`requirements-dev.txt`. Confirmed framework versions: `fastapi==0.141.1`, `starlette==1.6.0`, `uvicorn[standard]==0.52.4`.
+- **Production network reality** (Mac mini, `mac-prod-01`, `192.168.11.4`): `bagman-api` is exposed as `0.0.0.0:8200->8000/tcp` (not the repo's documented loopback-only default), with real access restricted by a macOS `pf` anchor rule (`/etc/pf.anchors/com.helm.bagman-api`) to source subnet `192.168.246.0/24` only, on plain HTTP with **no TLS of any kind** for the main application.
+- **A separate, narrowly-scoped Caddy container (`bagman-xero-oauth-tls`)** already exists, bound `127.0.0.1:8543->443/tcp` only, reverse-proxying `bagman-api:8000` purely to give Xero's OAuth authorization server the HTTPS `redirect_uri` its confidential "Web app" client registration requires. Its own Caddyfile comment states explicitly it is reachable "ONLY via 127.0.0.1... in practice, only through an SSH local port-forward... for the one-time manual OAuth-consent action" and that "BAGMAN's real GUI/API stays plain HTTP on the LAN... UNCHANGED." This container is real, working, narrowly justified, and **must not be disturbed** by this amendment's own HTTPS work.
+- **`GovernedEntity`** (`core/entity.py`) is confirmed as the sole, authoritative identity source — a frozen dataclass, UUIDv7 `entity_id` (`core/identity.py`), with `InMemoryEntityRepository`/`PostgresEntityRepository` implementations, seeded via `app/api/composition.py`'s `SEED_ENTITIES`/`ensure_seed_entities()`. No replacement registry is authorised.
+- **The GUI has no existing global entity-context concept.** Every current "company" UI element (`entities.js`, upload-modal select, documents filter) is local/per-feature. `shell.js` has zero per-tab/per-window state isolation today — a naive global-variable entity switch would instantly affect every open panel/tab simultaneously.
+- **Entity-scoping discipline is inconsistent today**: Xero has a real, repeatedly-applied `_require_entity` guard plus a redundant HTTP-layer cross-entity ownership re-check (`app/api/routers/xero.py:1007`, an independent-audit-driven fix); mailboxes have a deliberately weaker *hint-only*, non-FK pattern; Needs-You and evidence-classification have **no entity-scoping helper or `entity_id` column at all**.
+
+## 117.C Authentication model
+
+- Exactly one operator account; one securely stored password hash; one separate login page (`app/api/static/login.html`) and authentication service (`app/api/routers/auth.py`, `core/auth.py`).
+- **Password hashing: Argon2id** (not bcrypt), with pinned dependencies and tested compatibility with the production container architecture before activation — the Architect's explicit correction to an earlier bcrypt draft.
+- On successful login, the service issues a new, cryptographically random, opaque session token (`secrets.token_urlsafe(32)`, stdlib only). **Only a one-way SHA-256 digest of the token is persisted** in a new PostgreSQL table (`operator_sessions`), never the raw token — the raw token exists only in the browser's cookie and the transient server request context for that call.
+- `operator_sessions` carries creation, expiry, and revocation state, following this codebase's existing ABC + in-memory + Postgres repository pattern (mirroring `GovernedEntity`'s own `EntityRepository` shape) — no new persistence framework.
+- Session cookie: `Secure`, `HttpOnly`, `SameSite=Lax`, `Path=/`, **no `Domain` attribute** (host-only), preferably using the `__Host-` prefix.
+- Configurable **12-hour absolute maximum session lifetime** as the initial value.
+- Explicit logout immediately revokes the server-side session record.
+- **Session rotation on successful authentication** (a fresh token issued at login, never reused across login events).
+- **Fail-closed if the session store (Postgres) is unavailable** — an auth check that cannot reach its backing store must deny access, never silently allow it.
+
+## 117.D Private HTTPS transport (Option B — selected)
+
+No plaintext password or session-cookie transmission over the existing HTTP access path is authorised. A minimal private HTTPS entry point is required, reusing the existing Caddy technology:
+
+- A **second, additive Caddy site block** (same container image/technology already proven for the Xero OAuth leg, but **not** the same loopback-only listener) — bound to the LAN interface, on a distinct port, reverse-proxying to `bagman-api:8000`, exactly as the existing `:443` Xero-OAuth block already does structurally.
+- The existing Xero-OAuth Caddyfile block (`:443`, `127.0.0.1:8543->443/tcp`, self-signed cert at `/etc/caddy-tls/`) **must remain completely untouched** — its hostname, path, and connectivity contract for the OAuth callback are preserved exactly as-is.
+- **Certificate**: preferably one trusted on the operator's own device via a private CA (avoiding routine browser certificate-warning bypass, per the Architect's explicit instruction) — the implementation Work Order must determine and document the concrete mechanism (e.g. a locally-generated private CA installed once into the operator's device trust store, or an equivalent already-accepted pattern) rather than assuming the Xero leg's "accept the browser warning once" pattern is acceptable for routine daily login use.
+- **The `pf` firewall rule must be extended**, not replaced: a new rule permitting only `192.168.246.0/24` to the new HTTPS port, mirroring the existing `com.helm.bagman-api` anchor's exact restriction.
+- **Once HTTPS access is confirmed working, `bagman-api`'s direct plain-HTTP port (currently `0.0.0.0:8200`) must no longer remain directly reachable from operator devices** — the backend HTTP listener becomes internal-only (reachable from the Caddy container over `bagman-net`, not from the LAN directly). The implementation Work Order must define the exact mechanism (narrowing the `pf` rule's source to the Caddy container's own address only, or removing the host port-publish entirely and relying on the Docker network) and a tested rollback path if this narrowing breaks something unexpected.
+- **Proxy-header trust**: the application must not blindly trust `X-Forwarded-*`/`Forwarded` headers from any source other than the one, known, narrowly-scoped Caddy proxy — the implementation must explicitly validate or restrict trusted-proxy configuration, not assume Starlette's defaults are safe by omission.
+- Exact hostname/DNS/interface/certificate arrangements must be verified live, read-only, against the real production host **before** any deployment command is drafted in the implementation Work Order — no DNS name currently exists; the operator reaches BAGMAN today via a bare LAN IP (`192.168.11.4`), which this amendment does not assume will change, but which the Work Order must explicitly confirm or revise.
+
+## 117.E CSRF, login protection, and fail-closed handling
+
+- Session-bound CSRF protection (a double-submit or session-tied token) for all state-changing browser requests — `SameSite=Lax` is necessary but **explicitly not sufficient on its own**, per the Architect's instruction.
+- Origin verification as an additional, independent safeguard alongside the CSRF token.
+- Failed-login throttling (a short backoff after consecutive failures), recorded via the existing audit-event mechanism — no new logging subsystem.
+- Explicit, distinct handling for missing / expired / revoked session states — never conflated into a single generic "unauthenticated" branch where the distinction matters for diagnosis.
+- Access control must be enforced **server-side, on every protected request** — a client-side redirect-if-unauthenticated check in the GUI shell is a UX convenience only, never the actual access-control boundary.
+
+## 117.F Credential bootstrap and recovery
+
+- Follows BAGMAN's existing host-managed Docker-secret convention exactly (`BAGMAN_OPERATOR_PASSWORD_HASH_FILE=/run/secrets/operator_password_hash`, mirroring `BAGMAN_DB_PASSWORD_FILE`/`BAGMAN_LITELLM_API_KEY_FILE`).
+- One governed CLI procedure (`scripts/set_operator_password.py` or equivalent) for both initial credential creation and reset — prompts for a new password, writes only the Argon2id hash to the secret file path, never logs or echoes the plaintext, never persists it in Git, an environment variable value, or the database.
+- **Password reset revokes all existing sessions** — a reset is itself a security event, not merely a credential rotation.
+- The secret mount and its file permissions must be validated in development before any production activation attempt.
+
+## 117.G Application integration
+
+- Extends the existing FastAPI application and its existing composition/DI pattern (`RuntimeComposition`/`get_composition()`) — no parallel web application or framework is authorised.
+- New routes: `POST /auth/login`, `POST /auth/logout`, `GET /auth/status`; a new `app/api/static/login.html`.
+- A new auth-enforcement middleware, registered in `app/api/main.py` **alongside, not replacing,** the existing `correlation_id_middleware`.
+- **Explicit public-route exemption list**, derived from the real, current registered endpoint inventory (not invented): `/health`, `/version`, `/ready`/readiness-equivalent, `/auth/login`, `/auth/status`, and every existing OAuth-provider callback path already registered under the Xero and mailbox-provider routers (these are hit by external providers, not the browser session, and must keep working unauthenticated exactly as today). The implementation Work Order must enumerate this list exhaustively against the real router registration order in `app/api/main.py` before merge — an omitted callback path would break Xero/Gmail/Microsoft reconnection.
+- Protected without exception: the static GUI mount, evidence downloads, all internal/financial-operation APIs, and (unless a documented operational reason requires otherwise) the FastAPI auto-generated API documentation routes.
+
+## 117.H Entity Context
+
+- An authenticated session establishes the sole human operator. Entity selection is a **separate, orthogonal** concept: which governed entity's data is currently in view, not who is acting.
+- The operator may select any currently-registered `GovernedEntity` (today: `NOUSTAI_LIMITED`, `INFOSECURS_LIMITED`, `MATTHEW_SCOTT_PERSONAL`; any future entity if explicitly registered) — using existing immutable `entity_id` values. No new entity IDs are issued; no replacement registry is created.
+- **No per-operator entity-permission matrix is authorised or needed** — the one authenticated operator has access to all registered entities by definition, consistent with §117.A's non-goals.
+- Switching entities must **not**: require re-authentication; change financial-record ownership; reconnect Xero or any bank/mail provider; clear or invalidate another entity's stored provider credentials; change another browser tab's own active entity selection; or affect autonomous background workers (WO-114's scheduler and any future entity-scoped job continue independently of browser sessions entirely, per existing doctrine).
+- **Explicit server-side entity-ownership validation is retained regardless of the single-operator simplification** — these checks protect accounting correctness (never serving entity A's cached records under an entity-B-scoped request), not merely access security, and must not be weakened on the reasoning that "there's only one operator anyway."
+- A new, reusable `core/entity_context.py` contract (generalising the already-proven `_require_entity` and `xero.py:1007` redundant-ownership-check patterns) is the shared mechanism Banking, Invoicing, Tax, and every existing entity-touching service must call — not a bespoke per-service re-implementation.
+- GUI: a persistent header selector; per-browser-tab independent selection (new work — no existing mechanism provides this, per §117.B); a request "context epoch" guard against stale cross-entity responses; a dirty-state warning before a switch if unsaved work exists.
+
+## 117.I Explicit exclusions
+
+This amendment does **not** authorise: a users table, role/permission framework, or any multi-operator capability; public signup; SSO/LDAP/OAuth-login-provider integration for operator identity; organisation/workspace/tenant membership tables; per-user entity-permission matrices; any change to Xero/Microsoft/Gmail OAuth provider-connection flows beyond preserving their existing callback contracts untouched; any Banking/Invoicing/Tax domain implementation (governed separately, per the pending service-separation amendment); any production mutation of any kind — this section is architecture only.
+
+## 117.J Governed delivery sequencing
+
+Repository implementation, independent audit, Architect Acceptance, and production activation (including the HTTPS transport change and the eventual narrowing of `bagman-api`'s direct port exposure) are separated into properly governed stages, mirroring WO-114's own proven Stage A→G discipline: Stage A/B (repository implementation: auth code, migration, routes, login page, CLI script) → Independent Audit → PR → Architect Acceptance → Merge → Stage D (deploy disabled / inert) → Stage E (read-only safety verification, including a tested rollback plan for the HTTPS/port-narrowing change) → Stage F (explicit activation) → Stage G (bounded observation) → a second, production-activation Independent Audit → closure. Production activation must not proceed before independent audit and exact-head Architect Acceptance of the repository implementation. This amendment does not itself dispatch any implementation and does not touch production in any way. WO-114's live scheduler and the NoustAI accounting discovery/reconciliation work are both explicitly unaffected and must not be interrupted by this delivery.
