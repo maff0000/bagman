@@ -68,7 +68,16 @@ def _logged_in_client(dev_client) -> TestClient:
 
 def _csrf_headers(client) -> dict:
     csrf_token = client.cookies.get("__Host-bagman_csrf")
-    return {"x-bagman-csrf-token": csrf_token, "origin": "http://testserver"}
+    # `dev_client` is modeled as HTTPS (`TestClient(app, base_url="https://testserver")`
+    # below) — a well-behaved same-origin browser's own `Origin` header
+    # always carries the SAME scheme the page itself was served over,
+    # so this must be `https://`, never `http://` (WO-BAGMAN-117
+    # §6.A'.14: `_origin_is_trusted` now validates scheme too, not just
+    # host). Using `http://` here previously masked a real gap — see
+    # `test_origin_verification_rejects_http_against_an_https_modeled_application`
+    # below, which is the negative-case proof this positive helper's
+    # old value was accidentally relying on passing.
+    return {"x-bagman-csrf-token": csrf_token, "origin": "https://testserver"}
 
 
 # ---------------------------------------------------------------------
@@ -213,7 +222,13 @@ def test_with_auth_disabled_every_protected_route_is_fully_reachable_with_no_coo
 
 def test_state_changing_request_without_csrf_header_is_rejected_despite_a_valid_session(dev_client):
     _logged_in_client(dev_client)
-    response = dev_client.post("/auth/logout", headers={"origin": "http://testserver"})
+    # Origin correct (scheme+host+port all match `dev_client`'s own
+    # https://testserver) so the Origin gate passes and the ABSENT CSRF
+    # header is what's actually under test here — this was previously
+    # `"http://testserver"`, which (before WO-BAGMAN-117 §6.A'.14) the
+    # OLD, netloc-only `_origin_is_trusted` wrongly accepted too, but
+    # only by accident: it never exercised the scheme check at all.
+    response = dev_client.post("/auth/logout", headers={"origin": "https://testserver"})
     assert response.status_code == 403
     assert response.json()["error_code"] == "CSRF_REJECTED"
 
@@ -224,6 +239,135 @@ def test_state_changing_request_with_wrong_origin_is_rejected_despite_valid_csrf
     response = dev_client.post(
         "/auth/logout",
         headers={"x-bagman-csrf-token": csrf_token, "origin": "http://attacker.example"},
+    )
+    assert response.status_code == 403
+    assert response.json()["error_code"] == "ORIGIN_REJECTED"
+
+
+# ---------------------------------------------------------------------
+# WO-BAGMAN-117 §6.A'.14 (Architect correction, 2026-10-14) — full
+# Origin verification (scheme + hostname + effective port), §6.A'
+# required negative test matrix. `dev_client` is always modeled as
+# HTTPS (`TestClient(app, base_url="https://testserver")`), so the one
+# genuinely-correct Origin for every case below is exactly
+# "https://testserver" (default port 443, elided) — each test below
+# changes exactly ONE dimension of that away from correct and proves
+# the request is still rejected, with a valid CSRF token supplied
+# throughout so the Origin check is unambiguously what's under test.
+# ---------------------------------------------------------------------
+
+
+def test_origin_verification_rejects_http_against_an_https_modeled_application(dev_client):
+    """The exact stale gap the Architect correction named: the OLD
+    `_origin_is_trusted` compared `netloc` only, so `Origin:
+    http://testserver` was wrongly ACCEPTED against this HTTPS-modeled
+    test application. This is that same value, now proven rejected."""
+    _logged_in_client(dev_client)
+    csrf_token = dev_client.cookies.get("__Host-bagman_csrf")
+    response = dev_client.post(
+        "/auth/logout",
+        headers={"x-bagman-csrf-token": csrf_token, "origin": "http://testserver"},
+    )
+    assert response.status_code == 403
+    assert response.json()["error_code"] == "ORIGIN_REJECTED"
+
+
+def test_origin_verification_rejects_wrong_hostname(dev_client):
+    _logged_in_client(dev_client)
+    csrf_token = dev_client.cookies.get("__Host-bagman_csrf")
+    response = dev_client.post(
+        "/auth/logout",
+        headers={"x-bagman-csrf-token": csrf_token, "origin": "https://not-testserver"},
+    )
+    assert response.status_code == 403
+    assert response.json()["error_code"] == "ORIGIN_REJECTED"
+
+
+def test_origin_verification_rejects_wrong_port(dev_client):
+    """`https://` implies port 443 when elided (both in `Origin` and in
+    the real `Host` header this request arrives with) — an Origin that
+    explicitly names a DIFFERENT port must still be rejected even
+    though the scheme and hostname both match."""
+    _logged_in_client(dev_client)
+    csrf_token = dev_client.cookies.get("__Host-bagman_csrf")
+    response = dev_client.post(
+        "/auth/logout",
+        headers={"x-bagman-csrf-token": csrf_token, "origin": "https://testserver:9443"},
+    )
+    assert response.status_code == 403
+    assert response.json()["error_code"] == "ORIGIN_REJECTED"
+
+
+def test_origin_verification_accepts_the_explicit_default_port_matching_the_implicit_one(dev_client):
+    """Positive counterpart to the wrong-port case above — proves the
+    port comparison genuinely NORMALISES the default port rather than
+    merely happening to compare two elided values: an EXPLICIT
+    `:443` in `Origin` must still match the real `Host` header's
+    IMPLICIT (elided) 443."""
+    _logged_in_client(dev_client)
+    response = dev_client.post(
+        "/auth/logout",
+        headers={
+            "x-bagman-csrf-token": dev_client.cookies.get("__Host-bagman_csrf"),
+            "origin": "https://testserver:443",
+        },
+    )
+    assert response.status_code == 200
+
+
+def test_origin_verification_rejects_missing_origin_header_on_a_state_changing_request(dev_client):
+    _logged_in_client(dev_client)
+    csrf_token = dev_client.cookies.get("__Host-bagman_csrf")
+    response = dev_client.post("/auth/logout", headers={"x-bagman-csrf-token": csrf_token})
+    assert response.status_code == 403
+    assert response.json()["error_code"] == "ORIGIN_REJECTED"
+
+
+@pytest.mark.parametrize(
+    "malformed_origin",
+    [
+        "",
+        "not-a-url-at-all",
+        "https://",
+        "https:///testserver",  # empty host, path-shaped
+        "https://testserver/some/path",  # a well-formed Origin never carries a path
+        "https://user:pass@testserver",  # a well-formed Origin never carries userinfo
+        "null",  # the real browser-sent value for an opaque/sandboxed origin
+    ],
+)
+def test_origin_verification_rejects_malformed_origin_headers(dev_client, malformed_origin):
+    _logged_in_client(dev_client)
+    csrf_token = dev_client.cookies.get("__Host-bagman_csrf")
+    response = dev_client.post(
+        "/auth/logout",
+        headers={"x-bagman-csrf-token": csrf_token, "origin": malformed_origin},
+    )
+    assert response.status_code == 403
+    assert response.json()["error_code"] == "ORIGIN_REJECTED"
+
+
+def test_origin_verification_ignores_an_untrusted_forwarded_host_substitution_attempt(dev_client):
+    """Proves `_origin_is_trusted` genuinely IGNORES
+    `X-Forwarded-Host`/`Forwarded` rather than merely never having a
+    reason to use them in the happy path: an attacker-controlled
+    request carries a WRONG `Origin` plus a spoofed `X-Forwarded-Host`/
+    `Forwarded` crafted to match that wrong Origin — if the code ever
+    read either forwarded header instead of (or in addition to) the
+    request's own real `Host` header, this would incorrectly be
+    ACCEPTED. The real `Host` header TestClient sends underneath
+    (`testserver`, matching `dev_client`'s own `https://testserver`) is
+    never overridden here — only the forwarded headers are attacker-
+    supplied — so a 200 here would prove a real vulnerability."""
+    _logged_in_client(dev_client)
+    csrf_token = dev_client.cookies.get("__Host-bagman_csrf")
+    response = dev_client.post(
+        "/auth/logout",
+        headers={
+            "x-bagman-csrf-token": csrf_token,
+            "origin": "https://attacker.example",
+            "x-forwarded-host": "attacker.example",
+            "forwarded": "host=attacker.example;proto=https",
+        },
     )
     assert response.status_code == 403
     assert response.json()["error_code"] == "ORIGIN_REJECTED"

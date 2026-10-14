@@ -184,7 +184,12 @@ def test_logout_revokes_the_session_and_status_reflects_it(dev_client):
 
     logout_response = dev_client.post(
         "/auth/logout",
-        headers={"x-bagman-csrf-token": csrf_token, "origin": "http://testserver"},
+        # `dev_client` is modeled as HTTPS (`base_url="https://testserver"`)
+        # — a well-behaved same-origin browser sends an `Origin` whose
+        # SCHEME matches the page it was served from, so this must be
+        # `https://`, not `http://` (WO-BAGMAN-117 §6.A'.14: full
+        # scheme+host+port Origin verification).
+        headers={"x-bagman-csrf-token": csrf_token, "origin": "https://testserver"},
     )
     assert logout_response.status_code == 200
     assert logout_response.json()["authenticated"] is False

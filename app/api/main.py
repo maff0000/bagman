@@ -361,34 +361,105 @@ def _is_public_path(path: str) -> bool:
     return path in _PUBLIC_EXACT_PATHS or path.startswith(_PUBLIC_PREFIX)
 
 
+#: WO-BAGMAN-117 §6.A'.14 (Architect correction 2026-10-14) — `https://`
+#: and `http://` imply 443/80 respectively when no port is explicit in
+#: either the `Origin` header or the `Host` header, so an explicit
+#: `:443`/`:80` and an elided one must compare equal (RFC 6454 origin
+#: equality — "an explicit port MUST be considered the same as its
+#: scheme's default port").
+_DEFAULT_PORT_BY_SCHEME: dict[str, int] = {"https": 443, "http": 80}
+
+
+def _effective_port(scheme: str, explicit_port: int | None) -> int | None:
+    if explicit_port is not None:
+        return explicit_port
+    return _DEFAULT_PORT_BY_SCHEME.get(scheme)
+
+
 def _origin_is_trusted(origin_header: str, request: Request) -> bool:
     """PID §117.E's independent Origin-header safeguard (alongside, not
-    instead of, the CSRF token below). Compares the `Origin` header's
-    own `scheme://host[:port]` against the ACTUAL `Host` header this
-    request arrived with — never a hardcoded expected production
-    hostname (PID §117.D: no DNS name exists yet for BAGMAN's private
-    HTTPS entry point at the time of this delivery; the real
-    hostname/port is a Stage E, production-executor-verified fact, not
-    something Stage A's repository code can safely assume). This is a
-    same-origin check, not an allowlist of one specific domain — it
-    rejects a request whose `Origin` does not match the `Host` it
-    actually arrived on, regardless of what that `Host` turns out to be
-    in any given environment (development, test, or the eventual
-    production HTTPS entry point).
-    deliberately reads the request's own `Host` header directly (never
-    `X-Forwarded-Host`/`Forwarded`) — PID §117.D's own explicit
+    instead of, the CSRF token below).
+
+    WO-BAGMAN-117 §6.A'.14 (Architect correction, 2026-10-14): the
+    ORIGINAL version of this function compared only the `Origin`
+    header's `netloc` (host[:port]) against the `Host` header this
+    request arrived with — it never checked SCHEME at all, so
+    `Origin: http://realhost` was wrongly accepted against an
+    HTTPS-modeled application. This version validates the FULL expected
+    origin — scheme, hostname, AND effective (default-normalised) port
+    — never a hardcoded expected production hostname (PID §117.D: no
+    DNS name exists yet for BAGMAN's private HTTPS entry point at the
+    time of this delivery; the real hostname/port is a Stage E,
+    production-executor-verified fact, not something Stage A's
+    repository code can safely assume). This remains a same-origin
+    check, not an allowlist of one specific domain — it rejects a
+    request whose `Origin` does not match the scheme/host/port this
+    request itself actually arrived on, regardless of what that turns
+    out to be in any given environment (development, test, or the
+    eventual production HTTPS entry point).
+
+    Still deliberately reads the request's own `Host` header directly
+    (never `X-Forwarded-Host`/`Forwarded`) — PID §117.D's own explicit
     instruction that this application "must not blindly trust
     X-Forwarded-*/Forwarded headers from any source other than the
     one, known, narrowly-scoped Caddy proxy" (a Stage E production
     concern to configure/verify on the proxy side; this function does
-    not assume that hardening already exists elsewhere).
+    not assume that hardening already exists elsewhere, and does not
+    reference either header anywhere in this function — not even to
+    deliberately ignore a specific value — so there is nothing here an
+    attacker-supplied forwarded header could ever influence). The
+    SCHEME half of the comparison is, symmetrically, `request.url.scheme`
+    — whatever Starlette/ASGI reports this exact request as having
+    actually arrived over — never a header a browser-originated request
+    could set itself; the same "read the request's own truth, never a
+    client-controlled proxy header" discipline PID §117.D already
+    requires for `Host`, extended to scheme. Once the narrowly-trusted
+    HTTPS reverse-proxy topology (Caddy) exists (a separately-governed
+    Stage E production action), that proxy — not this function — is the
+    place `request.url.scheme` would be made to honestly reflect the
+    real external scheme (e.g. via an ASGI-server-level trusted-proxy
+    configuration scoped to exactly that one proxy's address); this
+    repository-level code makes no assumption about how, or whether,
+    that is already wired, exactly mirroring this function's pre-
+    existing Host-header discipline.
+
+    The independent CSRF-token check in `auth_enforcement_middleware`
+    below is retained UNCHANGED alongside this — Origin verification is
+    strengthened additively here, it does not replace or weaken CSRF.
     """
     host_header = request.headers.get("host", "")
+    if not host_header:
+        return False
     try:
-        origin_netloc = urllib.parse.urlsplit(origin_header).netloc
+        origin_parts = urllib.parse.urlsplit(origin_header)
+        # "//" + host_header lets urlsplit parse a bare "host[:port]"
+        # (correctly handling a bracketed IPv6 literal too) exactly the
+        # way it would inside a full URL's own netloc.
+        host_parts = urllib.parse.urlsplit("//" + host_header)
     except ValueError:
         return False
-    return bool(host_header) and origin_netloc.lower() == host_header.lower()
+
+    origin_scheme = origin_parts.scheme
+    origin_hostname = origin_parts.hostname
+    host_hostname = host_parts.hostname
+    if not origin_scheme or not origin_hostname or not host_hostname:
+        return False
+    # A well-formed `Origin` header is EXACTLY `scheme://host[:port]` —
+    # no path/query/fragment/userinfo. Anything else is malformed or
+    # suspicious and must fail CLOSED rather than be partially parsed
+    # into a false match.
+    if origin_parts.path not in ("", "/") or origin_parts.query or origin_parts.fragment or origin_parts.username:
+        return False
+
+    request_scheme = request.url.scheme
+    if origin_scheme.lower() != request_scheme.lower():
+        return False
+    if origin_hostname.lower() != host_hostname.lower():
+        return False
+
+    origin_port = _effective_port(origin_scheme.lower(), origin_parts.port)
+    host_port = _effective_port(request_scheme.lower(), host_parts.port)
+    return origin_port is not None and origin_port == host_port
 
 
 @app.middleware("http")

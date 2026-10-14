@@ -3,7 +3,7 @@
 // feature, same "feature owns its own endpoint map" pattern
 // `features/xero/xero-api.js`/`features/needs-you/needs-you-api.js`
 // already establish — never folded into `shared/api.js`.
-import { apiGet, apiPost } from "../../shared/api.js";
+import { apiGet, apiPost, csrfHeaders } from "../../shared/api.js";
 
 export const MAILBOX_API = {
   list: "/internal/mailboxes",
@@ -452,13 +452,16 @@ export function listGmailDomainRules(mailboxId) {
  * mirrors `apiPost`'s exact shape/contract (never throws on a non-2xx
  * response; always resolves to `{ok, status, body}`) for the one PUT
  * this feature needs, rather than adding a generic PUT helper to the
- * shared module for a single caller. */
+ * shared module for a single caller. Spreads the SAME shared
+ * `csrfHeaders()` helper `apiPost` itself uses (WO-BAGMAN-117 §6.A'.12)
+ * — this is a state-changing request too, so it needs the identical
+ * CSRF header `apiPost` already supplies. */
 async function apiPut(path, jsonBody) {
   let res;
   try {
     res = await fetch(path, {
       method: "PUT",
-      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      headers: { "Content-Type": "application/json", Accept: "application/json", ...csrfHeaders() },
       body: JSON.stringify(jsonBody),
     });
   } catch (networkErr) {
