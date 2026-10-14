@@ -138,7 +138,47 @@ function initCrossFeatureRefresh() {
   });
 }
 
-export function initShell() {
+// WO-BAGMAN-117 §6.A.5/§117.C/§117.G — authentication-only on-load
+// check: redirect to the login page if no valid session exists. This
+// is a UX convenience only, NEVER the real access-control boundary
+// (that is the server-side auth-enforcement middleware,
+// app/api/main.py) — a user who reaches this point with JavaScript
+// disabled, or before this check resolves, is still fully blocked
+// server-side on every actual request. Deliberately does NOT add any
+// entity-selector UI, header dropdown, per-tab entity persistence, or
+// stale-response epoch guard (PID §117.H's explicit scope split — all
+// of that belongs to a separate, later, immediately-following Work
+// Order, not this one).
+//
+// `auth_enabled` (from `GET /auth/status`) distinguishes "the operator
+// is not logged in and enforcement is ACTIVE" from "server-side
+// enforcement is not yet turned on at all" (WO-BAGMAN-117 §6.D's
+// Stage D "installed but inert" deployment state) — without checking
+// it, every operator would be redirected to the login page the moment
+// this code is deployed, even before Stage F's later, separately
+// governed production action ever flips real enforcement on.
+async function redirectToLoginIfUnauthenticated() {
+  try {
+    const response = await fetch("/auth/status", { credentials: "same-origin" });
+    if (!response.ok) return true; // ambiguous result (e.g. 503) — do not block rendering; the server-side middleware is the real boundary
+    const body = await response.json();
+    if (body.auth_enabled && !body.authenticated) {
+      window.location.replace("/login.html");
+      return false;
+    }
+    return true;
+  } catch (err) {
+    // Network/parse failure: never block rendering the shell on an
+    // ambiguous client-side check — the server-side middleware is the
+    // real boundary and will reject any actual API call regardless.
+    return true;
+  }
+}
+
+export async function initShell() {
+  const shouldContinue = await redirectToLoginIfUnauthenticated();
+  if (!shouldContinue) return;
+
   const activateTab = initTabs();
   initOverviewRefresh();
   initMailboxesAdd();

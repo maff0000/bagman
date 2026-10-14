@@ -74,6 +74,7 @@ from __future__ import annotations
 import logging
 import os
 import time
+import urllib.parse
 import uuid
 from pathlib import Path
 
@@ -81,6 +82,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from starlette.staticfiles import StaticFiles
 
+from core.auth import SessionStatus, evaluate_session_token, tokens_match
 from core.errors import (
     ActiveInvocationConflictError,
     BagmanError,
@@ -101,6 +103,7 @@ from app.api.logging_config import configure_logging
 from app.api.routers import (
     activity,
     ai,
+    auth,
     documents,
     evidence_classification,
     health,
@@ -123,6 +126,12 @@ app = FastAPI(title="BAGMAN Runtime API", version="1")
 
 app.include_router(health.router)
 app.include_router(version.router)
+#: WO-BAGMAN-117 §6.A.3/§117.C/§117.G — single-operator
+#: login/logout/status. `POST /auth/login` and `GET /auth/status` are
+#: public (see `auth_enforcement_middleware`'s own allow-list below);
+#: `POST /auth/logout` is protected like every other state-changing
+#: route.
+app.include_router(auth.router)
 app.include_router(internal.router)
 app.include_router(intake.router)
 #: CD-5 WI-2 — the background AI gateway HTTP surface (PID §68).
@@ -273,6 +282,190 @@ async def correlation_id_middleware(request: Request, call_next):
         },
     )
     return response
+
+
+#: WO-BAGMAN-117 §6.A.6/§117.G — the exhaustive, individually-justified
+#: public-route allow-list. Every entry below is named EXACTLY, never a
+#: wildcard under "/" (the one deliberate exception, `_PUBLIC_PREFIX`,
+#: is documented separately below and is itself scoped to one single,
+#: named feature's own two sub-routes — never a generic prefix).
+#:
+#: Re-verified directly against the real, current router registration
+#: order in this exact file (see the `app.include_router(...)` calls
+#: above) and the real `@router.get`/`@router.post` decorator lines in
+#: each named module, at the exact dispatch SHA this delivery was built
+#: against — NOT copied from the WO's own citation without
+#: independent re-confirmation (the WO explicitly required this; the
+#: WO's own citation turned out to already be stale in one respect: it
+#: named bare paths like `/oauth/result`, but every one of these
+#: routers is mounted with its own `APIRouter(prefix=...)`, so the REAL
+#: path Starlette ever sees is the prefixed one below):
+#:
+#: * `/health`                                    — health.py:64  `@router.get("/health")` (no prefix) — container healthchecks, run intra-container, never through a browser session.
+#: * `/version`                                   — version.py:73 `@router.get("/version")` (no prefix) — same: an operational/ops probe, never a browser-session-gated action.
+#: * `/ready`                                      — health.py:69  `@router.get("/ready")` (no prefix) — readiness-equivalent; same reasoning as `/health`.
+#: * `/auth/login`                                 — auth.py `@router.post("/login")`, router prefix `/auth` — the login mechanism itself cannot require a session to reach.
+#: * `/auth/status`                                — auth.py `@router.get("/status")`, router prefix `/auth` — must be reachable with no session cookie (it is what tells the GUI shell/an operator whether one exists at all).
+#: * `/login.html`                                 — `app/api/static/login.html`, served by the `StaticFiles` mount at `/` (see this module's own docstring) — the one page an unauthenticated browser must be able to load. Fully self-contained (inline CSS/JS, no separate `.css`/`.js` asset of its own), so this is the ONLY static path this delivery exempts — never a wildcard under the static mount.
+#: * `/internal/xero/oauth/result`                 — xero.py:407 `@router.get("/oauth/result")`, router prefix `/internal/xero` (xero.py:105) — the clean, code/state-free OAuth landing page every `/oauth/callback` outcome redirects to; reachable directly and unauthenticated today (xero.py's own module docstring).
+#: * `/internal/xero/oauth/callback`               — xero.py:531 `@router.get("/oauth/callback")`, same prefix — the exact path Xero's own OAuth redirect targets; hit by Xero's authorization server, never by an authenticated browser session.
+#: * `/internal/xero/oauth/pending-selection/{selection_id}` and `/internal/xero/oauth/pending-selection/{selection_id}/resolve` — xero.py:692/716, same prefix — the governed multi-tenant candidate-selection broker, reached mid-OAuth-round-trip; covered by `_PUBLIC_PREFIX` below (both the `GET .../{selection_id}` and `POST .../{selection_id}/resolve` legs), not an exact-path entry, since the `{selection_id}` segment is a real path parameter, not static text — the prefix is scoped to exactly this one feature's own sub-path, never a wildcard under `/internal/xero` as a whole. This flow's OWN `selection_id`-scoped state/expiry/replay protection and `_eligible_candidates` multi-tenant-consent disambiguation (xero.py, `services.xero.tenant_selection`) are completely untouched by this middleware — it only ever decides whether the SESSION layer applies to a request, never touching that flow's own independent anti-replay/anti-substitution checks.
+#: * `/internal/mailboxes/microsoft/oauth/result`  — mailboxes_microsoft.py:338 `@router.get("/microsoft/oauth/result")`, router prefix `/internal/mailboxes` (mailboxes_microsoft.py:191).
+#: * `/internal/mailboxes/microsoft/oauth/callback`— mailboxes_microsoft.py:343 `@router.get("/microsoft/oauth/callback")`, same prefix.
+#: * `/internal/mailboxes/gmail/oauth/result`      — mailboxes_gmail.py:222 `@router.get("/gmail/oauth/result")`, router prefix `/internal/mailboxes` (mailboxes_gmail.py:122).
+#: * `/internal/mailboxes/gmail/oauth/callback`    — mailboxes_gmail.py:227 `@router.get("/gmail/oauth/callback")`, same prefix.
+#:
+#: Everything else — the entire rest of the static GUI mount (`/`,
+#: `/index.html`, `/app.js`, `/style.css`, `/shell/*`, `/features/*`),
+#: every `/internal/*` JSON API (entities, evidence, needs-you,
+#: activity, xero connection-management, mailboxes, mailbox provider
+#: connect/disconnect/sweep/messages/domain-review/security-review,
+#: evidence-classification, ai, documents, operator chat),
+#: `POST /auth/logout`, and FastAPI's own `/docs`/`/redoc`/
+#: `/openapi.json` — is protected WITHOUT exception (PID §117.G), with
+#: zero special-casing required: it simply is not in this allow-list.
+_PUBLIC_EXACT_PATHS: frozenset[str] = frozenset(
+    {
+        "/health",
+        "/version",
+        "/ready",
+        "/auth/login",
+        "/auth/status",
+        "/login.html",
+        "/internal/xero/oauth/result",
+        "/internal/xero/oauth/callback",
+        "/internal/mailboxes/microsoft/oauth/result",
+        "/internal/mailboxes/microsoft/oauth/callback",
+        "/internal/mailboxes/gmail/oauth/result",
+        "/internal/mailboxes/gmail/oauth/callback",
+    }
+)
+
+#: Xero's governed multi-tenant candidate-selection broker — the ONE
+#: prefix exemption, deliberately narrow (scoped to this one feature's
+#: own sub-path, never a generic wildcard under `/` or even under
+#: `/internal/xero`): covers both
+#: `GET /internal/xero/oauth/pending-selection/{selection_id}` and
+#: `POST /internal/xero/oauth/pending-selection/{selection_id}/resolve`
+#: (the `{selection_id}` path parameter cannot be named as an exact
+#: string above).
+_PUBLIC_PREFIX = "/internal/xero/oauth/pending-selection/"
+
+#: Methods that never carry a CSRF-relevant side effect (PID §117.E:
+#: CSRF/Origin verification applies to "state-changing browser
+#: requests" only).
+_SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+
+
+def _is_public_path(path: str) -> bool:
+    return path in _PUBLIC_EXACT_PATHS or path.startswith(_PUBLIC_PREFIX)
+
+
+def _origin_is_trusted(origin_header: str, request: Request) -> bool:
+    """PID §117.E's independent Origin-header safeguard (alongside, not
+    instead of, the CSRF token below). Compares the `Origin` header's
+    own `scheme://host[:port]` against the ACTUAL `Host` header this
+    request arrived with — never a hardcoded expected production
+    hostname (PID §117.D: no DNS name exists yet for BAGMAN's private
+    HTTPS entry point at the time of this delivery; the real
+    hostname/port is a Stage E, production-executor-verified fact, not
+    something Stage A's repository code can safely assume). This is a
+    same-origin check, not an allowlist of one specific domain — it
+    rejects a request whose `Origin` does not match the `Host` it
+    actually arrived on, regardless of what that `Host` turns out to be
+    in any given environment (development, test, or the eventual
+    production HTTPS entry point).
+    deliberately reads the request's own `Host` header directly (never
+    `X-Forwarded-Host`/`Forwarded`) — PID §117.D's own explicit
+    instruction that this application "must not blindly trust
+    X-Forwarded-*/Forwarded headers from any source other than the
+    one, known, narrowly-scoped Caddy proxy" (a Stage E production
+    concern to configure/verify on the proxy side; this function does
+    not assume that hardening already exists elsewhere).
+    """
+    host_header = request.headers.get("host", "")
+    try:
+        origin_netloc = urllib.parse.urlsplit(origin_header).netloc
+    except ValueError:
+        return False
+    return bool(host_header) and origin_netloc.lower() == host_header.lower()
+
+
+@app.middleware("http")
+async def auth_enforcement_middleware(request: Request, call_next):
+    """WO-BAGMAN-117 §6.A.6/§117.C/§117.E/§117.G — server-side session
+    enforcement on every request except the narrow, individually-
+    justified allow-list above. Registered ALONGSIDE, never replacing,
+    `correlation_id_middleware` above (declared first in this file, so
+    it remains the OUTERMOST layer — every response, including a
+    401/403/503 this middleware itself returns, still gets a
+    correlation id and the one sanitized completion log line).
+
+    Feature-flagged via `auth.auth_enabled()` (`BAGMAN_AUTH_ENABLED`,
+    default `false` — WO-BAGMAN-117 §6.D's "deploy the merged image
+    with the new middleware feature-flagged off" staged-activation
+    requirement): when disabled, every request passes straight through
+    completely unchanged, so this code can be MERGED and DEPLOYED
+    (Stage D) with zero behavioural change until a later, separately
+    governed production action (Stage F) turns it on.
+
+    Fail-closed on session-store unavailability (PID §117.C): a
+    `core.errors.PersistenceError` from the session repository is
+    translated to `503`, never silently treated as "no session" (which
+    would be a silent ALLOW-shaped outcome for every protected route
+    the moment the database is unreachable — the opposite of fail-
+    closed).
+    """
+    if not auth.auth_enabled() or _is_public_path(request.url.path):
+        return await call_next(request)
+
+    repository = auth.get_session_repository()
+    raw_token = request.cookies.get(auth.SESSION_COOKIE_NAME)
+    try:
+        evaluation = evaluate_session_token(raw_token, repository=repository)
+    except PersistenceError as exc:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "error_code": "SESSION_STORE_UNAVAILABLE",
+                "message": f"the session store is unreachable; access denied (fail-closed): {exc.message}",
+            },
+        )
+
+    if evaluation.status is not SessionStatus.VALID:
+        return JSONResponse(
+            status_code=401,
+            content={
+                "error_code": "UNAUTHENTICATED",
+                "message": "authentication required",
+                "reason": evaluation.status.value,
+            },
+        )
+
+    if request.method not in _SAFE_METHODS:
+        origin_header = request.headers.get("origin")
+        if not origin_header or not _origin_is_trusted(origin_header, request):
+            return JSONResponse(
+                status_code=403,
+                content={"error_code": "ORIGIN_REJECTED", "message": "request Origin did not match this server"},
+            )
+        csrf_cookie = request.cookies.get(auth.CSRF_COOKIE_NAME)
+        csrf_header = request.headers.get(auth.CSRF_HEADER_NAME)
+        session_csrf_token = evaluation.session.csrf_token if evaluation.session is not None else None
+        if (
+            not csrf_cookie
+            or not csrf_header
+            or session_csrf_token is None
+            or not tokens_match(csrf_cookie, csrf_header)
+            or not tokens_match(csrf_cookie, session_csrf_token)
+        ):
+            return JSONResponse(
+                status_code=403,
+                content={"error_code": "CSRF_REJECTED", "message": "missing or invalid CSRF token"},
+            )
+
+    request.state.operator_session = evaluation.session
+    return await call_next(request)
 
 
 @app.exception_handler(BagmanError)

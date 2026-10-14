@@ -148,6 +148,7 @@ CANONICAL_TABLES = (
     "evidence_classification_rules",  # CD-6 Slice 5 WI-1
     "background_jobs",  # CD-6 §103 Inference Architecture Ruling
     "evidence_classification_jobs",  # evidence/automatic-classification-activation WO
+    "operator_sessions",  # WO-BAGMAN-117 (single-operator authentication, PID §117.C)
 )
 
 

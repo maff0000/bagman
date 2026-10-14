@@ -1,0 +1,206 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>BAGMAN — Sign in</title>
+  <!--
+    WO-BAGMAN-117 §6.A.4/§117.C/§117.G — a new, separate static page.
+
+    Deliberately fully self-contained (inline <style>/<script>, no
+    separate .css/.js file of its own): the auth-enforcement middleware
+    (app/api/main.py) must exempt this page from the session check so
+    an unauthenticated browser can load it at all, and WO-BAGMAN-117
+    §6.A.6 requires that exemption be "GET /login.html and only the
+    specific static assets the login page itself requires to render
+    ... enumerated exactly, not a wildcard". Making this page
+    self-contained means the answer to "which assets does it require"
+    is "none beyond itself" — the allow-list in app/api/main.py names
+    exactly one path, never a second exemption that would have to be
+    separately justified.
+
+    No entity-selector GUI, header dropdown, per-tab entity
+    persistence, or stale-response guard exists anywhere on this page
+    (PID §117.H's scope split) — this page's only job is a password
+    field and a submit button.
+  -->
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: #f4f5f7;
+      --panel: #ffffff;
+      --text: #1b1f24;
+      --muted: #5b6472;
+      --border: #d7dce2;
+      --accent: #1f6feb;
+      --accent-text: #ffffff;
+      --error-bg: #fdecea;
+      --error-text: #8a1f11;
+      --error-border: #f3b4ac;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root:not([data-theme="light"]) {
+        --bg: #14171c;
+        --panel: #1c2026;
+        --text: #e7eaee;
+        --muted: #9aa4b2;
+        --border: #2b313a;
+        --accent: #4c8dff;
+        --accent-text: #0b0d10;
+        --error-bg: #3a1613;
+        --error-text: #ffb4a8;
+        --error-border: #6b2a22;
+      }
+    }
+    :root[data-theme="dark"] {
+      --bg: #14171c;
+      --panel: #1c2026;
+      --text: #e7eaee;
+      --muted: #9aa4b2;
+      --border: #2b313a;
+      --accent: #4c8dff;
+      --accent-text: #0b0d10;
+      --error-bg: #3a1613;
+      --error-text: #ffb4a8;
+      --error-border: #6b2a22;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+      background: var(--bg);
+      color: var(--text);
+      font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    }
+    .card {
+      width: 100%;
+      max-width: 360px;
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 32px 28px;
+    }
+    .brand {
+      font-weight: 700;
+      font-size: 20px;
+      letter-spacing: 0.02em;
+      margin: 0 0 4px;
+    }
+    .sub {
+      color: var(--muted);
+      margin: 0 0 24px;
+      font-size: 13px;
+    }
+    label {
+      display: block;
+      font-size: 13px;
+      color: var(--muted);
+      margin-bottom: 6px;
+    }
+    input[type="password"] {
+      width: 100%;
+      padding: 10px 12px;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      background: transparent;
+      color: var(--text);
+      font-size: 15px;
+    }
+    input[type="password"]:focus {
+      outline: 2px solid var(--accent);
+      outline-offset: 1px;
+    }
+    button {
+      width: 100%;
+      margin-top: 18px;
+      padding: 10px 12px;
+      border-radius: 8px;
+      border: none;
+      background: var(--accent);
+      color: var(--accent-text);
+      font-size: 15px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    button:disabled {
+      opacity: 0.6;
+      cursor: default;
+    }
+    .error {
+      margin-top: 14px;
+      padding: 10px 12px;
+      border-radius: 8px;
+      background: var(--error-bg);
+      color: var(--error-text);
+      border: 1px solid var(--error-border);
+      font-size: 13px;
+    }
+    [hidden] { display: none !important; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <p class="brand">BAGMAN</p>
+    <p class="sub">Sign in to continue.</p>
+    <form id="login-form" autocomplete="off">
+      <label for="password">Password</label>
+      <input type="password" id="password" name="password" autocomplete="current-password" required autofocus />
+      <button type="submit" id="submit-btn">Sign in</button>
+      <p class="error" id="error" hidden></p>
+    </form>
+  </div>
+  <script>
+    (function () {
+      "use strict";
+      var form = document.getElementById("login-form");
+      var passwordInput = document.getElementById("password");
+      var submitBtn = document.getElementById("submit-btn");
+      var errorEl = document.getElementById("error");
+
+      function showError(message) {
+        errorEl.textContent = message;
+        errorEl.hidden = false;
+      }
+
+      form.addEventListener("submit", function (event) {
+        event.preventDefault();
+        errorEl.hidden = true;
+        submitBtn.disabled = true;
+
+        fetch("/auth/login", {
+          method: "POST",
+          credentials: "same-origin",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ password: passwordInput.value }),
+        })
+          .then(function (response) {
+            if (response.ok) {
+              // A real top-level navigation (not a fetch) so the
+              // server's own session-gated "/" response is what the
+              // browser actually renders next.
+              window.location.assign("/");
+              return;
+            }
+            return response
+              .json()
+              .catch(function () {
+                return { message: "Sign-in failed (" + response.status + ")." };
+              })
+              .then(function (body) {
+                submitBtn.disabled = false;
+                showError(body && body.message ? body.message : "Sign-in failed.");
+              });
+          })
+          .catch(function () {
+            submitBtn.disabled = false;
+            showError("Could not reach BAGMAN. Check your connection and try again.");
+          });
+      });
+    })();
+  </script>
+</body>
+</html>

@@ -47,6 +47,7 @@ EXPECTED_TABLES = {
     "xero_account_suggestions",  # xero/account-suggestion-producer WO
     "xero_account_assignments",  # xero/account-suggestion-producer WO
     "evidence_classification_jobs",  # evidence/automatic-classification-activation WO
+    "operator_sessions",  # WO-BAGMAN-117 (single-operator authentication, PID §117.C)
 }
 
 
@@ -114,6 +115,7 @@ def test_xero_migration_downgrade_genuinely_undoes_the_upgrade(postgres_containe
         "xero_account_suggestions",  # xero/account-suggestion-producer WO, chained downstream of c7a3f9e1b542
         "xero_account_assignments",  # xero/account-suggestion-producer WO, chained downstream of c7a3f9e1b542
         "evidence_classification_jobs",  # evidence/automatic-classification-activation WO, chained downstream of e8c4a1f97b23
+        "operator_sessions",  # WO-BAGMAN-117, chained downstream of ae936a444eae
     }
     try:
         command.downgrade(cfg, "712c5a2aab92")
@@ -158,6 +160,7 @@ def test_mailbox_migration_downgrade_genuinely_undoes_the_upgrade(postgres_conta
         "xero_account_suggestions",  # xero/account-suggestion-producer WO, chained downstream of c7a3f9e1b542
         "xero_account_assignments",  # xero/account-suggestion-producer WO, chained downstream of c7a3f9e1b542
         "evidence_classification_jobs",  # evidence/automatic-classification-activation WO, chained downstream of e8c4a1f97b23
+        "operator_sessions",  # WO-BAGMAN-117, chained downstream of ae936a444eae
     }
     try:
         command.downgrade(cfg, "5e8c1f42b9a7")
@@ -191,6 +194,7 @@ def test_mailbox_microsoft_sweep_migration_downgrade_genuinely_undoes_the_upgrad
         "xero_account_suggestions",  # xero/account-suggestion-producer WO, chained downstream of c7a3f9e1b542
         "xero_account_assignments",  # xero/account-suggestion-producer WO, chained downstream of c7a3f9e1b542
         "evidence_classification_jobs",  # evidence/automatic-classification-activation WO, chained downstream of e8c4a1f97b23
+        "operator_sessions",  # WO-BAGMAN-117, chained downstream of ae936a444eae
     }
     try:
         command.downgrade(cfg, "a3d7c1f9e246")
