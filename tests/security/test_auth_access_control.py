@@ -34,6 +34,9 @@ from fastapi.testclient import TestClient
 
 from app.api.composition import get_composition, reset_composition_for_tests
 from app.api.main import _PUBLIC_EXACT_PATHS, _PUBLIC_PREFIX, app
+from app.api.routers import auth as auth_router
+from core.auth import SessionRepository
+from core.errors import PersistenceError
 
 ACTOR_ID = "bagman-auth-access-control-tests"
 _TEST_PASSWORD = "a genuinely random auth access control test password 7q2z"
@@ -520,3 +523,87 @@ def test_no_entity_selector_gui_code_exists_in_this_wos_own_delivered_files(rela
     lowered = content.lower()
     for pattern in _FORBIDDEN_PATTERNS:
         assert pattern.lower() not in lowered, f"forbidden entity-selector-scope pattern {pattern!r} found in actual code (not a comment) in {relative_path}"
+
+
+# ---------------------------------------------------------------------
+# Fail-closed on session-store unavailability — HTTP/middleware-level
+# proof (WO-BAGMAN-117 §11.1 audit checklist / §12 acceptance criterion
+# 5; closes the Independent Auditor's AMBER-verdict gap, item 6).
+#
+# `core.auth.evaluate_session_token` deliberately lets a
+# `core.errors.PersistenceError` from the `SessionRepository` propagate
+# (see that function's own docstring); `tests/persistence/
+# test_operator_session_repository.py::
+# test_create_session_with_an_unreachable_engine_raises_persistence_error`
+# already proves that repository-level contract against a real,
+# unreachable Postgres engine. What was MISSING — and what the
+# Auditor's own ad-hoc probe confirmed by hand but which did not exist
+# as a committed test — is the same proof one layer up: a real HTTP
+# request, through a live `TestClient`, against the actual
+# `auth_enforcement_middleware` (`app/api/main.py`) and `POST
+# /auth/login` (`app/api/routers/auth.py`) call sites that are the ONLY
+# two places in this codebase that catch that `PersistenceError` and
+# translate it to a 503, never a silent allow.
+#
+# `_FailingSessionRepository` below is a minimal fake implementing
+# `core.auth.SessionRepository`'s ABC (mirrors the "swap in a fake
+# repository" precedent already used throughout
+# `app/api/composition.py::_build_development_or_test`, just raising
+# instead of succeeding) and is wired in by monkeypatching
+# `app.api.routers.auth.get_session_repository` — the one, single
+# function both the middleware (`auth.get_session_repository()`) and
+# `POST /auth/login`'s own handler (the same module-global name) call
+# to reach the session store, per that function's own docstring. No
+# new DI mechanism is introduced.
+# ---------------------------------------------------------------------
+
+
+class _FailingSessionRepository(SessionRepository):
+    """Every operation raises `PersistenceError` — simulates a session
+    store that is genuinely unreachable (e.g. the database is down),
+    never a "no session" / "unknown token" outcome."""
+
+    def create_session(self, *, token_digest, csrf_token, created_at, expires_at):
+        raise PersistenceError("simulated session store outage (create_session)")
+
+    def get_by_token_digest(self, token_digest):
+        raise PersistenceError("simulated session store outage (get_by_token_digest)")
+
+    def revoke_session(self, token_digest):
+        raise PersistenceError("simulated session store outage (revoke_session)")
+
+    def revoke_all_sessions(self, *, now=None):
+        raise PersistenceError("simulated session store outage (revoke_all_sessions)")
+
+
+def test_protected_route_with_forged_cookie_returns_503_when_session_store_is_down(dev_client, monkeypatch):
+    """A protected route, hit with a (forged/unknown) session cookie
+    while the session-store repository raises `PersistenceError` on
+    lookup, must fail CLOSED: 503 `SESSION_STORE_UNAVAILABLE`, never a
+    silent 200 (allow) or 401 (indistinguishable from "no session" —
+    which would hide a genuine infrastructure outage behind an
+    ordinary auth-required response)."""
+    monkeypatch.setattr(auth_router, "get_session_repository", lambda: _FailingSessionRepository())
+
+    response = dev_client.get(
+        "/internal/entities",
+        headers={"Cookie": "__Host-bagman_session=forged-or-stale-token-value"},
+    )
+
+    assert response.status_code == 503
+    body = response.json()
+    assert body["error_code"] == "SESSION_STORE_UNAVAILABLE"
+
+
+def test_login_returns_503_with_no_set_cookie_header_when_session_store_is_down(dev_client, monkeypatch):
+    """`POST /auth/login` with a CORRECT password, while the session
+    store is down: must return 503 and must carry NO `Set-Cookie`
+    header at all (fail-closed — never issue a cookie for a session
+    that was never durably persisted)."""
+    monkeypatch.setattr(auth_router, "get_session_repository", lambda: _FailingSessionRepository())
+
+    response = dev_client.post("/auth/login", json={"password": _TEST_PASSWORD})
+
+    assert response.status_code == 503
+    assert response.json()["error_code"] == "SESSION_STORE_UNAVAILABLE"
+    assert "set-cookie" not in {k.lower() for k in response.headers.keys()}
