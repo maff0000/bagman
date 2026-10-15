@@ -26,7 +26,7 @@
 // `POST /internal/intake/evidence` endpoint every other uploader in
 // this GUI already calls (PID §98.3's own "There is no special
 // image-upload bypass").
-import { API, apiGet } from "../shared/api.js";
+import { API, apiGet, csrfHeaders } from "../shared/api.js";
 import { generateRequestId } from "../shared/uuid.js";
 
 /**
@@ -66,7 +66,12 @@ export async function submitIntakeUpload(file, { entityHint, evidenceType, actor
   try {
     response = await fetch(API.intakeEvidence, {
       method: "POST",
-      headers: { "Idempotency-Key": idempotencyKey },
+      // WO-BAGMAN-117 §6.A'.12 — the shared CSRF header, spread
+      // alongside the existing Idempotency-Key header; the
+      // multipart Content-Type/boundary is left entirely to fetch()
+      // itself (unchanged — never set explicitly here, exactly as
+      // before).
+      headers: { "Idempotency-Key": idempotencyKey, ...csrfHeaders() },
       body: formData,
     });
   } catch (networkErr) {

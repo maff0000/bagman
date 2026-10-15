@@ -135,6 +135,33 @@
 #   uvicorn[standard] 0.52.4
 #   python-multipart  0.0.32
 #
+# argon2-cffi - introduced by WO-BAGMAN-117 (single-operator
+# authentication, PID §117.C), PL decision already made (the
+# Architect's own explicit correction to an earlier bcrypt draft):
+#
+#   argon2-cffi - the Argon2id password-hashing library core/auth.py
+#                 imports directly (argon2.PasswordHasher,
+#                 argon2.exceptions.*). Its own `argon2-cffi-bindings`
+#                 dependency is a compiled CFFI extension; confirmed
+#                 before this pin that PyPI publishes a prebuilt
+#                 manylinux wheel for BOTH linux/amd64
+#                 (manylinux_2_26_x86_64) and linux/arm64
+#                 (manylinux_2_26_aarch64) for this exact version, so
+#                 no C toolchain is required inside the
+#                 `python:3.12-slim` bagman-api image on either
+#                 architecture (the production Mac mini target runs
+#                 linux/arm64 containers under Docker).
+#
+# Pinned to 25.1.0, the latest stable release as of this work item
+# (2026-10-14; verified via `pip index versions argon2-cffi`). A real
+# hash/verify round trip was proven directly in this delivery's own
+# test environment (x86_64) — see the delivery report for the exact
+# arm64-specific verification gap this leaves (no arm64 host was
+# available to this Implementer; the prebuilt-wheel fact above is the
+# strongest evidence obtainable short of running on the real
+# production architecture, and the production activation stage
+# (WO-BAGMAN-117 §6.D/§6.E) must independently re-confirm it there
+# before `BAGMAN_AUTH_ENABLED` is ever flipped on).
 # starlette - introduced by CD-4 WI-4 (Documents GUI): app/api/main.py
 # imports `starlette.staticfiles.StaticFiles` directly to serve the
 # BAGMAN Documents GUI's static assets (app/api/static/) alongside the
@@ -159,3 +186,4 @@ alembic==1.20.0
 fastapi==0.141.1
 uvicorn[standard]==0.52.4
 python-multipart==0.0.32
+argon2-cffi==25.1.0

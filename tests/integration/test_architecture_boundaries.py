@@ -197,7 +197,15 @@ def test_no_redis_import_under_core_services_contracts_or_scripts():
 # no SDK-shaped third-party dependency introduced in core/ yet
 # ---------------------------------------------------------------------
 
-_ALLOWED_THIRD_PARTY_IN_CORE = {"jsonschema", "referencing", "rfc3339_validator"}
+#: WO-BAGMAN-117 (single-operator authentication, PID §117.C) adds
+#: `argon2` (argon2-cffi) to this allow-list — the Architect's own
+#: explicit, binding choice of Argon2id password hashing, imported
+#: directly by `core/auth.py` (`argon2.PasswordHasher`,
+#: `argon2.exceptions.*`). Unlike the SDK-shaped imports this test
+#: guards against (`msal`/`google.*`/`xero*`/...), this is a pure,
+#: dependency-free cryptographic primitive with no external network
+#: dependency of its own — not a provider SDK.
+_ALLOWED_THIRD_PARTY_IN_CORE = {"jsonschema", "referencing", "rfc3339_validator", "argon2"}
 
 
 def test_only_allowed_third_party_imports_exist_under_core():

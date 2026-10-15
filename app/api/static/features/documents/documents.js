@@ -11,7 +11,7 @@
 // features/documents/detail.js's `Detail.openDocument(row)`.
 import { el, clear, qs } from "../../shared/dom.js";
 import { fmtBytes, fmtDateTime, hashPrefix } from "../../shared/format.js";
-import { API, apiGet, errorMessage } from "../../shared/api.js";
+import { API, apiGet, errorMessage, csrfHeaders } from "../../shared/api.js";
 import { generateRequestId } from "../../shared/uuid.js";
 import { listDocuments } from "./documents-api.js";
 import { classificationBadge, decisionStateLabel, sourceSummaryLabel } from "./classification-format.js";
@@ -367,7 +367,12 @@ export const Documents = {
       try {
         response = await fetch(API.intakeEvidence, {
           method: "POST",
-          headers: { "Idempotency-Key": idempotencyKey },
+          // WO-BAGMAN-117 §6.A'.12 — the shared CSRF header, spread
+          // alongside the existing Idempotency-Key header; the
+          // multipart Content-Type/boundary is left entirely to
+          // fetch() itself (unchanged — never set explicitly here,
+          // exactly as before).
+          headers: { "Idempotency-Key": idempotencyKey, ...csrfHeaders() },
           body: formData,
         });
       } catch (networkErr) {

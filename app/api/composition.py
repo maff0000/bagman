@@ -65,6 +65,7 @@ from ai.jobs import BackgroundJobRepository
 from ai.providers.litellm.client import LiteLLMClientProtocol
 from core import actor
 from core.api import BagmanCanonicalAPI
+from core.auth import SessionRepository
 from persistence.objects.store import EvidenceObjectStore
 from services.evidence.classification import EvidenceClassificationRepository
 from services.evidence.classification_job import EvidenceClassificationJobRepository
@@ -486,6 +487,34 @@ class RuntimeComposition:
     #: `background_job_repository`'s own "bounded operator/
     #: maintenance-mode procedure, not a background service" precedent).
     classification_job_repository: EvidenceClassificationJobRepository
+    #: WO-BAGMAN-117 §6.A.1/§117.C — the durable operator-session store
+    #: backing single-operator authentication. In-memory in
+    #: development/test, a real `PostgresSessionRepository` (sharing
+    #: `engine`) in production — same never-mixed-across-modes
+    #: discipline as every repository above.
+    #:
+    #: Deviation note (recorded here, not silently done): WO-BAGMAN-117
+    #: §6.A's own enumerated file list does not name `app/api/
+    #: composition.py` as an authorised file. This one field + its two
+    #: one-line constructions below are nonetheless added, because this
+    #: module's OWN docstring states a hard, pre-existing invariant this
+    #: WO cannot honour without it: "No other file under core/,
+    #: services/, or persistence/ contains an if ENV == ... check of
+    #: any kind — and none should ever be added there; if a future
+    #: change seems to need one, it belongs here instead" — combined
+    #: with PID §117.G's own explicit instruction that this delivery
+    #: "Extends the existing FastAPI application and its existing
+    #: composition/DI pattern (RuntimeComposition/get_composition()) —
+    #: no parallel web application or framework is authorised", and the
+    #: fact that EVERY OTHER durable repository in this entire codebase
+    #: (entity, xero, mailbox, needs_you, background_job,
+    #: classification — zero exceptions) is wired through exactly this
+    #: dataclass. The alternative (giving `app/api/routers/auth.py` its
+    #: own independent `BAGMAN_RUNTIME_ENV` branch) would have directly
+    #: violated that stated invariant instead. Flagged explicitly in
+    #: this delivery's own report as a deviation from the WO's literal
+    #: enumerated list, for Architect review.
+    operator_session_repository: SessionRepository
 
 
 def _build_development_or_test(runtime_environment: str) -> RuntimeComposition:
@@ -521,6 +550,8 @@ def _build_development_or_test(runtime_environment: str) -> RuntimeComposition:
     from services.xero.sync import InMemoryXeroSyncRunRepository
     from services.xero.tenant_selection import InMemoryPendingTenantSelectionStore
 
+    from core.auth import InMemorySessionRepository
+
     api = BagmanCanonicalAPI()  # CD-2's own in-memory default construction
     object_store = InMemoryObjectStore()
     scanner = _AlwaysCleanDevelopmentScanner()
@@ -541,6 +572,11 @@ def _build_development_or_test(runtime_environment: str) -> RuntimeComposition:
     xero_token_store = InMemoryTokenStore()
     xero_pending_tenant_selection_store = InMemoryPendingTenantSelectionStore()
     mailbox_source_repository = InMemoryMailboxSourceRepository()
+
+    # WO-BAGMAN-117 §6.A.1 — the durable operator-session store;
+    # in-memory in development/test, exactly like every other
+    # repository in this function.
+    operator_session_repository = InMemorySessionRepository()
 
     # CD-6 Slice 4: no real Microsoft Entra app exists yet — development/
     # test composition ALWAYS uses the deterministic fakes, never the
@@ -687,6 +723,7 @@ def _build_development_or_test(runtime_environment: str) -> RuntimeComposition:
         classification_rule_repository=classification_rule_repository,
         classification_repository=classification_repository,
         classification_job_repository=classification_job_repository,
+        operator_session_repository=operator_session_repository,
     )
 
 
@@ -723,6 +760,7 @@ def _build_production() -> RuntimeComposition:
     )
     from persistence.postgres.mailbox_repository import PostgresMailboxSourceRepository
     from persistence.postgres.needs_you_repository import PostgresNeedsYouRepository
+    from persistence.postgres.operator_session_repository import PostgresSessionRepository
     from persistence.postgres.provenance_repository import PostgresProvenanceRepository
     from persistence.postgres.session import get_engine
     from persistence.postgres.source_repository import PostgresSourceRepository
@@ -900,6 +938,10 @@ def _build_production() -> RuntimeComposition:
     # docstring).
     mailbox_source_repository = PostgresMailboxSourceRepository(engine)
 
+    # WO-BAGMAN-117 §6.A.1 — durable operator-session store, sharing
+    # the same engine as every other Postgres-backed repository above.
+    operator_session_repository = PostgresSessionRepository(engine)
+
     # CD-6 Slice 4 (first real Microsoft Graph adapter + sweep engine):
     # durable repositories sharing `engine`, plus the two real Microsoft
     # adapters and the real file-backed per-mailbox token store — same
@@ -1013,6 +1055,7 @@ def _build_production() -> RuntimeComposition:
         classification_rule_repository=classification_rule_repository,
         classification_repository=classification_repository,
         classification_job_repository=classification_job_repository,
+        operator_session_repository=operator_session_repository,
     )
 
 
