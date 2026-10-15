@@ -80,6 +80,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
+from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.staticfiles import StaticFiles
 
 from core.auth import SessionStatus, evaluate_session_token, tokens_match
@@ -252,8 +253,40 @@ def _status_for(exc: BagmanError) -> int:
     return 500  # anything else, e.g. IntegrityError — PID's literal mapping table
 
 
-@app.middleware("http")
 async def correlation_id_middleware(request: Request, call_next):
+    """Registered explicitly (see the `app.add_middleware(...)` calls
+    near the bottom of this module, right after `auth_enforcement_middleware`'s
+    own definition) rather than via `@app.middleware("http")` — WO-
+    BAGMAN-117 §6.A″ (2026-10-15 Architect correction): this function
+    used to be declared FIRST in this file, before
+    `auth_enforcement_middleware`, and both were registered via the
+    `@app.middleware("http")` decorator. That decorator is sugar for
+    `Starlette.add_middleware`, which does
+    `self.user_middleware.insert(0, ...)` — so the MOST RECENTLY
+    registered middleware ends up at `user_middleware[0]`, and
+    `Starlette.build_middleware_stack` wraps strictly in that list's
+    order, making `user_middleware[0]` the OUTERMOST layer actually
+    wrapping every request. Declaring this function first in the file
+    therefore made it register FIRST and end up INNERMOST — the
+    opposite of this module's own prior docstring claim, and the exact,
+    now-confirmed defect an Independent Auditor found (reproduced
+    directly via `app.user_middleware` introspection, and again in
+    `tests/security/test_auth_correlation_and_sanitization.py`): every
+    401/403/503 `auth_enforcement_middleware` itself returned bypassed
+    `X-Correlation-Id` tagging and the sanitized completion log line
+    below entirely.
+
+    The explicit `app.add_middleware(...)` ordering below registers
+    `auth_enforcement_middleware` FIRST and this function SECOND (i.e.
+    LAST), so this function genuinely ends up outermost —
+    `app.user_middleware[0]` — wrapping every response the inner
+    `auth_enforcement_middleware` returns, including every rejection it
+    generates itself. Function definition ORDER in this file no longer
+    controls registration order at all; only the explicit
+    `app.add_middleware(...)` call order does, so a future reader
+    cannot be misled by file order the way this defect's root cause
+    was.
+    """
     correlation_id = request.headers.get("x-correlation-id") or str(uuid.uuid4())
     request.state.correlation_id = correlation_id
     started_at = time.monotonic()
@@ -462,15 +495,21 @@ def _origin_is_trusted(origin_header: str, request: Request) -> bool:
     return origin_port is not None and origin_port == host_port
 
 
-@app.middleware("http")
 async def auth_enforcement_middleware(request: Request, call_next):
     """WO-BAGMAN-117 §6.A.6/§117.C/§117.E/§117.G — server-side session
     enforcement on every request except the narrow, individually-
-    justified allow-list above. Registered ALONGSIDE, never replacing,
-    `correlation_id_middleware` above (declared first in this file, so
-    it remains the OUTERMOST layer — every response, including a
-    401/403/503 this middleware itself returns, still gets a
-    correlation id and the one sanitized completion log line).
+    justified allow-list above. Registered explicitly (see the
+    `app.add_middleware(...)` calls below `correlation_id_middleware`'s
+    own definition) BEFORE `correlation_id_middleware`, so that
+    `correlation_id_middleware` — registered after it — ends up
+    OUTERMOST (`app.user_middleware[0]`): every response this function
+    itself returns, including every 401/403/503 rejection, still gets a
+    correlation id and the one sanitized completion log line. See
+    `correlation_id_middleware`'s own docstring for the exact
+    `Starlette.add_middleware`/`build_middleware_stack` mechanism this
+    relies on (WO-BAGMAN-117 §6.A″, 2026-10-15 Architect correction —
+    the prior `@app.middleware("http")`-decorator-based registration
+    had this backwards).
 
     Feature-flagged via `auth.auth_enabled()` (`BAGMAN_AUTH_ENABLED`,
     default `false` — WO-BAGMAN-117 §6.D's "deploy the merged image
@@ -486,6 +525,19 @@ async def auth_enforcement_middleware(request: Request, call_next):
     would be a silent ALLOW-shaped outcome for every protected route
     the moment the database is unreachable — the opposite of fail-
     closed).
+
+    WO-BAGMAN-117 §6.A″ item 2 (2026-10-15 Architect correction): the
+    503 body below is a STABLE, GENERIC, client-safe message — it never
+    embeds `exc.message` (which, for a `PersistenceError` raised by
+    `persistence.postgres.operator_session_repository`, may itself
+    carry raw SQLAlchemy/driver exception text, SQL fragments, or
+    connection details — see `core/errors.py::PersistenceError`'s own
+    docstring). The real diagnostic detail is logged server-side only
+    (`exc_info=True`, under this same correlation id), mirroring
+    `bagman_error_handler`'s own established "5xx body gets a generic
+    message + correlation_id; the server log gets the real detail"
+    convention below — extended here rather than reinvented, exactly as
+    the WO requires.
     """
     if not auth.auth_enabled() or _is_public_path(request.url.path):
         return await call_next(request)
@@ -494,12 +546,23 @@ async def auth_enforcement_middleware(request: Request, call_next):
     raw_token = request.cookies.get(auth.SESSION_COOKIE_NAME)
     try:
         evaluation = evaluate_session_token(raw_token, repository=repository)
-    except PersistenceError as exc:
+    except PersistenceError:
+        correlation_id = getattr(request.state, "correlation_id", None)
+        logger.error(
+            "session_store_unavailable",
+            extra={
+                "component": "bagman.runtime.http",
+                "correlation_id": correlation_id,
+                "event_type": "SESSION_STORE_UNAVAILABLE",
+            },
+            exc_info=True,
+        )
         return JSONResponse(
             status_code=503,
             content={
                 "error_code": "SESSION_STORE_UNAVAILABLE",
-                "message": f"the session store is unreachable; access denied (fail-closed): {exc.message}",
+                "message": "the session store is unreachable; access denied (fail-closed); see server logs for detail",
+                "correlation_id": correlation_id,
             },
         )
 
@@ -537,6 +600,31 @@ async def auth_enforcement_middleware(request: Request, call_next):
 
     request.state.operator_session = evaluation.session
     return await call_next(request)
+
+
+#: WO-BAGMAN-117 §6.A″ item 1 (2026-10-15 Architect correction) —
+#: explicit, intentionally-ordered middleware registration, replacing
+#: the previous `@app.middleware("http")`-decorator-based registration
+#: (whose ordering depended on these two functions' file declaration
+#: order — the exact thing that was misread and produced the original
+#: defect; see `correlation_id_middleware`'s own docstring for the full
+#: mechanism).
+#:
+#: `Starlette.add_middleware` (what `@app.middleware("http")` calls
+#: under the hood) does `self.user_middleware.insert(0, ...)`, and
+#: `Starlette.build_middleware_stack` wraps strictly in
+#: `app.user_middleware` order — so the LAST call below
+#: (`correlation_id_middleware`) ends up at `user_middleware[0]`, the
+#: OUTERMOST layer actually wrapping every request/response; the FIRST
+#: call below (`auth_enforcement_middleware`) ends up innermost of the
+#: two. This is the opposite of the two functions' own file order, by
+#: design — registration order, not file order, is what now controls
+#: actual wrapping order, and it is spelled out here explicitly rather
+#: than left implicit. Independently verified via `app.user_middleware`
+#: introspection in
+#: `tests/security/test_auth_correlation_and_sanitization.py`.
+app.add_middleware(BaseHTTPMiddleware, dispatch=auth_enforcement_middleware)
+app.add_middleware(BaseHTTPMiddleware, dispatch=correlation_id_middleware)
 
 
 @app.exception_handler(BagmanError)

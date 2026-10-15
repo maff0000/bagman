@@ -20,6 +20,7 @@ CSRF+Origin gate.
 """
 from __future__ import annotations
 
+import logging
 import os
 from datetime import timedelta
 
@@ -43,6 +44,13 @@ from core.errors import PersistenceError
 from core.timestamps import utc_now
 
 router = APIRouter(prefix="/auth")
+
+#: WO-BAGMAN-117 §6.A″ item 2 (2026-10-15 Architect correction) — mirrors
+#: ``app/api/routers/health.py``'s own ``logging.getLogger("bagman.runtime.api.<router>")``
+#: naming convention exactly, so these records flow through the same
+#: root JSON formatter/handler (``app/api/logging_config.py``) every
+#: other ``bagman.*`` logger already does.
+logger = logging.getLogger("bagman.runtime.api.auth")
 
 #: PID §117.C: ``Secure``, ``HttpOnly``, ``SameSite=Lax``, ``Path=/``,
 #: no ``Domain`` attribute, ``__Host-`` prefix where practical. The
@@ -177,13 +185,38 @@ async def login(payload: LoginRequest, request: Request) -> Response:
 
     try:
         stored_hash = read_operator_password_hash()
-    except RuntimeError as exc:
+    except RuntimeError:
         # No credential has been bootstrapped yet (scripts/set_operator_password.py
         # was never run) — an honest 503, never a silent "always reject"
         # that looks indistinguishable from a wrong password.
+        #
+        # WO-BAGMAN-117 §6.A″ item 2 (2026-10-15 Architect correction):
+        # the raw `RuntimeError` message embeds the configured
+        # `BAGMAN_OPERATOR_PASSWORD_HASH_FILE` filesystem path and the
+        # underlying `OSError` text (see
+        # `core.auth.read_operator_password_hash`'s own docstring) —
+        # neither may ever reach a browser response. A stable, generic
+        # message goes to the client; the full exception (path + OSError
+        # detail) goes only to the server-side log, under this request's
+        # correlation id, mirroring `bagman_error_handler`'s own
+        # established 5xx sanitisation convention.
+        correlation_id = getattr(request.state, "correlation_id", None)
+        logger.error(
+            "operator_credential_not_configured",
+            extra={
+                "component": "bagman.runtime.api.auth",
+                "correlation_id": correlation_id,
+                "event_type": "OPERATOR_CREDENTIAL_NOT_CONFIGURED",
+            },
+            exc_info=True,
+        )
         return JSONResponse(
             status_code=503,
-            content={"error_code": "OPERATOR_CREDENTIAL_NOT_CONFIGURED", "message": str(exc)},
+            content={
+                "error_code": "OPERATOR_CREDENTIAL_NOT_CONFIGURED",
+                "message": "the operator credential is not configured; see server logs for detail",
+                "correlation_id": correlation_id,
+            },
         )
 
     if not verify_operator_password(payload.password, stored_hash):
@@ -215,13 +248,36 @@ async def login(payload: LoginRequest, request: Request) -> Response:
             created_at=now,
             expires_at=expires_at,
         )
-    except PersistenceError as exc:
+    except PersistenceError:
         # Fail-closed (PID §117.C): the session store is unavailable —
         # never issue a cookie for a session that may not actually have
         # been durably persisted.
+        #
+        # WO-BAGMAN-117 §6.A″ item 2 (2026-10-15 Architect correction):
+        # `exc.message` may itself carry raw SQLAlchemy/driver exception
+        # text (see `core/errors.py::PersistenceError`'s own docstring)
+        # — never returned to the client. Same stable, generic
+        # message/error_code as `app/api/main.py
+        # ::auth_enforcement_middleware`'s own session-store-unavailable
+        # path; full detail logged server-side only, under this
+        # request's correlation id.
+        correlation_id = getattr(request.state, "correlation_id", None)
+        logger.error(
+            "session_store_unavailable",
+            extra={
+                "component": "bagman.runtime.api.auth",
+                "correlation_id": correlation_id,
+                "event_type": "SESSION_STORE_UNAVAILABLE",
+            },
+            exc_info=True,
+        )
         return JSONResponse(
             status_code=503,
-            content={"error_code": "SESSION_STORE_UNAVAILABLE", "message": str(exc.message)},
+            content={
+                "error_code": "SESSION_STORE_UNAVAILABLE",
+                "message": "the session store is unreachable; access denied (fail-closed); see server logs for detail",
+                "correlation_id": correlation_id,
+            },
         )
 
     composition.api.record_audit_event(
