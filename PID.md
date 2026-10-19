@@ -3083,3 +3083,139 @@ This amendment does **not** authorise: a users table, role/permission framework,
 ## 117.J Governed delivery sequencing
 
 Repository implementation, independent audit, Architect Acceptance, and production activation (including the HTTPS transport change and the eventual narrowing of `bagman-api`'s direct port exposure) are separated into properly governed stages, mirroring WO-114's own proven Stage A→G discipline: Stage A/B (repository implementation: auth code, migration, routes, login page, CLI script) → Independent Audit → PR → Architect Acceptance → Merge → Stage D (deploy disabled / inert) → Stage E (read-only safety verification, including a tested rollback plan for the HTTPS/port-narrowing change) → Stage F (explicit activation) → Stage G (bounded observation) → a second, production-activation Independent Audit → closure. Production activation must not proceed before independent audit and exact-head Architect Acceptance of the repository implementation. This amendment does not itself dispatch any implementation and does not touch production in any way. WO-114's live scheduler and the NoustAI accounting discovery/reconciliation work are both explicitly unaffected and must not be interrupted by this delivery.
+
+# 118. Mailbox Connection Health and Operator Alerting (Architect ruling, 2026-10-19)
+
+## 118.A Scope and non-goals
+
+BAGMAN shall provide deterministic detection of, and actionable operator notification for, a configured/enabled mailbox becoming unable to authenticate, reconnect, or ingest messages. Initial delivery covers Gmail; contracts are provider-neutral so Microsoft Graph and IMAP gain equivalent coverage without redesign. Existing `MailboxSource` state, `mailbox_sweep_runs` history, `AuditEvent`, and Needs You infrastructure are reused wherever genuinely sufficient — this amendment does not authorise a new general-purpose monitoring platform, a duplicate alerting mechanism, Gmail OAuth implementation changes or token handling rewrites, unsolicited provider reconnection, any accounting mutation, or any change to WO-114 or WO-BAGMAN-117. This document authorises architecture only — no implementation, migration, production change, or FORGE dispatch.
+
+## 118.B Ground truth this amendment is built on (independently verified facts)
+
+- `MailboxSource` (`services/mailbox/mailbox.py`) already carries real, durable `connection_state` (governed transitions including `AUTH_REQUIRED`), `last_error_code`, `last_error_detail`, `last_connection_check_at`, `last_successful_sweep_at` — a point-in-time status, with no existing incident/history concept layered on top.
+- `mailbox_sweep_runs` (`persistence/postgres/mailbox_microsoft_models.py`, provider-neutral despite its filename) is a real, application-written execution-history table; every row to date carries `trigger=MANUAL` — `TRIGGER_SCHEDULED` is defined in code but has zero producers anywhere. **No recurring mailbox-sweep scheduler exists today**, independently confirmed via repository grep, live `launchctl list` on `mac-prod-01`, and WO-BAGMAN-112F's own closure evidence.
+- `core/audit.py`'s `AuditEvent` mechanism is genuine, structured, append-only, with real mailbox event types already in use (`MAILBOX_AUTH_INITIATED`, `MAILBOX_AUTH_FAILED`, `MAILBOX_CONNECTED`, `MAILBOX_SWEEP_STARTED/SUCCEEDED/PARTIAL/FAILED`) — the same mechanism §117.E already designates for login-failure throttling.
+- `ITEM_TYPE_MAILBOX_AUTH_REQUIRED` is a real, already-defined Needs You item type, fully wired for Microsoft (`_sync_needs_you_for_connection_state` in `app/api/routers/mailboxes_microsoft.py`, called after every connect/callback/disconnect/sweep) — **and wired for neither Gmail nor IMAP**, confirmed by exhaustive grep. This exact gap is why the real 2026-10-02 Gmail `invalid_grant` incident never reached the operator.
+- `NeedsYouItem.source_object_reference` is a genuine PostgreSQL `UUID` column (`persistence/postgres/needs_you_models.py`, `alembic/versions/9c2f4b1e7a05_needs_you_items.py`) — any dedupe-key design must supply a real UUID, never a composite/concatenated string.
+- `create_needs_you_item`'s dedupe behaviour binds a `(item_type, source_object_reference)` key **permanently** to the first item created under it, regardless of that item's later resolution — confirmed by direct reading of both the in-memory reference implementation and the ABC's own docstring. A reused, mailbox-scoped-forever reference therefore cannot represent "episode closed, new episode opens"; a fresh, independently-issued identity is required per episode.
+- No outbound notification capability (SMTP, Slack, SMS, push, or otherwise) exists anywhere in the codebase — confirmed by exhaustive search. `app/api/static/shared/notify.js` is an in-browser toast only, requiring the GUI to already be open.
+- `services/evidence/classification_job.py`'s `max_attempts`/`FAILED_RETRYABLE`→`FAILED_TERMINAL` model, and the shared rate-limit-backoff pattern in `services/mailbox/sweep.py`/`services/xero/sync.py`/`services/xero/client.py`, are existing, reusable bounded-retry precedents.
+- `persistence/postgres/session.py::session_scope(engine)` always opens a **new** `Session` per call; no existing repository method accepts an externally-supplied session. **True single-PostgreSQL-transaction composition across separate repositories is not supported by the current interfaces as-is** — this is addressed explicitly in §118.F below, not assumed away.
+
+## 118.C Durable incident model
+
+A new, narrow table, `mailbox_health_incidents` — justified because the existing Needs You dedupe key, being permanently binding once used, cannot itself carry episode identity; a real, independently-issued incident identity is required to anchor it correctly, without any change to the universal Needs You schema or contract.
+
+| Column | Type | Purpose |
+|---|---|---|
+| `incident_id` | UUID (PK, via the existing `core.identity.generate_id()` convention) | The canonical identity `NeedsYouItem.source_object_reference` points to |
+| `mailbox_id` | UUID (FK → `mailbox_sources`) | |
+| `failure_class` | text (§118.D) | |
+| `status` | text (`OPEN` / `RESOLVED`) | |
+| `first_observed_at`, `last_observed_at` | timestamptz | |
+| `resolved_at` | timestamptz, nullable | |
+| `recovery_evidence` | jsonb, nullable | e.g. the proving `sweep_run_id` and its `completed_at` |
+| `metadata` | jsonb | source-specific error codes/details |
+
+Structural invariants:
+- A **partial unique index** `(mailbox_id, failure_class) WHERE status = 'OPEN'` is the actual, PostgreSQL-enforced guarantee against duplicate open incidents — not application-level trust.
+- **Transactional, concurrency-safe creation**: `INSERT ... ON CONFLICT (mailbox_id, failure_class) WHERE status='OPEN' DO NOTHING RETURNING incident_id`; a `NULL` return means a concurrent evaluator already won, and the existing open incident is read instead. Two simultaneous evaluators racing for the same new failure resolve to exactly one row via the database's own conflict target, never application-level locking.
+- **Fresh `incident_id` per episode is a direct, mechanical consequence of the partial index's own scope**: resolving an incident (flipping it out of `status='OPEN'`) is precisely what un-blocks a new row for the same `(mailbox_id, failure_class)` — the next genuine failure's `INSERT` succeeds cleanly with a new identity.
+- Resolved incidents are immutable — no code path updates a `RESOLVED` row's `failure_class`/`first_observed_at`/`resolved_at` after the fact; a new episode is always a new row, and all historical incidents remain queryable, never overwritten.
+- One incident produces exactly one `NeedsYouItem` (`source_object_reference = incident_id`), reusing the existing, unchanged Needs You contract and dedupe mechanism — now correctly anchored.
+
+## 118.D Failure taxonomy
+
+- `AUTH_REQUIRED` — immediate incident on confirmed credential/authentication failure.
+- `PERSISTENT_PROVIDER_ERROR` — incident after three consecutive qualifying failed sweep attempts (reusing the classification-job `max_attempts` pattern).
+- `OAUTH_RECONNECT_INCOMPLETE` — incident after the mailbox's own governed pending-OAuth-state expiry elapses with no completion.
+- `STALE_INGESTION` — reserved and inactive until a separately governed recurring mailbox-sweep schedule exists (§118.G).
+
+Source-specific provider error codes/details live in `metadata`, never expanding this taxonomy per-provider-response. Mailboxes with `status` other than `ACTIVE` (`DISABLED`/`RETIRED`) are structurally excluded from evaluation — never trigger an incident.
+
+## 118.E Durable notification outbox
+
+A new, narrow table, `mailbox_health_notifications` — justified because `AuditEvent` is append-only with no claim/retry/scheduling semantics; it continues to record *what happened*, while this table coordinates *what work is still pending*.
+
+| Column | Type | Purpose |
+|---|---|---|
+| `notification_id` | UUID (PK) | |
+| `incident_id` | UUID (FK → `mailbox_health_incidents`) | |
+| `purpose` | text (`INITIAL` / `REMINDER_24H` / `RECOVERY`) | |
+| `state` | text (`PENDING` / `IN_PROGRESS` / `ACCEPTED` / `RETRYABLE_FAILURE` / `TERMINAL_FAILURE`) | |
+| `attempt_count`, `max_attempts` | int | bounded retry |
+| `next_attempt_at` | timestamptz | backoff scheduling |
+| `claimed_by` | text, nullable | worker identity |
+| `claimed_at` | timestamptz, nullable | |
+| `claim_generation` | int, default 0 | **fencing token** — incremented on every successful claim (§118.E.1) |
+| `created_at`, `completed_at` | timestamptz | |
+| `provider_response_metadata` | jsonb | provider HTTP status / message id only — **never** message content, financial evidence, or OAuth token material |
+
+### 118.E.1 Claim predicate and fencing (mandatory correction)
+
+The claim operation must reclaim **due `PENDING`/`RETRYABLE_FAILURE` work and expired `IN_PROGRESS` work alike**, and must protect against a stale (previously-timed-out) worker later overwriting a newer worker's result:
+
+```
+UPDATE mailbox_health_notifications
+SET state = 'IN_PROGRESS', claimed_by = $worker_id, claimed_at = now(),
+    claim_generation = claim_generation + 1
+WHERE notification_id = $id
+  AND (
+    (state IN ('PENDING', 'RETRYABLE_FAILURE') AND next_attempt_at <= now())
+    OR (state = 'IN_PROGRESS' AND claimed_at < now() - interval '<claim_timeout>')
+  )
+RETURNING *, claim_generation;
+```
+
+The returned `claim_generation` is the fencing token the claiming worker must carry through to completion:
+
+```
+UPDATE mailbox_health_notifications
+SET state = $outcome, completed_at = now(), provider_response_metadata = $meta
+WHERE notification_id = $id AND claim_generation = $my_generation;
+```
+
+If this completion write affects zero rows, the worker's claim was superseded by a later reclaim (its own prior attempt was judged abandoned) — the stale worker's result is silently discarded, never applied; the newer claim's own eventual completion write is authoritative. This is the complete answer to "reclaim expired `IN_PROGRESS` work with fencing protection": the generation counter, not wall-clock timing alone, decides which worker's write wins.
+
+### 118.E.2 Other invariants
+
+- Bounded retry/backoff via `attempt_count`/`max_attempts`/`next_attempt_at`, reusing the existing backoff shape already proven in `services/mailbox/sweep.py`/`services/xero/sync.py`.
+- `REMINDER_24H` is governed by an explicit application invariant: no reminder is created for an incident unless the prior notification for that incident (any purpose) completed ≥24 hours ago and the incident remains `OPEN` — never on every 15-minute evaluator tick.
+- Exactly-once end-to-end provider delivery is **not** claimed: a worker that sends successfully via Pushover but crashes before its completion write will, on reclaim, retry — an accepted, honestly-disclosed at-least-once characteristic of the outbox pattern.
+- No financial evidence, mailbox message content, or OAuth token material in any outbox row or outbound payload — mailbox identity, failure class, timestamps, and a Needs-You-item pointer only.
+- `ACCEPTED` reflects only that the provider's API accepted the send request — never a claim of confirmed device delivery.
+- `AuditEvent` records actual outcomes (`MAILBOX_HEALTH_NOTIFICATION_ATTEMPTED`/`_ACCEPTED`/`_FAILED`); the outbox table owns pending work, `AuditEvent` owns the historical record — each doing only the job it is suited for.
+
+## 118.F Transactional consistency (mandatory correction)
+
+**Incident creation, its `NeedsYouItem`, and its `INITIAL` notification intent must be coordinated durably — preferably as one PostgreSQL transaction — and the equivalent must hold for incident resolution, Needs You resolution, and `RECOVERY` notification intent.**
+
+Per §118.B's ground truth, the existing repository interfaces do not support this directly: `session_scope()` always opens a new session, and no existing method accepts an externally-supplied one. The resolution, in order of preference:
+
+1. **Primary design — a minimal, additive interface extension.** Add an optional `session: Optional[Session] = None` parameter to exactly the methods this feature composes: the new incident repository's create/resolve methods, `NeedsYouRepository.create_needs_you_item`, `NeedsYouRepository.resolve_needs_you_item`, and the new notification-outbox insert method. When `session` is supplied, the method participates in the caller's existing transaction instead of opening its own; when omitted (every existing call site, unchanged), behaviour is exactly as today. The health evaluator's own create-path then becomes: `with session_scope(engine) as session: incident = create_incident(..., session=session); needs_you_item = create_needs_you_item(..., session=session); create_notification(purpose="INITIAL", ..., session=session)` — one transaction, committing atomically or not at all, with no partial-write window of any kind. The symmetric resolve-path composes `resolve_incident`, `resolve_needs_you_item`, and `create_notification(purpose="RECOVERY", ...)` the same way. This is a narrow, backward-compatible, additive signature change to existing code — not a rewrite — and is the preferred design.
+2. **Fallback — idempotent reconciliation**, only if the implementation Work Order finds the above genuinely unsafe or disproportionate for some reason not yet identified: perform the writes as separate transactions in a fixed order (incident first, since everything else derives from its `incident_id`), with the same 15-minute evaluator independently checking, on every run, "does every `OPEN` incident have a corresponding `NeedsYouItem` and a non-`PENDING`-eligible `INITIAL` notification row yet — if not, create the missing one(s)." This is safe and self-correcting *because* it is built entirely on the same idempotent dedupe keys/partial unique indexes already established in §118.C/§118.E — re-running it is always a no-op once consistent — but it accepts a transient, bounded inconsistency window (up to one evaluator cycle) rather than true atomicity, and must be explicitly disclosed as such if used.
+
+The implementing Work Order must state which of these two it uses, and if neither proves workable for a reason not anticipated here, must return to the Architect rather than inventing a third approach silently.
+
+## 118.G Health evaluator
+
+An independent process, its own launchd plist, its own JSON-per-run execution log (mirroring WO-114's own proven convention) as the primary, honestly-bounded evidence of its own liveness, at a 15-minute cadence — structurally separate from, and never contending with, WO-114's 5-minute classification scheduler, which remains completely untouched. Examines `MailboxSource.connection_state`, pending-OAuth-state expiry, and `mailbox_sweep_runs` history only. **Never** fetches email, advances a cursor, or invokes ingestion. Does not detect `STALE_INGESTION` in this delivery — correctly, since no recurring sweep cadence exists yet to be stale against; that check activates only once a separately governed recurring-sweep workstream exists. No claim is made that this evaluator can detect or notify during its own total outage — a further independent watchdog is explicitly out of this amendment's scope, available as a separate, later governance item.
+
+## 118.H Recovery policy
+
+- **`AUTH_REQUIRED`**: successful reconnection, a real subsequent `mailbox_sweep_runs` row with `status=SUCCEEDED`, `last_successful_sweep_at` genuinely advanced past the incident's own `first_observed_at`, and no mutation of any cursor, historical evidence, or prior incident record.
+- **`PERSISTENT_PROVIDER_ERROR`**: a real subsequent successful sweep and the mailbox's own state recovering accordingly — no OAuth callback requirement, since this class was never an authentication failure.
+- **`OAUTH_RECONNECT_INCOMPLETE`**: completion of the originally-intended reconnect flow, plus a successful sweep only where ingestion restoration was the thing actually required.
+- No incident closes on a bare `connection_state=CONNECTED` transition alone, for any class. A successful sweep may legitimately create new evidence rows — expected and correct — while preserving historical cursor integrity and ingestion idempotency exactly as the existing sweep code already guarantees.
+
+## 118.I Notification policy
+
+Pushover as the first channel, pending the Architect/operator's own credential provisioning (new file-based secret, following the existing `BAGMAN_*_FILE` convention exactly) — not blocking this document's acceptance, only blocking eventual production activation. Initial alert on confirmed incident creation; exactly one 24-hour reminder if still unresolved, governed entirely by the outbox's own state machine; a recovery notice only after §118.H's full proof; every external attempt flows through the outbox defined in §118.E, none bypass it. Notification content carries only mailbox identity, failure class, and relevant timestamps/pointers — never message content, tokens, or accounting data.
+
+## 118.J Required test coverage
+
+Both existing Gmail failure modes (the real 2026-10-02 incident data); abandoned/incomplete OAuth reconnect; **repeated outage episodes** (fail → incident → recover → resolve → fail again → a second, distinct `incident_id` and `NeedsYouItem`, the first incident provably untouched); **concurrent evaluators** (two simultaneous runs against the same new failure → exactly one `INSERT` wins the partial unique index, both observe the same resulting `incident_id`); **worker crash / claim recovery with fencing** (a claimed, abandoned `IN_PROGRESS` notification becomes reclaimable after `<claim_timeout>`, and a stale worker's late completion write — carrying the old `claim_generation` — provably has no effect once superseded); **external API uncertainty** (provider timeout/5xx → `RETRYABLE_FAILURE` → bounded retries → `TERMINAL_FAILURE` without ever silently closing or hiding the still-open incident/Needs-You item); full recovery round-trip (incident closes only per §118.H, exactly one `RECOVERY` notification sent); paused/retired-mailbox exclusion; process-restart persistence (no in-flight incident/notification state lives only in memory); historical evidence/cursor integrity unchanged throughout every scenario above; and, if the §118.F fallback reconciliation path is used, its own idempotency under repeated runs.
+
+## 118.K Explicit exclusions
+
+No change to WO-114 or WO-BAGMAN-117; no Gmail OAuth remediation, token-handling rewrite, or provider-connection-flow change beyond what §118.C–§118.I themselves require; no general-purpose monitoring platform; no recurring mailbox-sweep scheduler (a separately governed, later workstream); no production action, credential provisioning, or FORGE implementation dispatch authorised by this document — architecture only.
