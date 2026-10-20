@@ -1,0 +1,73 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Governed launchd scheduler definition — PID.md §118 (Mailbox Connection
+  Health and Operator Alerting, Architect ruling 2026-10-19), implemented
+  per work-orders/WO-BAGMAN-118-MAILBOX-HEALTH-ALERTING.md §6.A item 7.
+
+  This file is a GOVERNED artifact, applied to the canonical BAGMAN
+  production Mac mini (PID §0, 192.168.11.4) by an explicit, individually
+  recorded operator command — never auto-generated, never hand-edited
+  only on the appliance. Mirrors
+  deployment/launchd/com.bagman.evidence-classification-scheduler.plist's
+  own structure/installation discipline exactly (see
+  deployment/launchd/README.md) — structurally SEPARATE from, and never
+  contending with, that scheduler's own 300-second cadence (PID §118.G:
+  "structurally separate from, and never contending with, WO-114's
+  5-minute classification scheduler, which remains completely
+  untouched").
+
+  Narrow scheduler responsibility only — periodically invoke the
+  existing, unmodified worker (scripts/evaluate_mailbox_health.py) and
+  observe its exit/result. Never fetches email, advances a cursor, or
+  invokes ingestion (PID §118.G) — the worker script itself is
+  read-only against MailboxSource/MailboxSweepRun/the existing
+  OAuth-state tables, write-only against the two new mailbox-health
+  tables, NeedsYouItem, and AuditEvent.
+
+  Disabled-by-default: this file deliberately defines NO RunAtLoad key.
+  launchd's own default for an omitted RunAtLoad is false, so installing
+  (`launchctl load`) this file does not itself trigger an immediate
+  evaluation run. This file states only the governed StartInterval
+  (900s / 15 minutes, PID §118.G) itself — it does not assert or
+  guarantee an exact first-fire timestamp beyond that governed interval.
+
+  NOT INSTALLED ON ANY HOST BY THIS WORK ORDER'S OWN STAGE A/B — this
+  file exists in the repository only, exactly mirroring WO-114's own
+  "installed but inert until a separate production stage" discipline
+  (WO-BAGMAN-118-MAILBOX-HEALTH-ALERTING §6.A item 7, §6.D). Installing,
+  loading, or enabling this job on the real appliance requires a
+  separate, later-gated Architect authorisation (Stage D onward) — not
+  authorised by this delivery's own merge.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.bagman.mailbox-health-evaluator</string>
+
+    <!--
+      launchd jobs do not inherit a login shell's PATH, so the
+      production docker binary's full, confirmed path is used directly
+      — mirrors com.bagman.evidence-classification-scheduler.plist's own
+      already-proven `/opt/homebrew/bin/docker` invocation shape exactly.
+    -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/sh</string>
+        <string>-c</string>
+        <string>exec /opt/homebrew/bin/docker exec bagman-api python3 scripts/evaluate_mailbox_health.py --notification-limit 50 --claim-timeout-seconds 900 --runtime-dir /opt/bagman/runtime/mailbox-health --worker-id launchd-scheduler</string>
+    </array>
+
+    <!-- PID §118.G: 15-minute cadence. -->
+    <key>StartInterval</key>
+    <integer>900</integer>
+
+    <!-- stdout/stderr — mirrors the evidence-classification scheduler's
+         own minimum-sufficient observability. -->
+    <key>StandardOutPath</key>
+    <string>/opt/bagman/runtime/launchd/mailbox-health-evaluator.out.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/opt/bagman/runtime/launchd/mailbox-health-evaluator.err.log</string>
+</dict>
+</plist>

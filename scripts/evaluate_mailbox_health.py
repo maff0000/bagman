@@ -1,0 +1,599 @@
+#!/usr/bin/env python3
+"""scripts/evaluate_mailbox_health.py — the bounded, launchd/operator-
+invoked mailbox-health evaluator (PID §118, WO-BAGMAN-118-MAILBOX-
+HEALTH-ALERTING §6.A.5).
+
+Mirrors `scripts/process_evidence_classification_jobs.py`'s own shape
+and JSON-per-run logging convention exactly: argument parsing, a bounded
+single-invocation pass, a real JSON summary report. Genuinely different
+in one respect: this script constructs its own repositories directly
+against `persistence.postgres.session.get_engine()` rather than via
+`app.api.composition.get_composition()` — `app/api/composition.py` is
+not among the files this delivery's governing Work Order (§6.A)
+authorises FORGE to touch, so wiring the two new repositories into it is
+out of scope for Stage A; every repository this script needs already
+has a standalone, directly-constructible Postgres implementation.
+
+Never fetches email, advances a cursor, or invokes ingestion (PID
+§118.G) — read-only against `MailboxSource`/`MailboxSweepRun`/the
+existing OAuth-state tables, write-only against the two new tables,
+`NeedsYouItem`, and `AuditEvent`.
+
+A documented judgment call: disambiguating `AUTH_REQUIRED` from
+`OAUTH_RECONNECT_INCOMPLETE` when both key off the same
+`connection_state == AUTH_REQUIRED` value
+------------------------------------------------------------------------
+PID §118.D describes both classes independently, but does not itself
+resolve the fact that BOTH observe the identical
+`MailboxSource.connection_state == AUTH_REQUIRED` value — a mailbox
+mid-way through an operator-initiated (re)connect flow
+(`begin_microsoft_connect`) and a mailbox whose live token refresh
+failed (`mark_microsoft_auth_required`) are, at the `MailboxSource` row
+level, indistinguishable from `connection_state` alone. This evaluator
+resolves the ambiguity by consulting the SAME signal PID §118.D's own
+`OAUTH_RECONNECT_INCOMPLETE` wording points at — the mailbox's own
+governed pending-OAuth-state (read-only, against the existing,
+UNMODIFIED `mailbox_microsoft_oauth_states`/`mailbox_gmail_oauth_states`
+tables — IMAP has neither table and never reaches this branch, matching
+its own real, non-interactive authentication model):
+
+* An unconsumed OAuth state exists for this mailbox and has NOT yet
+  expired -> neither class triggers yet (the operator may genuinely
+  still be mid-flow; triggering `AUTH_REQUIRED` here would be a false
+  positive against a connect attempt already in progress).
+* An unconsumed OAuth state exists and HAS expired -> `OAUTH_RECONNECT_INCOMPLETE`.
+* No pending OAuth state exists at all (including every IMAP mailbox) ->
+  `AUTH_REQUIRED` (a confirmed, immediate credential/authentication
+  failure — PID §118.D's own wording for this class).
+
+This is a genuine, documented interpretation of an area the governing
+PID/WO text does not itself fully resolve — flagged explicitly in this
+delivery's own closure/handoff reporting for Architect/Independent
+Auditor attention, not a silent judgment call.
+
+Usage
+-----
+    python3 scripts/evaluate_mailbox_health.py \\
+        --runtime-dir /opt/bagman/runtime/mailbox-health \\
+        --notification-limit 50 --claim-timeout-seconds 900 \\
+        --worker-id operator-manual-run-1
+
+`--runtime-dir` may also be supplied via
+`BAGMAN_MAILBOX_HEALTH_RUNTIME_DIR`. This process expects to run with
+`BAGMAN_RUNTIME_ENV`/DB env vars already set, typically `docker exec
+bagman-api python3 scripts/evaluate_mailbox_health.py ...` — exactly
+like every other operator script in this directory. Never installed as
+a live periodic job by this delivery — `deployment/launchd/com.bagman.mailbox-health-evaluator.plist`
+exists in the repository only, inert, per Stage D's own separate gate.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import uuid
+from datetime import datetime
+from pathlib import Path
+from typing import Optional
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from core import identity  # noqa: E402
+from core.timestamps import to_contract_string, utc_now  # noqa: E402
+from persistence.postgres.audit_repository import PostgresAuditRepository  # noqa: E402
+from persistence.postgres.mailbox_gmail_models import MailboxGmailOAuthStateRow  # noqa: E402
+from persistence.postgres.mailbox_health_repository import (  # noqa: E402
+    PostgresMailboxHealthIncidentRepository,
+    PostgresMailboxHealthNotificationRepository,
+)
+from persistence.postgres.mailbox_microsoft_models import MailboxMicrosoftOAuthStateRow  # noqa: E402
+from persistence.postgres.mailbox_microsoft_repository import PostgresMailboxSweepRunRepository  # noqa: E402
+from persistence.postgres.mailbox_repository import PostgresMailboxSourceRepository  # noqa: E402
+from persistence.postgres.needs_you_repository import PostgresNeedsYouRepository  # noqa: E402
+from persistence.postgres.session import get_engine, session_scope  # noqa: E402
+from services.mailbox.health.incident import (  # noqa: E402
+    ALLOWED_ACTION_ACKNOWLEDGE_MAILBOX_HEALTH_INCIDENT,
+    FAILURE_CLASS_AUTH_REQUIRED,
+    FAILURE_CLASS_OAUTH_RECONNECT_INCOMPLETE,
+    FAILURE_CLASS_PERSISTENT_PROVIDER_ERROR,
+    ITEM_TYPE_MAILBOX_HEALTH_INCIDENT,
+    PERSISTENT_PROVIDER_ERROR_CONSECUTIVE_THRESHOLD,
+    detect_auth_required,
+    detect_oauth_reconnect_incomplete,
+    detect_persistent_provider_error,
+    detect_recovery,
+)
+from services.mailbox.health.notification import (  # noqa: E402
+    PURPOSE_INITIAL,
+    PURPOSE_RECOVERY,
+    PURPOSE_REMINDER_24H,
+    STATE_ACCEPTED,
+    STATE_RETRYABLE_FAILURE,
+    STATE_TERMINAL_FAILURE,
+    compute_next_attempt_at,
+    reminder_is_due,
+)
+from services.notifications.pushover import PushoverClient, PushoverOutcomeStatus, read_pushover_credentials
+
+_ACTOR_TYPE = "SYSTEM"
+_EVALUATOR_ACTOR_ID = "bagman-mailbox-health-evaluator"
+_INCIDENT_FAILURE_CLASSES = (
+    FAILURE_CLASS_AUTH_REQUIRED,
+    FAILURE_CLASS_PERSISTENT_PROVIDER_ERROR,
+    FAILURE_CLASS_OAUTH_RECONNECT_INCOMPLETE,
+)
+
+DEFAULT_CLAIM_TIMEOUT_SECONDS = 900.0  # 15 minutes
+DEFAULT_MAX_ATTEMPTS = 3
+DEFAULT_NOTIFICATION_LIMIT = 50
+_MAX_NOTIFICATION_LIMIT = 200
+
+
+def _pending_oauth_state_status(session, mailbox_id: str, *, now: datetime) -> Optional[bool]:
+    """`True` if the mailbox's own most recent unconsumed OAuth state has
+    expired, `False` if one exists and has not yet expired, `None` if no
+    unconsumed state exists at all (including every IMAP mailbox, which
+    has no OAuth-state table). Read-only against the existing,
+    UNMODIFIED `mailbox_microsoft_oauth_states`/`mailbox_gmail_oauth_states`
+    tables — see module docstring."""
+    for row_cls in (MailboxMicrosoftOAuthStateRow, MailboxGmailOAuthStateRow):
+        row = (
+            session.query(row_cls)
+            .filter(row_cls.mailbox_id == mailbox_id, row_cls.consumed_at.is_(None))
+            .order_by(row_cls.created_at.desc())
+            .first()
+        )
+        if row is not None:
+            return row.expires_at < now
+    return None
+
+
+def _evaluate_mailbox(
+    mailbox,
+    *,
+    sweep_run_repository,
+    incident_repository,
+    notification_repository,
+    needs_you_repository,
+    engine,
+    now: datetime,
+    audit_repository,
+) -> dict:
+    report = {"mailbox_id": mailbox.mailbox_id, "incidents_created": 0, "incidents_resolved": 0, "incidents_reaffirmed": 0}
+    if mailbox.status != "ACTIVE":
+        return report
+
+    recent_runs = sweep_run_repository.list_runs(
+        mailbox_id=mailbox.mailbox_id, limit=PERSISTENT_PROVIDER_ERROR_CONSECUTIVE_THRESHOLD
+    )
+
+    # -- Recovery check (PID §118.H) for every currently-OPEN incident
+    # this mailbox has, of any class --
+    for failure_class in _INCIDENT_FAILURE_CLASSES:
+        existing = incident_repository.get_open_incident(mailbox_id=mailbox.mailbox_id, failure_class=failure_class)
+        if existing is None:
+            continue
+        recovery_evidence = detect_recovery(existing, mailbox, recent_runs)
+        if recovery_evidence is None:
+            continue
+
+        with session_scope(engine) as session:
+            resolved = incident_repository.resolve_incident(
+                existing.incident_id, recovery_evidence=recovery_evidence, now=now, session=session
+            )
+            needs_you_item = needs_you_repository.find_by_dedupe_key(
+                ITEM_TYPE_MAILBOX_HEALTH_INCIDENT, resolved.incident_id
+            )
+            if needs_you_item is not None and needs_you_item.status == "OPEN":
+                needs_you_repository.resolve_needs_you_item(
+                    needs_you_item.item_id,
+                    new_status="RESOLVED",
+                    resolution={"incident_id": resolved.incident_id, "recovery_evidence": recovery_evidence},
+                    actor_type=_ACTOR_TYPE,
+                    actor_id=_EVALUATOR_ACTOR_ID,
+                    session=session,
+                )
+            notification_repository.create_notification(
+                incident_id=resolved.incident_id, purpose=PURPOSE_RECOVERY, max_attempts=DEFAULT_MAX_ATTEMPTS,
+                now=now, session=session,
+            )
+        report["incidents_resolved"] += 1
+        audit_repository.record_audit_event(
+            event_type="MAILBOX_HEALTH_INCIDENT_RESOLVED",
+            actor_type=_ACTOR_TYPE,
+            actor_id=_EVALUATOR_ACTOR_ID,
+            subject_type="MailboxHealthIncident",
+            subject_id=resolved.incident_id,
+            correlation_id=resolved.incident_id,
+            causation_id=None,
+            payload={"mailbox_id": mailbox.mailbox_id, "failure_class": failure_class},
+        )
+
+    # -- Trigger detection for a new/ongoing failure (PID §118.C/D) --
+    triggered_class: Optional[str] = None
+    if detect_auth_required(mailbox):
+        with session_scope(engine) as session:
+            pending_expired = _pending_oauth_state_status(session, mailbox.mailbox_id, now=now)
+        # See module docstring's own documented judgment call.
+        if pending_expired is True and detect_oauth_reconnect_incomplete(mailbox, pending_state_expired=True):
+            triggered_class = FAILURE_CLASS_OAUTH_RECONNECT_INCOMPLETE
+        elif pending_expired is None:
+            triggered_class = FAILURE_CLASS_AUTH_REQUIRED
+        # pending_expired is False -> still inside the connect-flow's
+        # own TTL window; neither class triggers this cycle.
+    if triggered_class is None and detect_persistent_provider_error(recent_runs, mailbox_status=mailbox.status):
+        triggered_class = FAILURE_CLASS_PERSISTENT_PROVIDER_ERROR
+
+    if triggered_class is not None:
+        with session_scope(engine) as session:
+            creation = incident_repository.create_incident(
+                mailbox_id=mailbox.mailbox_id,
+                failure_class=triggered_class,
+                metadata={"last_error_code": mailbox.last_error_code, "last_error_detail": mailbox.last_error_detail},
+                now=now,
+                session=session,
+            )
+            if creation.created:
+                needs_you_repository.create_needs_you_item(
+                    item_type=ITEM_TYPE_MAILBOX_HEALTH_INCIDENT,
+                    domain="MAILBOX",
+                    source_object_reference=creation.incident.incident_id,
+                    question=(
+                        f"Mailbox health incident ({triggered_class}) — "
+                        f"{mailbox.display_name} ({mailbox.email_address})"
+                    ),
+                    allowed_action_type=ALLOWED_ACTION_ACKNOWLEDGE_MAILBOX_HEALTH_INCIDENT,
+                    priority="HIGH",
+                    metadata={
+                        "mailbox_id": mailbox.mailbox_id,
+                        "incident_id": creation.incident.incident_id,
+                        "failure_class": triggered_class,
+                    },
+                    session=session,
+                )
+                notification_repository.create_notification(
+                    incident_id=creation.incident.incident_id, purpose=PURPOSE_INITIAL,
+                    max_attempts=DEFAULT_MAX_ATTEMPTS, now=now, session=session,
+                )
+                report["incidents_created"] += 1
+            else:
+                incident_repository.touch_observed(creation.incident.incident_id, observed_at=now, session=session)
+                report["incidents_reaffirmed"] += 1
+        if creation.created:
+            audit_repository.record_audit_event(
+                event_type="MAILBOX_HEALTH_INCIDENT_CREATED",
+                actor_type=_ACTOR_TYPE,
+                actor_id=_EVALUATOR_ACTOR_ID,
+                subject_type="MailboxHealthIncident",
+                subject_id=creation.incident.incident_id,
+                correlation_id=creation.incident.incident_id,
+                causation_id=None,
+                payload={"mailbox_id": mailbox.mailbox_id, "failure_class": triggered_class},
+            )
+
+    return report
+
+
+def _create_due_reminders(
+    *, incident_repository, notification_repository, now: datetime
+) -> int:
+    """PID §118.E.2's own `REMINDER_24H` gating invariant, applied to
+    every currently-OPEN incident. Idempotent via the real
+    `(incident_id, purpose)` unique constraint — a reminder already
+    created for an incident is never created twice (`created=False` is
+    a correct, silent no-op here, never an error)."""
+    created = 0
+    for incident in incident_repository.list_open_incidents():
+        latest_completed = notification_repository.get_latest_completed(incident.incident_id)
+        if not reminder_is_due(latest_completed, now=now):
+            continue
+        result = notification_repository.create_notification(
+            incident_id=incident.incident_id, purpose=PURPOSE_REMINDER_24H, max_attempts=DEFAULT_MAX_ATTEMPTS, now=now
+        )
+        if result.created:
+            created += 1
+    return created
+
+
+def _process_notifications(
+    *,
+    incident_repository,
+    notification_repository,
+    audit_repository,
+    pushover_client,
+    credentials,
+    claim_timeout_seconds: float,
+    limit: int,
+    worker_id: str,
+    now: datetime,
+) -> list[dict]:
+    claimed = notification_repository.claim_due_or_expired(
+        limit=limit, claimed_by=worker_id, claim_timeout_seconds=claim_timeout_seconds, now=now
+    )
+    records: list[dict] = []
+
+    for notification in claimed:
+        try:
+            incident = incident_repository.get_incident(notification.incident_id)
+        except Exception as exc:  # noqa: BLE001 - defensive only; FK makes this structurally near-impossible
+            records.append({"notification_id": notification.notification_id, "outcome": "INCIDENT_NOT_FOUND", "error": str(exc)})
+            continue
+
+        # Pre-dispatch suppression (WO §6.A.1.C) — RECOVERY is never
+        # subject to this check (PID §118.H/I: it exists specifically to
+        # announce the resolution and must always be sent once created).
+        if notification.purpose != PURPOSE_RECOVERY and incident.status == "RESOLVED":
+            cancelled = notification_repository.cancel_claimed(
+                notification.notification_id,
+                claim_generation=notification.claim_generation,
+                cancellation_reason={
+                    "reason": "incident resolved before dispatch",
+                    "incident_id": incident.incident_id,
+                    "resolved_at": to_contract_string(incident.resolved_at) if incident.resolved_at is not None else None,
+                },
+                now=now,
+            )
+            if cancelled is not None:
+                audit_repository.record_audit_event(
+                    event_type="MAILBOX_HEALTH_NOTIFICATION_CANCELLED",
+                    actor_type=_ACTOR_TYPE,
+                    actor_id=worker_id,
+                    subject_type="MailboxHealthNotification",
+                    subject_id=notification.notification_id,
+                    correlation_id=incident.incident_id,
+                    causation_id=None,
+                    payload={"incident_id": incident.incident_id, "purpose": notification.purpose},
+                )
+                records.append({"notification_id": notification.notification_id, "outcome": "CANCELLED"})
+            else:
+                records.append({"notification_id": notification.notification_id, "outcome": "SUPERSEDED_BY_LATER_CLAIM"})
+            continue
+
+        audit_repository.record_audit_event(
+            event_type="MAILBOX_HEALTH_NOTIFICATION_ATTEMPTED",
+            actor_type=_ACTOR_TYPE,
+            actor_id=worker_id,
+            subject_type="MailboxHealthNotification",
+            subject_id=notification.notification_id,
+            correlation_id=incident.incident_id,
+            causation_id=None,
+            payload={"incident_id": incident.incident_id, "purpose": notification.purpose, "attempt_count": notification.attempt_count},
+        )
+
+        if credentials is None:
+            result_status = PushoverOutcomeStatus.CONFIG_ERROR
+            result_detail = "Pushover is not configured yet (BAGMAN_PUSHOVER_API_TOKEN_FILE/BAGMAN_PUSHOVER_USER_KEY_FILE)"
+            http_status = None
+            provider_request_id = None
+        else:
+            title = f"BAGMAN mailbox alert — {notification.purpose}"
+            message = (
+                f"Mailbox: {incident.mailbox_id}\n"
+                f"Failure class: {incident.failure_class}\n"
+                f"First observed: {to_contract_string(incident.first_observed_at)}"
+            )
+            result = pushover_client.send(credentials=credentials, title=title, message=message)
+            result_status = result.status
+            result_detail = result.error_detail
+            http_status = result.http_status
+            provider_request_id = result.provider_request_id
+
+        provider_response_metadata = {
+            "provider_status": result_status.value if hasattr(result_status, "value") else str(result_status),
+            "http_status": http_status,
+            "provider_request_id": provider_request_id,
+            "error_detail": result_detail,
+        }
+
+        if result_status == PushoverOutcomeStatus.OK:
+            updated = notification_repository.complete_claim(
+                notification.notification_id, claim_generation=notification.claim_generation,
+                outcome=STATE_ACCEPTED, provider_response_metadata=provider_response_metadata, now=now,
+            )
+            event_type = "MAILBOX_HEALTH_NOTIFICATION_ACCEPTED"
+            outcome_label = "ACCEPTED"
+        else:
+            # Exhaustion-aware completion (WO §6.A.1.B): this claim's
+            # own attempt_count already reflects THIS attempt — if it has
+            # reached max_attempts, this is the FINAL permitted attempt,
+            # and completion-time failure handling transitions directly
+            # to TERMINAL_FAILURE (never a 4th claim being refused later).
+            if notification.attempt_count >= notification.max_attempts:
+                updated = notification_repository.complete_claim(
+                    notification.notification_id, claim_generation=notification.claim_generation,
+                    outcome=STATE_TERMINAL_FAILURE, provider_response_metadata=provider_response_metadata, now=now,
+                )
+                event_type = "MAILBOX_HEALTH_NOTIFICATION_FAILED"
+                outcome_label = "TERMINAL_FAILURE"
+            else:
+                next_attempt_at = compute_next_attempt_at(notification.attempt_count, now=now)
+                updated = notification_repository.complete_claim(
+                    notification.notification_id, claim_generation=notification.claim_generation,
+                    outcome=STATE_RETRYABLE_FAILURE, next_attempt_at=next_attempt_at,
+                    provider_response_metadata=provider_response_metadata, now=now,
+                )
+                event_type = "MAILBOX_HEALTH_NOTIFICATION_FAILED"
+                outcome_label = "RETRYABLE_FAILURE"
+
+        if updated is not None:
+            audit_repository.record_audit_event(
+                event_type=event_type,
+                actor_type=_ACTOR_TYPE,
+                actor_id=worker_id,
+                subject_type="MailboxHealthNotification",
+                subject_id=notification.notification_id,
+                correlation_id=incident.incident_id,
+                causation_id=None,
+                payload={"incident_id": incident.incident_id, "purpose": notification.purpose, "outcome": outcome_label},
+            )
+            records.append({"notification_id": notification.notification_id, "outcome": outcome_label})
+        else:
+            # A stale/superseded claim's completion write affected zero
+            # rows — a correct, silent no-op (WO §6.A.1.B); this worker
+            # must not treat this as an error requiring its own further
+            # action.
+            records.append({"notification_id": notification.notification_id, "outcome": "SUPERSEDED_BY_LATER_CLAIM"})
+
+    return records
+
+
+def run_evaluation(
+    *,
+    engine,
+    mailbox_source_repository,
+    sweep_run_repository,
+    incident_repository,
+    notification_repository,
+    needs_you_repository,
+    audit_repository,
+    pushover_client,
+    worker_id: str,
+    notification_limit: int,
+    claim_timeout_seconds: float,
+    now: Optional[datetime] = None,
+    credentials=None,
+) -> dict:
+    """`credentials` defaults to `None`, meaning "resolve it via
+    :func:`services.notifications.pushover.read_pushover_credentials`
+    right now" — the real, production behaviour. Dependency-injectable
+    (mirrors `scripts/process_evidence_classification_jobs.py`'s own
+    `_run_worker` extraction) so tests can supply a real
+    `PushoverCredentials` instance without needing real secret files on
+    disk; `main()` itself never overrides this default."""
+    resolved_now = now if now is not None else utc_now()
+    if credentials is None:
+        credentials = read_pushover_credentials()
+
+    mailbox_reports = [
+        _evaluate_mailbox(
+            mailbox,
+            sweep_run_repository=sweep_run_repository,
+            incident_repository=incident_repository,
+            notification_repository=notification_repository,
+            needs_you_repository=needs_you_repository,
+            engine=engine,
+            now=resolved_now,
+            audit_repository=audit_repository,
+        )
+        for mailbox in mailbox_source_repository.list_mailboxes()
+    ]
+
+    reminders_created = _create_due_reminders(
+        incident_repository=incident_repository, notification_repository=notification_repository, now=resolved_now
+    )
+
+    notification_records = _process_notifications(
+        incident_repository=incident_repository,
+        notification_repository=notification_repository,
+        audit_repository=audit_repository,
+        pushover_client=pushover_client,
+        credentials=credentials,
+        claim_timeout_seconds=claim_timeout_seconds,
+        limit=notification_limit,
+        worker_id=worker_id,
+        now=resolved_now,
+    )
+
+    return {
+        "mailbox_reports": mailbox_reports,
+        "incidents_created": sum(r["incidents_created"] for r in mailbox_reports),
+        "incidents_resolved": sum(r["incidents_resolved"] for r in mailbox_reports),
+        "reminders_created": reminders_created,
+        "notifications_claimed": len(notification_records),
+        "notification_records": notification_records,
+        "pushover_configured": credentials is not None,
+    }
+
+
+# ---------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------
+
+
+def _parse_args(argv: Optional[list[str]]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument(
+        "--runtime-dir",
+        default=None,
+        help="directory to hold this run's own JSON report (required here, or via BAGMAN_MAILBOX_HEALTH_RUNTIME_DIR)",
+    )
+    parser.add_argument(
+        "--notification-limit", type=int, default=DEFAULT_NOTIFICATION_LIMIT,
+        help=f"bounded claim count for the notification outbox (default {DEFAULT_NOTIFICATION_LIMIT})",
+    )
+    parser.add_argument(
+        "--claim-timeout-seconds", type=float, default=DEFAULT_CLAIM_TIMEOUT_SECONDS,
+        help=f"an IN_PROGRESS notification claim older than this is reclaimable (default {DEFAULT_CLAIM_TIMEOUT_SECONDS})",
+    )
+    parser.add_argument("--worker-id", default=None, help="worker identity stamped on claimed notifications; defaults to a generated id")
+
+    args = parser.parse_args(list(argv) if argv is not None else None)
+
+    if not (1 <= args.notification_limit <= _MAX_NOTIFICATION_LIMIT):
+        parser.error(f"--notification-limit must be between 1 and {_MAX_NOTIFICATION_LIMIT} (got {args.notification_limit})")
+    if args.claim_timeout_seconds <= 0:
+        parser.error(f"--claim-timeout-seconds must be > 0 (got {args.claim_timeout_seconds})")
+
+    runtime_dir = args.runtime_dir or os.environ.get("BAGMAN_MAILBOX_HEALTH_RUNTIME_DIR")
+    if not runtime_dir:
+        parser.error("--runtime-dir is required (or set BAGMAN_MAILBOX_HEALTH_RUNTIME_DIR) — no default path is ever assumed")
+    args.runtime_dir = runtime_dir
+
+    return args
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    args = _parse_args(argv)
+    runtime_dir = Path(args.runtime_dir)
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+
+    engine = get_engine()
+    mailbox_source_repository = PostgresMailboxSourceRepository(engine)
+    sweep_run_repository = PostgresMailboxSweepRunRepository(engine)
+    incident_repository = PostgresMailboxHealthIncidentRepository(engine)
+    notification_repository = PostgresMailboxHealthNotificationRepository(engine)
+    needs_you_repository = PostgresNeedsYouRepository(engine)
+    audit_repository = PostgresAuditRepository(engine)
+    pushover_client = PushoverClient()
+
+    run_id = identity.generate_id()
+    started_at = utc_now()
+    worker_id = args.worker_id or f"mailbox-health-evaluator-{uuid.uuid4()}"
+
+    result = run_evaluation(
+        engine=engine,
+        mailbox_source_repository=mailbox_source_repository,
+        sweep_run_repository=sweep_run_repository,
+        incident_repository=incident_repository,
+        notification_repository=notification_repository,
+        needs_you_repository=needs_you_repository,
+        audit_repository=audit_repository,
+        pushover_client=pushover_client,
+        worker_id=worker_id,
+        notification_limit=args.notification_limit,
+        claim_timeout_seconds=args.claim_timeout_seconds,
+        now=started_at,
+    )
+
+    report = {
+        "run_id": run_id,
+        "worker_id": worker_id,
+        **result,
+        "started_at": to_contract_string(started_at),
+        "completed_at": to_contract_string(utc_now()),
+    }
+
+    report_path = runtime_dir / f"mailbox-health-evaluate-{run_id}-report.json"
+    report_path.write_text(json.dumps(report, indent=2, sort_keys=True, default=str), encoding="utf-8")
+    print(json.dumps(report, indent=2, sort_keys=True, default=str))
+    print(f"[evaluate_mailbox_health] report written to {report_path}", file=sys.stderr)
+
+    has_failure = any(
+        r.get("outcome") in ("TERMINAL_FAILURE",) for r in result.get("notification_records", [])
+    )
+    return 1 if has_failure else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

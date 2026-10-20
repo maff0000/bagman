@@ -329,3 +329,115 @@ def test_batch_resolve_imap_domain_review_forwards_subject_predicate_fields(dev_
     assert len(captured) == 1
     assert captured[0]["subject_predicate_type"] == "STARTS_WITH"
     assert captured[0]["subject_predicate_value"] == "Order confirmed:"
+
+
+# ---------------------------------------------------------------------
+# WO-BAGMAN-118 §6.A.4 — provider-neutral Needs-You wiring at connect/
+# disconnect/sweep (IMAP has no OAuth callback — see module docstring
+# and services.mailbox.health.needs_you_sync's own docstring).
+# ---------------------------------------------------------------------
+
+
+def test_imap_has_no_oauth_callback_route_anywhere():
+    """Independently confirms WO §12 criterion 7's own "no IMAP OAuth
+    callback or callback-equivalent route exists anywhere" requirement
+    — read directly off the real FastAPI route table, not merely
+    asserted from code inspection."""
+    from app.api.routers import mailboxes_imap
+
+    paths = [route.path for route in mailboxes_imap.router.routes]
+    assert not any("callback" in path for path in paths)
+    assert not any("oauth" in path.lower() for path in paths)
+
+
+def test_failed_connect_auth_error_creates_exactly_one_needs_you_item(dev_client):
+    mailbox_id = _create_imap_mailbox(dev_client)
+    composition = get_composition()
+    composition.imap_mailbox_adapter._credentials_provider = _fake_credentials_provider(password="wrong")
+    composition.imap_client.queue_connect_result(
+        ImapConnectResult(status=ImapOutcomeStatus.AUTH_ERROR, error_detail="bad credentials")
+    )
+    dev_client.post(f"/internal/mailboxes/{mailbox_id}/imap/connect", json={"actor_type": "USER", "actor_id": ACTOR_ID})
+
+    items = [
+        i for i in composition.needs_you_repository.list_needs_you_items(item_type="MAILBOX_AUTH_REQUIRED")
+        if i.source_object_reference == mailbox_id
+    ]
+    assert len(items) == 1
+    assert items[0].status == "OPEN"
+    assert items[0].allowed_action_type == "RECONNECT_IMAP_MAILBOX"
+
+    # retrying the failed connect must never duplicate the item
+    composition.imap_client.queue_connect_result(
+        ImapConnectResult(status=ImapOutcomeStatus.AUTH_ERROR, error_detail="bad credentials")
+    )
+    dev_client.post(f"/internal/mailboxes/{mailbox_id}/imap/connect", json={"actor_type": "USER", "actor_id": ACTOR_ID})
+    items_again = [
+        i for i in composition.needs_you_repository.list_needs_you_items(item_type="MAILBOX_AUTH_REQUIRED")
+        if i.source_object_reference == mailbox_id
+    ]
+    assert len(items_again) == 1
+
+
+def test_successful_connect_resolves_the_needs_you_item(dev_client):
+    mailbox_id = _create_imap_mailbox(dev_client)
+    composition = get_composition()
+    composition.imap_mailbox_adapter._credentials_provider = _fake_credentials_provider(password="wrong")
+    composition.imap_client.queue_connect_result(
+        ImapConnectResult(status=ImapOutcomeStatus.AUTH_ERROR, error_detail="bad credentials")
+    )
+    dev_client.post(f"/internal/mailboxes/{mailbox_id}/imap/connect", json={"actor_type": "USER", "actor_id": ACTOR_ID})
+
+    composition.imap_mailbox_adapter._credentials_provider = _fake_credentials_provider()
+    composition.imap_client.queue_connect_result(ImapConnectResult(status=ImapOutcomeStatus.OK))
+    dev_client.post(f"/internal/mailboxes/{mailbox_id}/imap/connect", json={"actor_type": "USER", "actor_id": ACTOR_ID})
+
+    items = [
+        i for i in composition.needs_you_repository.list_needs_you_items(item_type="MAILBOX_AUTH_REQUIRED")
+        if i.source_object_reference == mailbox_id
+    ]
+    assert all(i.status == "RESOLVED" for i in items)
+
+
+def test_connect_success_without_a_prior_auth_required_episode_creates_no_item(dev_client):
+    """A mailbox whose very first connect attempt succeeds immediately
+    (never having been `AUTH_REQUIRED` from the sync helper's own point
+    of view — `sync_needs_you_for_connection_state` is only ever called
+    once per request, with the FINAL connection_state) creates no
+    `MAILBOX_AUTH_REQUIRED` item at all — there was never an unresolved
+    question to raise. Mirrors Microsoft's own identical, pre-existing
+    behaviour."""
+    mailbox_id = _create_imap_mailbox(dev_client)
+    composition = get_composition()
+    composition.imap_mailbox_adapter._credentials_provider = _fake_credentials_provider()
+    composition.imap_client.queue_connect_result(ImapConnectResult(status=ImapOutcomeStatus.OK))
+    dev_client.post(f"/internal/mailboxes/{mailbox_id}/imap/connect", json={"actor_type": "USER", "actor_id": ACTOR_ID})
+
+    items = [
+        i for i in composition.needs_you_repository.list_needs_you_items(item_type="MAILBOX_AUTH_REQUIRED")
+        if i.source_object_reference == mailbox_id
+    ]
+    assert items == []
+
+
+def test_disconnecting_a_connected_mailbox_surfaces_a_fresh_needs_you_item(dev_client):
+    """The real gap this delivery closes (PID §118.B): disconnecting a
+    mailbox that silently connected (no prior `AUTH_REQUIRED` item ever
+    needed) now correctly surfaces a fresh, actionable
+    `MAILBOX_AUTH_REQUIRED` item — previously IMAP had no wiring at all,
+    so this state was invisible to the operator."""
+    mailbox_id = _create_imap_mailbox(dev_client)
+    composition = get_composition()
+    composition.imap_mailbox_adapter._credentials_provider = _fake_credentials_provider()
+    composition.imap_client.queue_connect_result(ImapConnectResult(status=ImapOutcomeStatus.OK))
+    dev_client.post(f"/internal/mailboxes/{mailbox_id}/imap/connect", json={"actor_type": "USER", "actor_id": ACTOR_ID})
+
+    response = dev_client.post(f"/internal/mailboxes/{mailbox_id}/imap/disconnect", json={"actor_type": "USER", "actor_id": ACTOR_ID})
+    assert response.status_code == 200
+    items = [
+        i for i in composition.needs_you_repository.list_needs_you_items(item_type="MAILBOX_AUTH_REQUIRED")
+        if i.source_object_reference == mailbox_id
+    ]
+    assert len(items) == 1
+    assert items[0].status == "OPEN"
+    assert items[0].allowed_action_type == "RECONNECT_IMAP_MAILBOX"

@@ -162,11 +162,9 @@ from core.errors import BagmanError, ConflictError, NotFoundError, OAuthStateErr
 from core.timestamps import to_contract_string, utc_now
 from services.mailbox.domain_rule import MATCH_MODE_EXACT
 from services.mailbox.lock import MailboxSweepLockError
-from services.mailbox.mailbox import (
-    CONNECTION_STATE_CONNECTED,
-    PROVIDER_MICROSOFT_GRAPH,
-)
+from services.mailbox.mailbox import PROVIDER_MICROSOFT_GRAPH
 from services.mailbox.domain_review_priority import aggregate_discovery_reasons, compute_review_priority
+from services.mailbox.health.needs_you_sync import sync_needs_you_for_connection_state
 from services.mailbox.microsoft.graph_client import GraphOutcomeStatus
 from services.mailbox.microsoft.oauth_state import consume_state
 from services.mailbox.review_resolution import (
@@ -177,9 +175,7 @@ from services.mailbox.review_resolution import (
 from services.mailbox.sweep import run_sweep
 from services.mailbox.sweep_run import TRIGGER_MANUAL
 from services.needs_you.needs_you import (
-    ALLOWED_ACTION_CONNECT_MICROSOFT_MAILBOX,
     ITEM_TYPE_MAILBOX_AUTHENTICATION_ESCALATION,
-    ITEM_TYPE_MAILBOX_AUTH_REQUIRED,
     ITEM_TYPE_MAILBOX_DOMAIN_REVIEW,
 )
 from services.xero.supplier_correlation import (
@@ -227,34 +223,18 @@ def _require_microsoft_mailbox(composition, mailbox_id: str):
 
 
 def _sync_needs_you_for_connection_state(composition, mailbox, *, actor_type: str, actor_id: str) -> None:
-    """See module docstring's 'Needs You integration' section."""
-    existing = composition.needs_you_repository.find_by_dedupe_key(
-        ITEM_TYPE_MAILBOX_AUTH_REQUIRED, mailbox.mailbox_id
-    )
-    if mailbox.connection_state == CONNECTION_STATE_CONNECTED:
-        if existing is not None and existing.status == "OPEN":
-            composition.needs_you_repository.resolve_needs_you_item(
-                existing.item_id,
-                new_status="RESOLVED",
-                resolution={"mailbox_id": mailbox.mailbox_id, "connected": True},
-                actor_type=actor_type,
-                actor_id=actor_id,
-            )
-        return
+    """See module docstring's 'Needs You integration' section.
 
-    if mailbox.status != "ACTIVE":
-        return  # a disabled/retired mailbox never raises a fresh Needs You item
-
-    if existing is not None and existing.status == "OPEN":
-        return  # already open — never a duplicate unresolved item for the same mailbox
-
-    composition.needs_you_repository.create_needs_you_item(
-        item_type=ITEM_TYPE_MAILBOX_AUTH_REQUIRED,
-        domain="MAILBOX",
-        source_object_reference=mailbox.mailbox_id,
-        question=f"Connect Microsoft 365 mailbox — {mailbox.display_name} ({mailbox.email_address})",
-        allowed_action_type=ALLOWED_ACTION_CONNECT_MICROSOFT_MAILBOX,
-        metadata={"mailbox_id": mailbox.mailbox_id, "email_address": mailbox.email_address},
+    WO-BAGMAN-118 §6.A.4: this is now a thin wrapper over the shared,
+    provider-neutral
+    ``services.mailbox.health.needs_you_sync.sync_needs_you_for_connection_state``
+    helper, generalised out of what used to be this function's own
+    private body — Microsoft's own call sites (connect/callback/
+    disconnect/sweep) and behaviour are unchanged: identical dedupe key,
+    identical idempotent-resolve behaviour, identical metadata shape,
+    identical question wording ("Connect Microsoft 365 mailbox — ...")."""
+    sync_needs_you_for_connection_state(
+        composition.needs_you_repository, mailbox, actor_type=actor_type, actor_id=actor_id
     )
 
 

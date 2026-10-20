@@ -779,3 +779,50 @@ def test_batch_resolve_gmail_domain_review_forwards_subject_predicate_fields(dev
     assert len(captured) == 1
     assert captured[0]["subject_predicate_type"] == "STARTS_WITH"
     assert captured[0]["subject_predicate_value"] == "Order confirmed:"
+
+
+# ---------------------------------------------------------------------
+# WO-BAGMAN-118 §6.A.4 — provider-neutral Needs-You wiring at connect/
+# callback/disconnect/sweep. Mirrors
+# tests/app_api/test_mailbox_microsoft_endpoints.py's own
+# `test_connect_creates_exactly_one_needs_you_item`/
+# `test_full_connect_flow_reaches_connected_and_resolves_needs_you`
+# exactly — this exact gap (PID §118.B) is why the real 2026-10-02
+# Gmail `invalid_grant` incident never reached the operator.
+# ---------------------------------------------------------------------
+
+
+def test_connect_creates_exactly_one_needs_you_item(dev_client):
+    mailbox_id = _create_gmail_mailbox(dev_client)
+    comp = get_composition()
+    dev_client.post(f"/internal/mailboxes/{mailbox_id}/gmail/connect", json={"actor_type": "USER", "actor_id": ACTOR_ID})
+    items = [
+        i for i in comp.needs_you_repository.list_needs_you_items(item_type="MAILBOX_AUTH_REQUIRED")
+        if i.source_object_reference == mailbox_id
+    ]
+    assert len(items) == 1
+    assert items[0].status == "OPEN"
+    assert items[0].allowed_action_type == "CONNECT_GMAIL_MAILBOX"
+    assert "Gmail mailbox" in items[0].question
+
+    # Re-clicking Connect must never duplicate the item.
+    dev_client.post(f"/internal/mailboxes/{mailbox_id}/gmail/connect", json={"actor_type": "USER", "actor_id": ACTOR_ID})
+    items_again = [
+        i for i in comp.needs_you_repository.list_needs_you_items(item_type="MAILBOX_AUTH_REQUIRED")
+        if i.source_object_reference == mailbox_id
+    ]
+    assert len(items_again) == 1
+
+
+def test_full_connect_flow_reaches_connected_and_resolves_needs_you(dev_client):
+    mailbox_id = _create_gmail_mailbox(dev_client, email="mgs241171@gmail.com")
+    dev_client.post(f"/internal/mailboxes/{mailbox_id}/gmail/connect", json={"actor_type": "USER", "actor_id": ACTOR_ID})
+    _connect_and_complete(dev_client, mailbox_id, email="mgs241171@gmail.com")
+
+    comp = get_composition()
+    items = [
+        i for i in comp.needs_you_repository.list_needs_you_items(item_type="MAILBOX_AUTH_REQUIRED")
+        if i.source_object_reference == mailbox_id
+    ]
+    assert len(items) == 1
+    assert items[0].status == "RESOLVED"
