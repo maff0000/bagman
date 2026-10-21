@@ -108,12 +108,20 @@ def test_full_pipeline_incident_to_accepted_notification_and_recovery():
     assert result2["incidents_created"] == 0
     assert result2["notifications_claimed"] == 0
 
-    # Real recovery (PID §118.H): reconnect + a real successful sweep.
+    # Real recovery (PID §118.H): reconnect + a real successful sweep,
+    # AND the mailbox's own canonical last_successful_sweep_at genuinely
+    # advancing past the incident's start (Architect Finding A) — in
+    # production this stamp is made by the real sweep executor
+    # (`services/mailbox/sweep.py`) immediately after a run reaches
+    # SUCCEEDED, which this test reproduces explicitly here.
     mailbox = repos["mailbox_source_repository"].mark_microsoft_connected(mailbox.mailbox_id)
     run = repos["sweep_run_repository"].create_run(mailbox_id=mailbox.mailbox_id, trigger="MANUAL")
-    repos["sweep_run_repository"].complete_run(
+    completed_run = repos["sweep_run_repository"].complete_run(
         run.sweep_run_id, new_status="SUCCEEDED", folders_attempted=[], messages_seen=1, messages_new=1,
         evidence_created=1, duplicates=0, quarantined=0, failures=0,
+    )
+    repos["mailbox_source_repository"].record_microsoft_sweep_success(
+        mailbox.mailbox_id, swept_at=completed_run.completed_at
     )
 
     result3 = evl.run_evaluation(
@@ -199,12 +207,17 @@ def test_repeated_outage_episodes_produce_two_distinct_incidents_and_needs_you_i
     first_needs_you_item = repos["needs_you_repository"].find_by_dedupe_key(ITEM_TYPE_MAILBOX_HEALTH_INCIDENT, first_incident.incident_id)
     assert first_needs_you_item is not None
 
-    # recover
+    # recover — both a real successful sweep run AND
+    # last_successful_sweep_at genuinely advancing past the incident's
+    # start (Architect Finding A; see equivalent comment above).
     repos["mailbox_source_repository"].mark_microsoft_connected(mailbox.mailbox_id)
     run = repos["sweep_run_repository"].create_run(mailbox_id=mailbox.mailbox_id, trigger="MANUAL")
-    repos["sweep_run_repository"].complete_run(
+    completed_run = repos["sweep_run_repository"].complete_run(
         run.sweep_run_id, new_status="SUCCEEDED", folders_attempted=[], messages_seen=1, messages_new=1,
         evidence_created=1, duplicates=0, quarantined=0, failures=0,
+    )
+    repos["mailbox_source_repository"].record_microsoft_sweep_success(
+        mailbox.mailbox_id, swept_at=completed_run.completed_at
     )
     _evaluate()
     assert repos["incident_repository"].get_incident(first_incident.incident_id).status == "RESOLVED"

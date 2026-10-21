@@ -125,7 +125,12 @@ def test_recovery_never_closes_on_bare_connection_state_alone():
         run.sweep_run_id, new_status="SUCCEEDED", folders_attempted=[], messages_seen=1, messages_new=1,
         evidence_created=1, duplicates=0, quarantined=0, failures=0,
     )
-    recovery_evidence = detect_recovery(incident, connected_mailbox, [completed])
+    # A SUCCEEDED sweep-run row alone is still not sufficient (Architect
+    # Finding A, PID §118.H) — the mailbox's own canonical
+    # last_successful_sweep_at must also have genuinely advanced past
+    # the incident's start.
+    swept_mailbox = repo.record_microsoft_sweep_success(mailbox.mailbox_id, swept_at=completed.completed_at)
+    recovery_evidence = detect_recovery(incident, swept_mailbox, [completed])
     assert recovery_evidence is not None
     assert recovery_evidence["sweep_run_id"] == completed.sweep_run_id
 
@@ -144,9 +149,100 @@ def test_persistent_provider_error_recovery_needs_no_connection_state_change():
         run.sweep_run_id, new_status="SUCCEEDED", folders_attempted=[], messages_seen=1, messages_new=1,
         evidence_created=1, duplicates=0, quarantined=0, failures=0,
     )
+    swept_mailbox = repo.record_microsoft_sweep_success(mailbox.mailbox_id, swept_at=completed.completed_at)
     # mailbox never left NOT_CONFIGURED/whatever connection_state it was
     # at — no connection_state requirement for this class.
-    assert detect_recovery(incident, mailbox, [completed]) is not None
+    assert detect_recovery(incident, swept_mailbox, [completed]) is not None
+
+
+def test_recovery_rejects_succeeded_run_when_last_successful_sweep_at_is_null():
+    """Architect Finding A reproduction: a genuine SUCCEEDED sweep run
+    exists after the incident began, but mailbox.last_successful_sweep_at
+    was never stamped (still None) — detect_recovery must NOT treat this
+    as recovered. Against the pre-correction code (which never read
+    last_successful_sweep_at at all), this scenario would have falsely
+    returned recovery_evidence."""
+    repo = InMemoryMailboxSourceRepository()
+    mailbox = repo.create_mailbox(display_name="m", email_address="e@example.com", provider_kind=PROVIDER_GOOGLE_GMAIL)
+    mailbox = repo.begin_microsoft_connect(mailbox.mailbox_id)
+    incident_repo = InMemoryMailboxHealthIncidentRepository()
+    incident = incident_repo.create_incident(mailbox_id=mailbox.mailbox_id, failure_class=FAILURE_CLASS_AUTH_REQUIRED).incident
+
+    connected_mailbox = repo.mark_microsoft_connected(mailbox.mailbox_id)
+    assert connected_mailbox.last_successful_sweep_at is None
+
+    sweep_repo = InMemoryMailboxSweepRunRepository()
+    run = sweep_repo.create_run(mailbox_id=mailbox.mailbox_id, trigger="MANUAL")
+    completed = sweep_repo.complete_run(
+        run.sweep_run_id, new_status="SUCCEEDED", folders_attempted=[], messages_seen=1, messages_new=1,
+        evidence_created=1, duplicates=0, quarantined=0, failures=0,
+    )
+    assert completed.completed_at > incident.first_observed_at
+
+    # Deliberately do NOT call record_microsoft_sweep_success — mirrors a
+    # mailbox with a SUCCEEDED run recorded but a stale/null
+    # last_successful_sweep_at.
+    assert detect_recovery(incident, connected_mailbox, [completed]) is None
+
+
+def test_recovery_rejects_last_successful_sweep_at_backdated_to_before_incident():
+    """Backdated-timestamp variant: last_successful_sweep_at is non-null
+    but is at-or-before incident.first_observed_at (a stale value from
+    before this incident even started, not merely absent) — must also
+    correctly fail to prove recovery."""
+    repo = InMemoryMailboxSourceRepository()
+    mailbox = repo.create_mailbox(display_name="m", email_address="f@example.com", provider_kind=PROVIDER_GOOGLE_GMAIL)
+    mailbox = repo.begin_microsoft_connect(mailbox.mailbox_id)
+
+    # Stamp a stale last_successful_sweep_at BEFORE the incident starts.
+    stale_swept_at = utc_now() - timedelta(hours=1)
+    mailbox = repo.record_microsoft_sweep_success(mailbox.mailbox_id, swept_at=stale_swept_at)
+
+    incident_repo = InMemoryMailboxHealthIncidentRepository()
+    incident = incident_repo.create_incident(mailbox_id=mailbox.mailbox_id, failure_class=FAILURE_CLASS_AUTH_REQUIRED).incident
+    assert mailbox.last_successful_sweep_at <= incident.first_observed_at
+
+    connected_mailbox = repo.mark_microsoft_connected(mailbox.mailbox_id)
+    # connection_state is CONNECTED and last_successful_sweep_at is
+    # non-null, but it never advanced past the incident's own start.
+    assert connected_mailbox.last_successful_sweep_at == stale_swept_at
+
+    sweep_repo = InMemoryMailboxSweepRunRepository()
+    run = sweep_repo.create_run(mailbox_id=mailbox.mailbox_id, trigger="MANUAL")
+    completed = sweep_repo.complete_run(
+        run.sweep_run_id, new_status="SUCCEEDED", folders_attempted=[], messages_seen=1, messages_new=1,
+        evidence_created=1, duplicates=0, quarantined=0, failures=0,
+    )
+    assert completed.completed_at > incident.first_observed_at
+
+    assert detect_recovery(incident, connected_mailbox, [completed]) is None
+
+
+def test_recovery_proven_when_both_sweep_run_and_last_successful_sweep_at_advance():
+    """Positive case: a genuine SUCCEEDED sweep run after the incident
+    AND last_successful_sweep_at genuinely advanced past the incident's
+    start — recovery must still be correctly proven (the legitimate case
+    is not broken by the new requirement)."""
+    repo = InMemoryMailboxSourceRepository()
+    mailbox = repo.create_mailbox(display_name="m", email_address="g@example.com", provider_kind=PROVIDER_GOOGLE_GMAIL)
+    mailbox = repo.begin_microsoft_connect(mailbox.mailbox_id)
+    incident_repo = InMemoryMailboxHealthIncidentRepository()
+    incident = incident_repo.create_incident(mailbox_id=mailbox.mailbox_id, failure_class=FAILURE_CLASS_AUTH_REQUIRED).incident
+
+    connected_mailbox = repo.mark_microsoft_connected(mailbox.mailbox_id)
+
+    sweep_repo = InMemoryMailboxSweepRunRepository()
+    run = sweep_repo.create_run(mailbox_id=mailbox.mailbox_id, trigger="MANUAL")
+    completed = sweep_repo.complete_run(
+        run.sweep_run_id, new_status="SUCCEEDED", folders_attempted=[], messages_seen=1, messages_new=1,
+        evidence_created=1, duplicates=0, quarantined=0, failures=0,
+    )
+    swept_mailbox = repo.record_microsoft_sweep_success(mailbox.mailbox_id, swept_at=completed.completed_at)
+    assert swept_mailbox.last_successful_sweep_at > incident.first_observed_at
+
+    recovery_evidence = detect_recovery(incident, swept_mailbox, [completed])
+    assert recovery_evidence is not None
+    assert recovery_evidence["sweep_run_id"] == completed.sweep_run_id
 
 
 # ---------------------------------------------------------------------

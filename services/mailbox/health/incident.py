@@ -392,11 +392,20 @@ def detect_recovery(
     """Returns a `recovery_evidence` dict if `incident`'s own per-class
     PID §118.H proof holds, else `None`. Never closes an incident on a
     bare `connection_state == CONNECTED` transition alone, for any class
-    (PID §118.H's own explicit requirement) — every class requires a
-    REAL subsequent successful sweep (`MailboxSweepRun.status ==
-    'SUCCEEDED'`) whose `completed_at` is genuinely after
-    `incident.first_observed_at`, proving the mailbox did not merely
-    flip a status flag but actually ingested again.
+    (PID §118.H's own explicit requirement) — every class requires BOTH
+    of the following, not either alone:
+
+    1. A REAL subsequent successful sweep (`MailboxSweepRun.status ==
+       'SUCCEEDED'`) whose `completed_at` is genuinely after
+       `incident.first_observed_at`.
+    2. `mailbox.last_successful_sweep_at` — the mailbox's own canonical
+       "last success" field — is non-`None` and has itself genuinely
+       advanced past `incident.first_observed_at`.
+
+    A `SUCCEEDED` sweep-run row alone is not sufficient proof: it must
+    be corroborated by the mailbox's own `last_successful_sweep_at`
+    having actually moved forward, not merely a stale/null value
+    (Architect Finding A, PID §118.H).
 
     * `AUTH_REQUIRED` — additionally requires `mailbox.connection_state
       == CONNECTED` (the remedy for this class IS reconnecting).
@@ -412,6 +421,13 @@ def detect_recovery(
         if run.status == "SUCCEEDED" and run.completed_at is not None and run.completed_at > incident.first_observed_at
     ]
     if not successful_runs_after_incident:
+        return None
+
+    if mailbox.last_successful_sweep_at is None or mailbox.last_successful_sweep_at <= incident.first_observed_at:
+        # A SUCCEEDED sweep-run row exists, but the mailbox's own
+        # canonical "last success" field never genuinely advanced past
+        # the incident's start — either it is still null, or it is
+        # stale (at/before first_observed_at). Not recovered.
         return None
 
     proving_run = successful_runs_after_incident[0]
