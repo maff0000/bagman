@@ -9,6 +9,7 @@ via `FakePushoverClient` (no real network I/O in any test).
 """
 from __future__ import annotations
 
+import threading
 from datetime import timedelta
 
 import pytest
@@ -18,7 +19,7 @@ from core.timestamps import utc_now
 from persistence.postgres.audit_repository import PostgresAuditRepository
 from persistence.postgres.mailbox_gmail_models import MailboxGmailOAuthStateRow
 from persistence.postgres.mailbox_gmail_repository import PostgresMailboxGmailOAuthStateRepository
-from persistence.postgres.mailbox_health_models import MailboxHealthNotificationRow
+from persistence.postgres.mailbox_health_models import MailboxHealthIncidentRow, MailboxHealthNotificationRow
 from persistence.postgres.mailbox_health_repository import (
     PostgresMailboxHealthIncidentRepository,
     PostgresMailboxHealthNotificationRepository,
@@ -866,4 +867,282 @@ def test_decision_d_7_never_connected_abandoned_expired_reconnect_produces_only_
     assert still_open.incident_id == reconnect_incident.incident_id
     assert len(repos["notification_repository"].list_by_incident(reconnect_incident.incident_id)) == 1
     assert repos["incident_repository"].get_open_incident(mailbox_id=mailbox.mailbox_id, failure_class=FAILURE_CLASS_AUTH_REQUIRED) is None
+
+
+# ---------------------------------------------------------------------
+# WO-BAGMAN-118 final Independent Audit, AMBER item 1 (§12 criterion 16)
+# — adversarial-marker proof that no financial evidence, mailbox
+# content, or OAuth token material ever reaches this WO's own new
+# surfaces (the two new tables, the evaluator's own AuditEvents, the
+# Pushover outbound payload). Mirrors
+# `tests/security/test_auth_correlation_and_sanitization.py`'s own
+# adversarial-marker test shape exactly (WO-117's own §6.A″ precedent):
+# distinctive, domain-shaped fake marker strings, injected at a
+# realistic point a real failure's `error_detail` could plausibly carry
+# adversarial content, then proven absent from every externally-
+# observable surface this evaluator produces — never merely asserted
+# from code inspection alone.
+#
+# Injection-point scoping note (judgment call, stated honestly): the
+# governing Work Order names TWO candidate injection points —
+# `MailboxSweepRun.error_detail` OR a `mark_microsoft_auth_required
+# (error_detail=...)` call. This test uses ONLY the former. Verified by
+# hand while authoring this test: `_evaluate_mailbox` (in
+# `scripts/evaluate_mailbox_health.py`) creates every new incident with
+# `metadata={"last_error_code": mailbox.last_error_code,
+# "last_error_detail": mailbox.last_error_detail}` — i.e. whatever was
+# last passed to `mark_microsoft_auth_required`/
+# `mark_microsoft_connection_error` is, BY DESIGN, stored verbatim in
+# `mailbox_health_incidents.metadata`. That field is never serialized by
+# any `app/api` route today (only `NeedsYouItem.metadata`, which
+# deliberately carries only `mailbox_id`/`incident_id`/`failure_class`,
+# is ever returned to a caller — confirmed by reading
+# `app/api/routers/needs_you.py` in full), but it IS a genuine, literal
+# write of raw `error_detail` content into one of this WO's two new
+# tables. An adversarial marker placed in the
+# `mark_microsoft_auth_required` call therefore DOES appear in
+# `mailbox_health_incidents.metadata` as stored — confirmed by hand
+# during authoring (not included as a committed test, since it would
+# fail against current, in-scope, not-to-be-modified behaviour; this is
+# a real tension with criterion 16's literal "never appears in
+# mailbox_health_incidents.metadata" wording for that specific
+# injection point, surfaced here for Architect/BAGMAN judgment rather
+# than silently avoided). `MailboxSweepRun.error_detail`, by contrast,
+# is genuinely never read into incident metadata, the Pushover payload,
+# or any AuditEvent payload — `_has_durable_auth_required_evidence`
+# reads only `run.error_code` — making it the injection point this test
+# can prove the exclusion against without contradicting current,
+# intentional, out-of-scope-to-change behaviour.
+# ---------------------------------------------------------------------
+
+_FINANCIAL_MARKER = "INVOICE-CANARY-8f2c: account_number=4111-CANARY-1111-0000, balance=$CANARY_94821.33"
+_MAILBOX_CONTENT_MARKER = "CANARY_EMAIL_BODY_MARKER_7c3d: Subject: Confidential -- do not leak this message body"
+_OAUTH_TOKEN_MARKER = "CANARY_OAUTH_TOKEN_MARKER_9f1e_refresh_token_do_not_leak"
+_ALL_ADVERSARIAL_MARKERS = (_FINANCIAL_MARKER, _MAILBOX_CONTENT_MARKER, _OAUTH_TOKEN_MARKER)
+_ADVERSARIAL_SWEEP_RUN_ERROR_DETAIL = (
+    "invalid_grant: token refresh failed; raw provider response captured "
+    f"verbatim by the client's own error path -- {_OAUTH_TOKEN_MARKER} -- "
+    f"embedded message excerpt: {_MAILBOX_CONTENT_MARKER} -- associated "
+    f"billing context: {_FINANCIAL_MARKER}"
+)
+
+
+def test_adversarial_markers_in_sweep_run_error_detail_never_leak_onto_any_new_surface():
+    """§12 criterion 16 — a realistic, confirmed `TOKEN_REFRESH_FAILED`
+    `MailboxSweepRun` whose own `error_detail` happens to carry
+    financial-evidence-, mailbox-content-, and OAuth-token-shaped
+    adversarial content (exactly the kind of thing a raw provider/driver
+    exception message can accidentally embed — mirrors `_SQL_MARKER`'s
+    own "fake SQL fragment embedded in a real exception path" shape;
+    `services/mailbox/sweep.py`'s own real call sites populate this
+    field directly from caught exceptions during a live sweep) must
+    never let that content reach:
+
+    1. `mailbox_health_incidents.metadata` as stored — read back from the
+       REAL repository (`get_open_incident`), never the in-process
+       domain object returned at creation time;
+    2. the Pushover outbound payload — the real `FakePushoverClient` test
+       double, the same one wired into every other test in this file;
+    3. any `AuditEvent` payload recorded during this run — queried from
+       the real audit repository by this incident's own
+       `correlation_id`, never assumed absent.
+
+    This sweep run is this cycle's SOLE qualifying `AUTH_REQUIRED`
+    evidence (source 2, `_has_durable_auth_required_evidence` — no
+    pending OAuth state exists, but `connection_state` is deliberately
+    left `CONNECTED` here, so source 1 does NOT independently fire and
+    the only route by which this incident could possibly be influenced
+    by the adversarial row is source 2's own read of it), which is what
+    makes a clean marker-absence result here a genuine proof about this
+    evaluator's own handling of that row, not an accident of a second,
+    unrelated source also having fired.
+    """
+    repos = _repos()
+    mailbox = repos["mailbox_source_repository"].create_mailbox(
+        display_name="Adversarial Marker Test",
+        email_address=f"adversarial-marker-{utc_now().timestamp()}@example.com",
+        provider_kind=PROVIDER_GOOGLE_GMAIL,
+    )
+    mailbox = repos["mailbox_source_repository"].begin_microsoft_connect(mailbox.mailbox_id)
+    mailbox = repos["mailbox_source_repository"].mark_microsoft_connected(mailbox.mailbox_id)
+    _complete_failed_run(
+        repos, mailbox.mailbox_id,
+        error_code=SweepFailureReason.TOKEN_REFRESH_FAILED, error_detail=_ADVERSARIAL_SWEEP_RUN_ERROR_DETAIL,
+    )
+
+    # Sanity: the adversarial content genuinely made it into the real,
+    # persisted `MailboxSweepRun.error_detail` row BEFORE the evaluator
+    # ever runs — otherwise an absent marker downstream would prove
+    # nothing (it could mean "never leaked" OR "never present in the
+    # first place").
+    persisted_runs = repos["sweep_run_repository"].list_runs(mailbox_id=mailbox.mailbox_id, limit=None)
+    assert any(run.error_detail == _ADVERSARIAL_SWEEP_RUN_ERROR_DETAIL for run in persisted_runs)
+    # And `connection_state` is genuinely `CONNECTED` (source 1 withheld)
+    # — this incident can only exist via source 2's own read of the
+    # adversarial row above.
+    pre_run_mailbox = repos["mailbox_source_repository"].get_mailbox(mailbox.mailbox_id)
+    assert pre_run_mailbox.connection_state == "CONNECTED"
+
+    fake_pushover = FakePushoverClient(result=PushoverSendResult(status=PushoverOutcomeStatus.OK, http_status=200))
+    fake_credentials = PushoverCredentials(api_token="fake-token", user_key="fake-user")
+
+    result = evl.run_evaluation(
+        engine=repos["engine"],
+        mailbox_source_repository=repos["mailbox_source_repository"],
+        sweep_run_repository=repos["sweep_run_repository"],
+        incident_repository=repos["incident_repository"],
+        notification_repository=repos["notification_repository"],
+        needs_you_repository=repos["needs_you_repository"],
+        audit_repository=repos["audit_repository"],
+        pushover_client=fake_pushover,
+        worker_id="test-worker",
+        notification_limit=50,
+        claim_timeout_seconds=900,
+        credentials=fake_credentials,
+    )
+    assert result["incidents_created"] == 1
+
+    # 1. The REAL, PERSISTED incident row's own metadata, read back from
+    # the repository — never the in-process creation-time object alone.
+    incident = repos["incident_repository"].get_open_incident(
+        mailbox_id=mailbox.mailbox_id, failure_class=FAILURE_CLASS_AUTH_REQUIRED
+    )
+    assert incident is not None
+    incident_metadata_text = str(incident.metadata)
+    for marker in _ALL_ADVERSARIAL_MARKERS:
+        assert marker not in incident_metadata_text
+
+    # 2. The Pushover outbound payload — at least one real send occurred
+    # (the INITIAL notification for the incident just created), and NONE
+    # of its title/message text carries any marker.
+    assert len(fake_pushover.calls) >= 1
+    for call in fake_pushover.calls:
+        for marker in _ALL_ADVERSARIAL_MARKERS:
+            assert marker not in call["title"]
+            assert marker not in call["message"]
+
+    # 3. Every AuditEvent recorded against this incident's own
+    # correlation_id during this run (MAILBOX_HEALTH_INCIDENT_CREATED +
+    # MAILBOX_HEALTH_NOTIFICATION_ATTEMPTED/ACCEPTED all share
+    # `correlation_id == incident.incident_id` — see
+    # `scripts/evaluate_mailbox_health.py`).
+    audit_events = repos["audit_repository"].list_by_correlation(incident.incident_id)
+    assert len(audit_events) >= 1
+    for event in audit_events:
+        payload_text = str(event.payload)
+        for marker in _ALL_ADVERSARIAL_MARKERS:
+            assert marker not in payload_text
+
+
+# ---------------------------------------------------------------------
+# WO-BAGMAN-118 final Independent Audit, AMBER item 2 (§12 criterion 10)
+# — two concurrent, FULL `run_evaluation()` orchestration runs against
+# the SAME new qualifying failure must still produce exactly one
+# incident and exactly one INITIAL notification. Reuses
+# `tests/persistence/test_mailbox_health_repository.py`'s own
+# `test_partial_unique_index_prevents_duplicate_open_incident_under_real_race`
+# threading convention verbatim (genuine OS threads + a
+# `threading.Barrier`, never sequential calls — the GIL and this
+# codebase's own fresh-`Session`-per-call discipline make sequential
+# calls misleadingly "safe" even when the underlying constraint is what
+# actually matters) — but drives the race through the REAL, FULL
+# evaluator entry point (`evl.run_evaluation`), never the lower-level
+# repository primitives those existing tests already prove race-safe in
+# isolation. Closes exactly the gap the Independent Auditor named: the
+# delivered suite proved the partial unique index and the
+# `(incident_id, purpose)` unique constraint are race-safe individually
+# — never that the full `_evaluate_mailbox` -> `create_incident` ->
+# `create_notification` orchestration sequence, invoked twice
+# concurrently via the real public entry point, still converges on
+# exactly one of each.
+# ---------------------------------------------------------------------
+
+
+def test_two_concurrent_full_run_evaluation_calls_against_the_same_new_failure_produce_exactly_one_incident_and_one_initial_notification():
+    repos = _repos()
+    mailbox = repos["mailbox_source_repository"].create_mailbox(
+        display_name="Concurrent Evaluator Race",
+        email_address=f"concurrent-evaluator-race-{utc_now().timestamp()}@example.com",
+        provider_kind=PROVIDER_GOOGLE_GMAIL,
+    )
+    mailbox = repos["mailbox_source_repository"].begin_microsoft_connect(mailbox.mailbox_id)
+    # connection_state just became AUTH_REQUIRED for the first time (no
+    # pending OAuth state at all -> source 1 fires immediately, the
+    # "live signal" case); no incident exists yet for this mailbox.
+    mailbox = repos["mailbox_source_repository"].mark_microsoft_auth_required(
+        mailbox.mailbox_id, error_detail="concurrent evaluator race test token failure"
+    )
+    assert repos["incident_repository"].get_open_incident(
+        mailbox_id=mailbox.mailbox_id, failure_class=FAILURE_CLASS_AUTH_REQUIRED
+    ) is None
+
+    # Two fully independent repository-set instances — never a shared
+    # one — each constructed exactly as `main()` does in production, both
+    # against the same real underlying database. This is what makes this
+    # a genuine two-worker race rather than two calls sharing in-process
+    # Python state.
+    repos_a = _repos()
+    repos_b = _repos()
+    fake_pushover_a = FakePushoverClient(result=PushoverSendResult(status=PushoverOutcomeStatus.OK, http_status=200))
+    fake_pushover_b = FakePushoverClient(result=PushoverSendResult(status=PushoverOutcomeStatus.OK, http_status=200))
+    fake_credentials = PushoverCredentials(api_token="fake-token", user_key="fake-user")
+
+    barrier = threading.Barrier(2)
+    errors: list[BaseException] = []
+
+    def _evaluate(repos_for_worker, pushover_for_worker, worker_id: str) -> None:
+        try:
+            barrier.wait(timeout=10)
+            evl.run_evaluation(
+                engine=repos_for_worker["engine"],
+                mailbox_source_repository=repos_for_worker["mailbox_source_repository"],
+                sweep_run_repository=repos_for_worker["sweep_run_repository"],
+                incident_repository=repos_for_worker["incident_repository"],
+                notification_repository=repos_for_worker["notification_repository"],
+                needs_you_repository=repos_for_worker["needs_you_repository"],
+                audit_repository=repos_for_worker["audit_repository"],
+                pushover_client=pushover_for_worker,
+                worker_id=worker_id,
+                notification_limit=50,
+                claim_timeout_seconds=900,
+                credentials=fake_credentials,
+            )
+        except BaseException as exc:  # noqa: BLE001 - surfaced to the main thread below, never swallowed
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=_evaluate, args=(repos_a, fake_pushover_a, "worker-a")),
+        threading.Thread(target=_evaluate, args=(repos_b, fake_pushover_b, "worker-b")),
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+    assert not any(t.is_alive() for t in threads), "a concurrent run_evaluation() call hung"
+    assert errors == [], f"a concurrent run_evaluation() call raised: {errors!r}"
+
+    # Exactly one OPEN incident for this (mailbox_id, failure_class) —
+    # proven both via the repository's own dedupe read AND a direct row
+    # count against the real table (never trusting the dedupe read alone
+    # to mask a genuine duplicate row the read happens not to surface).
+    incident = repos["incident_repository"].get_open_incident(
+        mailbox_id=mailbox.mailbox_id, failure_class=FAILURE_CLASS_AUTH_REQUIRED
+    )
+    assert incident is not None
+    with session_scope(repos["engine"]) as session:
+        incident_count = (
+            session.query(MailboxHealthIncidentRow)
+            .filter(
+                MailboxHealthIncidentRow.mailbox_id == mailbox.mailbox_id,
+                MailboxHealthIncidentRow.failure_class == FAILURE_CLASS_AUTH_REQUIRED,
+            )
+            .count()
+        )
+    assert incident_count == 1
+
+    # Exactly one INITIAL-purpose notification for that one incident —
+    # not two, not zero.
+    notifications = repos["notification_repository"].list_by_incident(incident.incident_id)
+    initial_notifications = [n for n in notifications if n.purpose == PURPOSE_INITIAL]
+    assert len(initial_notifications) == 1
 
