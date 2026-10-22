@@ -19,37 +19,100 @@ Never fetches email, advances a cursor, or invokes ingestion (PID
 existing OAuth-state tables, write-only against the two new tables,
 `NeedsYouItem`, and `AuditEvent`.
 
-A documented judgment call: disambiguating `AUTH_REQUIRED` from
-`OAUTH_RECONNECT_INCOMPLETE` when both key off the same
-`connection_state == AUTH_REQUIRED` value
+`AUTH_REQUIRED` and `OAUTH_RECONNECT_INCOMPLETE` are independent,
+never-mutually-exclusive conditions (WO-BAGMAN-118 §6.A' Decision D,
+Architect amendment 2026-10-21, corrected 2026-10-21/2026-10-22)
 ------------------------------------------------------------------------
-PID §118.D describes both classes independently, but does not itself
-resolve the fact that BOTH observe the identical
-`MailboxSource.connection_state == AUTH_REQUIRED` value — a mailbox
-mid-way through an operator-initiated (re)connect flow
-(`begin_microsoft_connect`) and a mailbox whose live token refresh
-failed (`mark_microsoft_auth_required`) are, at the `MailboxSource` row
-level, indistinguishable from `connection_state` alone. This evaluator
-resolves the ambiguity by consulting the SAME signal PID §118.D's own
-`OAUTH_RECONNECT_INCOMPLETE` wording points at — the mailbox's own
-governed pending-OAuth-state (read-only, against the existing,
-UNMODIFIED `mailbox_microsoft_oauth_states`/`mailbox_gmail_oauth_states`
-tables — IMAP has neither table and never reaches this branch, matching
-its own real, non-interactive authentication model):
+An earlier revision of this evaluator used a single `triggered_class`
+variable that could hold only one value per mailbox per cycle — WRONG:
+PID §118.D describes both classes independently, and the schema already
+supports both being `OPEN` simultaneously for the same mailbox (the
+partial unique index is scoped per `(mailbox_id, failure_class)`, never
+per-mailbox alone). This evaluator now detects each independently and
+may raise/sustain BOTH in the same cycle.
 
-* An unconsumed OAuth state exists for this mailbox and has NOT yet
-  expired -> neither class triggers yet (the operator may genuinely
-  still be mid-flow; triggering `AUTH_REQUIRED` here would be a false
-  positive against a connect attempt already in progress).
-* An unconsumed OAuth state exists and HAS expired -> `OAUTH_RECONNECT_INCOMPLETE`.
-* No pending OAuth state exists at all (including every IMAP mailbox) ->
-  `AUTH_REQUIRED` (a confirmed, immediate credential/authentication
-  failure — PID §118.D's own wording for this class).
+Both classes still key off the same, overloaded
+`MailboxSource.connection_state == AUTH_REQUIRED` value — set both by a
+genuine confirmed failure (`mark_microsoft_auth_required`/
+`mark_microsoft_connection_error`-with-`AUTH_ERROR`, called with a real
+`error_detail`) AND by the mere act of starting a fresh connect attempt
+(`begin_microsoft_connect`'s own `NOT_CONFIGURED -> AUTH_REQUIRED` step,
+before any login outcome is known). Disambiguating these two cases is
+why `AUTH_REQUIRED` is evidenced by TWO fully independent, provider-
+neutral sources, either of which is sufficient (the partial unique index
+already prevents a duplicate row if both independently hold in the same
+cycle):
 
-This is a genuine, documented interpretation of an area the governing
-PID/WO text does not itself fully resolve — flagged explicitly in this
-delivery's own closure/handoff reporting for Architect/Independent
-Auditor attention, not a silent judgment call.
+1. **Source 1 — live signal** (`detect_auth_required`,
+   `services.mailbox.health.incident`): `connection_state ==
+   AUTH_REQUIRED` while `mailbox.status == "ACTIVE"`. Trusted as
+   independent proof ONLY while `pending_expired is None` — i.e. NO
+   OAuth-pending-state record exists for this mailbox at all (read-only
+   against the existing, UNMODIFIED
+   `mailbox_microsoft_oauth_states`/`mailbox_gmail_oauth_states` tables
+   — IMAP has neither table, so `pending_expired` is always `None`
+   there, matching its own real, non-interactive, synchronous
+   authentication model). Gated by `is None`, NOT merely `is False`
+   (Architect correction, 2026-10-22): once ANY pending-state record
+   exists — unexpired (`pending_expired is False`, genuinely mid-flow)
+   OR expired (`pending_expired is True`, abandoned) — `connection_state`
+   alone can no longer be trusted as independent proof of a confirmed
+   failure, since the SAME value is also produced by merely starting
+   that very reconnect attempt. An abandoned-and-expired reconnect with
+   no independent failure evidence must therefore produce `OAUTH_RECONNECT_INCOMPLETE`
+   alone, never a speculative `AUTH_REQUIRED` from this source.
+2. **Source 2 — durable signal** (`_has_durable_auth_required_evidence`,
+   below; newly added by this correction): a qualifying
+   `MailboxSweepRun` row with `error_code ==
+   SweepFailureReason.TOKEN_REFRESH_FAILED`, dated at or after the
+   mailbox's own last known-good checkpoint
+   (`mailbox.last_successful_sweep_at`, or `mailbox.created_at` if the
+   mailbox has never completed a successful sweep). Fires independently
+   of `pending_expired`/`connection_state` ENTIRELY — present, unexpired,
+   expired, or even after a completed reconnect reaches `CONNECTED` — so
+   a later reconnect attempt (abandoned, still in flight, or already
+   completed) never silences already-durably-evidenced proof of a real
+   prior failure. This is intentional, not a defect: PID §118.H's own
+   recovery-proof principle (`connection_state == CONNECTED` alone is
+   never proof of recovery) applied consistently to incident
+   creation/reaffirmation too — a mailbox is not treated as healthy until
+   a real ingestion succeeds, not merely until a login screen is
+   completed. A consciously accepted tradeoff: an operator who has just
+   completed a visibly successful reconnect may still see this incident
+   remain `OPEN` until the next sweep genuinely succeeds.
+
+`OAUTH_RECONNECT_INCOMPLETE` (`detect_oauth_reconnect_incomplete`) is
+unchanged: an unconsumed, expired pending OAuth state — only its
+STRENGTH as a silencer of a separately-evidenced `AUTH_REQUIRED`
+incident changed (it no longer can silence one at all).
+
+No fabrication of historical error evidence, and no provider-
+authentication-code rewrite: this reads existing, already-recorded
+`mailbox_sweep_runs`/`MailboxSource.connection_state` history exactly as
+it already exists; it does not backfill, synthesize, or alter any
+historical row, and does not touch `services/mailbox/gmail/`,
+`services/mailbox/microsoft/`, `services/mailbox/imap/`, or
+`services/mailbox/sweep.py` in any way.
+
+Legacy `MAILBOX_AUTH_REQUIRED` vs. episode-scoped
+`MAILBOX_HEALTH_INCIDENT` coexistence (WO-BAGMAN-118 §6.A' Decision C)
+------------------------------------------------------------------------
+The pre-existing, legacy `MAILBOX_AUTH_REQUIRED` Needs-You item
+(mailbox-scoped, one per mailbox, no episode concept, already wired for
+all three providers via `services.mailbox.health.needs_you_sync` per
+§6.A item 4) and this evaluator's own new, episode-scoped
+`MAILBOX_HEALTH_INCIDENT` item (one per incident/episode, per §6.A item
+2) are two SEPARATE, independently-lifecycled things — both may
+legitimately be `OPEN` simultaneously for the same mailbox. Resolving or
+auto-resolving the legacy item (e.g. via `connection_state` reaching
+`CONNECTED`) is NOT proof that a coexisting `MAILBOX_HEALTH_INCIDENT` has
+recovered — only this module's own `detect_recovery` (PID §118.H's own
+per-class proof) ever closes an incident, and only this evaluator's own
+canonical `mailbox_health_notifications` outbox ever sends an external
+(Pushover) notification — the legacy item type has, and gains, no
+notification-outbox interaction of any kind. Consolidated single-GUI-
+surface presentation of both item types is explicitly deferred, not
+addressed here.
 
 Usage
 -----
@@ -114,6 +177,7 @@ from services.mailbox.health.notification import (  # noqa: E402
     compute_next_attempt_at,
     reminder_is_due,
 )
+from services.mailbox.sweep_run import SweepFailureReason  # noqa: E402
 from services.notifications.pushover import PushoverClient, PushoverOutcomeStatus, read_pushover_credentials
 
 _ACTOR_TYPE = "SYSTEM"
@@ -147,6 +211,47 @@ def _pending_oauth_state_status(session, mailbox_id: str, *, now: datetime) -> O
         if row is not None:
             return row.expires_at < now
     return None
+
+
+def _has_durable_auth_required_evidence(sweep_run_repository, mailbox) -> bool:
+    """`AUTH_REQUIRED` source 2 (durable signal — WO-BAGMAN-118 §6.A'
+    Decision D, module docstring's "Source 2" section): `True` if a
+    qualifying `MailboxSweepRun` row (`error_code ==
+    SweepFailureReason.TOKEN_REFRESH_FAILED`) exists at or after
+    ``mailbox``'s own last known-good checkpoint.
+
+    The checkpoint is ``mailbox.last_successful_sweep_at`` — the one
+    field already in the existing schema that unambiguously marks the
+    mailbox's last known-good point (stamped only by a genuine
+    successful sweep completion) — or, if the mailbox has never
+    completed a successful sweep (``last_successful_sweep_at is None``),
+    ``mailbox.created_at``. A qualifying row dated BEFORE this
+    checkpoint belongs to a prior, already-recovered episode and must
+    not be treated as evidence of a new, currently-unresolved problem
+    (the "stale-prior-episode" regression test this bound exists for).
+
+    Deliberately NOT a `limit=`-bounded `list_runs(...)` call (the
+    `PERSISTENT_PROVIDER_ERROR` trigger's own convention, reused
+    verbatim, does NOT satisfy this requirement — Independent Audit,
+    2026-10-21) — the lookback must scan sweep-run history all the way
+    back to the checkpoint, however far that is, never merely the most
+    recent N rows. `MailboxSweepRunRepository.list_runs` already
+    supports an unbounded scan via `limit=None`.
+
+    Entirely independent of `connection_state`/any OAuth pending-state
+    status — callers must NOT gate a call to this function on
+    `pending_expired` the way source 1 (`detect_auth_required`) is
+    gated; that independence is the whole point of this source (module
+    docstring's own "Source 2" section).
+    """
+    checkpoint = mailbox.last_successful_sweep_at if mailbox.last_successful_sweep_at is not None else mailbox.created_at
+    all_runs = sweep_run_repository.list_runs(mailbox_id=mailbox.mailbox_id, limit=None)
+    return any(
+        run.error_code == SweepFailureReason.TOKEN_REFRESH_FAILED
+        and run.completed_at is not None
+        and run.completed_at >= checkpoint
+        for run in all_runs
+    )
 
 
 def _evaluate_mailbox(
@@ -210,22 +315,52 @@ def _evaluate_mailbox(
             payload={"mailbox_id": mailbox.mailbox_id, "failure_class": failure_class},
         )
 
-    # -- Trigger detection for a new/ongoing failure (PID §118.C/D) --
-    triggered_class: Optional[str] = None
+    # -- Trigger detection for a new/ongoing failure (PID §118.C/D,
+    # corrected per WO-BAGMAN-118 §6.A' Decision D — AUTH_REQUIRED and
+    # OAUTH_RECONNECT_INCOMPLETE are independently observable, never
+    # mutually exclusive; see module docstring for the full two-source
+    # AUTH_REQUIRED design) --
+    triggered_classes: list[str] = []
+
+    # Source 1 (live signal) and OAUTH_RECONNECT_INCOMPLETE both depend
+    # on whether a pending OAuth-state record exists for this mailbox
+    # and, if so, whether it has expired — computed once, only when
+    # `connection_state == AUTH_REQUIRED` (the only case either check
+    # can ever fire), exactly as before this correction.
     if detect_auth_required(mailbox):
         with session_scope(engine) as session:
             pending_expired = _pending_oauth_state_status(session, mailbox.mailbox_id, now=now)
-        # See module docstring's own documented judgment call.
-        if pending_expired is True and detect_oauth_reconnect_incomplete(mailbox, pending_state_expired=True):
-            triggered_class = FAILURE_CLASS_OAUTH_RECONNECT_INCOMPLETE
-        elif pending_expired is None:
-            triggered_class = FAILURE_CLASS_AUTH_REQUIRED
-        # pending_expired is False -> still inside the connect-flow's
-        # own TTL window; neither class triggers this cycle.
-    if triggered_class is None and detect_persistent_provider_error(recent_runs, mailbox_status=mailbox.status):
-        triggered_class = FAILURE_CLASS_PERSISTENT_PROVIDER_ERROR
 
-    if triggered_class is not None:
+        # Source 1 — gated by `pending_expired is None`, NOT merely
+        # `pending_expired is False` (Architect correction, 2026-10-22):
+        # see module docstring's own "Source 1" section for why
+        # `connection_state == AUTH_REQUIRED` cannot be trusted as
+        # independent proof while ANY pending-state record exists.
+        if pending_expired is None:
+            triggered_classes.append(FAILURE_CLASS_AUTH_REQUIRED)
+
+        if pending_expired is True and detect_oauth_reconnect_incomplete(mailbox, pending_state_expired=True):
+            triggered_classes.append(FAILURE_CLASS_OAUTH_RECONNECT_INCOMPLETE)
+        # pending_expired is False -> still inside the connect-flow's own
+        # TTL window; source 1 and OAUTH_RECONNECT_INCOMPLETE both
+        # correctly withhold this cycle (source 2, below, is NOT gated by
+        # this at all).
+
+    # Source 2 (durable signal) — entirely independent of
+    # connection_state/pending_expired (module docstring's own "Source
+    # 2" section). Evaluated regardless of whether source 1 already
+    # fired above — the partial unique index on `(mailbox_id,
+    # failure_class)` already prevents a duplicate AUTH_REQUIRED row if
+    # both sources independently hold in the same cycle.
+    if FAILURE_CLASS_AUTH_REQUIRED not in triggered_classes and _has_durable_auth_required_evidence(
+        sweep_run_repository, mailbox
+    ):
+        triggered_classes.append(FAILURE_CLASS_AUTH_REQUIRED)
+
+    if not triggered_classes and detect_persistent_provider_error(recent_runs, mailbox_status=mailbox.status):
+        triggered_classes.append(FAILURE_CLASS_PERSISTENT_PROVIDER_ERROR)
+
+    for triggered_class in triggered_classes:
         with session_scope(engine) as session:
             creation = incident_repository.create_incident(
                 mailbox_id=mailbox.mailbox_id,
