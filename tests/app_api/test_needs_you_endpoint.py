@@ -523,3 +523,188 @@ def test_resolving_company_required_with_bogus_source_object_reference_fails(cli
 
     still_open = client.get(f"/internal/needs-you/{item.item_id}").json()
     assert still_open["status"] == "OPEN"
+
+
+# ---------------------------------------------------------------------
+# WO-BAGMAN-118 §6.A' Decision B — resolving a MAILBOX_HEALTH_INCIDENT
+# item: manual resolution can never outrun genuine, evaluator-proven
+# recovery; DISMISSED is never valid; resolving after genuine recovery
+# succeeds idempotently; the evaluator's own automatic path is unaffected.
+# ---------------------------------------------------------------------
+
+
+def _make_mailbox_health_incident_fixture(client):
+    """Constructs a real `MailboxHealthIncident` row (`AUTH_REQUIRED`,
+    still `OPEN`) and its corresponding `MAILBOX_HEALTH_INCIDENT`
+    `NeedsYouItem` — exactly the shape
+    `scripts/evaluate_mailbox_health.py`'s own real evaluator produces —
+    directly against the SAME real, disposable Postgres composition this
+    module's own `client` fixture is wired to. Returns
+    `(incident_repository, incident, needs_you_item)`."""
+    from app.api.composition import get_composition
+    from persistence.postgres.mailbox_health_repository import PostgresMailboxHealthIncidentRepository
+    from services.mailbox.health.incident import (
+        ALLOWED_ACTION_ACKNOWLEDGE_MAILBOX_HEALTH_INCIDENT,
+        FAILURE_CLASS_AUTH_REQUIRED,
+        ITEM_TYPE_MAILBOX_HEALTH_INCIDENT,
+    )
+    from services.mailbox.mailbox import PROVIDER_GOOGLE_GMAIL
+
+    composition = get_composition()
+    mailbox = composition.mailbox_source_repository.create_mailbox(
+        display_name="Decision B Fixture", email_address=f"decision-b-{_unique_email_suffix()}@example.com",
+        provider_kind=PROVIDER_GOOGLE_GMAIL,
+    )
+    incident_repository = PostgresMailboxHealthIncidentRepository(composition.engine)
+    incident = incident_repository.create_incident(mailbox_id=mailbox.mailbox_id, failure_class=FAILURE_CLASS_AUTH_REQUIRED).incident
+    needs_you_item = composition.needs_you_repository.create_needs_you_item(
+        item_type=ITEM_TYPE_MAILBOX_HEALTH_INCIDENT,
+        domain="MAILBOX",
+        source_object_reference=incident.incident_id,
+        question=f"Mailbox health incident (AUTH_REQUIRED) — {mailbox.display_name} ({mailbox.email_address})",
+        allowed_action_type=ALLOWED_ACTION_ACKNOWLEDGE_MAILBOX_HEALTH_INCIDENT,
+        priority="HIGH",
+        metadata={"mailbox_id": mailbox.mailbox_id, "incident_id": incident.incident_id, "failure_class": FAILURE_CLASS_AUTH_REQUIRED},
+    )
+    return incident_repository, incident, needs_you_item
+
+
+def _unique_email_suffix() -> str:
+    from core.timestamps import utc_now
+
+    return str(utc_now().timestamp()).replace(".", "-")
+
+
+def test_resolving_a_mailbox_health_incident_item_to_resolved_while_incident_still_open_conflicts(client):
+    """§12 criterion 27 — a manual `RESOLVED` request against an `OPEN`
+    `MAILBOX_HEALTH_INCIDENT` item must return 409: manual resolution can
+    never outrun genuine, evaluator-proven recovery."""
+    _incident_repository, incident, needs_you_item = _make_mailbox_health_incident_fixture(client)
+    assert incident.status == "OPEN"
+
+    response = client.post(
+        f"/internal/needs-you/{needs_you_item.item_id}/resolve",
+        json={"new_status": "RESOLVED", "actor_type": "SYSTEM", "actor_id": "test-operator"},
+    )
+    assert response.status_code == 409, response.text
+
+    still_open = client.get(f"/internal/needs-you/{needs_you_item.item_id}").json()
+    assert still_open["status"] == "OPEN"
+
+
+def test_dismissing_a_mailbox_health_incident_item_is_always_rejected(client):
+    """§12 criterion 27 — `DISMISSED` is never a valid resolution for a
+    `MAILBOX_HEALTH_INCIDENT` item, regardless of the underlying
+    incident's own status."""
+    _incident_repository, incident, needs_you_item = _make_mailbox_health_incident_fixture(client)
+
+    response = client.post(
+        f"/internal/needs-you/{needs_you_item.item_id}/resolve",
+        json={"new_status": "DISMISSED", "actor_type": "SYSTEM", "actor_id": "test-operator"},
+    )
+    assert response.status_code == 422, response.text
+
+    still_open = client.get(f"/internal/needs-you/{needs_you_item.item_id}").json()
+    assert still_open["status"] == "OPEN"
+
+
+def test_resolving_a_mailbox_health_incident_item_after_genuine_recovery_succeeds_idempotently(client):
+    """§12 criterion 27 — once the underlying incident is already
+    genuinely `RESOLVED` at the database level (the evaluator's own real
+    recovery proof), a manual `RESOLVED` request against the item must
+    succeed as idempotent reconciliation — regardless of whether the
+    incoming `resolution` payload matches whatever the evaluator itself
+    recorded."""
+    incident_repository, incident, needs_you_item = _make_mailbox_health_incident_fixture(client)
+
+    # The evaluator's own real recovery proof — the incident genuinely
+    # RESOLVED, but its own NeedsYouItem NOT yet caught up (the common
+    # real-world ordering: the evaluator resolves both in one atomic
+    # transaction, so by the time an operator's manual request arrives
+    # the NeedsYouItem is normally ALREADY resolved too — reproduced here
+    # explicitly so this test also covers the narrower documented timing
+    # window).
+    incident_repository.resolve_incident(incident.incident_id, recovery_evidence={"proof": "test"})
+
+    first = client.post(
+        f"/internal/needs-you/{needs_you_item.item_id}/resolve",
+        json={
+            "new_status": "RESOLVED",
+            "resolution": {"acknowledged_by": "matt"},
+            "actor_type": "USER", "actor_id": "matt",
+        },
+    )
+    assert first.status_code == 200, first.text
+    assert first.json()["status"] == "RESOLVED"
+
+    # A SECOND manual request, with a DIFFERENT resolution payload, must
+    # ALSO succeed idempotently — never the generic "different
+    # resolution -> 409" conflict check (Decision B's own explicit
+    # requirement; this item type's idempotent contract is its own,
+    # distinct from every other item type's).
+    second = client.post(
+        f"/internal/needs-you/{needs_you_item.item_id}/resolve",
+        json={
+            "new_status": "RESOLVED",
+            "resolution": {"acknowledged_by": "someone-else", "a_totally_different_payload": True},
+            "actor_type": "USER", "actor_id": "someone-else",
+        },
+    )
+    assert second.status_code == 200, second.text
+
+
+def test_resolving_an_already_evaluator_resolved_mailbox_health_incident_item_succeeds_idempotently(client):
+    """The common, expected real-world path: the evaluator has already
+    resolved BOTH the incident AND its own NeedsYouItem (its own atomic
+    incident+NeedsYou transaction) by the time the operator's manual
+    acknowledgment arrives — this must succeed idempotently too,
+    regardless of the resolution payload."""
+    incident_repository, incident, needs_you_item = _make_mailbox_health_incident_fixture(client)
+
+    from app.api.composition import get_composition
+
+    composition = get_composition()
+    recovery_evidence = {"proof": "evaluator-recorded-evidence"}
+    incident_repository.resolve_incident(incident.incident_id, recovery_evidence=recovery_evidence)
+    composition.needs_you_repository.resolve_needs_you_item(
+        needs_you_item.item_id,
+        new_status="RESOLVED",
+        resolution={"incident_id": incident.incident_id, "recovery_evidence": recovery_evidence},
+        actor_type="SYSTEM", actor_id="bagman-mailbox-health-evaluator",
+    )
+
+    response = client.post(
+        f"/internal/needs-you/{needs_you_item.item_id}/resolve",
+        json={"new_status": "RESOLVED", "resolution": {"acknowledged_by": "matt"}, "actor_type": "USER", "actor_id": "matt"},
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "RESOLVED"
+    # The evaluator's own originally-recorded resolution is untouched —
+    # this manual request never overwrote it (a true idempotent no-op,
+    # not a second mutation).
+    assert response.json()["resolution"] == {"incident_id": incident.incident_id, "recovery_evidence": recovery_evidence}
+
+
+def test_evaluators_own_automatic_resolve_path_is_unaffected_by_the_new_manual_request_guards(client):
+    """§12 criterion 27's own explicit requirement: the evaluator's
+    automatic recovery/closure path — calling
+    `NeedsYouRepository.resolve_needs_you_item` directly, exactly as
+    `scripts/evaluate_mailbox_health.py`'s own real recovery-check loop
+    does — is completely unaffected by the new manual-request guards this
+    delivery adds to the HTTP router, because that automatic path never
+    goes through the HTTP router at all."""
+    _incident_repository, incident, needs_you_item = _make_mailbox_health_incident_fixture(client)
+
+    from app.api.composition import get_composition
+
+    composition = get_composition()
+    resolved = composition.needs_you_repository.resolve_needs_you_item(
+        needs_you_item.item_id,
+        new_status="RESOLVED",
+        resolution={"incident_id": incident.incident_id, "recovery_evidence": {"proof": "auto"}},
+        actor_type="SYSTEM", actor_id="bagman-mailbox-health-evaluator",
+    )
+    assert resolved.status == "RESOLVED"
+
+    refetched = client.get(f"/internal/needs-you/{needs_you_item.item_id}").json()
+    assert refetched["status"] == "RESOLVED"
