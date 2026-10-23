@@ -385,8 +385,12 @@ def _evaluate_mailbox(
                 # `mark_microsoft_auth_required`), or a closed
                 # `SweepFailureReason`/provider-status enum value (set only
                 # by `mark_microsoft_connection_error`, always called with an
-                # enum member — confirmed at every real call site,
-                # `services/mailbox/sweep.py:1018,1130`). `mailbox
+                # enum/closed-constant member — confirmed at every real call
+                # site: `services/mailbox/sweep.py:1018,1130` (both pass
+                # `SweepFailureReason.PERMISSION_ERROR`) and
+                # `app/api/routers/mailboxes_imap.py:125-126` (passes
+                # `ImapOutcomeStatus(...).value`, itself a closed `str`
+                # enum). `mailbox
                 # .last_error_detail`, by contrast, is always free text (raw
                 # exception messages, raw provider response bodies) and must
                 # never be persisted verbatim — replaced here with a bounded
