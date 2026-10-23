@@ -108,6 +108,7 @@ from core.timestamps import to_contract_string, utc_now
 from services.mailbox.domain_rule import MATCH_MODE_EXACT
 from services.mailbox.gmail.gmail_client import GmailOutcomeStatus
 from services.mailbox.gmail.oauth_state import consume_state
+from services.mailbox.health.needs_you_sync import sync_needs_you_for_connection_state
 from services.mailbox.lock import MailboxSweepLockError
 from services.mailbox.mailbox import PROVIDER_GOOGLE_GMAIL
 from services.mailbox.review_resolution import (
@@ -182,6 +183,9 @@ async def connect_gmail(mailbox_id: str, payload: ConnectGmailRequest) -> dict[s
         correlation_id=mailbox.mailbox_id,
         causation_id=None,
         payload={"mailbox_id": mailbox_id},
+    )
+    sync_needs_you_for_connection_state(
+        composition.needs_you_repository, mailbox, actor_type=payload.actor_type, actor_id=payload.actor_id
     )
     return {"mailbox_id": mailbox_id, "authorize_url": authorize_url, "state_expires_at": oauth_state.expires_at.isoformat()}
 
@@ -308,6 +312,10 @@ async def gmail_oauth_callback(code: Optional[str] = None, state: Optional[str] 
         causation_id=None,
         payload={"mailbox_id": mailbox_id},
     )
+    updated_mailbox = composition.mailbox_source_repository.get_mailbox(mailbox_id)
+    sync_needs_you_for_connection_state(
+        composition.needs_you_repository, updated_mailbox, actor_type="SYSTEM", actor_id="gmail-oauth-callback"
+    )
     return _redirect_to_result(ok=True, reason="connected")
 
 
@@ -328,6 +336,9 @@ async def disconnect_gmail(mailbox_id: str, payload: DisconnectGmailRequest) -> 
         correlation_id=mailbox_id,
         causation_id=None,
         payload={"mailbox_id": mailbox_id},
+    )
+    sync_needs_you_for_connection_state(
+        composition.needs_you_repository, updated, actor_type=payload.actor_type, actor_id=payload.actor_id
     )
     return updated.to_dict()
 
@@ -452,6 +463,10 @@ async def sweep_gmail(mailbox_id: str, payload: SweepGmailRequest) -> dict[str, 
             "evidence_created": run.evidence_created,
             "error_code": run.error_code,
         },
+    )
+    updated_mailbox = composition.mailbox_source_repository.get_mailbox(mailbox_id)
+    sync_needs_you_for_connection_state(
+        composition.needs_you_repository, updated_mailbox, actor_type=payload.actor_type, actor_id=payload.actor_id
     )
     return run.to_dict()
 

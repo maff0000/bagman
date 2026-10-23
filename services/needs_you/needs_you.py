@@ -376,6 +376,7 @@ class NeedsYouRepository(abc.ABC):
         source_object_reference: Optional[str] = None,
         priority: str = DEFAULT_PRIORITY,
         metadata: Optional[Mapping[str, Any]] = None,
+        session: Optional[Any] = None,
     ) -> NeedsYouItem:
         """Create a new `NeedsYouItem` in `OPEN` — or, if a prior item
         already exists for the same `(item_type, source_object_reference)`
@@ -384,7 +385,17 @@ class NeedsYouRepository(abc.ABC):
         "Idempotency design decision"; no error is raised for this
         case, unlike `IntakeRecord`'s stricter conflict semantics,
         because there is no independent "identifying content" to
-        disagree on here)."""
+        disagree on here).
+
+        `session` (WO-BAGMAN-118 §6.A.3, PID §118.F's primary
+        transactional-consistency design) — an OPTIONAL, additive
+        parameter: when supplied (a real `sqlalchemy.orm.Session`, for
+        the Postgres implementation), this call participates in the
+        caller's own already-open transaction instead of opening its
+        own `session_scope()`; when omitted (every existing call site,
+        unchanged), behaviour is exactly as before this parameter
+        existed. The in-memory reference implementation accepts and
+        ignores it (no transaction concept applies there)."""
         raise NotImplementedError
 
     @abc.abstractmethod
@@ -425,9 +436,15 @@ class NeedsYouRepository(abc.ABC):
         resolution: Optional[Mapping[str, Any]],
         actor_type: str,
         actor_id: str,
+        session: Optional[Any] = None,
     ) -> NeedsYouItem:
         """Look up `item_id`, apply :func:`transition`, persist and
-        return the resulting `NeedsYouItem`."""
+        return the resulting `NeedsYouItem`.
+
+        `session` — same optional, additive, backward-compatible
+        shared-transaction extension as
+        :meth:`create_needs_you_item`'s own `session` parameter (see
+        that method's own docstring)."""
         raise NotImplementedError
 
     @abc.abstractmethod
@@ -492,7 +509,12 @@ class InMemoryNeedsYouRepository(NeedsYouRepository):
         source_object_reference: Optional[str] = None,
         priority: str = DEFAULT_PRIORITY,
         metadata: Optional[Mapping[str, Any]] = None,
+        session: Optional[Any] = None,
     ) -> NeedsYouItem:
+        # `session` is accepted for interface parity with
+        # NeedsYouRepository's own (WO-BAGMAN-118 §6.A.3) signature, and
+        # deliberately ignored — no transaction concept applies to this
+        # in-memory reference implementation.
         dedupe_key = _dedupe_key(item_type, source_object_reference)
         if dedupe_key is not None:
             existing_id = self._by_dedupe_key.get(dedupe_key)
@@ -574,7 +596,10 @@ class InMemoryNeedsYouRepository(NeedsYouRepository):
         resolution: Optional[Mapping[str, Any]],
         actor_type: str,
         actor_id: str,
+        session: Optional[Any] = None,
     ) -> NeedsYouItem:
+        # `session` accepted-and-ignored — see create_needs_you_item's
+        # own identical note above.
         current = self.get_needs_you_item(item_id)
         updated = transition(
             current,

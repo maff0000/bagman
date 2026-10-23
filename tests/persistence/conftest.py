@@ -149,6 +149,8 @@ CANONICAL_TABLES = (
     "background_jobs",  # CD-6 §103 Inference Architecture Ruling
     "evidence_classification_jobs",  # evidence/automatic-classification-activation WO
     "operator_sessions",  # WO-BAGMAN-117 (single-operator authentication, PID §117.C)
+    "mailbox_health_notifications",  # WO-BAGMAN-118 (mailbox health alerting, PID §118) — FK child, truncate first via CASCADE
+    "mailbox_health_incidents",  # WO-BAGMAN-118 (mailbox health alerting, PID §118)
 )
 
 

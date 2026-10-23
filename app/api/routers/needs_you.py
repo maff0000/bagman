@@ -41,13 +41,33 @@ from pydantic import BaseModel
 
 from core.errors import ConflictError, ValidationError
 from app.api.composition import get_composition
+from persistence.postgres.mailbox_health_repository import PostgresMailboxHealthIncidentRepository
 from services.evidence.classification_review import resolve_classification_review
+from services.mailbox.health.incident import (
+    ITEM_TYPE_MAILBOX_HEALTH_INCIDENT,
+    STATUS_RESOLVED as MAILBOX_HEALTH_INCIDENT_STATUS_RESOLVED,
+)
 from services.needs_you.needs_you import (
     ITEM_TYPE_CLASSIFICATION_REVIEW,
     ITEM_TYPE_COMPANY_REQUIRED,
     ITEM_TYPE_XERO_ACCOUNT_REQUIRED,
 )
 from services.xero.account_suggestion_resolution import resolve_account_suggestion
+
+#: WO-BAGMAN-118 §6.A' Decision B — constructed directly against
+#: `persistence.postgres.session.get_engine()` (the repository's own
+#: default when no engine is supplied), never through
+#: `app.api.composition` — `app/api/composition.py` is NOT among the
+#: files this delivery's governing Work Order authorises FORGE to
+#: touch, mirroring `scripts/evaluate_mailbox_health.py`'s own
+#: identical, already-documented "construct the Postgres repository
+#: directly, do not wire it into composition" decision (see that
+#: script's own module docstring). `MailboxHealthIncident` rows only
+#: ever exist against the real, durable Postgres backing store (the
+#: evaluator script is their one and only producer), so there is no
+#: development/in-memory counterpart to fall back to here.
+def _mailbox_health_incident_repository() -> PostgresMailboxHealthIncidentRepository:
+    return PostgresMailboxHealthIncidentRepository()
 
 router = APIRouter(prefix="/internal/needs-you")
 
@@ -217,6 +237,59 @@ async def resolve_needs_you_item(item_id: str, payload: ResolveNeedsYouItemReque
             "resolution (WI-4 §26); classify the document as NON_ACCOUNTING_DOCUMENT if it should not "
             "enter accounting workflows, or UNKNOWN if it truly cannot be determined"
         )
+
+    # WO-BAGMAN-118 §6.A' Decision B — a narrow branch in this generic
+    # HTTP-orchestration-layer handler (same shape/placement as the
+    # CLASSIFICATION_REVIEW DISMISSED-rejection immediately above): an
+    # open mailbox-health failure is never dismissible the way an
+    # advisory question is, and a manual RESOLVED request can never
+    # outrun the evaluator's own genuine, PID §118.H-proven recovery.
+    # Fires BEFORE the generic OPEN-check below (both checks below must
+    # run even against an already-terminal item — the DISMISSED rejection
+    # unconditionally, the RESOLVED idempotent-reconciliation path
+    # specifically BECAUSE the item may already be terminal).
+    #
+    # Forward constraint (not new scope — no such feature is authorised
+    # or required by this amendment): if any future operator-
+    # acknowledgment feature is ever exposed against this item type, it
+    # must not itself change the incident's or this item's own lifecycle
+    # `status` — acknowledgment, if it ever exists, is metadata only.
+    if current.item_type == ITEM_TYPE_MAILBOX_HEALTH_INCIDENT:
+        if payload.new_status == "DISMISSED":
+            raise ValidationError(
+                f"NeedsYouItem '{item_id}' is a MAILBOX_HEALTH_INCIDENT item — DISMISSED is never a "
+                "valid resolution for an open mailbox-health failure (WO-BAGMAN-118 §6.A' Decision B); "
+                "the evaluator's own automatic recovery detection is the sole path to closing it"
+            )
+        if payload.new_status == "RESOLVED":
+            incident = _mailbox_health_incident_repository().get_incident(current.source_object_reference)
+            if incident.status != MAILBOX_HEALTH_INCIDENT_STATUS_RESOLVED:
+                raise ConflictError(
+                    f"NeedsYouItem '{item_id}' references MailboxHealthIncident '{incident.incident_id}', "
+                    f"which is still '{incident.status}' — manual resolution can never outrun genuine, "
+                    "evaluator-proven recovery (WO-BAGMAN-118 §6.A' Decision B, PID §118.H); only the "
+                    "evaluator's own automatic recovery detection (`detect_recovery`) closes this incident"
+                )
+            if current.status != "OPEN":
+                # The incident is already genuinely RESOLVED at the
+                # database level AND this item is already terminal too —
+                # the normal, expected path once the evaluator has
+                # already closed both. Succeeds idempotently regardless
+                # of whether the incoming `resolution` payload matches
+                # whatever the evaluator itself originally recorded —
+                # this is an operator ACKNOWLEDGMENT, not a race to
+                # police, so it deliberately bypasses the generic
+                # "different resolution -> 409" conflict check below,
+                # which does not apply to this item type's own idempotent
+                # contract (Decision B's own explicit requirement).
+                return current.to_dict()
+            # current.status == "OPEN" but the incident is already
+            # genuinely RESOLVED underneath (a narrow timing window — the
+            # evaluator's own atomic incident+NeedsYou resolve
+            # transaction had not yet reached this specific item when
+            # this request arrived, or raced it): fall through to the
+            # generic resolve below, exactly as any other RESOLVED
+            # request against a genuinely OPEN item would.
 
     if current.status != "OPEN":
         same_outcome = current.status == payload.new_status and (current.resolution or {}) == (

@@ -90,7 +90,28 @@ class PostgresNeedsYouRepository(NeedsYouRepository):
         source_object_reference: Optional[str] = None,
         priority: str = DEFAULT_PRIORITY,
         metadata: Optional[Mapping[str, Any]] = None,
+        session: Optional[Any] = None,
     ) -> NeedsYouItem:
+        """See the ABC's own docstring for the `session` parameter's
+        full contract (WO-BAGMAN-118 §6.A.3, PID §118.F).
+
+        Deliberate scope note: when `session` is supplied, this method
+        inserts directly through the CALLER's own transaction and does
+        NOT catch/translate a genuine `IntegrityError` the way the
+        standalone (`session=None`) path below does — a caught exception
+        would leave the caller's shared, multi-statement transaction
+        (e.g. the mailbox-health evaluator's incident+NeedsYou+
+        notification composition) in PostgreSQL's own aborted-transaction
+        state for every subsequent statement, which is strictly worse
+        than letting a genuine, unexpected conflict propagate and roll
+        back the whole unit of work. This is safe for this delivery's
+        own real caller: every shared-session call site passes a
+        freshly-`core.identity.generate_id()`-minted `source_object_reference`
+        (a new `MailboxHealthIncident.incident_id`) that cannot already
+        be bound to an existing dedupe key by construction — a
+        structural guarantee, not merely an assumption. A future caller
+        that cannot make the same guarantee must not reuse this
+        `session=`-supplied path without re-examining this note."""
         if source_object_reference is not None:
             existing = self.find_by_dedupe_key(item_type, source_object_reference)
             if existing is not None:
@@ -134,9 +155,22 @@ class PostgresNeedsYouRepository(NeedsYouRepository):
             metadata_=dict(candidate.metadata),
         )
 
-        try:
-            with session_scope(self._engine) as session:
+        if session is not None:
+            # Shared-transaction path (PID §118.F) — see this method's
+            # own docstring note above for why no IntegrityError
+            # handling happens here: a genuine conflict must propagate
+            # and roll back the caller's whole shared transaction, never
+            # be caught and silently worked around mid-transaction.
+            try:
                 session.add(row)
+                session.flush()
+            except SQLAlchemyError as exc:
+                raise PersistenceError(f"could not create NeedsYouItem: {exc}") from exc
+            return candidate
+
+        try:
+            with session_scope(self._engine) as db_session:
+                db_session.add(row)
         except IntegrityError as exc:
             if source_object_reference is not None and unique_violation_constraint(exc) == _DEDUPE_CONSTRAINT:
                 winner = self.find_by_dedupe_key(item_type, source_object_reference)
@@ -245,42 +279,54 @@ class PostgresNeedsYouRepository(NeedsYouRepository):
         resolution: Optional[Mapping[str, Any]],
         actor_type: str,
         actor_id: str,
+        session: Optional[Any] = None,
     ) -> NeedsYouItem:
+        """See the ABC's own docstring for the `session` parameter's
+        full contract (WO-BAGMAN-118 §6.A.3, PID §118.F)."""
+
+        def _do(db_session: Any) -> NeedsYouItem:
+            try:
+                row = db_session.get(NeedsYouItemRow, item_id, with_for_update=True)
+            except DataError as exc:
+                if is_invalid_uuid_format(exc):
+                    raise NotFoundError(
+                        f"no NeedsYouItem with item_id '{item_id}' "
+                        "(malformed identifier can never exist)"
+                    ) from exc
+                raise
+            if row is None:
+                raise NotFoundError(f"no NeedsYouItem with item_id '{item_id}'")
+
+            current = _row_to_item(row)
+            updated = transition(
+                current,
+                new_status,
+                resolution=resolution,
+                resolved_by_actor_type=actor_type,
+                resolved_by_actor_id=actor_id,
+            )
+
+            row.status = updated.status
+            row.resolved_at = updated.resolved_at
+            row.resolved_by_actor_type = updated.resolved_by_actor_type
+            row.resolved_by_actor_id = updated.resolved_by_actor_id
+            row.resolution = dict(updated.resolution) if updated.resolution is not None else None
+            db_session.flush()
+            return updated
+
         try:
-            with session_scope(self._engine) as session:
-                try:
-                    row = session.get(NeedsYouItemRow, item_id, with_for_update=True)
-                except DataError as exc:
-                    if is_invalid_uuid_format(exc):
-                        raise NotFoundError(
-                            f"no NeedsYouItem with item_id '{item_id}' "
-                            "(malformed identifier can never exist)"
-                        ) from exc
-                    raise
-                if row is None:
-                    raise NotFoundError(f"no NeedsYouItem with item_id '{item_id}'")
-
-                current = _row_to_item(row)
-                updated = transition(
-                    current,
-                    new_status,
-                    resolution=resolution,
-                    resolved_by_actor_type=actor_type,
-                    resolved_by_actor_id=actor_id,
-                )
-
-                row.status = updated.status
-                row.resolved_at = updated.resolved_at
-                row.resolved_by_actor_type = updated.resolved_by_actor_type
-                row.resolved_by_actor_id = updated.resolved_by_actor_id
-                row.resolution = dict(updated.resolution) if updated.resolution is not None else None
-                session.flush()
+            if session is not None:
+                # Shared-transaction path (PID §118.F) — run directly
+                # against the caller's own session; commit/rollback
+                # remain entirely the caller's own `session_scope`
+                # responsibility.
+                return _do(session)
+            with session_scope(self._engine) as db_session:
+                return _do(db_session)
         except (NotFoundError, InvalidStateTransitionError, ValidationError):
             raise
         except SQLAlchemyError as exc:
             raise PersistenceError(f"could not resolve NeedsYouItem: {exc}") from exc
-
-        return updated
 
     def update_item_metadata(self, item_id: str, *, metadata_updates: Mapping[str, Any]) -> NeedsYouItem:
         try:

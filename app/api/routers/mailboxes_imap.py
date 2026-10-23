@@ -77,6 +77,7 @@ from app.api.composition import ensure_seed_entities, get_composition, get_mailb
 from core.errors import ConflictError, NotFoundError, ValidationError
 from core.timestamps import to_contract_string, utc_now
 from services.mailbox.domain_rule import MATCH_MODE_EXACT
+from services.mailbox.health.needs_you_sync import sync_needs_you_for_connection_state
 from services.mailbox.imap.imap_client import ImapOutcomeStatus
 from services.mailbox.lock import MailboxSweepLockError
 from services.mailbox.mailbox import PROVIDER_IMAP
@@ -184,6 +185,9 @@ async def connect_imap(mailbox_id: str, payload: ConnectImapRequest) -> dict[str
         causation_id=None,
         payload={"mailbox_id": mailbox_id, "status": outcome.status.value},
     )
+    sync_needs_you_for_connection_state(
+        composition.needs_you_repository, updated, actor_type=payload.actor_type, actor_id=payload.actor_id
+    )
     return updated.to_dict()
 
 
@@ -202,6 +206,9 @@ async def disconnect_imap(mailbox_id: str, payload: DisconnectImapRequest) -> di
         correlation_id=mailbox_id,
         causation_id=None,
         payload={"mailbox_id": mailbox_id},
+    )
+    sync_needs_you_for_connection_state(
+        composition.needs_you_repository, updated, actor_type=payload.actor_type, actor_id=payload.actor_id
     )
     return updated.to_dict()
 
@@ -326,6 +333,10 @@ async def sweep_imap(mailbox_id: str, payload: SweepImapRequest) -> dict[str, An
             "evidence_created": run.evidence_created,
             "error_code": run.error_code,
         },
+    )
+    updated_mailbox = composition.mailbox_source_repository.get_mailbox(mailbox_id)
+    sync_needs_you_for_connection_state(
+        composition.needs_you_repository, updated_mailbox, actor_type=payload.actor_type, actor_id=payload.actor_id
     )
     return run.to_dict()
 
