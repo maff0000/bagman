@@ -39,6 +39,7 @@ from services.mailbox.health.notification import (
     PRE_DISPATCH_SUPPRESSIBLE_STATES,
     PURPOSE_INITIAL,
     PURPOSE_RECOVERY,
+    STATE_ACCEPTED,
     STATE_CANCELLED,
     STATE_RETRYABLE_FAILURE,
 )
@@ -913,6 +914,14 @@ def test_decision_d_7_never_connected_abandoned_expired_reconnect_produces_only_
 # reads only `run.error_code` — making it the injection point this test
 # can prove the exclusion against without contradicting current,
 # intentional, out-of-scope-to-change behaviour.
+#
+# RESOLVED 2026-10-23 (Architect correction, same §12 criterion 16): the
+# tension named above is fixed, not merely surfaced — `_evaluate_mailbox`
+# no longer stores `mailbox.last_error_detail` verbatim at all (replaced
+# with a bounded `last_error_detail_present` boolean); see
+# `test_adversarial_markers_in_mailbox_last_error_detail_never_leak_onto_any_new_surface`
+# below, which exercises exactly the `mark_microsoft_auth_required`
+# injection point this note once left untested, and now passes.
 # ---------------------------------------------------------------------
 
 _FINANCIAL_MARKER = "INVOICE-CANARY-8f2c: account_number=4111-CANARY-1111-0000, balance=$CANARY_94821.33"
@@ -1032,6 +1041,280 @@ def test_adversarial_markers_in_sweep_run_error_detail_never_leak_onto_any_new_s
         payload_text = str(event.payload)
         for marker in _ALL_ADVERSARIAL_MARKERS:
             assert marker not in payload_text
+
+
+# ---------------------------------------------------------------------
+# WO-BAGMAN-118 Architect correction, 2026-10-23 (§12 criterion 16,
+# Stage A acceptance gap) — the two companion adversarial-marker proofs
+# the prior AMBER-closure round's own comment block (above) explicitly
+# named as a real, then-unfixed tension and deliberately left untested:
+# (1) `mailbox.last_error_detail` via a direct
+# `mark_microsoft_auth_required(error_detail=...)` call, and (2)
+# Pushover's own `PushoverSendResult.error_detail`/`provider_request_id`.
+# Both fields are now dropped/validated rather than persisted verbatim
+# (see `scripts/evaluate_mailbox_health.py`'s own
+# `_validate_pushover_request_id` helper and the `metadata=` literals in
+# `_evaluate_mailbox`/`_process_notifications`) — these tests prove the
+# fix against real, persisted Postgres rows read back through the real
+# repositories, never merely in-memory objects or code inspection.
+# ---------------------------------------------------------------------
+
+
+def test_adversarial_markers_in_mailbox_last_error_detail_never_leak_onto_any_new_surface():
+    """§12 criterion 16 — the injection point the prior round's comment
+    block (above) identified as a genuine, then-unfixed gap: a real
+    `mark_microsoft_auth_required(error_detail=...)` call whose
+    `error_detail` carries financial-evidence-, mailbox-content-, and
+    OAuth-token-shaped adversarial content. Proves the markers never
+    reach `mailbox_health_incidents.metadata`, `NeedsYouItem.metadata`,
+    `mailbox_health_notifications.provider_response_metadata`, any
+    `AuditEvent.payload` for this incident's correlation_id, or the
+    outbound `FakePushoverClient` call's title/message — all read back
+    from the REAL repositories, never the in-process creation-time
+    objects alone. Also confirms the bounded replacement field
+    (`last_error_detail_present`) is `True`, proving the presence signal
+    still works even though the content itself is gone.
+    """
+    repos = _repos()
+    mailbox = repos["mailbox_source_repository"].create_mailbox(
+        display_name="Adversarial Last Error Detail Test",
+        email_address=f"adversarial-last-error-detail-{utc_now().timestamp()}@example.com",
+        provider_kind=PROVIDER_GOOGLE_GMAIL,
+    )
+    mailbox = repos["mailbox_source_repository"].begin_microsoft_connect(mailbox.mailbox_id)
+    # `begin_microsoft_connect` already lands on AUTH_REQUIRED (its own
+    # NOT_CONFIGURED -> AUTH_REQUIRED step, with no error_detail); a
+    # same-state `mark_microsoft_auth_required` call right after it would
+    # be an idempotent no-op (`_connection_transition`'s own
+    # already-in-that-state short-circuit) and would NOT apply
+    # `error_detail` at all. Routing through a genuine `CONNECTED ->
+    # AUTH_REQUIRED` transition first (mirrors
+    # `test_decision_d_6_durable_evidence_sustains_auth_required_after_connected_until_real_sweep_succeeds`'s
+    # own identical sequence) is what makes this a real transition that
+    # actually persists `error_detail`.
+    mailbox = repos["mailbox_source_repository"].mark_microsoft_connected(mailbox.mailbox_id)
+    adversarial_last_error_detail = (
+        "AADSTS700082: token refresh failed; raw provider response captured "
+        f"verbatim by the client's own error path -- {_OAUTH_TOKEN_MARKER} -- "
+        f"embedded message excerpt: {_MAILBOX_CONTENT_MARKER} -- associated "
+        f"billing context: {_FINANCIAL_MARKER}"
+    )
+    mailbox = repos["mailbox_source_repository"].mark_microsoft_auth_required(
+        mailbox.mailbox_id, error_detail=adversarial_last_error_detail
+    )
+
+    # Sanity: the adversarial content genuinely made it into the real,
+    # persisted mailbox row's own `last_error_detail` BEFORE the
+    # evaluator ever runs — otherwise an absent marker downstream would
+    # prove nothing.
+    pre_run_mailbox = repos["mailbox_source_repository"].get_mailbox(mailbox.mailbox_id)
+    assert pre_run_mailbox.last_error_detail == adversarial_last_error_detail
+    assert pre_run_mailbox.last_error_code == "AUTH_REQUIRED"
+
+    fake_pushover = FakePushoverClient(
+        result=PushoverSendResult(status=PushoverOutcomeStatus.OK, http_status=200, provider_request_id="deadbeef")
+    )
+    fake_credentials = PushoverCredentials(api_token="fake-token", user_key="fake-user")
+
+    result = evl.run_evaluation(
+        engine=repos["engine"],
+        mailbox_source_repository=repos["mailbox_source_repository"],
+        sweep_run_repository=repos["sweep_run_repository"],
+        incident_repository=repos["incident_repository"],
+        notification_repository=repos["notification_repository"],
+        needs_you_repository=repos["needs_you_repository"],
+        audit_repository=repos["audit_repository"],
+        pushover_client=fake_pushover,
+        worker_id="test-worker",
+        notification_limit=50,
+        claim_timeout_seconds=900,
+        credentials=fake_credentials,
+    )
+    assert result["incidents_created"] == 1
+
+    # 1. The REAL, PERSISTED incident row's own metadata, read back from
+    # the repository.
+    incident = repos["incident_repository"].get_open_incident(
+        mailbox_id=mailbox.mailbox_id, failure_class=FAILURE_CLASS_AUTH_REQUIRED
+    )
+    assert incident is not None
+    incident_metadata_text = str(incident.metadata)
+    for marker in _ALL_ADVERSARIAL_MARKERS:
+        assert marker not in incident_metadata_text
+    assert incident.metadata["last_error_code"] == "AUTH_REQUIRED"
+    assert incident.metadata["last_error_detail_present"] is True
+
+    # 2. The real, persisted `NeedsYouItem`'s own metadata.
+    needs_you_item = repos["needs_you_repository"].find_by_dedupe_key(
+        ITEM_TYPE_MAILBOX_HEALTH_INCIDENT, incident.incident_id
+    )
+    assert needs_you_item is not None
+    needs_you_metadata_text = str(needs_you_item.metadata)
+    for marker in _ALL_ADVERSARIAL_MARKERS:
+        assert marker not in needs_you_metadata_text
+
+    # 3. The real, persisted notification row's own
+    # `provider_response_metadata`.
+    notifications = repos["notification_repository"].list_by_incident(incident.incident_id)
+    assert len(notifications) >= 1
+    for notification in notifications:
+        notification_metadata_text = str(notification.provider_response_metadata)
+        for marker in _ALL_ADVERSARIAL_MARKERS:
+            assert marker not in notification_metadata_text
+
+    # 4. Every AuditEvent recorded against this incident's own
+    # correlation_id during this run.
+    audit_events = repos["audit_repository"].list_by_correlation(incident.incident_id)
+    assert len(audit_events) >= 1
+    for event in audit_events:
+        payload_text = str(event.payload)
+        for marker in _ALL_ADVERSARIAL_MARKERS:
+            assert marker not in payload_text
+
+    # 5. The Pushover outbound payload itself.
+    assert len(fake_pushover.calls) >= 1
+    for call in fake_pushover.calls:
+        for marker in _ALL_ADVERSARIAL_MARKERS:
+            assert marker not in call["title"]
+            assert marker not in call["message"]
+
+
+def test_adversarial_markers_in_pushover_error_detail_and_non_hex_request_id_never_leak_onto_any_new_surface():
+    """§12 criterion 16 — the second injection point: an adversarial/
+    malicious upstream Pushover response whose own `error_detail` AND
+    `request` (`provider_request_id`) fields carry financial-evidence-,
+    mailbox-content-, and OAuth-token-shaped content (simulating a
+    compromised or malfunctioning upstream provider, not merely a
+    well-formed failure). Proves the real, persisted
+    `mailbox_health_notifications.provider_response_metadata` row
+    carries none of it: `error_detail` is dropped from the metadata
+    shape entirely (not merely emptied), and a non-hex-shaped
+    `provider_request_id` (exactly this canary-shaped value) is dropped
+    to `None` rather than persisted verbatim.
+    """
+    repos = _repos()
+    mailbox = repos["mailbox_source_repository"].create_mailbox(
+        display_name="Adversarial Pushover Response Test",
+        email_address=f"adversarial-pushover-response-{utc_now().timestamp()}@example.com",
+        provider_kind=PROVIDER_GOOGLE_GMAIL,
+    )
+    mailbox = repos["mailbox_source_repository"].begin_microsoft_connect(mailbox.mailbox_id)
+    mailbox = repos["mailbox_source_repository"].mark_microsoft_auth_required(
+        mailbox.mailbox_id, error_detail="benign trigger for pushover-response adversarial test"
+    )
+
+    adversarial_provider_response_detail = (
+        "Pushover reported a non-1 status; raw errors[] joined verbatim -- "
+        f"{_OAUTH_TOKEN_MARKER} -- embedded message excerpt: {_MAILBOX_CONTENT_MARKER} "
+        f"-- associated billing context: {_FINANCIAL_MARKER}"
+    )
+    fake_pushover = FakePushoverClient(
+        result=PushoverSendResult(
+            status=PushoverOutcomeStatus.PROVIDER_ERROR,
+            http_status=500,
+            provider_request_id=_OAUTH_TOKEN_MARKER,  # canary-shaped, genuinely non-hex
+            error_detail=adversarial_provider_response_detail,
+        )
+    )
+    fake_credentials = PushoverCredentials(api_token="fake-token", user_key="fake-user")
+
+    result = evl.run_evaluation(
+        engine=repos["engine"],
+        mailbox_source_repository=repos["mailbox_source_repository"],
+        sweep_run_repository=repos["sweep_run_repository"],
+        incident_repository=repos["incident_repository"],
+        notification_repository=repos["notification_repository"],
+        needs_you_repository=repos["needs_you_repository"],
+        audit_repository=repos["audit_repository"],
+        pushover_client=fake_pushover,
+        worker_id="test-worker",
+        notification_limit=50,
+        claim_timeout_seconds=900,
+        credentials=fake_credentials,
+    )
+    assert result["incidents_created"] == 1
+
+    incident = repos["incident_repository"].get_open_incident(
+        mailbox_id=mailbox.mailbox_id, failure_class=FAILURE_CLASS_AUTH_REQUIRED
+    )
+    assert incident is not None
+
+    notifications = repos["notification_repository"].list_by_incident(incident.incident_id)
+    assert len(notifications) >= 1
+    for notification in notifications:
+        assert notification.provider_response_metadata is not None
+        notification_metadata_text = str(notification.provider_response_metadata)
+        for marker in _ALL_ADVERSARIAL_MARKERS:
+            assert marker not in notification_metadata_text
+        assert "error_detail" not in notification.provider_response_metadata
+        # The canary-shaped, non-hex `provider_request_id` was dropped to
+        # `None` — never persisted verbatim.
+        assert notification.provider_response_metadata.get("provider_request_id") is None
+        assert notification.provider_response_metadata.get("provider_status") == PushoverOutcomeStatus.PROVIDER_ERROR.value
+        assert notification.provider_response_metadata.get("http_status") == 500
+
+    audit_events = repos["audit_repository"].list_by_correlation(incident.incident_id)
+    assert len(audit_events) >= 1
+    for event in audit_events:
+        payload_text = str(event.payload)
+        for marker in _ALL_ADVERSARIAL_MARKERS:
+            assert marker not in payload_text
+
+
+def test_pushover_genuine_hex_shaped_provider_request_id_is_retained_on_acceptance():
+    """§12 criterion 16's own validation boundary, the positive case: a
+    genuinely hex-token-shaped `provider_request_id` (the known-safe
+    shape Pushover's own `request` field actually takes) survives the
+    new `_validate_pushover_request_id` guard and is persisted verbatim
+    — the guard drops unsafe shapes, it does not blank the field
+    unconditionally. Also closes the WO's own Test C note: an
+    `ACCEPTED` notification still retains a valid, non-`None`
+    `provider_response_metadata.provider_request_id` when Pushover
+    genuinely returns one.
+    """
+    repos = _repos()
+    mailbox = repos["mailbox_source_repository"].create_mailbox(
+        display_name="Genuine Hex Request Id Test",
+        email_address=f"genuine-hex-request-id-{utc_now().timestamp()}@example.com",
+        provider_kind=PROVIDER_GOOGLE_GMAIL,
+    )
+    mailbox = repos["mailbox_source_repository"].begin_microsoft_connect(mailbox.mailbox_id)
+    mailbox = repos["mailbox_source_repository"].mark_microsoft_auth_required(
+        mailbox.mailbox_id, error_detail="trigger for genuine-request-id test"
+    )
+
+    genuine_request_id = "4f9a0c2b7d8e"
+    fake_pushover = FakePushoverClient(
+        result=PushoverSendResult(status=PushoverOutcomeStatus.OK, http_status=200, provider_request_id=genuine_request_id)
+    )
+    fake_credentials = PushoverCredentials(api_token="fake-token", user_key="fake-user")
+
+    result = evl.run_evaluation(
+        engine=repos["engine"],
+        mailbox_source_repository=repos["mailbox_source_repository"],
+        sweep_run_repository=repos["sweep_run_repository"],
+        incident_repository=repos["incident_repository"],
+        notification_repository=repos["notification_repository"],
+        needs_you_repository=repos["needs_you_repository"],
+        audit_repository=repos["audit_repository"],
+        pushover_client=fake_pushover,
+        worker_id="test-worker",
+        notification_limit=50,
+        claim_timeout_seconds=900,
+        credentials=fake_credentials,
+    )
+    assert result["incidents_created"] == 1
+
+    incident = repos["incident_repository"].get_open_incident(
+        mailbox_id=mailbox.mailbox_id, failure_class=FAILURE_CLASS_AUTH_REQUIRED
+    )
+    assert incident is not None
+    notifications = repos["notification_repository"].list_by_incident(incident.incident_id)
+    accepted = [n for n in notifications if n.state == STATE_ACCEPTED]
+    assert len(accepted) >= 1
+    for notification in accepted:
+        assert notification.provider_response_metadata.get("provider_request_id") == genuine_request_id
+        assert notification.provider_response_metadata.get("provider_status") == PushoverOutcomeStatus.OK.value
 
 
 # ---------------------------------------------------------------------

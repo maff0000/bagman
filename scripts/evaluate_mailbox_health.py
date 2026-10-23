@@ -134,6 +134,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import uuid
 from datetime import datetime
@@ -192,6 +193,19 @@ DEFAULT_CLAIM_TIMEOUT_SECONDS = 900.0  # 15 minutes
 DEFAULT_MAX_ATTEMPTS = 3
 DEFAULT_NOTIFICATION_LIMIT = 50
 _MAX_NOTIFICATION_LIMIT = 200
+
+_PUSHOVER_REQUEST_ID_PATTERN = re.compile(r"^[0-9a-fA-F]{1,64}$")
+
+
+def _validate_pushover_request_id(value: object) -> Optional[str]:
+    """Pushover's own `request` field (`PushoverSendResult.provider_request_id`)
+    is a bounded, hex-token-shaped identifier when the provider genuinely
+    returns one — never trusted as arbitrary text (Architect correction,
+    2026-10-23, WO-BAGMAN-118 §12 criterion 16). Anything not matching this
+    known-safe shape is dropped, never persisted."""
+    if isinstance(value, str) and _PUSHOVER_REQUEST_ID_PATTERN.fullmatch(value):
+        return value
+    return None
 
 
 def _pending_oauth_state_status(session, mailbox_id: str, *, now: datetime) -> Optional[bool]:
@@ -365,7 +379,25 @@ def _evaluate_mailbox(
             creation = incident_repository.create_incident(
                 mailbox_id=mailbox.mailbox_id,
                 failure_class=triggered_class,
-                metadata={"last_error_code": mailbox.last_error_code, "last_error_detail": mailbox.last_error_detail},
+                # `mailbox.last_error_code` is closed-vocabulary and safe to
+                # keep verbatim: it is always one of `None`, the fixed
+                # literal `"AUTH_REQUIRED"` (set only by
+                # `mark_microsoft_auth_required`), or a closed
+                # `SweepFailureReason`/provider-status enum value (set only
+                # by `mark_microsoft_connection_error`, always called with an
+                # enum member — confirmed at every real call site,
+                # `services/mailbox/sweep.py:1018,1130`). `mailbox
+                # .last_error_detail`, by contrast, is always free text (raw
+                # exception messages, raw provider response bodies) and must
+                # never be persisted verbatim — replaced here with a bounded
+                # presence boolean only (Architect correction, 2026-10-23,
+                # WO-BAGMAN-118 §12 criterion 16): still gives an operator a
+                # useful signal ("more detail existed") without ever storing
+                # its content.
+                metadata={
+                    "last_error_code": mailbox.last_error_code,
+                    "last_error_detail_present": mailbox.last_error_detail is not None,
+                },
                 now=now,
                 session=session,
             )
@@ -514,11 +546,24 @@ def _process_notifications(
             http_status = result.http_status
             provider_request_id = result.provider_request_id
 
+        # `result_detail`/`PushoverSendResult.error_detail` is always free
+        # text — the raw HTTP error body, a raw transport-exception message,
+        # or the provider's own `errors[]` array joined into a string
+        # (`services/notifications/pushover.py`'s own `send()` method) —
+        # potentially adversary- or upstream-provider-controlled. It is
+        # dropped entirely here, never persisted (Architect correction,
+        # 2026-10-23, WO-BAGMAN-118 §12 criterion 16): `PushoverOutcomeStatus`
+        # already has 8 closed, meaningful enum values that fully capture
+        # the operationally-useful classification without any free text,
+        # and `error_detail` is always present whenever `result_status !=
+        # OK`, so a redundant presence flag would add nothing. `http_status`
+        # is already a safe, narrow integer from the HTTP layer (defensively
+        # re-checked here); `provider_request_id` is validated against a
+        # known-safe shape rather than trusted blindly.
         provider_response_metadata = {
             "provider_status": result_status.value if hasattr(result_status, "value") else str(result_status),
-            "http_status": http_status,
-            "provider_request_id": provider_request_id,
-            "error_detail": result_detail,
+            "http_status": http_status if isinstance(http_status, int) else None,
+            "provider_request_id": _validate_pushover_request_id(provider_request_id),
         }
 
         if result_status == PushoverOutcomeStatus.OK:
